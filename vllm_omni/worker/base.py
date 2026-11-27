@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import bisect
 import gc
 import math
 import os
@@ -13,7 +14,7 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 from vllm import envs
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import CompilationTimes
@@ -24,9 +25,67 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _save_non_parameter_tensors(models: list[torch.nn.Module], allocator) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """CPU copies of the device tensors a level-2 sleep discards and a weight sync does not rewrite.
+
+    Level 2 unmaps the "weights" pool without a host copy. Besides parameters,
+    that pool holds module buffers and plain tensor attributes of modules and
+    of their ``quant_method`` (rotary caches, for example). Tensors that share
+    storage with a parameter, or live outside the pool (the KV cache), are
+    skipped. An allocator without ``pointer_to_data`` gets vLLM's behavior:
+    every module buffer.
+    """
+    pointer_to_data = getattr(allocator, "pointer_to_data", None)
+    pool = (
+        sorted((ptr, data.handle[1]) for ptr, data in pointer_to_data.items() if data.tag == "weights")
+        if pointer_to_data is not None
+        else None
+    )
+    starts = [ptr for ptr, _ in pool or ()]
+
+    def in_weights_pool(ptr: int) -> bool:
+        if pool is None:
+            return True
+        i = bisect.bisect_right(starts, ptr) - 1
+        return i >= 0 and ptr < pool[i][0] + pool[i][1]
+
+    param_storages = {p.untyped_storage().data_ptr() for m in models for p in m.parameters()}
+    seen: set[int] = set()
+    saved = []
+
+    def visit(tensor) -> None:
+        if not isinstance(tensor, torch.Tensor) or isinstance(tensor, torch.nn.Parameter):
+            return
+        if id(tensor) in seen:
+            return
+        seen.add(id(tensor))
+        storage_ptr = tensor.untyped_storage().data_ptr()
+        if storage_ptr in param_storages or not in_weights_pool(storage_ptr):
+            return
+        saved.append((tensor, tensor.detach().to("cpu", copy=True)))
+
+    for model in models:
+        for module in model.modules():
+            for buffer in module._buffers.values():
+                visit(buffer)
+            if pool is None:
+                continue
+            for owner in (module, getattr(module, "quant_method", None)):
+                if owner is not None:
+                    for value in vars(owner).values():
+                        visit(value)
+    return saved
+
+
+def _restore_non_parameter_tensors(saved: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    for tensor, cpu_copy in saved:
+        tensor.data.copy_(cpu_copy)
 
 
 class OmniGPUWorkerBase(GPUWorker):
@@ -42,6 +101,8 @@ class OmniGPUWorkerBase(GPUWorker):
     It also replaces vLLM's TorchProfilerWrapper with OmniTorchProfilerWrapper
     for custom trace naming, background gzip, and trace path collection.
     """
+
+    use_v2_model_runner = True
 
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
@@ -88,11 +149,176 @@ class OmniGPUWorkerBase(GPUWorker):
         return result
 
     def load_model(self, *args, **kwargs):
+        weight_transfer = self.vllm_config.weight_transfer_config
+        is_merged_lora = weight_transfer is not None and weight_transfer.backend == "omni_lora_ipc"
+        if is_merged_lora and self.vllm_config.lora_config is not None:
+            raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
+            if is_merged_lora:
+                from vllm_omni.lora.capability import resolve_merged_lora_spec
+
+                model = self.model_runner.get_model()
+                if isinstance(model, torch.nn.Module):
+                    resolve_merged_lora_spec(model, stage="ar")
             current_omni_platform.synchronize()
             gc.collect()
             return res
+
+    def start_weight_update_with_id(self, update_id: str) -> None:
+        """Start an AR weight update session tagged with a caller-supplied ``update_id``."""
+        if not isinstance(update_id, str) or not update_id.strip():
+            raise ValueError("update_id must be a non-empty string")
+        if hasattr(GPUWorker, "_start_weight_update"):
+            with set_current_vllm_config(self.vllm_config):
+                self._start_weight_update(update_id=update_id)
+        else:
+            self.start_weight_update()
+            self._weight_update_id = update_id
+            engine = getattr(self, "weight_transfer_engine", None)
+            if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+                engine._update_id = update_id
+
+    def _start_weight_update(self, is_draft: bool = False, update_id: str | None = None) -> None:
+        was_active = getattr(self, "_weight_update_active", False)
+        incomplete = getattr(self, "_incomplete_weight_updates", None)
+        prior_incomplete = isinstance(incomplete, set) and is_draft in incomplete
+        try:
+            super()._start_weight_update(is_draft=is_draft)
+        except BaseException:
+            if (
+                not was_active
+                and not getattr(self, "_weight_update_active", False)
+                and not prior_incomplete
+                and isinstance(incomplete, set)
+                and isinstance(getattr(self, "weight_transfer_engine", None), MergedLoRAIPCWeightTransferEngine)
+            ):
+                incomplete.discard(is_draft)
+            raise
+        self._merged_lora_prior_incomplete: bool | None = prior_incomplete
+        self._weight_update_id: str | None = update_id
+        engine = getattr(self, "weight_transfer_engine", None)
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+            engine._update_id = update_id
+
+    def _maybe_restore_incomplete_after_non_mutating_abort(self) -> None:
+        engine = getattr(self, "weight_transfer_engine", None)
+        prior_incomplete = getattr(self, "_merged_lora_prior_incomplete", None)
+        self._merged_lora_prior_incomplete = None
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and getattr(
+            engine, "_last_abort_was_non_mutating", False
+        ):
+            engine._last_abort_was_non_mutating = False
+            if prior_incomplete is False:
+                incomplete = getattr(self, "_incomplete_weight_updates", None)
+                if isinstance(incomplete, set):
+                    incomplete.discard(getattr(self, "_weight_update_is_draft", False))
+
+    def _end_weight_update(self, refresh: bool) -> None:
+        engine = getattr(self, "weight_transfer_engine", None)
+        if not refresh and getattr(engine, "_skip_next_end_weight_update", False):
+            engine._skip_next_end_weight_update = False
+            return
+        super()._end_weight_update(refresh=refresh)
+        self._weight_update_id = None
+        if not refresh:
+            self._maybe_restore_incomplete_after_non_mutating_abort()
+        else:
+            self._merged_lora_prior_incomplete = None
+
+    def finish_weight_update(self) -> None:
+        """End failed merged sessions so the trainer can publish a new adapter.
+
+        Keep this cleanup on the public worker/engine lifecycle: the vLLM
+        version pinned by vLLM-Omni does not provide ``_end_weight_update``.
+        """
+        try:
+            super().finish_weight_update()
+            self._weight_update_id = None
+        except Exception:
+            self._merged_lora_prior_incomplete = None
+            self._weight_update_id = None
+            if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
+                self._weight_update_active = False
+                try:
+                    self.weight_transfer_engine.reset_weight_update_target()
+                except Exception:
+                    logger.warning(
+                        "Failed to reset weight update target while cleaning up a failed merged LoRA session.",
+                        exc_info=True,
+                    )
+            raise
+
+    def abort_weight_update(self, update_id: str | None = None) -> bool:
+        """Abort an active merged-LoRA update session without committing."""
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
+        if not getattr(self, "_weight_update_active", False):
+            return False
+        if update_id is not None and getattr(self, "_weight_update_id", None) != update_id:
+            return False
+        self._weight_update_active = False
+        self._weight_update_id = None
+        engine = getattr(self, "weight_transfer_engine", None)
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+            engine.abort_weight_update()
+        elif engine is not None:
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target during abort_weight_update.",
+                    exc_info=True,
+                )
+        kv_loan = getattr(self, "_weight_update_kv_cache_loan", None)
+        if kv_loan is not None and callable(getattr(kv_loan, "close", None)):
+            try:
+                kv_loan.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close KV cache loan during abort_weight_update.",
+                    exc_info=True,
+                )
+        self._maybe_restore_incomplete_after_non_mutating_abort()
+        return True
+
+    def remove_lora(self, lora_id: int) -> bool:
+        """Restore the dense base for a merged policy, or remove a runtime adapter.
+
+        Args:
+            lora_id: Adapter identifier to remove.
+
+        Returns:
+            Whether an adapter was removed.
+        """
+        engine = self.weight_transfer_engine
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and hasattr(engine, "lora_manager"):
+            return engine.lora_manager.remove_adapter(lora_id)
+        return super().remove_lora(lora_id)
+
+    def list_loras(self) -> set[int]:
+        """Return registered merged or runtime adapter identifiers."""
+        engine = self.weight_transfer_engine
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and hasattr(engine, "lora_manager"):
+            return set(engine.lora_manager.list_adapters())
+        return super().list_loras()
+
+    def get_stage_post_warmup_memory_stats(self) -> dict[str, int] | None:
+        if self.rank != 0:
+            return None
+        model = self.model_runner.get_model()
+        get_stats = getattr(model, "get_stage_post_warmup_memory_stats", None)
+        if get_stats is None:
+            return None
+
+        stats = get_stats()
+        if stats is None:
+            return None
+
+        return {
+            "allocated_bytes": stats.allocated_bytes,
+            "reserved_bytes": stats.reserved_bytes,
+        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -124,6 +350,7 @@ class OmniGPUWorkerBase(GPUWorker):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         """Override to set trace filename before starting the profiler.
 
@@ -132,6 +359,7 @@ class OmniGPUWorkerBase(GPUWorker):
             profile_prefix: Optional prefix for trace filename (vLLM compat).
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
 
         Generate a stage-specific trace filename before delegating the
         lifecycle and iteration controls to the profiler.
@@ -150,6 +378,9 @@ class OmniGPUWorkerBase(GPUWorker):
                 stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
                 filename = profile_prefix or f"stage{stage_id}_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
+            # WorkerProfiler.start accepts only the iteration bounds.
+            # Session kwargs go through set_profiler_kwargs, matching Worker.profile.
+            self.profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
@@ -167,10 +398,17 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. Measure weights + peak_activation + non_torch_increase with
-               ``memory_profiling`` around ``profile_run()``.
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time.
+            2. Measure weights + pre-profiling runner buffers +
+               peak_activation + non_torch_increase with ``memory_profiling``
+               around ``profile_run()``. Runner buffers allocated before
+               profiling are the torch allocations beyond the weights when
+               profiling starts; they are part of neither the weights nor the
+               profiling-window peak increase. ``non_torch_increase`` is
+               device-level, so it reflects whatever else is resident on the
+               GPU at profiling time. Upstream's ``non_kv_cache_memory`` is not
+               used: it also counts memory the caching allocator reserves but
+               does not allocate, e.g. graph pools captured at model load,
+               which co-located stage budgets are tuned without.
 
             3. Profile the CUDA graphs the runner captures through
                ``cudagraph_dispatcher``, the encoder graph manager and the
@@ -239,7 +477,7 @@ class OmniGPUWorkerBase(GPUWorker):
         # graph size again when it suggests --kv-cache-memory in
         # compile_or_warm_up_model. Keep the activation peak alone so that
         # suggestion counts the graph pool once.
-        self.peak_activation_memory = profile_result.torch_peak_increase
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         # Upstream 58b2012aa2 added `total_consumed` to the profiling result
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
@@ -248,8 +486,11 @@ class OmniGPUWorkerBase(GPUWorker):
         # --kv-cache-memory suggestion counts them here.
         self.total_consumed = profile_result.total_consumed + auxiliary_graph_memory
 
+        weights_memory = int(self.model_runner.model_memory_usage)
+        preprofile_buffers = max(0, profile_result.before_profile.torch_allocated - weights_memory)
         profiled_usage = (
-            int(self.model_runner.model_memory_usage)
+            weights_memory
+            + preprofile_buffers
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
             + cudagraph_memory_estimate
@@ -288,7 +529,7 @@ class OmniGPUWorkerBase(GPUWorker):
             return
         total = self.init_snapshot.total_memory
         free = self.init_snapshot.free_memory
-        current_util = self.cache_config.gpu_memory_utilization
+        current_util = self.cache_config.resolved_gpu_memory_utilization
         # Round up so the suggested value restores at least the reserved amount.
         # (0.8 + 0.1) * 10_000 is 9000.000000000002 in floating point, hence the inner round.
         scaled = round((current_util + cudagraph_memory_estimate / total) * 10_000, 6)
@@ -329,9 +570,9 @@ class OmniGPUWorkerBase(GPUWorker):
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             logger.info(f"[LLM Worker {self.rank}] Sleep Mode ENABLED. Activating CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         else:
@@ -342,9 +583,10 @@ class OmniGPUWorkerBase(GPUWorker):
         """
         Put the worker to sleep.
         Args:
-            level: 1 (Offload weights to CPU), level: 2 (Total Discard).
+            level: 1 (Offload weights to CPU), level: 2 (Total Discard; buffers
+                and other non-parameter tensors come back on ``wake_up``).
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
         # Drain in-flight kernels before CuMem unmap. Abort/decode can still
         # have GPU work after the scheduler reports idle; unmapping then
@@ -353,8 +595,18 @@ class OmniGPUWorkerBase(GPUWorker):
         gc.collect()
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
-        allocator = CuMemAllocator.get_instance()
+        # V2 keeps block-table pointers and captured inputs in these pools;
+        # waking their allocations does not recreate discarded contents.
+        offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
+        if level == 1:
+            offload_tags = ("weights", *offload_tags)
+        allocator = get_mem_allocator_instance()
+        if level == 2:
+            self._sleep_saved_tensors = _save_non_parameter_tensors(self._sleep_models(), allocator)
+            logger.info(
+                f"[LLM Worker {self.rank}] Level 2 Sleep: saved {len(self._sleep_saved_tensors)} non-parameter "
+                f"tensors ({sum(c.nbytes for _, c in self._sleep_saved_tensors) / 1024**2:.1f} MiB)."
+            )
         allocator.sleep(offload_tags=offload_tags)
         # allocator.sleep already gc.collects and empty_cache()s. A second
         # empty_cache on the pluggable allocator is a known CUDA invalid
@@ -372,13 +624,25 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
+        saved = getattr(self, "_sleep_saved_tensors", None)
+        if saved and (tags is None or "weights" in tags):
+            _restore_non_parameter_tensors(saved)
+            self._sleep_saved_tensors = []
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
+
+    def _sleep_models(self) -> list[torch.nn.Module]:
+        runner = getattr(self, "model_runner", None)
+        models = [getattr(runner, "model", None)]
+        get_draft_model = getattr(runner, "get_draft_model", None)
+        if callable(get_draft_model):
+            models.append(get_draft_model())
+        return [m for m in models if isinstance(m, torch.nn.Module)]
 
     def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK | None:
         "Handle deterministic Sleep command from the main process"

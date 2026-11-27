@@ -56,6 +56,8 @@ def test_pipeline_on_supported_tasks(
     if settings.checkpoint_filename is not None:
         model_path = str(Path(model_path) / settings.checkpoint_filename)
         model_kwargs["model_class_name"] = model_name
+    if settings.offline_init_timeout_s is not None:
+        model_kwargs["init_timeout"] = settings.offline_init_timeout_s
     omni = build_omni_from_diff_accelerations(
         accelerations=accelerations,
         model=model_path,

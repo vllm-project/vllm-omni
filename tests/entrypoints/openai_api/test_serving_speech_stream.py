@@ -3,7 +3,10 @@
 
 import asyncio
 import base64
+import json
+import math
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -16,7 +19,8 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest, StreamingSpeechSessionConfig
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech, _create_wav_header
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
@@ -69,6 +73,7 @@ def _build_test_app(
             request_arrival_ts=None,
             include_sample_rate=False,
             tts_params=None,
+            target_sample_rate=None,
             collect=None,
             cumulative_audio=False,
             audio_format=None,
@@ -685,12 +690,68 @@ class TestStreamingSpeechWebSocket:
             async def send_bytes(self, _data):
                 await self._write()
 
+            async def close(self):
+                await self._write()
+
         probe = ProbeWebSocket()
         websocket = streaming_speech_module._SerializedWebSocket(probe)
 
-        await asyncio.gather(websocket.send_json({"type": "error"}), websocket.send_bytes(b"audio"))
+        await asyncio.gather(websocket.send_json({"type": "error"}), websocket.send_bytes(b"audio"), websocket.close())
 
         assert probe.max_active_writes == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "operation, args",
+        [("send_json", ({"type": "probe"},)), ("send_bytes", (b"audio",)), ("close", ())],
+    )
+    @pytest.mark.parametrize("blocked_on", ["transport", "send_lock"])
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    async def test_websocket_writes_are_bounded_and_release_lock(
+        self, mocker, monkeypatch, operation, args, blocked_on, cancel
+    ):
+        monkeypatch.setattr(streaming_speech_module, "_SEND_TIMEOUT_SECONDS", 0.03)
+        write_started = asyncio.Event()
+        write_stopped = asyncio.Event()
+
+        async def blocked_write(*_args):
+            write_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                write_stopped.set()
+
+        raw_websocket = mocker.Mock(spec=WebSocket)
+        raw_websocket.send_json = mocker.AsyncMock()
+        write = mocker.AsyncMock(side_effect=blocked_write)
+        setattr(raw_websocket, operation, write)
+        websocket = streaming_speech_module._SerializedWebSocket(raw_websocket)
+        is_lock_held = blocked_on == "send_lock"
+        if is_lock_held:
+            await websocket._send_lock.acquire()
+        send = asyncio.create_task(getattr(websocket, operation)(*args))
+        try:
+            if not is_lock_held:
+                await asyncio.wait_for(write_started.wait(), timeout=3)
+            if cancel:
+                await asyncio.sleep(0)
+                send.cancel()
+            done, _ = await asyncio.wait({send}, timeout=1)
+            assert send in done
+            with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+                await send
+            if is_lock_held:
+                write.assert_not_awaited()
+            else:
+                write.assert_awaited_once_with(*args)
+                assert write_stopped.is_set()
+        finally:
+            send.cancel()
+            await asyncio.gather(send, return_exceptions=True)
+            if is_lock_held:
+                websocket._send_lock.release()
+        raw_websocket.send_json.side_effect = None
+        await asyncio.wait_for(websocket.send_json({"type": "probe"}), timeout=3)
 
     @pytest.mark.parametrize("language", (None, "Auto", "French"))
     def test_commitment_mode_requires_chinese_or_english(self, language, mocker: MockerFixture):
@@ -1198,7 +1259,7 @@ class TestStreamingSpeechWebSocket:
             captured_requests.append(request)
             assert arrival_time is not None
             captured_timing["prepare_arrival"] = arrival_time
-            return request_id or "req-stream", object(), {"_qwen3_tts_effective_max_tokens": [192]}
+            return request_id or "req-stream", object(), {"task_type": ["Base"]}
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
@@ -1210,6 +1271,7 @@ class TestStreamingSpeechWebSocket:
             request_arrival_ts=None,
             include_sample_rate=False,
             tts_params=None,
+            target_sample_rate=None,
             audio_format=None,
         ):
             assert request_start_s is not None
@@ -1265,7 +1327,7 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert captured_timing["prepare_arrival"] == captured_timing["chunk_arrival"]
         assert captured_timing["chunk_start"] > 0
-        assert captured_tts_params == [{"_qwen3_tts_effective_max_tokens": [192]}]
+        assert captured_tts_params == [{"task_type": ["Base"]}]
         assert speech_service._generate_audio_bytes.await_count == 0
 
     @staticmethod
@@ -1305,6 +1367,59 @@ class TestStreamingSpeechWebSocket:
                 assert start["channels"] == 2
                 assert ws.receive_bytes() == b"\x01\x02\x03\x04"
                 assert ws.receive_json()["type"] == "audio.done"
+
+    def test_streaming_wav_stream_starts_with_placeholder_header(self, mocker: MockerFixture):
+        """Binary frames concatenate into one WAV byte stream."""
+        first_chunk = b"\x01\x02\x03\x04"
+        second_chunk = b"\x05\x06\x07\x08"
+
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, audio_format=None, **_kwargs):
+            _fill_audio_format(audio_format, sample_rate=48000, channels=2)
+            yield first_chunk
+            yield second_chunk
+
+        speech_service = self._stream_service(mocker, mock_generate_pcm_chunks)
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": "wav",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["format"] == "wav"
+                assert start["sample_rate"] == 48000
+                assert start["channels"] == 2
+
+                header = _create_wav_header(sample_rate=48000, num_channels=2, bits_per_sample=16)
+                binary_stream = bytearray()
+                while True:
+                    message = ws.receive()
+                    if message.get("bytes") is not None:
+                        binary_stream.extend(message["bytes"])
+                        continue
+                    done = json.loads(message["text"])
+                    assert done["type"] == "audio.done"
+                    break
+                assert binary_stream == header + first_chunk + second_chunk
+
+                assert done["total_bytes"] == len(header) + len(first_chunk) + len(second_chunk)
+                assert done["error"] is False
+                assert ws.receive_json()["type"] == "session.done"
+
+        request = speech_service._prepare_speech_generation.await_args.args[0]
+        assert request.stream is True
+        assert request.response_format == "wav"
+        speech_service._generate_audio_bytes.assert_not_awaited()
 
     def test_streaming_pcm_error_before_audio_keeps_start_done_pairing(self, mocker: MockerFixture):
         """No audio means no known format: audio.start omits it rather than guessing."""
@@ -1407,6 +1522,7 @@ class TestStreamingSpeechWebSocket:
             request_arrival_ts=None,
             include_sample_rate=False,
             tts_params=None,
+            target_sample_rate=None,
             collect=None,
             cumulative_audio=False,
             audio_format=None,
@@ -1505,6 +1621,7 @@ class TestStreamingSpeechWebSocket:
             request_arrival_ts=None,
             include_sample_rate=False,
             tts_params=None,
+            target_sample_rate=None,
             collect=None,
             cumulative_audio=False,
             audio_format=None,
@@ -1575,12 +1692,12 @@ class TestStreamingSpeechWebSocket:
                         "type": "session.config",
                         "voice": "Vivian",
                         "stream_audio": True,
-                        "response_format": "wav",
+                        "response_format": "mp3",
                     }
                 )
                 error = ws.receive_json()
                 assert error["type"] == "error"
-                assert "response_format='pcm'" in error["message"]
+                assert "response_format='pcm' or 'wav'" in error["message"]
 
     def test_empty_input_text_emits_no_audio(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
@@ -1698,6 +1815,7 @@ class TestStreamingSpeechWebSocket:
             request_arrival_ts=None,
             include_sample_rate=False,
             tts_params=None,
+            target_sample_rate=None,
             audio_format=None,
         ):
             _fill_audio_format(audio_format)
@@ -1804,6 +1922,7 @@ class TestStreamingSpeechWebSocket:
             request_arrival_ts=None,
             include_sample_rate=False,
             tts_params=None,
+            target_sample_rate=None,
             audio_format=None,
         ):
             _fill_audio_format(audio_format)
@@ -1816,24 +1935,7 @@ class TestStreamingSpeechWebSocket:
         websocket.send_json = mocker.AsyncMock(side_effect=[None, WebSocketDisconnect()])
         websocket.send_bytes = mocker.AsyncMock(side_effect=WebSocketDisconnect())
 
-        config = mocker.MagicMock()
-        config.model = None
-        config.voice = "Vivian"
-        config.task_type = None
-        config.language = None
-        config.instructions = None
-        config.response_format = "pcm"
-        config.speed = 1.0
-        config.max_new_tokens = None
-        config.initial_codec_chunk_frames = None
-        config.ref_audio = None
-        config.ref_text = None
-        config.x_vector_only_mode = None
-        config.speaker_embedding = None
-        config.stream_audio = True
-        config.word_timestamps = False
-        config.seed = None
-        config.non_streaming_mode = None
+        config = StreamingSpeechSessionConfig(voice="Vivian", response_format="pcm", stream_audio=True)
 
         with pytest.raises(WebSocketDisconnect):
             asyncio.run(
@@ -1848,6 +1950,106 @@ class TestStreamingSpeechWebSocket:
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
+
+    @pytest.mark.parametrize(("configure_session"), [True, False])
+    def test_ping_echoes_pong_response(self, mocker: MockerFixture, configure_session):
+        # Server should respond to ping message despite the state of the session config
+        app, _ = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                if configure_session:
+                    ws.send_json(
+                        {
+                            "type": "session.config",
+                            "voice": "Vivian",
+                            "stream_audio": True,
+                            "response_format": "pcm",
+                        }
+                    )
+
+                ws.send_json({"type": "session.ping"})
+                pong_response = ws.receive_json()
+                assert pong_response == {"type": "session.pong"}
+
+    @pytest.mark.parametrize(
+        ("delay", "expected_response", "extends_timeout"),
+        [
+            (0.2, {"type": "session.pong"}, True),
+            (0.75, {"type": "session.pong"}, True),
+            (1.5, {"type": "error", "message": "Idle timeout: no message received"}, False),
+        ],
+    )
+    def test_session_ping_extends_idle_timeout(self, mocker: MockerFixture, delay, expected_response, extends_timeout):
+        # Reduce length of idle_timeout for the purposes of this test
+        # to avoid long waits to simulate the scenarios where:
+        # 1. A user issues a ping request before the idle timeout
+        # 2. Ping request is issued just as the idle timeout is about to expire
+        # 3. User waits too long to issue the ping and the timeout message appears
+        idle_timeout = 1.00
+        app, _ = _build_test_app(mocker=mocker, idle_timeout=idle_timeout)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                t1 = time.monotonic()
+
+                time.sleep(delay)
+                ws.send_json({"type": "session.ping"})
+                t2 = time.monotonic()
+                response = ws.receive_json()
+                assert response == expected_response
+
+                if extends_timeout:
+                    response = ws.receive_json()
+                    t3 = time.monotonic()
+
+                    assert t3 - t1 > idle_timeout
+                    assert math.isclose(t3 - t2, idle_timeout, rel_tol=0.01)
+
+    def test_generation_unaffected_by_ping(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "session.ping"})
+
+                pong = ws.receive_json()
+                assert pong["type"] == "session.pong"
+
+                ws.send_json({"type": "input.done"})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["sentence_index"] == 0
+                assert start["sentence_text"] == "Hello world."
+                assert start["format"] == "wav"
+
+                audio = ws.receive_bytes()
+                assert audio.startswith(b"RIFF")
+
+                done = ws.receive_json()
+                assert done == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": len(audio),
+                    "error": False,
+                }
+
+                session_done = ws.receive_json()
+                assert session_done == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
+
+        assert speech_service._generate_audio_bytes.await_count == 1
 
 
 class TestWebSocketSentenceSplitting:
@@ -1991,12 +2193,21 @@ class TestWebSocketSentenceSplitting:
         voices = [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list]
         assert voices == ["Vivian", "Vivian", "Serena"]
 
-    def test_seed_is_forwarded_to_speech_request(self, mocker: MockerFixture):
+    def test_session_options_are_forwarded_to_speech_request(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42})
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "seed": 42,
+                        "watermarking": False,
+                        "temperature": 0.7,
+                        "repetition_penalty": 1.1,
+                    }
+                )
                 ws.send_json({"type": "input.text", "text": "Hello."})
                 ws.send_json({"type": "input.done"})
                 ws.receive_json()
@@ -2004,7 +2215,175 @@ class TestWebSocketSentenceSplitting:
                 ws.receive_json()
                 ws.receive_json()
 
-        assert speech_service._generate_audio_bytes.await_args_list[0].args[0].seed == 42
+        speech_request = speech_service._generate_audio_bytes.await_args_list[0].args[0]
+        assert speech_request.seed == 42
+        assert speech_request.watermarking is False
+        assert speech_request.temperature == 0.7
+        assert speech_request.repetition_penalty == 1.1
+
+
+def _qwen3_sample_rate_check(request: OpenAICreateSpeechRequest) -> str | None:
+    """Run the real REST sample-rate rule for a Qwen3-TTS server (8 kHz and 24 kHz)."""
+    return OmniOpenAIServingSpeech._validate_speech_sample_rate(SimpleNamespace(_tts_model_type="qwen3_tts"), request)
+
+
+class TestSessionConfigRestParameters:
+    """session.config accepts the /v1/audio/speech parameters instead of dropping them."""
+
+    def test_rest_and_session_fields_differ_only_by_streaming_input(self):
+        # input arrives as input.text, and stream_audio replaces stream/stream_format.
+        rest_fields = set(OpenAICreateSpeechRequest.model_fields)
+        session_fields = set(StreamingSpeechSessionConfig.model_fields)
+        assert rest_fields - session_fields == {"input", "stream", "stream_format"}
+        assert session_fields - rest_fields == {
+            "text_input_mode",
+            "model_input_mode",
+            "split_granularity",
+            "stream_audio",
+        }
+
+    def test_every_shared_field_is_forwarded(self):
+        config = StreamingSpeechSessionConfig()
+        request = OmniStreamingSpeechHandler._speech_request(config, "Hello.")
+        shared = set(OpenAICreateSpeechRequest.model_fields) & set(StreamingSpeechSessionConfig.model_fields)
+        assert shared <= request.model_fields_set
+
+    def test_rest_parameters_reach_speech_request(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+        speech_service._validate_speech_sample_rate = _qwen3_sample_rate_check
+        options = {
+            "sample_rate": 8000,
+            "cache_salt": "tenant-a",
+            "extra_params": {"temperature": 0.5},
+            "ref_audio_2": "data:audio/wav;base64,AAAA",
+            "ambient_sound": "rain on a window",
+            "duration_seconds": 4.0,
+            "token_count": 50,
+            "ref_audio_codes": [[1, 2], [3, 4]],
+            "ref_text": "reference transcript",
+        }
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian", **options})
+                ws.send_json({"type": "input.text", "text": "Hello."})
+                ws.send_json({"type": "input.done"})
+                ws.receive_json()
+                ws.receive_bytes()
+                ws.receive_json()
+                ws.receive_json()
+
+        speech_request = speech_service._generate_audio_bytes.await_args_list[0].args[0]
+        for name, value in options.items():
+            assert getattr(speech_request, name) == value, name
+
+    @pytest.mark.parametrize("response_format", ["pcm", "wav"])
+    def test_streamed_audio_uses_requested_sample_rate(self, mocker: MockerFixture, response_format):
+        target_rates = []
+
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, target_sample_rate=None, audio_format=None, **_):
+            target_rates.append(target_sample_rate)
+            _fill_audio_format(audio_format, sample_rate=target_sample_rate or 24000)
+            yield b"\x01\x02"
+
+        speech_service = TestStreamingSpeechWebSocket._stream_service(mocker, mock_generate_pcm_chunks)
+        speech_service._validate_speech_sample_rate = _qwen3_sample_rate_check
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": response_format,
+                        "sample_rate": 8000,
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello."})
+                ws.send_json({"type": "input.done"})
+                start = ws.receive_json()
+                audio = ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+        assert target_rates == [8000]
+        assert start["sample_rate"] == 8000
+        if response_format == "wav":
+            assert audio.startswith(_create_wav_header(sample_rate=8000, num_channels=1, bits_per_sample=16))
+        assert speech_service._prepare_speech_generation.await_args.args[0].sample_rate == 8000
+
+    def test_word_timestamps_stream_uses_requested_sample_rate(self, mocker: MockerFixture):
+        target_rates = []
+
+        async def mock_generate_pcm_chunks(
+            _generator, _request_id, *, target_sample_rate=None, collect=None, audio_format=None, **_
+        ):
+            target_rates.append(target_sample_rate)
+            _fill_audio_format(audio_format, sample_rate=target_sample_rate)
+            yield b"\x01" * 1000, target_sample_rate
+            collect["aligner_res"] = _fake_aligner_res([[0, 200]], ["Hello"])
+
+        speech_service = TestStreamingSpeechWebSocket._stream_service(mocker, mock_generate_pcm_chunks)
+        speech_service._validate_speech_sample_rate = _qwen3_sample_rate_check
+        speech_service.forced_aligner_enabled = True
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                        "word_timestamps": True,
+                        "sample_rate": 8000,
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello."})
+                ws.send_json({"type": "input.done"})
+                start = ws.receive_json()
+                while ws.receive_json()["type"] != "audio.done":
+                    pass
+
+        assert target_rates == [8000]
+        assert start["sample_rate"] == 8000
+
+    def test_unsupported_sample_rate_is_rejected_at_session_config(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker, idle_timeout=1.0)
+        speech_service._validate_speech_sample_rate = _qwen3_sample_rate_check
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "sample_rate": 16000})
+                reply = ws.receive_json()
+
+        assert reply["type"] == "error"
+        assert "sample_rate=16000 is not supported" in reply["message"]
+        speech_service._generate_audio_bytes.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("options", "error"),
+        [
+            ({"cache_salt": ""}, "cache_salt"),
+            ({"ref_audio_codes": [[1, 2]]}, "requires 'ref_text'"),
+            ({"duration_seconds": 3.0, "split_granularity": "sentence"}, "split_granularity='none'"),
+            ({"token_count": 40, "split_granularity": "clause"}, "split_granularity='none'"),
+        ],
+    )
+    def test_invalid_rest_parameters_are_rejected_at_session_config(self, mocker: MockerFixture, options, error):
+        app, speech_service = _build_test_app(mocker=mocker, idle_timeout=1.0)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", **options})
+                reply = ws.receive_json()
+
+        assert reply["type"] == "error"
+        assert reply["message"].startswith("Invalid session config")
+        assert error in reply["message"]
+        speech_service._generate_audio_bytes.assert_not_awaited()
 
 
 class TestGeneratePcmChunksContract:

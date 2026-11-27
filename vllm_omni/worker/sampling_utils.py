@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Sampling helpers shared by the GPU and NPU AR model runners."""
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsProcessor
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.logits_processor import LogitsProcessors
 
 logger = init_logger(__name__)
 
 __all__ = [
+    "SamplingFeedback",
     "apply_fixed_seed_to_sampling_params",
     "get_tts_local_seed",
     "clamp_prompt_ids_to_penalty_padding",
@@ -20,6 +25,14 @@ __all__ = [
     "build_model_sampler_extra_args",
     "call_model_sampler",
 ]
+
+
+class SamplingFeedback(Protocol):
+    """Deferred sampling feedback consumed at token completion."""
+
+    def commit(self, *, ready: bool = False) -> None: ...
+
+    def invalid_rows(self) -> list[int]: ...
 
 
 def get_tts_local_seed(sampling_params: Any) -> int | None:
@@ -76,7 +89,7 @@ def build_model_sampler_extra_args(input_batch: Any, requests: Any) -> list[dict
     """Return per-request ``SamplingParams.extra_args`` in batch-row order."""
     request_states = requests or {}
     per_req_extra_args: list[dict | None] = []
-    for req_id in getattr(input_batch, "req_ids", []):
+    for req_id in input_batch.req_ids:
         state = request_states.get(req_id)
         params = getattr(state, "sampling_params", None)
         per_req_extra_args.append(getattr(params, "extra_args", None))
@@ -91,6 +104,7 @@ def call_model_sampler(
     *,
     input_batch: Any,
     requests: Any,
+    defer_rng: bool = False,
 ) -> Any:
     """Call an opted-in model sampler with per-request host arguments.
 
@@ -99,6 +113,9 @@ def call_model_sampler(
     """
     wants_extra_args = getattr(model, "model_sampler_wants_extra_args", False)
     wants_sampling_params = getattr(model, "model_sampler_wants_sampling_params", False)
+    can_defer_rng = getattr(model, "model_sampler_can_defer_rng", False)
+    if defer_rng and not can_defer_rng:
+        logger.debug_once("Model %s does not support deferred sampling RNG; using immediate RNG.", type(model).__name__)
     if not wants_extra_args and not wants_sampling_params:
         return model_sample(logits, sampling_metadata)
     kwargs: dict[str, Any] = {}
@@ -107,9 +124,10 @@ def call_model_sampler(
     if wants_sampling_params:
         request_states = requests or {}
         kwargs["per_req_sampling_params"] = [
-            getattr(request_states.get(req_id), "sampling_params", None)
-            for req_id in getattr(input_batch, "req_ids", [])
+            getattr(request_states.get(req_id), "sampling_params", None) for req_id in input_batch.req_ids
         ]
+    if defer_rng and can_defer_rng:
+        kwargs["defer_rng"] = True
     return model_sample(logits, sampling_metadata, **kwargs)
 
 
@@ -143,6 +161,8 @@ def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: in
     so each request is sanitized at most once; the processor's device-side
     mask slice is rebuilt only when an out-of-range id was found.
     """
+    from vllm.v1.sample.logits_processor import MinTokensLogitsProcessor
+
     for proc in logitsprocs.non_argmax_invariant:
         if not isinstance(proc, MinTokensLogitsProcessor):
             continue

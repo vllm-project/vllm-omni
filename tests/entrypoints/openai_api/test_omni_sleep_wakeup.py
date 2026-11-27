@@ -294,6 +294,7 @@ def pure_diffusion_engine(mocker):
     engine.sleep = mocker.AsyncMock(return_value=[FakeAck(stage_id=0)])
     engine.wake_up = mocker.AsyncMock(return_value=[FakeAck(stage_id=0)])
     engine.is_sleeping = mocker.AsyncMock(return_value=True)
+    engine.get_supported_tasks = mocker.AsyncMock(return_value=("generate",))
     # Remove attributes that would make _get_vllm_config return a config
     del engine.get_vllm_config
     del engine.vllm_config
@@ -315,6 +316,7 @@ def pure_diffusion_app(pure_diffusion_engine, mocker):
         disable_log_stats=True,
         max_log_len=0,
         enable_server_load_tracking=False,
+        enable_force_include_usage=False,
     )
 
     app = FastAPI()

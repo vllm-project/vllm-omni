@@ -31,18 +31,41 @@ from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
 
+from vllm_omni.benchmarks.data_modules import DatasetSource
+
 logger = logging.getLogger(__name__)
 
-# Matches Qwen3-Omni serving examples (``openai_chat_completion_client_for_multimodal_generation`` /
-# ``qwen3_omni/gradio_demo``) plus explicit TTS / voice-clone instructions for chat completions.
+
+def prepare_seed_tts_inputs(source: DatasetSource, count: int, work: Path) -> dict[str, str]:
+    """Keep the exact requested source prefix even when a row is invalid."""
+    locale = Path(source.manifest).parent
+    root = source.resolve([f"{locale}/**"])
+    lines = [
+        line for line in (root / source.manifest).read_text().splitlines() if line.strip() and not line.startswith("#")
+    ]
+    if len(lines) != source.count:
+        raise ValueError("Pinned Seed-TTS utterance count changed")
+    if not 0 < count <= source.count:
+        raise ValueError("Request count exceeds the pinned dataset")
+    target = work / locale
+    target.mkdir(parents=True)
+    for child in (root / locale).iterdir():
+        if child.name != Path(source.manifest).name:
+            (target / child.name).symlink_to(child.resolve(), target_is_directory=child.is_dir())
+    (work / source.manifest).write_text("\n".join(lines[:count]) + "\n", encoding="utf-8")
+    return {"dataset_path": str(work), "seed_tts_root": str(work), "seed_tts_locale": str(locale)}
+
+
+# Keep the Qwen3-Omni identity prefix, but distinguish reading from conversation:
+# Seed-TTS contains questions and instructions that must be spoken, not answered.
 SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
     "capable of perceiving auditory and visual inputs, as well as generating text and speech.\n"
-    "For this request you act as a text-to-speech engine with zero-shot voice cloning: "
-    "the API provides reference audio and its transcript (ref_audio, ref_text) and task_type Base. "
-    "The user message is the exact text you must speak. "
-    "Synthesize natural speech in the same language as that user text, "
-    "matching the timbre, prosody, and speaking style of the reference audio while reading the new content clearly."
+    "For this request, read the user message aloud verbatim. "
+    "Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. "
+    "Your text response must be exactly the user message. "
+    "Do not add introductions, explanations, answers, or any other words. "
+    "Do not paraphrase, translate, or continue the text."
 )
 
 

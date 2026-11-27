@@ -24,9 +24,11 @@ import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+from vllm_omni.diffusion.layers import vae_rms_norm as vrn
 
 from . import triton_data_movement as dm
 from . import triton_rms_norm_cl as cl
+from ._utils import on_kernel_device
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Grid axis 1 (tiles per plane) is limited by CUDA; larger planes decline.
@@ -72,13 +74,13 @@ if HAS_TRITON:
             d = tl.load(DENOM + (b * T + t) * S + s, mask=mask, other=1)
             g = tl.load(GAMMA + c).to(tl.float32)
             # Same operations and materialization boundaries as rms_norm_scale.
-            v = tl.math.div_rn(x, d).to(dtype).to(tl.float32)
+            v = rn.div_rn(x, d).to(dtype).to(tl.float32)
             v = (v * scale).to(dtype).to(tl.float32)
             v = (v * g).to(dtype).to(tl.float32)
             v = (v + 0.0).to(dtype)
             if SILU:
                 v32 = v.to(tl.float32)
-                v = tl.math.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
+                v = rn.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
             value = v
         elif TC > 0:
             cached_frame = frame - (PAD - TC)
@@ -149,8 +151,9 @@ def norm_act_cat_time(
     channels_last: bool,
     silu: bool,
     bias: torch.Tensor | None = None,
+    probe_reduction: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return ``[zeros | history | norm_act(x)]`` and its last two frames.
+    """Return ``[zeros | history | norm_act(x)]`` and its last (at most two) history/``x`` frames.
 
     ``channels_last`` selects the existing approximate normalization, not a
     layout conversion. Lossless supports dense channels-first/frame-major
@@ -158,7 +161,7 @@ def norm_act_cat_time(
     """
     if (
         not HAS_TRITON
-        or not x.is_cuda
+        or not on_kernel_device(x)
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or x.ndim != 5
@@ -207,7 +210,7 @@ def norm_act_cat_time(
         return None
 
     out_t = pad_front + t
-    keep_t = min(2, out_t)
+    keep_t = min(2, tc + t)  # never the zero front padding, like dm.cat_time_5d
     if channels_last:
         block_c = triton.next_power_of_2(c)
         block_p = max(1, cl._TILE_ELEMENTS // block_c)
@@ -246,7 +249,7 @@ def norm_act_cat_time(
                 enable_fp_fusion=False,
             )
         else:
-            denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
+            denom = vrn.fp32_channel_norm(x, probe=probe_reduction).clamp_min_(1e-12)
             if not denom.is_contiguous():
                 denom = denom.contiguous()
             _norm_scale_cat_time_kernel[(b * c * out_t, tiles)](

@@ -92,6 +92,7 @@ def test_graph_vae_updates_only_active_context_and_keeps_last_patch():
     owner.active_slots = torch.tensor([True, False, False])
     owner.model = SimpleNamespace(
         _patch_size=2,
+        _vae_dtype=torch.float32,
         _get_vae_decode_sr_cond=lambda _: None,
         tts=SimpleNamespace(
             audio_vae=SimpleNamespace(
@@ -131,10 +132,10 @@ def test_post_sample_stops_only_valid_patch_rows(monkeypatch, length_limit):
         num_computed_tokens_np=np.zeros(3),
         num_scheduled_tokens=[1, 1, 1],
     )
-    monkeypatch.setattr(OmniModelState, "run_eager_mtp", lambda *_args: None)
+    monkeypatch.setattr(OmniModelState, "post_sample", lambda *_args, **_kwargs: None)
     # CPU reference test: bypass pinning, not a CUDA synchronization test.
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
-    owner.run_eager_mtp(batch, None, torch.tensor([[1], [0], [1]]), {})
+    owner.post_sample(batch, None, torch.tensor([[1], [0], [1]]), {})
     assert owner.active_slots.tolist() == [length_limit != 2, True, False, False]
     assert owner._step_ended.tolist() == [True, length_limit == 2, False]
 
@@ -179,6 +180,8 @@ def test_incremental_tail_flush_rejects_already_scheduled_extra_step(monkeypatch
     owner.model = SimpleNamespace(
         _patch_size=2,
         _audio_emit_every=3,
+        # decode_patch reads the deployment-dtype contract unconditionally.
+        _vae_dtype=torch.float32,
         tts=SimpleNamespace(audio_vae=vae),
         _get_vae_decode_sr_cond=lambda _: None,
         _audio_length_limit_reached=lambda computed, scheduled, limits: computed + scheduled + 1 >= limits,
@@ -190,7 +193,7 @@ def test_incremental_tail_flush_rejects_already_scheduled_extra_step(monkeypatch
         num_computed_tokens_np=np.zeros(1),
         num_scheduled_tokens=[1],
     )
-    monkeypatch.setattr(OmniModelState, "run_eager_mtp", lambda *_: None)
+    monkeypatch.setattr(OmniModelState, "post_sample", lambda *_, **_kwargs: None)
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
     patches = torch.randn(1, 6, 2)
     request = AudioRequest(samples_per_frame=4, chunk_frames=3, emitted=True)
@@ -205,7 +208,7 @@ def test_incremental_tail_flush_rejects_already_scheduled_extra_step(monkeypatch
             if step == 1 and stop_source == "length":
                 owner._length_limits[0] = 2
             sampled = torch.tensor([[int(step == 1 and stop_source == "sample")]])
-            owner.run_eager_mtp(batch, None, sampled, {})
+            owner.post_sample(batch, None, sampled, {})
             outputs.append(
                 VoxCPM2AudioOutput.per_patch(
                     pcm, valid, owner._step_ended, torch.tensor(48000), [request]
@@ -224,7 +227,7 @@ def test_incremental_tail_flush_rejects_already_scheduled_extra_step(monkeypatch
         pcm, valid = owner.decode_patch(batch.idx_mapping, torch.tensor([True]), patch)
         owner.commit_patch(batch.idx_mapping, valid, torch.full((1, 4), 99.0), patch, torch.ones(1, 2))
         owner._step_pcm = (pcm, valid, None)
-        owner.run_eager_mtp(batch, None, torch.tensor([[1]]), {})
+        owner.post_sample(batch, None, torch.tensor([[1]]), {})
         assert not valid[0] and not owner._step_ended[0]
         assert VoxCPM2AudioOutput.per_patch(
             pcm, valid, owner._step_ended, torch.tensor(48000), [request]

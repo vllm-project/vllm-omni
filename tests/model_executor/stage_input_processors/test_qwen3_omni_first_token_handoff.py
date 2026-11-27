@@ -29,7 +29,12 @@ class _Manager:
         self.request_payload: dict[str, dict] = {}
         self._pending_streaming_prefills: dict[str, dict] = {}
         self.config = SimpleNamespace(
-            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT))
+            hf_config=SimpleNamespace(
+                im_start_token_id=151644,
+                user_token_id=872,
+                talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT),
+                thinker_config=SimpleNamespace(audio_token_id=151675, image_token_id=151655, video_token_id=151656),
+            )
         )
 
     def process(self, output, request, is_finished=False):
@@ -114,7 +119,8 @@ def test_sampled_stream_sends_each_token_one_step_earlier():
     chunk0 = manager.process(_output(PROMPT, sampled=_embed(11)), _request([11]))
     assert chunk0 is not None  # at the prefill step, not after the next decode step
     assert torch.equal(chunk0.embed.prefill, torch.cat([_embed(t) for t in [*PROMPT, 11]]))
-    assert chunk0.hidden_states.output.shape[0] == len(PROMPT)
+    # Text-only prompt: the merged prefill is all embeddings.
+    assert chunk0.hidden_states is None
     assert chunk0.ids.all == [*PROMPT, 11]
     # Decode step 1 processes 11 and samples 12: it carries 12.
     chunk1 = manager.process(_output([11], sampled=_embed(12)), _request([11, 12], history=False))
@@ -201,6 +207,59 @@ def test_tool_call_as_the_first_token_forwards_no_speech(publish):
     # Prompt prefill goes out so chunk_id can advance. No generated token does.
     assert rows == []
     assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+
+
+@pytest.mark.parametrize("consumed", [False, True])
+@pytest.mark.parametrize("first_chunk", [False, True])
+@pytest.mark.parametrize("preface", [[], [11, 12]])
+def test_speculative_tool_span_keeps_only_spoken_rows(consumed, first_chunk, preface):
+    manager = _Manager()
+    if first_chunk:
+        assert manager.process(_output(PROMPT), _request([11])) is None
+    else:
+        manager.put_req_chunk["r"] = 1
+
+    span = preface + [TOOL_CALL_START_TOKEN_ID, 99]
+    history = ([] if first_chunk else [10]) + span + ([100] if consumed else [])
+    delta = span[1:] + [100] if consumed else span[int(first_chunk) :]
+    payload = {
+        "hidden_states": {"layers": {0: torch.cat([_embed(t) for t in span])}},
+        "ids": {"output": span},
+        "meta": {"decode_span": True, "consumed_input_span": consumed, "committed_token_count": len(span)},
+    }
+    output = q3.thinker2talker_async_chunk(manager, payload, _request(history), new_token_ids=delta)
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+    if first_chunk:
+        assert output is not None
+        assert output.ids.all == PROMPT + preface[:1]
+        assert output.embed.prefill.shape[0] == len(PROMPT) + min(1, len(preface))
+        assert output.embed.decode.shape[0] == max(0, len(preface) - 1)
+        if preface:
+            assert torch.equal(output.embed.prefill[-1:], _embed(preface[0]))
+            assert torch.equal(output.embed.decode, _embed(preface[1]))
+        # The prompt's accept-hidden rows survive marking the speech cut.
+        assert output.hidden_states.output.shape[0] == len(PROMPT)
+    elif preface:
+        assert output.ids.output == preface
+        assert output.meta.committed_token_count == len(preface)
+        assert output.embed.decode_token_start == 1
+        assert output.embed.decode_token_end == 1 + len(preface)
+        assert torch.equal(output.embed.decode, torch.cat([_embed(t) for t in preface]))
+    else:
+        assert output is None
+
+    # Later chunks need not contain the marker: their JSON is still not speech.
+    following = {
+        "hidden_states": {"layers": {0: _embed(100)}},
+        "ids": {"output": [100]},
+        "meta": {"decode_span": True, "consumed_input_span": consumed, "committed_token_count": 1},
+    }
+    assert (
+        q3.thinker2talker_async_chunk(
+            manager, following, _request(history + [101]), is_finished=True, new_token_ids=[101]
+        )
+        is None
+    )
 
 
 def test_cleanup_lets_the_same_external_id_speak_again():

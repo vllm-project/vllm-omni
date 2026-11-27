@@ -36,6 +36,7 @@ from vllm_omni.engine.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    SessionStats,
     SessionUpdated,
     new_event_id,
 )
@@ -50,6 +51,7 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     InvalidResumeTokenError,
     ResumeToken,
 )
+from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex.websocket import (
     MAX_EVENT_BYTES,
     SendJson,
@@ -69,7 +71,8 @@ _DEFAULT_IDLE_TIMEOUT_S = 300.0
 #: connection open; the pump itself closes the socket on its way out.
 _PUMP_DRAIN_TIMEOUT_S = 5.0
 #: session.created is journaled by the registry when it hands out the resume credential.
-_UNJOURNALED_EVENTS = (SessionCreated,)
+#: session.stats is a point-in-time answer and must not be replayed on resume.
+_UNJOURNALED_EVENTS = (SessionCreated, SessionStats)
 
 
 def _log_rollback_failure(done: asyncio.Task[None]) -> None:
@@ -175,6 +178,9 @@ class OmniDuplexSessionHandler:
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await websocket.accept()
+        # Complete the transport handshake before holding session admission;
+        # cold warmup can exceed the client's WebSocket opening timeout.
+        await wait_for_duplex_warmup(websocket)
         envelope = RealtimeEnvelope.from_query_params(websocket.query_params)
 
         async def send_json(payload: Mapping[str, object]) -> None:

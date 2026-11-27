@@ -15,15 +15,19 @@ import json
 import math
 import os
 import signal
+from collections.abc import Mapping
+from contextlib import ExitStack
 from types import FrameType
 from typing import TYPE_CHECKING, Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.config.watermarking import WATERMARK_CONFIG_EXAMPLE, WatermarkConfig
 from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, is_frontend_only
 from vllm_omni.entrypoints.api_server_shared_dir import (
@@ -35,7 +39,7 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
-from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
+from vllm_omni.entrypoints.utils import mark_serve_cli_args, parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 if TYPE_CHECKING:
@@ -64,11 +68,13 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
   Use `--help=all` to show all available flags at once.
 """
 
+_WATERMARK_CONFIG_HELP = f"JSON watermark configuration. Example: {WATERMARK_CONFIG_EXAMPLE}."
+
 
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     """Adapt shared stage-override validation to argparse's error type."""
     try:
-        parsed = parse_stage_overrides(value)
+        parsed = parse_stage_overrides(value, filter_deploy_fields=False)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     if parsed is None:
@@ -109,6 +115,20 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("must be a JSON object")
     return parsed
+
+
+def _parse_watermark_config(value: str) -> WatermarkConfig:
+    """Parse a watermark config from the CLI."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(_WATERMARK_CONFIG_HELP) from exc
+    if not isinstance(config, Mapping):
+        raise argparse.ArgumentTypeError(_WATERMARK_CONFIG_HELP)
+    try:
+        return WatermarkConfig.from_dict(config)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _ensure_vllm_platform():
@@ -152,6 +172,7 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        mark_serve_cli_args(args)
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()
@@ -159,6 +180,11 @@ class OmniServeCommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
+
+        # Argument converters can run more than once in the tracking parser.
+        # Filter and warn once before any API workers receive the overrides.
+        if (stage_overrides := getattr(args, "stage_overrides", None)) is not None:
+            args.stage_overrides = parse_stage_overrides(stage_overrides)
 
         if getattr(args, "no_guardrails", False):
             existing = getattr(args, "model_config", None)
@@ -337,15 +363,18 @@ class OmniServeCommand(CLISubcommand):
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
         model = getattr(args, "model_tag", None) or getattr(args, "model", None)
+        revision = getattr(args, "revision", None)
         native_single_file = resolve_native_single_file(getattr(args, "model_class_name", None))
-        if model and ((native_single_file is not None and os.path.isfile(model)) or is_diffusion_model(model)):
+        if model and (
+            (native_single_file is not None and os.path.isfile(model)) or is_diffusion_model(model, revision=revision)
+        ):
             if api_server_count is not None and api_server_count > 1:
                 raise ValueError("--api-server-count > 1 is not supported for diffusion models")
             logger.info("Detected diffusion model: %s", model)
             return
         validate_parsed_serve_args(args)
 
-    def subparser_init(self, subparsers: argparse._SubParsersAction) -> TrackingArgumentParser:
+    def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,
@@ -354,6 +383,8 @@ class OmniServeCommand(CLISubcommand):
 
         _ensure_vllm_platform()
         serve_parser = make_arg_parser(serve_parser)
+        if not isinstance(serve_parser, TrackingArgumentParser):
+            raise TypeError("Omni serve requires a TrackingArgumentParser")
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
 
         # Create OmniConfig argument group for omni-related parameters
@@ -366,6 +397,36 @@ class OmniServeCommand(CLISubcommand):
             "--omni",
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
+        )
+        omni_config_group.add_argument(
+            "--disable-websocket-compression",
+            action="store_true",
+            default=False,
+            help="Disable per-message deflate for all WebSocket routes on this server. "
+            "Useful for already-compressed video streams, including browser clients.",
+        )
+        omni_config_group.add_argument(
+            "--video-output-warmup",
+            type=str,
+            default=None,
+            metavar="REQUEST_JSON",
+            help="Run a streaming video session.start JSON file before HTTP startup. "
+            "Requires explicit num_frames and no playback pacing. Disabled when omitted.",
+        )
+        omni_config_group.add_argument(
+            "--video-output-warmup-timeout",
+            type=float,
+            default=180.0,
+            metavar="SECONDS",
+            help="Generation/encoding deadline for --video-output-warmup (default: 180 seconds). "
+            "A failure or timeout aborts server startup.",
+        )
+        serve_parser.maybe_override_argument(
+            omni_config_group,
+            "--watermark-config",
+            argument_type=_parse_watermark_config,
+            default=None,
+            help=_WATERMARK_CONFIG_HELP,
         )
 
         try:
@@ -423,6 +484,11 @@ class OmniServeCommand(CLISubcommand):
             help="Path to a deploy config YAML (new format with stages/engine_args).",
         )
         omni_config_group.add_argument(
+            "--duplex-engine-backend-as-process",
+            action="store_true",
+            help="Run the duplex runtime in a separate process to isolate the frontend GIL; serves sessions only.",
+        )
+        omni_config_group.add_argument(
             "--strategy-config",
             type=str,
             default=None,
@@ -474,12 +540,6 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=600,
             help="The timeout for initializing the stages.",
-        )
-        omni_config_group.add_argument(
-            "--shm-threshold-bytes",
-            type=int,
-            default=65536,
-            help="The threshold for the shared memory size.",
         )
         omni_config_group.add_argument(
             "--log-stats",
@@ -604,6 +664,12 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--controlnet-model-path",
+            type=str,
+            default=None,
+            help="Local original MiniMax H3 Fun ControlNet Union safetensors checkpoint.",
+        )
+        omni_config_group.add_argument(
             "--hsdp-weight-load-strategy",
             choices=["full", "pre_sharded"],
             default=None,
@@ -633,10 +699,22 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-application",
+            choices=["runtime", "merged"],
+            default=None,
+            help="Apply diffusion LoRA per request, or merge one global policy into dense weights.",
+        )
+        omni_config_group.add_argument(
             "--lora-scale",
             type=float,
             default=None,
-            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+            help=(
+                "Multiplier on top of a startup PEFT LoRA's own alpha/rank scaling; "
+                "effective strength = lora_scale * lora_alpha / r. Pass the same "
+                "value the reference framework uses (e.g. LightX2V's --lora-scale), "
+                "not the pre-multiplied scale * alpha / rank. Distilled LoRAs are "
+                "fused at their checkpoint scale."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
@@ -645,7 +723,8 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
-                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+                "incompatible with HSDP, sequence parallelism, CPU offload, layerwise offload, and "
+                "--diffusion-attention-schedule profiles."
             ),
         )
         omni_config_group.add_argument(
@@ -665,6 +744,16 @@ class OmniServeCommand(CLISubcommand):
                 "Capture fixed-shape KV-cache decode steps into CUDA graphs on models that implement them "
                 "(currently Qwen-Image-2.1). Independent of compilation_config.cudagraph_mode; "
                 "disable with --no-enable-cuda-graph-decode. --enforce-eager also disables it."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "Off by default. Not used with cfg-parallel or a cache backend."
             ),
         )
         omni_config_group.add_argument(
@@ -730,12 +819,28 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
-            "--ulysses-a2a-permute",
-            action=argparse.BooleanOptionalAction,
+            "--ulysses-a2a-backend",
+            type=str,
+            default=None,
+            # Kept in sync with vllm_omni.diffusion.data.ULYSSES_A2A_BACKENDS (asserted in tests); importing it here
+            # would pull in vllm when the docs build renders the parser.
+            choices=["auto", "nccl", "copy_engine"],
+            help=(
+                "Transport for the strict Ulysses all-to-all. 'auto' (default) uses the copy engine when the "
+                "Ulysses group is on one node with CUDA peer access between all GPUs, otherwise 'nccl'. "
+                "'copy_engine' uses CUDA copy engines on CUDA and TorchNPU on NPU. Only strict Ulysses layouts are "
+                "eligible. NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, with libshmem.so on LD_LIBRARY_PATH."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--ulysses-overlap-chunks",
+            type=int,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
-                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+                "On the copy-engine transport, split each rank's attention heads into this many chunks and move them "
+                "on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; 0 disables; "
+                "ignored when auto resolves to nccl). Requires strict pure Ulysses. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(
@@ -774,6 +879,17 @@ class OmniServeCommand(CLISubcommand):
                 "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
             ),
         )
+        omni_config_group.add_argument(
+            "--diffusion-flashinfer-autotune",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Diffusion-only: autotune FlashInfer GEMMs (on SM100+: MXFP8 and per-tensor FP8 linears) so they use "
+                "tuned tactics instead of heuristics. Default: on for CUDA SM100+ with FlashInfer, off elsewhere; "
+                "--no-diffusion-flashinfer-autotune disables it. The first request of each new shape pays the tuning; "
+                "tactics are cached per rank under VLLM_CACHE_ROOT and reused after a restart."
+            ),
+        )
 
         # HSDP (Hybrid Sharded Data Parallel) parameters
         omni_config_group.add_argument(
@@ -788,6 +904,15 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=-1,
             help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-data-parallel",
+            action="store_true",
+            help=(
+                "Process one independent compatible request per HSDP rank while "
+                "retaining collective parameter sharding. Requires all other "
+                "parallel sizes to be 1."
+            ),
         )
         omni_config_group.add_argument(
             "--hsdp-replicate-size",
@@ -827,6 +952,21 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
+        )
+
+        omni_config_group.add_argument(
+            "--diffusion-attention-schedule",
+            type=_json_object,
+            default=None,
+            help="Startup attention profiles with either default step ranges or sigma noise windows, as JSON "
+            "or dotted flags. Each profile is an independent attention config. Step ranges use zero-based "
+            "[start, end), with null end meaning the actual sequence end. Sigma windows use scheduler "
+            "sigma in [0, 1] as [low, high); a high of 1 includes 1. Non-empty default and sigma lists "
+            "are mutually exclusive. "
+            'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'. Sigma example: '
+            '\'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"sigma": [{"low": 0.0, "high": 0.3, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters
@@ -872,10 +1012,43 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=_nonneg_finite_float,
-            default=0.0,
+            default=None,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
-            "0 disables admission (default).",
+            "0 disables admission. Defaults to 500 with --hsdp-data-parallel, else 0.",
+        )
+        # Server-level MixFusion defaults. Unset flags leave the deploy YAML's
+        # per-stage ``enable_mixfusion`` / ``mixfusion_min_chunk_tokens`` /
+        # ``mixfusion_max_chunks`` values in force; per-request extra_args still
+        # take precedence over this server default.
+        omni_config_group.add_argument(
+            "--enable-mixfusion",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable mixed-resolution batch packing (MixFusion) in the diffusion scheduler "
+                "as the server-level default (default: disabled). MixFusion requires step "
+                "execution, which is enabled automatically when this flag is set. "
+                "--no-enable-mixfusion overrides a deploy YAML stage enabled with enable_mixfusion."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-min-chunk-tokens",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: minimum token budget per ragged-latent chunk (default: 256). "
+                "Unset leaves the deploy YAML value in force."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-max-chunks",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: maximum number of chunks packed into one fused forward "
+                "(default: 128). Unset leaves the deploy YAML value in force."
+            ),
         )
 
         # VAE memory optimization parameters
@@ -888,6 +1061,16 @@ class OmniServeCommand(CLISubcommand):
             "--vae-use-tiling",
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
+        )
+        omni_config_group.add_argument(
+            "--vae-stack-tiles",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Decode a rank's VAE spatial tiles in batches of up to 7 (default). Currently only the "
+                "MiniMax-H3 video VAE reads this flag; other models ignore it. --no-vae-stack-tiles "
+                "decodes one tile at a time."
+            ),
         )
         omni_config_group.add_argument(
             "--vae-fast-path",
@@ -947,6 +1130,23 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-isolate",
+            action="store_true",
+            default=None,
+            help="Experimental MiniMax-H3 visual-reference isolation with one-time KV capture, "
+            "Host INT8 and asynchronous layer prefetch. Changes model semantics and takes "
+            "precedence over --kv-offload-config.",
+        )
+        omni_config_group.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help="MiniMax-H3 reference-KV cache as JSON: mode=on, "
+            "kv_refresh_interval (default 2), kv_host_quantization=none|fp8|int8. "
+            "Reference projections are skipped on reuse steps. "
+            "Omit to keep the existing attention path.",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Compatibility alias for model-level CPU offload. New integrations should use "
@@ -990,6 +1190,13 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=0,
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-chunk-size-mb",
+            type=int,
+            default=64,
+            help="Full-chunk target size in MiB for distributed layerwise offload "
+            "(each chunk is one host-to-device copy + AllGather unit).",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-mode",
@@ -1126,13 +1333,13 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
             dest="no_guardrails",
             action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            help="Disable Cosmos3 and PAN2 text/video safety guardrails for this server.",
         )
         omni_config_group.add_argument(
             "--robot-openpi-idle-timeout",
@@ -1198,6 +1405,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
 
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
 
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
@@ -1309,7 +1519,7 @@ def _start_api_server_process_manager(**manager_kwargs: object) -> APIServerProc
 
 def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     """Launch API subprocesses that share one set of local stage engines."""
-    from vllm.entrypoints.openai.api_server import setup_server
+    from vllm.entrypoints.launchers.launcher import setup_server
     from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 
     num_api_servers = int(args.api_server_count)
@@ -1336,7 +1546,16 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     stage_runtime = None
     api_server_manager = None
     engine_launch = None
+    startup_environment = ExitStack()
     try:
+        deploy_config = getattr(args, "deploy_config", None)
+        if deploy_config:
+            from vllm_omni.platforms import current_omni_platform
+
+            if current_omni_platform.is_npu():
+                from vllm_omni.model_executor.models.minicpmo_4_5.config import npu_prefill_startup_environment
+
+                startup_environment.enter_context(npu_prefill_startup_environment(deploy_config))
         stage_runtime = _build_multi_api_stage_runtime(args, num_api_servers)
         with stage_runtime.launch_stage_engines(num_api_servers) as engine_launch:
             args._omni_stage_client_configs = engine_launch.client_configs
@@ -1358,14 +1577,17 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
         _wait_for_multi_api_server_completion(api_server_manager, engine_launch)
     finally:
         timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
-        if api_server_manager is not None:
-            api_server_manager.shutdown(timeout=timeout)
-        if engine_launch is not None:
-            engine_launch.shutdown()
-        if stage_runtime is not None:
-            stage_runtime.shutdown()
-        sock.close()
-        remove_api_server_shared_dir(shared_dir)
+        try:
+            if api_server_manager is not None:
+                api_server_manager.shutdown(timeout=timeout)
+            if engine_launch is not None:
+                engine_launch.shutdown()
+            if stage_runtime is not None:
+                stage_runtime.shutdown()
+        finally:
+            startup_environment.close()
+            sock.close()
+            remove_api_server_shared_dir(shared_dir)
         if shutdown_requested:
             logger.info("Shared API server shutdown completed")
 
@@ -1452,6 +1674,9 @@ def run_headless(args: TrackingNamespace) -> None:
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
 
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
+
     try:
         stage_cfg = resolved.stage_by_id(stage_id)
     except KeyError:
@@ -1477,7 +1702,17 @@ def run_headless(args: TrackingNamespace) -> None:
         )
         return
 
-    omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+    from vllm_omni.engine.stage_engine_startup import fetch_deployment_id
+
+    expected_deployment_id = fetch_deployment_id(
+        omni_master_address=omni_master_address,
+        omni_master_port=omni_master_port,
+    )
+    omni_transfer_config = load_omni_transfer_config_for_model(
+        model,
+        config_path,
+        deployment_scope=expected_deployment_id,
+    )
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
@@ -1507,6 +1742,8 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_connector_spec=stage_connector_spec,
         engine_args_dict=engine_args_dict,
         headless=True,
+        watermark_config=args.watermark_config,
+        local_replica_count=omni_dp_size_local,
     )
     parallel_config = vllm_config.parallel_config
 
@@ -1550,6 +1787,7 @@ def run_headless(args: TrackingNamespace) -> None:
         omni_dp_size_local=omni_dp_size_local,
         per_replica_devices=per_replica_devices,
         replica_bind_address=omni_replica_address,
+        expected_deployment_id=expected_deployment_id,
     )
 
 

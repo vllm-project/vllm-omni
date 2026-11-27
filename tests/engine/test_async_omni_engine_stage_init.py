@@ -11,25 +11,31 @@ import time
 import types
 from dataclasses import dataclass, field
 from subprocess import CompletedProcess
+from unittest.mock import MagicMock
 
 import pytest
 from omegaconf import OmegaConf
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from tests.helpers.mock import patch_hf_snapshot_download
-from vllm_omni.config.omni_config import OmniStageRuntimeConfig
+from vllm_omni.config.omni_config import OmniStageRuntimeConfig, VllmOmniARStageConfig
+from vllm_omni.config.stage_config import StagePipelineConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
+from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
     build_stage0_input_processor,
+    build_vllm_config,
     compute_replica_layout,
     split_devices_for_replicas,
     stage_runtime_env,
 )
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -51,6 +57,7 @@ class _FakeVllmConfig:
 @dataclass
 class _FakeRuntimeConfig:
     devices: str
+    num_replicas: int = 1
 
 
 @dataclass
@@ -59,6 +66,18 @@ class _FakeStageConfig:
     stage_type: str
     engine_args: dict[str, object]
     runtime: _FakeRuntimeConfig
+    final_output_type: str | None = None
+
+
+@dataclass
+class _FakeModelConfig:
+    hf_config: object = field(default_factory=object)
+
+
+@dataclass
+class _FakeEngineConfig:
+    quant_config: object
+    model_config: _FakeModelConfig = field(default_factory=_FakeModelConfig)
 
 
 def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
@@ -140,6 +159,122 @@ def test_stage_runtime_env_restores_first_value_for_normalized_keys(monkeypatch)
         assert os.environ["123"] == "second"
 
     assert os.environ["123"] == "original"
+
+
+@pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+def test_stage_runtime_initializes_configured_audio_watermarker(monkeypatch, stage_type: str):
+    """Ensure runtime initialization constructs the configured stage watermarker."""
+    watermarker = object()
+    constructor = MagicMock(return_value=watermarker)
+    monkeypatch.setitem(StagePool._watermarker_registry["audio"], "audioseal", constructor)
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        watermark_config=WatermarkConfig({"audio": {"algorithm": "audioseal"}}, strict=True),
+    )
+    if stage_type == "llm":
+        config = types.SimpleNamespace(model_config=types.SimpleNamespace(skip_tokenizer_init=True))
+        plan = _make_llm_plan(0, stage_id=0, vllm_config=config, final_output=True, final_output_type="audio")
+    else:
+        plan = _make_diffusion_plan(0, stage_id=0, final_output_type="audio")
+    client = types.SimpleNamespace(
+        stage_type=stage_type,
+        final_output=True,
+        final_output_type="audio",
+        is_comprehension=False,
+        default_sampling_params=types.SimpleNamespace(),
+    )
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_initialize_replica", lambda *_args: client)
+
+    runtime.initialize()
+
+    assert len(runtime.stage_pools) == 1
+    constructor.assert_called_once_with()
+    assert runtime.stage_pools[0]._watermarkers == {"audio": watermarker}
+    assert runtime.stage_pools[0]._strict_watermarking
+
+
+@pytest.mark.parametrize(
+    ("final_output_type", "use_v2_model_runner", "expected"),
+    [
+        ("text", True, {"key": 1234, "algorithm": "gumbel"}),
+        # vLLM only watermarks while sampling in Model Runner V2
+        ("text", False, None),
+        ("audio", True, None),
+    ],
+)
+def test_build_vllm_config_forwards_text_watermark_config(
+    monkeypatch: pytest.MonkeyPatch,
+    final_output_type: str,
+    use_v2_model_runner: bool,
+    expected: dict[str, object] | None,
+) -> None:
+    """Ensure vLLM gets the text watermark config only for text output on Model Runner V2."""
+
+    class _StopAfterEngineArgsError(Exception):
+        """Stops build_vllm_config once vLLM has received the engine args."""
+
+    def create_engine_config(engine_args, **_kwargs):
+        forwarded.append(engine_args.watermark_config)
+        raise _StopAfterEngineArgsError
+
+    monkeypatch.setattr(stage_init_utils.OmniEngineArgs, "create_engine_config", create_engine_config)
+    stage = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test", final_output_type=final_output_type)
+    )
+    forwarded: list[dict[str, object] | None] = []
+
+    expected_error = _StopAfterEngineArgsError if use_v2_model_runner else ValueError
+    expected_match = None if use_v2_model_runner else "Model Runner V1 is not supported"
+    with pytest.raises(expected_error, match=expected_match):
+        # start to build the vLLM config and ensure the Omni watermark config is properly parsed
+        build_vllm_config(
+            stage,
+            "dummy-model",
+            engine_args_dict={"use_v2_model_runner": use_v2_model_runner},
+            watermark_config=WatermarkConfig({"text": {"key": 1234, "algorithm": "gumbel"}}),
+        )
+
+    assert forwarded == ([expected] if use_v2_model_runner else [])
+
+
+def test_build_vllm_config_upgrades_inc_quant_config_in_place(monkeypatch):
+    original_quant_config = object()
+    upgraded_quant_config = object()
+    fake_config = _FakeEngineConfig(quant_config=original_quant_config)
+    sentinel_executor = object()
+
+    monkeypatch.setattr(
+        stage_init_utils.OmniEngineArgs,
+        "create_engine_config",
+        lambda _self, **_kwargs: fake_config,
+    )
+    monkeypatch.setattr(stage_init_utils.Executor, "get_class", lambda _config: sentinel_executor)
+    monkeypatch.setattr(
+        stage_init_utils.OmniINCConfig,
+        "maybe_upgrade",
+        lambda quant_config: upgraded_quant_config if quant_config is original_quant_config else quant_config,
+    )
+    stage = _FakeStageConfig(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime=_FakeRuntimeConfig(devices="0"),
+    )
+
+    vllm_config, executor_class = build_vllm_config(
+        stage,
+        "dummy-model",
+        engine_args_dict={"tensor_parallel_size": 1, "use_v2_model_runner": True},
+    )
+
+    assert vllm_config is fake_config
+    assert vllm_config.quant_config is upgraded_quant_config
+    assert executor_class is sentinel_executor
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
@@ -255,6 +390,7 @@ def _make_diffusion_plan(
     *,
     stage_id: int,
     num_replicas: int = 1,
+    final_output_type: str = "image",
 ):
     replicas: list[ReplicaInitPlan] = []
     for replica_id in range(num_replicas):
@@ -270,7 +406,11 @@ def _make_diffusion_plan(
                 num_replicas=num_replicas,
                 launch_mode="local",
                 stage_cfg=stage_cfg,
-                metadata=_make_diffusion_metadata(stage_id, replica_id=replica_id),
+                metadata=_make_diffusion_metadata(
+                    stage_id,
+                    replica_id=replica_id,
+                    final_output_type=final_output_type,
+                ),
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
             )
@@ -317,7 +457,11 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.stage_configs = [
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="text_encoder", owns_tokenizer=True)
+        )
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -332,6 +476,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
     engine._client_config = engine_mod.OmniClientConfig(client_count=2, client_index=1, stage_addresses={})
+    engine._watermark_config = WatermarkConfig({"audio": {"algorithm": "audioseal"}})
     engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
@@ -348,13 +493,18 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     assert captured["stage_init_timeout"] == 7
     assert captured["log_stats"] is True
     assert captured["client_config"] is engine._client_config
+    assert captured["watermark_config"] is engine._watermark_config
 
 
 def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.stage_configs = [
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="text_encoder", owns_tokenizer=True)
+        )
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -1495,6 +1645,61 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
     }
 
 
+def test_startup_crash_preserves_sibling_and_replica_id(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import LocalReplicaStartupError
+
+    runtime = StageRuntime([], "dummy", None, stage_init_timeout=1, async_chunk=False)
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig(), num_replicas=2)
+    survivor = types.SimpleNamespace()
+
+    def initialize(replica, _timeout):
+        if replica.replica_id == 0:
+            raise LocalReplicaStartupError("exited before READY")
+        return survivor
+
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_build_init_groups", lambda _: {"shared": [(0, r) for r in plan.replicas]})
+    monkeypatch.setattr(runtime, "_initialize_replica", initialize)
+    monkeypatch.setattr("vllm_omni.engine.stage_runtime.build_llm_stage_output_processor", lambda *args, **kwargs: None)
+
+    runtime.initialize()
+
+    assert runtime.stage_pools[0].clients == [None, survivor]
+    assert runtime.stage_pools[0].available_replica_ids() == [1]
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["all_replicas_exit", "cancelled"])
+def test_startup_failure_cleans_up_initialized_clients(monkeypatch, mocker, cancelled):
+    from vllm_omni.engine.stage_engine_startup import LocalReplicaStartupError
+
+    runtime = StageRuntime([], "dummy", None, stage_init_timeout=1, async_chunk=False)
+    plans = [_make_llm_plan(i, stage_id=i, vllm_config=_FakeVllmConfig(), num_replicas=n) for i, n in enumerate([1, 2])]
+    other_stage_client = mocker.Mock()
+    sibling = mocker.Mock()
+
+    def initialize(replica, _timeout):
+        if replica.metadata.stage_id == 0:
+            return other_stage_client
+        if cancelled:
+            if replica.replica_id == 0:
+                return sibling
+            runtime._init_cancelled.set()
+        raise LocalReplicaStartupError("exited before READY")
+
+    groups = {"shared": [(plan.stage_idx, replica) for plan in plans for replica in plan.replicas]}
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: plans)
+    monkeypatch.setattr(runtime, "_build_init_groups", lambda _: groups)
+    monkeypatch.setattr(runtime, "_initialize_replica", initialize)
+
+    error = RuntimeError if cancelled else LocalReplicaStartupError
+    message = "cancelled" if cancelled else "exited before READY"
+    with pytest.raises(error, match=message):
+        runtime.initialize()
+    other_stage_client.shutdown.assert_called_once_with()
+    if cancelled:
+        sibling.shutdown.assert_called_once_with()
+
+
 def test_remote_replicas_use_distinct_init_group_keys():
     runtime = StageRuntime(
         stage_configs=[],
@@ -1588,7 +1793,8 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     assert captured_cleanup == [[initialized_client]]
 
 
-def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
+@pytest.mark.parametrize("log_stats", [False, True])
+def test_initialize_local_llm_replica_passes_launch_options(monkeypatch, log_stats):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.platforms import current_omni_platform
 
@@ -1598,12 +1804,14 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         config_path="dummy-config",
         stage_init_timeout=1,
         async_chunk=False,
+        log_stats=log_stats,
     )
     stage_init_timeout = 302
 
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
     captured_timeout: int | None = None
+    captured_log_stats: bool | None = None
 
     plan = ReplicaInitPlan(
         replica_id=0,
@@ -1632,7 +1840,9 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     @contextlib.contextmanager
-    def _fake_launch_stage_replica(**_kwargs):
+    def _fake_launch_stage_replica(**kwargs):
+        nonlocal captured_log_stats
+        captured_log_stats = kwargs["log_stats"]
         yield StageReplicaResources(
             manager=types.SimpleNamespace(shutdown=lambda: None),
             addresses=fake_addresses,
@@ -1654,6 +1864,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == stage_init_timeout
+    assert captured_log_stats is log_stats
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
@@ -2563,7 +2774,7 @@ def test_engine_async_chunk_includes_downstream_stages(monkeypatch, stage_modes,
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
+def test_dist_stage_runtime_preserves_stage_total_when_local_dp_is_set(typed):
     from vllm_omni.config.omni_config import VllmOmniARStageConfig
     from vllm_omni.config.stage_config import StagePipelineConfig
     from vllm_omni.engine.stage_runtime import DistStageRuntime
@@ -2574,6 +2785,7 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
     else:
         runtime_cfg = types.SimpleNamespace(num_replicas=1)
         stage = types.SimpleNamespace(stage_id=0, runtime=runtime_cfg)
+    runtime_cfg.num_replicas = 3
     runtime = DistStageRuntime(
         stage_configs=[stage],
         model="dummy-model",
@@ -2588,7 +2800,10 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
 
     runtime._validate_single_stage_mode_replica_constraints()
 
-    assert runtime_cfg.num_replicas == 2
+    assert runtime_cfg.num_replicas == 3
+    assert runtime._get_replica_launch_mode(0, 0) == "local"
+    assert runtime._get_replica_launch_mode(0, 1) == "local"
+    assert runtime._get_replica_launch_mode(0, 2) == "remote"
 
 
 @pytest.mark.parametrize("num_replicas", [1, 2, 3])

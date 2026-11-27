@@ -13,7 +13,7 @@ from typing import cast
 
 import numpy as np
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.personaplex.duplex.plugin import (
     PersonaPlexSessionState,
 )
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -108,18 +109,24 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 
-def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches() -> None:
+def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches(monkeypatch) -> None:
     import inspect
 
-    stages = merge_pipeline_deploy(
-        PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
-    )
-    overrides = stages[0].yaml_engine_args["hf_overrides"]
+    # This is explicitly the CUDA MRv2 profile. Keep the assertion independent
+    # of the host running the CPU suite, since non-CUDA platforms intentionally
+    # retain a rejecting V1 override and are covered in tests/config.
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    deploy = load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
+    overrides = deploy.stages[0].engine_extras["hf_overrides"]
 
     # PersonaPlexConfig takes **kwargs, so a misspelled switch would be ignored silently.
     assert set(overrides) <= set(inspect.signature(PersonaPlexConfig.__init__).parameters)
     assert overrides["mimi_cuda_graphs"] is True
     assert overrides["depformer_cuda_graphs"] is True
+
+    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
+    assert len(stages) == 2
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
 
 def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_path: Path) -> None:
@@ -150,6 +157,32 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
         assert resolve(model_arch, dict(stage.yaml_engine_args["hf_overrides"])).mimi_cuda_graphs is True
         # Without the deploy override the flag keeps its default.
         assert resolve(model_arch, None).mimi_cuda_graphs is False
+
+
+@pytest.mark.parametrize("deploy", ["personaplex.yaml", "personaplex_duplex_mrv2.yaml"])
+def test_personaplex_deploy_config_keeps_context_past_the_sliding_window(tmp_path: Path, deploy: str) -> None:
+    """Both profiles configure an hour of 80 ms frames, past Helium's 3000-frame window."""
+    (tmp_path / "config.json").write_text("{}")
+    deploy_config = load_deploy_config(DEPLOY_PATH.with_name(deploy))
+    # The historical mixed-runner profile inherits the context length but
+    # replaces hf_overrides. Check the resolved settings before admission,
+    # which separately rejects its V1 Talker.
+    stage0 = deploy_config.stages[0]
+
+    model_config = OmniEngineArgs(
+        model=str(tmp_path),
+        model_arch=PERSONAPLEX_PIPELINE.stages[0].model_arch or PERSONAPLEX_PIPELINE.model_arch,
+        hf_overrides=dict(stage0.engine_extras["hf_overrides"]),
+        max_model_len=stage0.max_model_len,
+        skip_tokenizer_init=True,
+        trust_remote_code=True,
+    ).create_model_config()
+
+    temporal = model_config.hf_config.temporal_config
+    assert model_config.hf_text_config is temporal
+    assert temporal.sliding_window == 3000
+    assert temporal.max_position_embeddings == 46_080  # 60 min of 80 ms frames + 1080 of prefill
+    assert model_config.max_model_len == 46_080
 
 
 # --------------------------------------------------------------------------- #
@@ -347,7 +380,7 @@ def test_data_plane_context_is_the_framework_default() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_sampling_params_are_greedy_one_token_on_stage0_only() -> None:
+def test_sampling_params_are_greedy_on_stage0_and_delta_on_code2wav() -> None:
     defaults = (SamplingParams(temperature=0.8, top_k=10, max_tokens=10), SamplingParams(max_tokens=1024))
 
     configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
@@ -355,9 +388,26 @@ def test_sampling_params_are_greedy_one_token_on_stage0_only() -> None:
     assert configured[0].temperature == 0.0
     assert configured[0].top_k == 1
     assert configured[0].max_tokens == 1
-    assert configured[1] is defaults[1]
+    assert configured[0].output_kind == RequestOutputKind.CUMULATIVE
+    assert configured[1] is not defaults[1]
+    assert configured[1].output_kind == RequestOutputKind.DELTA
+    assert configured[1].max_tokens == 1024
     assert defaults[0].max_tokens == 10
+    assert defaults[1].output_kind == RequestOutputKind.CUMULATIVE
+    assert PersonaPlexDataPlaneSession.audio_output_is_delta is True
     assert _plugin().configure_sampling_params(runtime_config={}, defaults=()) == ()
+
+
+def test_only_the_final_stage_switches_to_delta_output() -> None:
+    defaults = (SamplingParams(), SamplingParams(), SamplingParams())
+
+    configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
+
+    assert [params.output_kind for params in configured] == [
+        RequestOutputKind.CUMULATIVE,
+        RequestOutputKind.CUMULATIVE,
+        RequestOutputKind.DELTA,
+    ]
 
 
 def test_plan_append_reserves_one_slot_plus_prefill_on_the_first_seq() -> None:

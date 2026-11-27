@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .audio_prep import (
     _coerce_prompt_latents,
@@ -135,19 +136,27 @@ def _encode_prompt_waveform_to_latents(
         patch_size=wrapper.ming_config.patch_size,
         sample_rate=wrapper.ming_config.sample_rate,
     )
-    dev = next(encoder.encoder.parameters()).device
-    waveform = waveform.to(device=dev, dtype=next(encoder.encoder.parameters()).dtype)
+    # Lengths stay on the host: the encoder only validates them and derives
+    # frame counts, so a device copy would add a sync per prompt.
     if waveform_length is None:
-        waveform_length = torch.full((waveform.shape[0],), waveform.shape[-1], dtype=torch.int32, device=dev)
-    elif not isinstance(waveform_length, torch.Tensor):
-        waveform_length = torch.as_tensor(waveform_length, dtype=torch.int32, device=dev)
+        waveform_length = torch.full((waveform.shape[0],), waveform.shape[-1], dtype=torch.int32)
     else:
-        waveform_length = waveform_length.to(device=dev, dtype=torch.int32)
+        waveform_length = torch.as_tensor(waveform_length).to(device="cpu", dtype=torch.int32)
 
+    # A model may supply the deterministic encoder output itself (computed
+    # ahead, cached or from a CUDA graph) from the host waveform; posterior
+    # sampling below still draws from the request generator.
+    encoder_forward = getattr(wrapper, "_prompt_encoder_forward", None)
+    encoder_output = encoder_forward(encoder, waveform) if callable(encoder_forward) else None
+    if encoder_output is None:
+        param = next(encoder.encoder.parameters())
+        # A blocking host copy would wait for all queued device work.
+        waveform = to_device_nonblocking(waveform, param.device).to(dtype=param.dtype)
     latents, _ = encoder.encode_latent(
         waveform,
         waveform_length,
         generator=generator,
+        encoder_output=encoder_output,
     )
     if latents.ndim == 3 and latents.shape[0] == 1:
         latents = latents.squeeze(0)

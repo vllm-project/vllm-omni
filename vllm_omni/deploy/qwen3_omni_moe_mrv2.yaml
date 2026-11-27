@@ -1,6 +1,8 @@
-# Opt-in CUDA Model Runner V2 profile for Qwen3-Omni-MoE: the Thinker (stage 0),
-# Talker (stage 1) and Code2Wav (stage 2) run on MRv2 with its native data
-# plane. The base profile keeps every stage on V1.
+# Model Runner V2 codec profile on top of the default deploy. The default
+# qwen3_omni_moe.yaml already selects model_runner v2 for Thinker, Talker and
+# Code2Wav on CUDA and ROCm. This overlay adds the codec chunk ramp and
+# length-grouped CUDA/HIP graphs, plus CUDA-only first-frame delivery and
+# fused blocks.
 #
 # On MRv2 the Thinker hands each generated token's embedding to the Talker with
 # the step that sampled it (one Thinker step earlier than its next forward would
@@ -11,8 +13,8 @@
 # docs/configuration/stage_configs.md); startup warns when no MPS server is found.
 #
 # Turn-based sessions use this profile. Duplex sessions use
-# qwen3_omni_duplex_mrv2.yaml. Resumable streaming input uses the V1 chunk
-# adapter.
+# qwen3_omni_duplex_mrv2.yaml. Resumable streaming input is unsupported
+# by this native MRv2 profile.
 base_config: qwen3_omni_moe.yaml
 
 connectors:
@@ -27,7 +29,7 @@ connectors:
       talker_first_audio: true
       codec_chunk_ramp: [1, 2, 4, 8, 16, 25]
       # Code2Wav decodes a streaming step as a few length groups on multi-row
-      # CUDA graphs instead of one eager call padded to its longest window
+      # CUDA/HIP graphs instead of one eager call padded to its longest window
       # (with the ramp, over half of those padded frames were waste).
       codec_graph_batch_sizes: [2, 3, 4, 6, 8, 12, 16]
       codec_fused_snake: true
@@ -35,17 +37,18 @@ connectors:
 stages:
   - stage_id: 0
     model_runner: v2
+    # Opt-in: true reuses Thinker KV and merges the cached rows the Talker
+    # consumes (stage-output prefix cache).
+    enable_prefix_caching: false
   - stage_id: 1
     model_runner: v2
+    # Opt-in: on MRv2 the Talker reuses native KV only; its outputs are
+    # sampled codec frames, so a prefix hit has no output rows to replay.
   - stage_id: 2
     model_runner: v2
 
 platforms:
   npu:
-    model_runner: v1
-  xpu:
-    model_runner: v1
-  rocm:
     model_runner: v1
   musa:
     model_runner: v1

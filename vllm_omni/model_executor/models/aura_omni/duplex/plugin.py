@@ -7,43 +7,69 @@ from __future__ import annotations
 
 import binascii
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pybase64 as base64
+from vllm.multimodal.image import open_image
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
     DuplexOutputAction,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
 )
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, EncodeAudio
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, EncodeAudio
+from vllm_omni.engine.duplex.response_judge import judge_rejects
+from vllm_omni.model_executor.models.aura_omni.control_tokens import (
+    AURA_V1,
+    AURA_V2,
+    profile_for_stop_ids,
+    stop_ids_for_profile,
+)
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
     AuraDataPlaneContext,
     AuraDataPlaneSession,
 )
 from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
+    AURA_STAGE_LAYOUT,
+    AuraStageLayout,
+)
+from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import chat_template_tools
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_AURA_SYSTEM_PROMPT,
+    DEFAULT_AURA_V2_SYSTEM_PROMPT,
     SILENT_TEXT,
     is_effectively_silent,
 )
 
-# AURA v1 (Qwen3-VL) silent / ChatML turn-end ids.
-AURA_SILENT_TOKEN_ID = 151669
-AURA_IM_END_TOKEN_ID = 151645
-AURA_SILENT_TOKEN_IDS = frozenset({AURA_SILENT_TOKEN_ID})
+# v1 id, kept for callers that compare against the Qwen3-VL silent token.
+# The live family is ``AuraDuplexPlugin._profile``, chosen from stage stop ids.
+AURA_SILENT_TOKEN_ID = AURA_V1.silent_id
 
 _PRIVATE_KEYS = frozenset(
     {
         "aura_system_prompt",
         "aura_history_revision",
+        "aura_two_token",
+        "aura_tools",
+        "aura_tool_pending",
+        "aura_tool_batch",
+        "aura_tool_rounds",
     }
 )
+
+# Native gateway MAX_TOOL_ROUNDS. After this many tool follow-ups the next
+# answer turn gets the silent + nudge pair so the model stops calling tools.
+_NATIVE_MAX_TOOL_ROUNDS = 5
+_TOOL_FOLLOWUP_NUDGE = "请根据当前工具结果，直接回答用户的问题。"
 
 _TTS_EXTRA_KEYS = (
     "tts_task_type",
@@ -76,8 +102,6 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
         return {}
     from io import BytesIO
 
-    from PIL import Image
-
     images: list[object] = []
     for frame in frames:
         if not isinstance(frame, str) or not frame:
@@ -87,7 +111,7 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
         except (binascii.Error, ValueError):
             continue
         try:
-            images.append(np.asarray(Image.open(BytesIO(raw)).convert("RGB")))
+            images.append(np.asarray(open_image(BytesIO(raw)).convert("RGB")))
         except Exception:
             continue
     if not images:
@@ -134,15 +158,59 @@ def _first_completion(output: object) -> object | None:
     return None
 
 
+# 16 kHz pcm16 of a short spoken request ("请只说：暖机完成。"). A tone is
+# transcribed as an empty string, and an empty request is answered with
+# <|silent|>, which never reaches Talker or Code2Wav.
+_WARMUP_REQUEST_PCM = Path(__file__).with_name("warmup_request.pcm")
+
+
 class AuraDuplexPlugin(DuplexModelPlugin):
     """Turn-commit AURA: one ephemeral four-stage request per utterance."""
 
     plugin_id = "aura"
     private_runtime_config_keys = _PRIVATE_KEYS
+    # A timed-out call stays in aura_tool_batch until something settles it.
+    # The shared notice is that settlement, so the calls that did return can
+    # still follow up. Cancel and epoch-change keep the default no-op.
+    abandoned_tool_call_reasons = frozenset({ToolCallAbandonReason.TIMEOUT})
+    stages: AuraStageLayout = AURA_STAGE_LAYOUT
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
-        self.data_plane = AuraDataPlaneSession(encode_audio)
+        self.data_plane = AuraDataPlaneSession(encode_audio, stages=self.stages)
+        # Empty sampling defaults stay on v1. A stage that already lists the
+        # v2 silent or im_end id switches this before the first request.
+        self._profile = AURA_V1
+        # Tool-result history writes planned by ``plan_append`` and applied by
+        # ``commit_append_plan``: request_id -> (session_id, outputs, nudge).
+        self._staged_tool_history: dict[str, tuple[str, tuple[str, ...], bool]] = {}
+
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        stages = AuraStageLayout.from_pipeline(pipeline_config)
+        self.data_plane.configure_stages(stages)
+        self.stages = stages
+
+    def input_stage_id(self, payload: object) -> int:
+        return self.stages.asr
+
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        # A missing clip (e.g. a build without package data) keeps the shared tone.
+        if not _WARMUP_REQUEST_PCM.is_file():
+            return None
+        pcm = _WARMUP_REQUEST_PCM.read_bytes()
+        if not pcm:
+            return None
+        return {
+            "audio": base64.b64encode(pcm).decode("ascii"),
+            "format": "pcm16",
+            "sample_rate_hz": 16000,
+            "is_speech": True,
+        }
+
+    def _default_system_prompt(self) -> str:
+        if self._profile is AURA_V2:
+            return DEFAULT_AURA_V2_SYSTEM_PROMPT
+        return DEFAULT_AURA_SYSTEM_PROMPT
 
     def configure_sampling_params(
         self,
@@ -152,36 +220,45 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     ) -> tuple[object, ...]:
         del runtime_config
         configured = list(defaults)
-        if len(configured) > 1 and isinstance(configured[1], SamplingParams):
-            stage1 = configured[1].clone()
-            stop_ids = list(stage1.stop_token_ids or [])
-            for stop_id in (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID):
-                if stop_id not in stop_ids:
-                    stop_ids.append(stop_id)
-            stage1.stop_token_ids = stop_ids
-            # 151669 is a stop id: keep it in the completion so decide_output /
-            # aura2tts can see <|silent|> instead of an empty detokenized string.
+        aura, talker = self.stages.aura, self.stages.talker
+        if len(configured) > aura and isinstance(configured[aura], SamplingParams):
+            stage1 = configured[aura].clone()
+            self._profile = profile_for_stop_ids(stage1.stop_token_ids)
+            stage1.stop_token_ids = stop_ids_for_profile(stage1.stop_token_ids, self._profile)
+            # Silent / im_end are stop ids: keep them in the completion so
+            # decide_output / aura2tts can see <|silent|> instead of an empty
+            # detokenized string. <|respond|> stays off the stop list.
             stage1.include_stop_str_in_output = True
             stage1.skip_special_tokens = False
-            configured[1] = stage1
-        # Codec EOS (2150) and the 240-token cap are defaults for an unset
+            if self._profile is AURA_V2:
+                # Two-token logits processor opt-in. Temperature stays at the
+                # stage yaml value (native two-token sampling is 0.2).
+                stage1.min_tokens = 0
+                stage1.repetition_penalty = 1.0
+                stage1.presence_penalty = 0.0
+                stage1.frequency_penalty = 0.0
+                extra = dict(stage1.extra_args or {})
+                extra["aura_mode"] = "streaming"
+                stage1.extra_args = extra
+            configured[aura] = stage1
+        # Codec EOS (2150) and the 1024-token cap are defaults for an unset
         # Talker config. A value already set by yaml or the caller is kept,
-        # even when max_tokens is longer than 240.
-        if len(configured) > 2 and isinstance(configured[2], SamplingParams):
-            stage2 = configured[2].clone()
+        # even when max_tokens is longer than 1024.
+        if len(configured) > talker and isinstance(configured[talker], SamplingParams):
+            stage2 = configured[talker].clone()
             if not stage2.stop_token_ids:
                 stage2.stop_token_ids = [2150]
             if stage2.max_tokens is None:
-                stage2.max_tokens = 240
-            configured[2] = stage2
+                stage2.max_tokens = 1024
+            configured[talker] = stage2
         return tuple(configured)
 
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
-        # Talker is stage 2; Code2Wav is the last stage. Stage 0/1 are the
+        # Talker through Code2Wav drain. The stages before Talker are the
         # input gate and are idle once a turn is released.
-        if stage_count <= 2:
+        if stage_count <= self.stages.talker:
             return frozenset()
-        return frozenset(range(2, stage_count))
+        return frozenset(range(self.stages.talker, stage_count))
 
     def plan_append(
         self,
@@ -196,7 +273,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del request_id, session_config, seq, turn_seq, sampling_params
+        del session_config, seq, turn_seq, sampling_params
 
         def _skip() -> DuplexAppendPlan:
             return DuplexAppendPlan(
@@ -217,6 +294,12 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             raise ValueError("AURA duplex plan_append expects a mapping payload")
         if not final and not payload.get("aura_turn_commit"):
             return _skip()
+        # A bare response.create. The runner may attach ``_native_explicit_reply``;
+        # that flag is not user audio or video. ``has_pending_tool_followup``
+        # decides whether the whole tool batch is ready to answer.
+        public_payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+        if public_payload.get("type") == "conversation" and len(public_payload) == 1:
+            return self._plan_tool_followup(request_id=request_id, fence=fence, runtime_config=runtime_config)
 
         mm = _video_frames_to_mm(payload.get("video_frames"))
         audio_b64 = payload.get("audio")
@@ -239,12 +322,14 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             has_audio = True
         if not has_audio and not mm:
             raise ValueError("AURA duplex commit requires audio and/or video_frames")
-        system_prompt = runtime_config.get("aura_system_prompt", DEFAULT_AURA_SYSTEM_PROMPT)
+        system_prompt = runtime_config.get("aura_system_prompt", self._default_system_prompt())
+        two_token = bool(runtime_config.get("aura_two_token", self._profile is AURA_V2))
 
         additional_information: dict[str, object] = {
             "aura_system_prompt": system_prompt,
             "aura_session_id": fence.session_id,
             "aura_duplex": True,
+            "aura_two_token": two_token,
             "session_id": fence.session_id,
             "epoch": fence.epoch,
             "turn_id": fence.turn_id,
@@ -257,6 +342,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         item_id = payload.get("realtime_item_id")
         if isinstance(item_id, str) and item_id:
             additional_information["realtime_item_id"] = item_id
+        tools = runtime_config.get("aura_tools")
+        if tools:
+            additional_information["aura_tools"] = tools
         for key in _TTS_EXTRA_KEYS:
             if key in additional_information:
                 continue
@@ -282,7 +370,101 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             "multi_modal_data": multi_modal_data,
             "additional_information": additional_information,
         }
+        if is_speech:
+            # A new utterance drops results of a batch that never got its
+            # follow-up (round cap, or the user spoke over the tools).
+            prompt["_aura_tool_pending_consumed"] = True
+            prompt["_aura_tool_rounds"] = 0
         return DuplexAppendPlan(prompt=prompt)
+
+    def _plan_tool_followup(
+        self, *, request_id: str, fence: DuplexFence, runtime_config: dict[str, object]
+    ) -> DuplexAppendPlan:
+        """Answer an accepted tool result: no new user audio/video this turn.
+
+        Splices the result into this session's history, not in ``asr2aura``:
+        this is the one place with both ``fence.session_id`` and the plugin's
+        own ``runtime_config``. The splice is staged here and written by
+        ``commit_append_plan`` once the stage accepts the request, so a failed
+        submit leaves ``aura_tool_pending`` and the history untouched and a
+        retry does not append the same result twice. Stage0 still needs *some* audio
+        (a near-silent pad, same trick as a vision-follow commit); ``is_speech
+        =False`` drops whatever it ASRs into noise.
+        """
+        if not self.has_pending_tool_followup(runtime_config):
+            raise ValueError("AURA duplex tool followup has no pending result")
+        results = runtime_config["aura_tool_pending"]
+        batch = runtime_config.get("aura_tool_batch")
+        if isinstance(batch, list) and batch:
+            # Results arrive in whatever order the tools finish; the prompt
+            # keeps no call ids, so it must follow the order Stage1 called them.
+            by_id = {pending["call_id"]: pending["output"] for pending in results}
+            outputs = tuple(by_id[call_id] for call_id in batch)
+        else:
+            outputs = tuple(pending["output"] for pending in results)
+        rounds = int(runtime_config.get("aura_tool_rounds") or 0) + 1
+        # A plan that never reached commit (failed submit) is replaced, not stacked.
+        for staged_id in [k for k, v in self._staged_tool_history.items() if v[0] == fence.session_id]:
+            del self._staged_tool_history[staged_id]
+        # Native's last chat after MAX_TOOL_ROUNDS: silent assistant + nudge user.
+        self._staged_tool_history[request_id] = (fence.session_id, outputs, rounds > _NATIVE_MAX_TOOL_ROUNDS)
+        system_prompt = runtime_config.get("aura_system_prompt", self._default_system_prompt())
+        two_token = bool(runtime_config.get("aura_two_token", self._profile is AURA_V2))
+        sample_rate_hz = 16000
+        wav = np.linspace(1e-4, -1e-4, max(1600, sample_rate_hz // 10), dtype=np.float32)
+        additional_information: dict[str, object] = {
+            "aura_system_prompt": system_prompt,
+            "aura_session_id": fence.session_id,
+            "aura_duplex": True,
+            "aura_two_token": two_token,
+            "aura_tool_followup": True,
+            "session_id": fence.session_id,
+            "epoch": fence.epoch,
+            "turn_id": fence.turn_id,
+            "is_speech": False,
+            "tts_task_type": runtime_config.get("tts_task_type", "CustomVoice"),
+            "tts_language": runtime_config.get("tts_language", "Chinese"),
+            "tts_speaker": runtime_config.get("tts_speaker", "Vivian"),
+        }
+        tools = runtime_config.get("aura_tools")
+        if tools:
+            additional_information["aura_tools"] = tools
+        for key in _TTS_EXTRA_KEYS:
+            if key in additional_information:
+                continue
+            value = runtime_config.get(key)
+            if value is not None:
+                additional_information[key] = value
+        asr_prompt = (
+            "<|im_start|>user\n"
+            "<|audio_start|><|audio_pad|><|audio_end|>"
+            "Please transcribe this speech.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        prompt: dict[str, Any] = {
+            "prompt": asr_prompt,
+            "multi_modal_data": {"audio": (wav, sample_rate_hz)},
+            "additional_information": additional_information,
+            # Popped by runtime_patch_for_submitted_prompt once this submits.
+            "_aura_tool_pending_consumed": True,
+            "_aura_tool_rounds": rounds,
+        }
+        return DuplexAppendPlan(prompt=prompt)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Write the tool-result history staged for this request, once accepted."""
+        staged = self._staged_tool_history.pop(request_id, None)
+        if staged is None:
+            return
+        session_id, outputs, nudge = staged
+        from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
+
+        history = get_or_create_session_history(session_id)
+        for output in outputs:
+            history.append_tool_response(output)
+        if nudge:
+            history.messages.append({"role": "assistant", "content": "<|silent|>"})
+            history.messages.append({"role": "user", "content": _TOOL_FOLLOWUP_NUDGE, "video": None})
 
     def project_intermediate_output(
         self,
@@ -291,9 +473,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         output: object,
         context: object,
     ) -> bool:
-        """Project Stage1 thinker text to the client without short-circuiting TTS."""
+        """Project AURA thinker text to the client without short-circuiting TTS."""
         del output, context
-        return stage_id == 1
+        return stage_id == self.stages.aura
 
     def user_transcript(
         self,
@@ -308,7 +490,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         Vision-follow sets ``is_speech`` false; that audio is a silent pad and
         must not open a user bubble. The pipeline still forwards Stage0.
         """
-        if stage_id != 0 or not finished:
+        if stage_id != self.stages.asr or not finished:
             return None
         info = prompt.get("additional_information") if isinstance(prompt, dict) else None
         if isinstance(info, dict) and info.get("is_speech") is False:
@@ -336,7 +518,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             plan_partial_stage_output,
         )
 
-        return plan_partial_stage_output(orchestrator, stage_id, replica_id, output, req_state)
+        return plan_partial_stage_output(
+            orchestrator, stage_id, replica_id, output, req_state, aura_stage_id=self.stages.aura
+        )
 
     def partial_stage_followup(self, plan: Any, req_state: Any) -> Any:
         """Close the Talker stream after a resumable final sentence.
@@ -353,9 +537,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             info["aura_tts_partial"] = True
             info["aura_tts_close_only"] = True
         from vllm_omni.engine.duplex.plugin import PartialStageForward
-        from vllm_omni.model_executor.models.aura_omni.duplex.sentence_tts import (
-            SentenceTtsOutput,
-        )
+        from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput
 
         request_id = str(getattr(plan.output, "request_id", ""))
         return PartialStageForward(
@@ -378,10 +560,13 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
-        """After Stage1 text/silent final, next commit may start while TTS drains."""
+        """After AURA text/silent final, next commit may start while TTS drains."""
         del context
-        if stage_id != 1:
+        if stage_id == self.stages.judge:
+            return segment_finished and judge_rejects(output, streaming_context)
+        if stage_id != self.stages.aura:
             return False
         if segment_finished:
             return True
@@ -396,20 +581,52 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_output_metadata
-        # Stage1 silent → short-circuit TTS/Code2Wav.
-        if stage_id != 1 or not segment_finished:
+        if stage_id == self.stages.judge:
+            if not segment_finished or not judge_rejects(output, streaming_context):
+                return None
+            return DuplexOutputDecision(
+                action=DuplexOutputAction.DIRECT_RESPONSE,
+                metadata={
+                    "duplex_direct_response": True,
+                    "model_listen": True,
+                    "listen_source": "response_judge",
+                },
+            )
+        # AURA silent → short-circuit TTS/Code2Wav.
+        if stage_id != self.stages.aura or not segment_finished:
             return None
         completion = _first_completion(output)
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
         text = getattr(completion, "text", None) if completion is not None else None
         cumulative = getattr(completion, "cumulative_text", None) if completion is not None else None
         text_blob = " ".join(part for part in (text, cumulative) if isinstance(part, str))
-        # Empty finished Stage1 is silent: stop_token 151669 is often omitted from
-        # token_ids/text unless include_stop_str_in_output is set.
+        # A finished Stage1 chunk can carry the silent stop id and still be spoken.
+        # include_stop_str_in_output leaves <|silent|> on that text.
+        # is_effectively_silent is only the exact marker, so a sentence with
+        # the marker still appended is spoken. Classifying it as listen aborts
+        # the utterance sentence TTS already handed to Talker.
+        spoken = next(
+            (
+                part
+                for part in (cumulative, text)
+                if isinstance(part, str) and part.strip() and not is_effectively_silent(part)
+            ),
+            None,
+        )
+        if spoken is not None:
+            return None
+        # Empty finished Stage1 is silent: the silent stop id is often omitted from
+        # token_ids/text unless include_stop_str_in_output is set. A leading
+        # respond id means the turn spoke (even if the body is still empty).
+        respond_id = self._profile.respond_id
+        silent_ids = frozenset({self._profile.silent_id})
+        if token_ids and respond_id is not None and token_ids[0] == respond_id:
+            return None
         is_silent = (
-            any(sid in token_ids for sid in AURA_SILENT_TOKEN_IDS)
+            any(sid in token_ids for sid in silent_ids)
             or (isinstance(text, str) and is_effectively_silent(text))
             or (isinstance(cumulative, str) and is_effectively_silent(cumulative))
             or SILENT_TEXT in text_blob
@@ -417,8 +634,8 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         if not is_silent and not token_ids and not text_blob.strip():
             is_silent = True
         if not is_silent and token_ids:
-            is_silent = token_ids[0] in AURA_SILENT_TOKEN_IDS or (
-                len(token_ids) > 3 and any(sid in token_ids[:6] for sid in AURA_SILENT_TOKEN_IDS)
+            is_silent = token_ids[0] in silent_ids or (
+                len(token_ids) > 3 and any(sid in token_ids[:6] for sid in silent_ids)
             )
         if not is_silent:
             return None
@@ -431,6 +648,118 @@ class AuraDuplexPlugin(DuplexModelPlugin):
                 "silent_text": SILENT_TEXT,
             },
         )
+
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        raw = model_result.get("aura_function_call")
+        if not isinstance(raw, Mapping):
+            return None
+        call_id = raw.get("call_id")
+        name = raw.get("name")
+        arguments = raw.get("arguments", "")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            return None
+        if not isinstance(arguments, str):
+            return None
+        return {"call_id": call_id, "name": name, "arguments": arguments}
+
+    def function_call_releases_turn(self, model_result: Mapping[str, object]) -> bool:
+        # Set by the data plane only when the call has no spoken prefix.
+        # A prose prefix still has TTS in flight; that turn ends on its own.
+        return model_result.get("aura_tool_call_ends_turn") is True
+
+    def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        """True when every call in the open batch has a string result.
+
+        A partial batch must not start the follow-up. ``response.create`` then
+        finds nothing to answer and leaves ``aura_tool_batch`` in place, so a
+        result that arrives later is still accepted. The batch is cleared only
+        when that follow-up is actually submitted.
+        """
+        pending = runtime_config.get("aura_tool_pending")
+        if not (
+            isinstance(pending, list)
+            and bool(pending)
+            and all(isinstance(entry, Mapping) and isinstance(entry.get("output"), str) for entry in pending)
+        ):
+            return False
+        batch = runtime_config.get("aura_tool_batch")
+        if not isinstance(batch, list) or not batch:
+            return True
+        ready = {
+            entry.get("call_id")
+            for entry in pending
+            if isinstance(entry, Mapping)
+            and isinstance(entry.get("call_id"), str)
+            and isinstance(entry.get("output"), str)
+        }
+        return all(isinstance(call_id, str) and call_id in ready for call_id in batch)
+
+    def runtime_config_for_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
+    ) -> dict[str, object]:
+        """Accept a tool result: queue it for the next bare ``response.create``.
+
+        Results of one batch of calls accumulate in arrival order; the
+        follow-up splices them all into history as one user turn. A result
+        for a call outside the current batch is settled but not kept.
+        """
+        del config, history_len
+        call_id = item.get("call_id")
+        output = item.get("output")
+        name = item.get("name")
+        arguments = item.get("arguments")
+        if not isinstance(call_id, str) or not call_id:
+            raise DuplexRuntimeConfigError(
+                "function_call_output requires call_id",
+                code="invalid_function_call_output",
+            )
+        if not isinstance(output, str):
+            raise DuplexRuntimeConfigError(
+                "function_call_output requires a string output",
+                code="invalid_function_call_output",
+            )
+        if not isinstance(name, str) or not name or not isinstance(arguments, str):
+            raise DuplexRuntimeConfigError(
+                "function_call_output requires the session call name and arguments",
+                code="invalid_function_call_output",
+            )
+        updated = dict(current)
+        batch = current.get("aura_tool_batch")
+        if not isinstance(batch, list) or call_id not in batch:
+            return updated
+        pending = current.get("aura_tool_pending")
+        updated["aura_tool_pending"] = [
+            *(pending if isinstance(pending, list) else ()),
+            {"call_id": call_id, "name": name, "arguments": arguments, "output": output},
+        ]
+        return updated
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        del history_len
+        batch = runtime_config.get("aura_tool_batch")
+        updated = dict(runtime_config)
+        updated["aura_tool_batch"] = [*(batch if isinstance(batch, list) else ()), call_id]
+        return updated
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        if "_aura_tool_pending_consumed" not in prompt:
+            return None
+        prompt.pop("_aura_tool_pending_consumed")
+        patch: dict[str, object] = {"aura_tool_pending": None, "aura_tool_batch": None}
+        if "_aura_tool_rounds" in prompt:
+            patch["aura_tool_rounds"] = prompt.pop("_aura_tool_rounds")
+        return patch
 
     def create_session_state(self) -> AuraServingSessionState:
         return AuraServingSessionState()
@@ -449,14 +778,19 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         del model_config
         extra = config.extra_body if isinstance(config.extra_body, dict) else {}
-        system_prompt = extra.get("aura_system_prompt") or config.instructions or DEFAULT_AURA_SYSTEM_PROMPT
+        default_prompt = self._default_system_prompt()
+        system_prompt = extra.get("aura_system_prompt") or config.instructions or default_prompt
         runtime: dict[str, object] = {
             "aura_system_prompt": str(system_prompt),
             "instructions": str(system_prompt),
+            "aura_two_token": self._profile is AURA_V2,
             "tts_task_type": str(extra.get("tts_task_type") or "CustomVoice"),
             "tts_language": str(extra.get("tts_language") or "Chinese"),
             "tts_speaker": str(extra.get("tts_speaker") or "Vivian"),
         }
+        tools = chat_template_tools(extra.get("realtime_tools"))
+        if tools:
+            runtime["aura_tools"] = tools
         for key in _TTS_EXTRA_KEYS:
             if key in runtime:
                 continue
@@ -475,6 +809,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         # instructions, then the prompt already installed (or the default).
         # setdefault would keep the creation-time prompt and ignore a later
         # session.update.instructions.
+        default_prompt = self._default_system_prompt()
         explicit = extra.get("aura_system_prompt") if "aura_system_prompt" in extra else None
         if isinstance(explicit, str) and explicit:
             prompt = explicit
@@ -482,13 +817,15 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             prompt = str(config.instructions)
         else:
             current_prompt = current.get("aura_system_prompt")
-            prompt = (
-                str(current_prompt)
-                if isinstance(current_prompt, str) and current_prompt
-                else DEFAULT_AURA_SYSTEM_PROMPT
-            )
+            prompt = str(current_prompt) if isinstance(current_prompt, str) and current_prompt else default_prompt
         updated["aura_system_prompt"] = prompt
         updated["instructions"] = str(config.instructions) if config.instructions else prompt
+        updated["aura_two_token"] = self._profile is AURA_V2
+        tools = chat_template_tools(extra.get("realtime_tools"))
+        if tools:
+            updated["aura_tools"] = tools
+        elif "realtime_tools" in extra:
+            updated.pop("aura_tools", None)
         for key in _TTS_EXTRA_KEYS:
             if key in extra and extra[key] is not None:
                 updated[key] = extra[key]

@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -192,6 +193,9 @@ class Flux2KleinPipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    # Both CFG branches share latents and timestep; prompts are padded to a
+    # fixed length and the position ids are batched like the latents.
+    supports_cfg_batching = True
     support_image_input = True
 
     def __init__(
@@ -707,16 +711,18 @@ class Flux2KleinPipeline(
         if num_inference_steps is not None and num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
 
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * 2) != 0
-            or width is not None
-            and width % (self.vae_scale_factor * 2) != 0
-        ):
+        multiple_of = self.vae_scale_factor * 2
+        for name, size in (("height", height), ("width", width)):
+            if size is not None and size < multiple_of:
+                raise OmniClientError(
+                    f"`{name}` must be at least {multiple_of} to produce a non-empty latent grid, got {size}."
+                )
+
+        if any(size is not None and size % multiple_of for size in (height, width)):
             logger.warning(
                 "`height` and `width` have to be divisible by %s but are %s and %s. "
                 "Dimensions will be resized accordingly",
-                self.vae_scale_factor * 2,
+                multiple_of,
                 height,
                 width,
             )

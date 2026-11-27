@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.device import DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.cache.teacache.extractors import extract_sensenova_u1_context
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -19,10 +20,9 @@ from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
     _patchify,
 )
 from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import SenseNovaU1Model
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.sensenova_u1 import SenseNovaU1Config, SenseNovaU1VisionConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 class _BranchProbe(nn.Module):
@@ -65,6 +65,7 @@ def _forbid_item(self, *args, **kwargs):
         ([False, True], (True, True)),
     ],
 )
+@pytest.mark.cpu
 def test_token_routing_fallback(indicators, expected):
     model = _RoutingModel()
     model(
@@ -76,6 +77,7 @@ def test_token_routing_fallback(indicators, expected):
 
 
 @pytest.mark.parametrize("teacache", [False, True])
+@pytest.mark.cpu
 def test_known_generation_type_avoids_scalar_reads(monkeypatch, teacache):
     model = _RoutingModel()
     embeds = torch.randn(1, 2, 4)
@@ -104,6 +106,7 @@ def _vision_config():
 
 @pytest.mark.parametrize("sizes", [[[4, 6]], [[4, 6], [6, 4]]])
 @torch.inference_mode()
+@pytest.mark.cpu
 def test_vision_grid_reuse_preserves_changing_image_features(monkeypatch, sizes):
     torch.manual_seed(42)
     model = NEOVisionEmbeddings(_vision_config())
@@ -173,6 +176,7 @@ class _LoopProbe(SenseNovaU1Pipeline):
 )
 @pytest.mark.parametrize("noise_embedding", [False, True])
 @torch.inference_mode()
+@pytest.mark.cpu
 def test_denoise_loop_preserves_cfg_boundaries_and_request_isolation(
     is_it2i, interval, scale, img_scale, noise_embedding
 ):
@@ -211,14 +215,14 @@ def test_denoise_loop_preserves_cfg_boundaries_and_request_isolation(
         assert not torch.equal(pipe.steps[0][1], pipe.steps[1][1])
 
 
-@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
-@hardware_test(res={"cuda": "L4"})
+@pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="NVIDIA CUDA or XPU required")
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
 @torch.inference_mode()
 def test_cached_vision_grid_has_no_device_scalar_reads():
-    model = NEOVisionEmbeddings(_vision_config()).to("cuda")
-    grid_hw = torch.tensor([[4, 6]], device="cuda")
+    model = NEOVisionEmbeddings(_vision_config()).to(DEVICE_TYPE)
+    grid_hw = torch.tensor([[4, 6]], device=DEVICE_TYPE)
     grid = VisionGrid.from_tensor(grid_hw)
-    pixels = torch.randn(24, 12, device="cuda")
+    pixels = torch.randn(24, 12, device=DEVICE_TYPE)
     expected = model(pixels, grid_hw)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
         actual = model(pixels, grid=grid)

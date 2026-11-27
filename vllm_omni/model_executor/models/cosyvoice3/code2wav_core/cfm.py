@@ -95,6 +95,21 @@ class ConditionalCFM(BASECFM):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond):
+        runner = getattr(self, "_npu_euler_graphs", None)
+        if runner is None or spks is None or cond is None or not isinstance(self.estimator, nn.Module):
+            return self._solve_euler(x, t_span, mu, mask, spks, cond)
+        # Noise is drawn by forward() outside capture and copied on every replay.
+        # Shapes/dtypes are keyed by the runner; changing the CFG coefficient or
+        # autocast policy also requires a distinct graph.
+        autocast = torch.is_autocast_enabled("npu")
+        return runner.run(
+            "cfm_euler",
+            (x, t_span, mu, mask, spks, cond),
+            (self.inference_cfg_rate, autocast, torch.get_autocast_dtype("npu") if autocast else None),
+            lambda *values: (self._solve_euler(*values),),
+        )[0]
+
+    def _solve_euler(self, x, t_span, mu, mask, spks, cond):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -139,6 +154,17 @@ class ConditionalCFM(BASECFM):
             if cond is not None:
                 cond_in[:batch_size] = cond
 
+        blocked_attn_mask = None
+        if isinstance(self.estimator, torch.nn.Module) and getattr(self.estimator, "_use_npu_graph_attention", False):
+            from vllm_omni.platforms.npu.models.cosyvoice3_graph import cosyvoice3_fia_blocked_mask
+
+            keep_mask = mask_in[:, 0].bool()
+            blocked_attn_mask = cosyvoice3_fia_blocked_mask(
+                keep_mask,
+                query_len=x_in.shape[2],
+                key_len=x_in.shape[2],
+            )
+
         estimator_session = nullcontext(None)
         if not isinstance(self.estimator, torch.nn.Module):
             session_factory = getattr(self.estimator, "estimation_session", None)
@@ -161,6 +187,7 @@ class ConditionalCFM(BASECFM):
                         spks_in,
                         cond_in,
                         estimator_session=trt_session,
+                        blocked_attn_mask=blocked_attn_mask,
                     )
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
                     dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
@@ -174,21 +201,16 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond, estimator_session=None):
-        if isinstance(self.estimator, torch.nn.Module):
-            return self.estimator(x, mask, mu, t, spks, cond)
-        elif estimator_session is not None:
-            return estimator_session.run(x, mask, mu, t, spks, cond)
-        else:
-            # TensorRT estimator: bind raw device pointers. The flow runs in
-            # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),
-            # so cast inputs/output to the engine's dtype at the boundary. Keep
-            # references to the cast buffers alive until execute completes (a bare
-            # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
-            io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
-            [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            caller_stream = torch.cuda.current_stream(x.device)
-            stream.wait_stream(caller_stream)
+    def _forward_estimator_trt_once(self, x, mask, mu, t, spks, cond):
+        """Execute one TensorRT estimator call for a profile-supported shape."""
+        io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
+        [estimator, stream], trt_engine = self.estimator.acquire_estimator(
+            int(x.shape[0]),
+            int(x.shape[2]),
+        )
+        caller_stream = torch.cuda.current_stream(x.device)
+        stream.wait_stream(caller_stream)
+        try:
             with torch.cuda.stream(stream):
                 x_e = x.to(io_dtype).contiguous()
                 mask_e = mask.to(io_dtype).contiguous()
@@ -214,7 +236,6 @@ class ConditionalCFM(BASECFM):
                 ]
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
-                # run trt engine
                 assert estimator.execute_async_v3(stream.cuda_stream) is True
                 for tensor in (x_e, mask_e, mu_e, t_e, spks_e, cond_e, out_e):
                     if tensor.is_cuda:
@@ -222,8 +243,66 @@ class ConditionalCFM(BASECFM):
             caller_stream.wait_stream(stream)
             if out_e.is_cuda:
                 out_e.record_stream(caller_stream)
-            self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
+        finally:
+            self.estimator.release_estimator(estimator, stream)
+
+    def forward_estimator(
+        self,
+        x,
+        mask,
+        mu,
+        t,
+        spks,
+        cond,
+        estimator_session=None,
+        blocked_attn_mask=None,
+    ):
+        if isinstance(self.estimator, torch.nn.Module):
+            if blocked_attn_mask is not None:
+                return self.estimator(x, mask, mu, t, spks, cond, blocked_attn_mask=blocked_attn_mask)
+            return self.estimator(x, mask, mu, t, spks, cond)
+        if estimator_session is not None:
+            return estimator_session.run(x, t)
+
+        batch_size = int(x.shape[0])
+        sequence_length = int(x.shape[2])
+        supports_shape = getattr(self.estimator, "supports_estimator_shape", None)
+        if batch_size > 2 and supports_shape is not None and not supports_shape(batch_size, sequence_length):
+            if batch_size % 2 != 0:
+                raise RuntimeError(f"TensorRT CFG estimator batch must be even, got {batch_size}")
+
+            # Dynamic profile 1 intentionally covers the common batched-flow
+            # window only. If a long cumulative stream (or an unusually large
+            # request batch) falls outside that profile, preserve TensorRT and
+            # exact CFG semantics by serializing request pairs through profile 0.
+            # CFG layout is [B conditioned rows | B unconditional rows].
+            requests = batch_size // 2
+            conditioned = []
+            unconditional = []
+            for index in range(requests):
+                pair = (
+                    slice(index, index + 1),
+                    slice(index + requests, index + requests + 1),
+                )
+
+                def pair_rows(tensor):
+                    return torch.cat((tensor[pair[0]], tensor[pair[1]]), dim=0)
+
+                pair_out = self._forward_estimator_trt_once(
+                    pair_rows(x),
+                    pair_rows(mask),
+                    pair_rows(mu),
+                    pair_rows(t),
+                    pair_rows(spks),
+                    pair_rows(cond),
+                )
+                conditioned.append(pair_out[:1])
+                unconditional.append(pair_out[1:])
+
+            return torch.cat((*conditioned, *unconditional), dim=0)
+
+        return self._forward_estimator_trt_once(x, mask, mu, t, spks, cond)
 
 
 class CausalConditionalCFM(ConditionalCFM):

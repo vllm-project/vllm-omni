@@ -66,6 +66,31 @@ def append(state, lengths, offset=0, retain=None):
     return handles
 
 
+def test_pending_archive_views_require_all_layers_and_exclude_transient_conditioning():
+    cache = make_cache()
+    state = make_state(cache).segmented("main")
+    with pytest.raises(RuntimeError, match="Stage every"):
+        state.pending_layer_views()
+    state.prepare_layer_views(4, 3)
+    handles = state.begin_commit((2, 2))
+    for layer in range(cache.num_layers):
+        state.assemble(layer, rows(3, -20), rows(3, 20), rows(4, layer), -rows(4, layer))
+        if layer == 0:
+            with pytest.raises(RuntimeError, match="Stage every"):
+                state.pending_layer_views()
+        state.stage(layer)
+    views = state.pending_layer_views()
+    assert len(views) == cache.num_layers
+    for layer, (key, value) in enumerate(views):
+        assert key.shape == value.shape == (4, 2, 4)
+        torch.testing.assert_close(key, rows(4, layer))
+        torch.testing.assert_close(value, -rows(4, layer))
+    state.commit(retain=handles)
+    with pytest.raises(RuntimeError, match="Stage every"):
+        state.pending_layer_views()
+    state.close()
+
+
 @pytest.mark.parametrize("lengths", [(1, 1), (15, 3), (17, 5)])
 def test_ragged_pages_match_dense_attention_without_padding(lengths):
     cache = make_cache()
@@ -96,6 +121,25 @@ def test_ragged_pages_match_dense_attention_without_padding(lengths):
         torch.testing.assert_close(actual, reference)
     owner.close()
     assert cache.manager.block_pool.get_num_free_blocks() == free
+
+
+def test_commit_validation_does_not_publish_or_evict_before_peer_agreement():
+    cache = make_cache()
+    owner = make_state(cache)
+    state = owner.segmented("main")
+    old = append(state, (3, 5), offset=7)
+    free = cache.manager.block_pool.get_num_free_blocks()
+    state.prepare_layer_views(6, 2)
+    pending = state.begin_commit((2, 4))
+    for layer in range(cache.num_layers):
+        state.assemble(layer, rows(2), rows(2), rows(6, 99), rows(6, 99))
+        state.stage(layer)
+    assert state.validate_commit(retain=pending) == pending
+    assert state.handles == old and state.history_tokens == 8 and state.commit_active
+    state.rollback()
+    assert state.handles == old
+    assert cache.manager.block_pool.get_num_free_blocks() == free
+    owner.close()
 
 
 def test_noisy_steps_reuse_history_and_never_mutate_committed_pages():

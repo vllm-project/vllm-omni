@@ -83,6 +83,35 @@ def test_denoising_releases_prefix_kv_and_geometry_without_clearing_graphs(mode)
     assert pipeline.transformer._request_geometry_owner is None
     assert pipeline.transformer.sequence_prepare._request_geometry is None
     pipeline.transformer._decode_graph_manager.clear.assert_not_called()
+    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_called_once_with()
+
+
+def test_release_step_request_drops_request_kv_without_dropping_graphs():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
+
+    pipeline = _Pipeline("success")
+    cache = QwenImage21KVCache([{"cond": {"key": torch.ones(1, 4, 8), "value": torch.ones(1, 4, 8)}}])
+    state = SimpleNamespace(extra={"kv_cache": cache})
+    pipeline.transformer._request_geometry_owner = ("live",)
+    pipeline.transformer.sequence_prepare._request_geometry = {"positions": torch.arange(4)}
+
+    QwenImage21Pipeline.release_step_request(pipeline, state)
+
+    assert state.extra["kv_cache"] is None
+    assert pipeline.transformer._request_geometry_owner is None
+    assert pipeline.transformer.sequence_prepare._request_geometry is None
+    pipeline.transformer._decode_graph_manager.clear.assert_not_called()
+    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_not_called()
+
+
+def test_step_prefill_releases_idle_graphs():
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
+
+    pipeline = _Pipeline("success")
+    QwenImage21Pipeline._release_idle_decode_graphs(pipeline)
+    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_called_once_with()
 
 
 def test_dropped_step_request_releases_geometry_and_prefix_without_explicit_finalization():

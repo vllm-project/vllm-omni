@@ -168,7 +168,7 @@ def test_talker_builds_graphs_at_vllm_capture_sizes_and_runs_through_them() -> N
 _CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @_CUDA
 def test_graph_replay_matches_padded_eager() -> None:
     rows = 3
@@ -197,7 +197,7 @@ def test_graph_replay_matches_padded_eager() -> None:
         _assert_same_state(graph_runtime, eager_runtime)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @_CUDA
 def test_graph_rows_above_the_largest_bucket_match_the_unpadded_path() -> None:
     device = torch.device("cuda")

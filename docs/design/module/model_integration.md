@@ -57,3 +57,20 @@ sufficient; an override MUST document the behavioral difference.
 
 Test registration, checkpoint loading, input conversion, and representative
 model execution. Test shared utilities against more than one integration.
+
+## Platform-specific model adapters
+
+Drama 3's Ascend attention compatibility, hybrid model state, and FP8 expert
+adapter live under `platforms/npu/models/` and `platforms/npu/quant/`. Shared
+model code selects these adapters lazily on NPU; CUDA keeps the upstream
+implementations. Generic eager kernels and request-history snapshots remain
+in the shared model implementation.
+
+Qwen3-TTS initializes the ROCm eager streaming decoder through the existing
+post-load warmup hook before worker readiness. It exercises every reachable
+batch size up to the configured eager batch limit, prefix mode, chunk growth
+phase and rolling window with private synthetic request state. This initializes
+MIOpen's shape-dependent resources without changing decoding precision or
+retaining synthetic state in live request caches. Weight reload repeats the
+initialization; repeated readiness hooks do not. Uncapped eager batching retains
+on-demand initialization.

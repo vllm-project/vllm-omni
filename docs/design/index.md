@@ -19,6 +19,7 @@ implementation contract; it is not, by itself, a general support claim.
 
 - [Full-Duplex Runtime (MiniCPM-o 4.5)](fullduplex.md)
 - [Full-Duplex Runtime (PersonaPlex)](fullduplex-personaplex.md)
+- [Full-Duplex Runtime (AURA_v2)](aura_v2_duplex.md)
 - [Disaggregated Inference](feature/disaggregated_inference.md)
 - [Host Weight Runtime](feature/host_weight_runtime.md)
 - [Async Chunk](feature/async_chunk.md)
@@ -26,7 +27,9 @@ implementation contract; it is not, by itself, a general support claim.
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Runner-to-model Prefill/Decode Phase Contract](feature/preprocess_phase_contract.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
+- [Mooncake KV and Hidden-State Cache](feature/mooncake_kv_hs_cache.md)
 - [Model-local KV Caches](feature/model_local_kv_caches.md)
+- [Hunyuan AR VAE Request RNG](feature/mm_request_rng.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
 ### Communication
@@ -56,7 +59,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Sequence Parallel](feature/sequence_parallel.md)
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
-- [Noisy KV](feature/noisy_kv.md)
+- [Noisy PP](feature/noisy_pp.md)
 
 #### KV cache and memory management
 

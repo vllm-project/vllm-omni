@@ -19,6 +19,8 @@ EXECUTION_SETTINGS = {
     # Match CPU RNG on NPU; preserve native dense and reference segmented prefill.
     # See thresholds.json for the resulting IT2I calibration scope.
     "npu": {"generator_device": "cpu", "attention_backend": "TORCH_SDPA"},
+    # ROCm reports the CUDA device namespace, but cuDNN attention is not available.
+    "rocm": {"generator_device": "cuda", "attention_backend": "TORCH_SDPA"},
 }
 INPUTS = (
     ("qwen_image_edit_2511_test1.png", "ae23dbfe1723f0cae27a4152fa21feea83180437c079dd32d142112c18095b1d"),
@@ -63,13 +65,25 @@ def device_preflight(device_type: str) -> dict:
     if device_type == "npu":
         import torch_npu  # noqa: F401 -- register the NPU device in the independent reference
 
-    accelerator = getattr(torch, device_type)
+    torch_device = "cuda" if device_type == "rocm" else device_type
+    accelerator = getattr(torch, torch_device)
     assert accelerator.is_available(), f"{device_type} is required; accuracy preflight must not skip"
     assert accelerator.is_bf16_supported(), f"BF16 {device_type} hardware is required"
-    memory = accelerator.get_device_properties(0).total_memory
-    if device_type == "cuda":
-        assert memory >= 70 * 1024**3, "Use one >=80 GB CUDA GPU"
-    return {"device_type": device_type, "device": accelerator.get_device_name(0), "memory_bytes": memory}
+    properties = accelerator.get_device_properties(0)
+    memory = properties.total_memory
+    device_name = accelerator.get_device_name(0)
+    device_arch = str(getattr(properties, "gcnArchName", "")) if device_type == "rocm" else ""
+    # Some ROCm CI images return an empty marketing name. Preserve a stable
+    # architecture identity so calibration cannot silently fall back to CUDA's
+    # default thresholds.
+    if not device_name and device_arch:
+        device_name = device_arch
+    if device_type in {"cuda", "rocm"}:
+        assert memory >= 70 * 1024**3, "Use one >=80 GB GPU"
+    result = {"device_type": device_type, "device": device_name, "memory_bytes": memory}
+    if device_arch:
+        result["device_arch"] = device_arch
+    return result
 
 
 def validate_model(model: Path) -> dict:

@@ -25,8 +25,6 @@ See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 
 from __future__ import annotations
 
-import base64
-import binascii
 import os
 import tempfile
 import threading
@@ -34,14 +32,17 @@ from collections import deque
 from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import httpx
 import numpy as np
+import pybase64 as base64
 import torch
 from PIL import Image, UnidentifiedImageError
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -50,6 +51,13 @@ from vllm.multimodal.video import (
 )
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.media_input import (
+    MAX_AUDIO_INPUT_BYTES,
+    MAX_IMAGE_INPUT_BYTES,
+    MAX_VIDEO_INPUT_BYTES,
+    decode_base64_media,
+    download_media_bytes,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     FileImageReference,
     FileVideoReference,
@@ -72,6 +80,58 @@ DEFAULT_AUDIO_SAMPLE_RATE = 24_000
 VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
 AudioSample = int | float
 AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
+
+
+def validate_control_media_file(
+    path: str,
+    *,
+    allow_image: bool = False,
+    max_duration: float = 15.0,
+    max_frames: int = 3600,
+) -> None:
+    """Validate uploaded conditioning media without retaining decoded frames.
+
+    A static mask can be an image. Video inputs must contain a non-empty,
+    fixed-size video stream. Audio streams are not used for conditioning.
+    Inspect only the usable prefix, with a frame cap for missing/broken
+    timestamps. Long clips remain valid: the model trims to output duration.
+    """
+    import av
+
+    try:
+        if allow_image:
+            try:
+                with Image.open(path) as image:
+                    _validate_image_pixel_limit(image)
+                    image.verify()
+                return
+            except UnidentifiedImageError:
+                pass
+        with av.open(path) as container:
+            if not container.streams.video:
+                raise ValueError("no video stream")
+            shape = None
+            first_time = None
+            for index, frame in enumerate(container.decode(video=0)):
+                timestamp = frame.time
+                if first_time is None and timestamp is not None:
+                    first_time = timestamp
+                if shape is not None and (
+                    index >= max_frames
+                    or (timestamp is not None and first_time is not None and timestamp - first_time >= max_duration)
+                ):
+                    break
+                current_shape = (frame.width, frame.height)
+                if shape is not None and current_shape != shape:
+                    raise ValueError("video frame dimensions must be consistent")
+                shape = current_shape
+                max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+                if max_pixels > 0 and frame.width * frame.height > max_pixels:
+                    raise ValueError("video frame exceeds the decoder pixel limit")
+            if shape is None:
+                raise ValueError("no decodable video frames")
+    except (av.error.FFmpegError, OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+        raise InvalidInputReferenceError(f"Invalid conditioning media: {exc}") from exc
 
 
 class VideoFrames(list[Image.Image]):
@@ -121,7 +181,7 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        with Image.open(BytesIO(image_bytes)) as image:
+        with open_image(BytesIO(image_bytes)) as image:
             _validate_image_pixel_limit(image)
             return image.convert("RGB")
     except _ImagePixelLimitError:
@@ -223,10 +283,7 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
         else:
             b64_data = input_reference
 
-        try:
-            image_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
-            raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
+        image_bytes = decode_base64_media(b64_data, max_bytes=MAX_IMAGE_INPUT_BYTES, source=source)
         return _decode_image_bytes(image_bytes, source=source)
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
@@ -237,24 +294,25 @@ async def decode_image_url(image_url: str) -> Image.Image:
 
     if image_url.startswith(("http://", "https://")):
         allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
-        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
-            try:
-                response = await client.get(image_url)
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.has_redirect_location and not allow_redirects:
-                    raise InvalidInputReferenceError(
-                        "Invalid image_reference.image_url: redirect response was rejected because "
-                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
-                    ) from exc
+        try:
+            image_bytes = await download_media_bytes(
+                image_url,
+                max_bytes=MAX_IMAGE_INPUT_BYTES,
+                source="image_reference.image_url",
+                follow_redirects=allow_redirects,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.has_redirect_location and not allow_redirects:
                 raise InvalidInputReferenceError(
-                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                    "Invalid image_reference.image_url: redirect response was rejected because "
+                    "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
                 ) from exc
-            except httpx.RequestError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid image_reference.image_url: failed to download image."
-                ) from exc
-        return _decode_image_bytes(response.content, source="image_reference.image_url")
+            raise InvalidInputReferenceError(
+                f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise InvalidInputReferenceError("Invalid image_reference.image_url: failed to download image.") from exc
+        return _decode_image_bytes(image_bytes, source="image_reference.image_url")
 
     raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
 
@@ -273,10 +331,7 @@ def _decode_base64_video(
         else:
             b64_data = video_reference
 
-        try:
-            video_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
-            raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
+        video_bytes = decode_base64_media(b64_data, max_bytes=MAX_VIDEO_INPUT_BYTES, source=source)
         if source_path is not None:
             with open(source_path, "wb") as output:
                 output.write(video_bytes)
@@ -312,25 +367,25 @@ async def decode_video_url(
             raise
 
     if video_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                response = await client.get(video_url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid video_reference.video_url: failed to download video."
-                ) from exc
+        try:
+            video_bytes = await download_media_bytes(
+                video_url,
+                max_bytes=MAX_VIDEO_INPUT_BYTES,
+                source="video_reference.video_url",
+            )
+        except httpx.HTTPError as exc:
+            raise InvalidInputReferenceError("Invalid video_reference.video_url: failed to download video.") from exc
         path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         try:
             with open(path, "wb") as output:
-                output.write(response.content)
+                output.write(video_bytes)
         except Exception:
             if os.path.exists(path):
                 os.unlink(path)
             raise
         try:
             return _decode_video_bytes(
-                response.content,
+                video_bytes,
                 source="video_reference.video_url",
                 max_frames=max_frames,
                 keep=keep,
@@ -352,22 +407,22 @@ async def decode_audio_url(audio_url: str) -> str:
 
     if audio_url.startswith("data:audio"):
         _, b64_data = audio_url.split(",", 1)
-        try:
-            audio_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:
-            raise InvalidInputReferenceError(
-                "Invalid audio_reference.audio_url: audio data is not valid base64."
-            ) from exc
+        if not b64_data:
+            raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
+        audio_bytes = decode_base64_media(
+            b64_data,
+            max_bytes=MAX_AUDIO_INPUT_BYTES,
+            source="audio_reference.audio_url",
+        )
     elif audio_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                response = await client.get(audio_url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid audio_reference.audio_url: failed to download audio."
-                ) from exc
-        audio_bytes = response.content
+        try:
+            audio_bytes = await download_media_bytes(
+                audio_url,
+                max_bytes=MAX_AUDIO_INPUT_BYTES,
+                source="audio_reference.audio_url",
+            )
+        except httpx.HTTPError as exc:
+            raise InvalidInputReferenceError("Invalid audio_reference.audio_url: failed to download audio.") from exc
     else:
         raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
 
@@ -786,12 +841,16 @@ def _log_video_encoding_path(
 
 
 def _resolve_audio_sample_rate(audio: AudioInput | None, audio_sample_rate: int | None) -> int:
+    if audio_sample_rate is not None:
+        if isinstance(audio_sample_rate, bool) or not isinstance(audio_sample_rate, Integral) or audio_sample_rate <= 0:
+            raise ValueError("audio_sample_rate must be a positive integer")
+        return int(audio_sample_rate)
     if audio is not None and audio_sample_rate is None:
         logger.info_once(
             "Audio sample rate was not provided; using default sample rate of %s Hz.",
             DEFAULT_AUDIO_SAMPLE_RATE,
         )
-    return audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE
+    return DEFAULT_AUDIO_SAMPLE_RATE
 
 
 def _encode_prepared_video_bytes_legacy(
@@ -950,19 +1009,62 @@ class FragmentedMP4VideoEncoder:
         self._video_codec_options = video_codec_options
         self._muxer: Any | None = None
 
-    def encode(self, video: Any) -> bytes:
-        """Encode one generated video chunk and return newly emitted fMP4 bytes."""
+    def encode(
+        self,
+        video: Any,
+        audio: Any | None = None,
+        *,
+        audio_sample_rate: int | None = None,
+    ) -> bytes:
+        """Encode one generated video chunk (plus its audio, if any) and return newly emitted fMP4 bytes.
+
+        The audio track is created with the first chunk that carries audio and
+        must then be present on every later chunk; the chunk's samples are
+        appended after its frames so both timelines advance together.
+        Returned bytes may include buffered packets from an earlier call and
+        omit the current tail until a later call or close().
+        """
         from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
 
-        frames_u8 = _coerce_video_to_uint8_frames(video)
+        frames_u8 = _coerce_video_to_uint8_frames(video) if _has_frames(video) else None
+        audio_np = _coerce_audio_to_numpy(audio) if audio is not None and _has_samples(audio) else None
+        if audio_sample_rate is not None:
+            audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate)
+        if self._muxer is not None:
+            if self._muxer.has_audio:
+                if frames_u8 is not None and audio_np is None:
+                    raise ValueError("Every video chunk must include audio after the audio track is created.")
+                if audio_sample_rate is not None and audio_sample_rate != self._muxer.audio_sample_rate:
+                    raise ValueError("audio_sample_rate must match the existing audio track")
+            elif audio_np is not None:
+                raise ValueError("Audio arrived after the fMP4 header was written without an audio track.")
         if self._muxer is None:
+            if frames_u8 is None:
+                return b""
+            muxer_kwargs: dict[str, Any] = {}
+            if audio_np is not None:
+                audio_channels = int(min(audio_np.shape)) if audio_np.ndim == 2 else 1
+                muxer_kwargs = {
+                    "audio_sample_rate": _resolve_audio_sample_rate(audio_np, audio_sample_rate),
+                    "audio_channels": 1 if audio_channels == 1 else 2,
+                }
             self._muxer = FragmentedMP4Muxer(
                 width=frames_u8.shape[2],
                 height=frames_u8.shape[1],
                 fps=self._fps,
                 video_codec_options=self._video_codec_options,
+                **muxer_kwargs,
             )
-        return self._muxer.mux_video_frames(frames_u8)
+        chunk = b""
+        if frames_u8 is not None:
+            chunk += self._muxer.mux_video_frames(frames_u8)
+        if audio_np is not None:
+            chunk += self._muxer.mux_audio_samples(audio_np)
+        return chunk
+
+    @property
+    def audio_sample_rate(self) -> int | None:
+        return self._muxer.audio_sample_rate if self._muxer is not None else None
 
     def close(self) -> bytes:
         """Close the underlying fMP4 muxer and return trailing bytes, if any."""
@@ -972,6 +1074,22 @@ class FragmentedMP4VideoEncoder:
 
 
 StreamingVideoFormat = Literal["m4s"]
+
+
+def _has_frames(video: Any) -> bool:
+    if isinstance(video, (np.ndarray, torch.Tensor)):
+        return video.ndim >= 1 and int(video.shape[0]) > 0
+    if isinstance(video, list):
+        return len(video) > 0
+    return video is not None
+
+
+def _has_samples(audio: Any) -> bool:
+    if isinstance(audio, (np.ndarray, torch.Tensor)):
+        return audio.ndim >= 1 and int(np.prod(audio.shape)) > 0
+    if isinstance(audio, list):
+        return len(audio) > 0
+    return audio is not None
 
 
 def create_streaming_video_encoder(

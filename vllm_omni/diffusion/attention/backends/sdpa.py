@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     PackingMode,
     ParallelStrategy,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -164,7 +165,16 @@ class SDPABackend(AttentionBackend):
         return ExecutionPathResult.unmigrated(cls.get_name(), context, path="runtime_gqa_dependent")
 
     @classmethod
+    def supports_packed_mask_free(cls) -> bool:
+        return current_omni_platform.is_npu()
+
+    @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
+    @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         return True
 
@@ -375,6 +385,17 @@ class SDPAImpl(AttentionImpl):
     ) -> torch.Tensor:
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
 
+    def forward_oot(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # Out-of-tree platforms share the generic path and mask semantics of
+        # forward_xpu and forward_hip.
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+
     def forward_npu(
         self,
         query: torch.Tensor,
@@ -382,4 +403,11 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.packed_padding is not None:
+            if self.causal or attn_metadata.attn_mask is not None:
+                raise ValueError("NPU SDPA packed padding requires non-causal attention without an explicit mask")
+            # The producer guarantees the [real, pad] layout; slice the padding
+            # off K/V instead of materializing the Q x K mask.
+            length = attn_metadata.packed_padding.kv_length
+            return self._forward_impl(query, key[:, :length], value[:, :length])
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")

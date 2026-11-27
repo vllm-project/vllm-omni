@@ -137,21 +137,22 @@ def test_the_duplex_capabilities_reject_unimplemented_turn_detection() -> None:
 # `docs/serving/realtime_duplex_api.md` sorts every message into three tiers.
 # Tier 1 is pure OpenAI and lives in protocol/realtime; Tier 2 (OpenAI names
 # carrying our extensions) and Tier 3 (ours alone) live in protocol/duplex.
-_TIER1_EVENTS = ("SessionUpdated", "ItemAdded", "ItemCreated", "TextDelta", "OutputItemAdded")
+_TIER1_EVENTS = ("SessionUpdated", "ItemAdded", "ItemCreated", "OutputItemAdded")
 _TIER2_EVENTS = (
     "SessionCreated",
     "ResponseCreated",
     "ResponseDone",
     "AudioDelta",
+    "TextDelta",
     "InputCommitted",
     "ItemDeleted",
     "ItemTruncated",
     "ErrorEvent",
 )
-_TIER3_EVENTS = ("Listen", "Speak", "OverlapDecision", "PlaybackAcknowledged", "SessionResumed")
+_TIER3_EVENTS = ("Listen", "Speak", "OverlapDecision", "PlaybackAcknowledged", "SessionResumed", "SessionStats")
 _TIER1_COMMANDS = ("UpdateSession", "CreateItem", "CancelResponse", "ClearInput")
 _TIER2_COMMANDS = ("AppendAudio", "Commit")
-_TIER3_COMMANDS = ("BargeIn", "AckPlayback", "Heartbeat", "SignalTurn", "CloseSession")
+_TIER3_COMMANDS = ("BargeIn", "AckPlayback", "Heartbeat", "SignalTurn", "CloseSession", "GetSessionStats")
 
 
 @pytest.mark.parametrize("name", _TIER1_EVENTS)

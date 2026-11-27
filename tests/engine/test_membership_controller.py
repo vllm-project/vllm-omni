@@ -41,13 +41,13 @@ async def _wait_until(predicate, timeout=1):
 class FakePool:
     def __init__(self, stage_id: int):
         self.stage_id = stage_id
-        self.clients = []
-        self.added = []
-        self.removed = []
-        self.invalidated = []
+        self.clients: list[object] = []
+        self.added: list[tuple[str, object, int | None]] = []
+        self.removed: list[str] = []
+        self.invalidated: list[str] = []
         self.hub = None
         self.lb = None
-        self.replica_ids = {}
+        self.replica_ids: dict[str, int] = {}
 
     def attach_hub(self, hub):
         self.hub = hub
@@ -223,7 +223,7 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     async def cleanup(_request_ids):
         return None
 
-    controller.install_unregister_handlers(
+    controller.install_membership_handlers(
         output_queue=asyncio.Queue(),
         cleanup_callback=cleanup,
         replica_removed_callback=lambda stage_id, replica_id: removed_replicas.append((stage_id, replica_id)),
@@ -239,6 +239,33 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     assert pool.get_replica_id_by_addr("tcp://old-1") is None
     assert pool.available_replica_ids() == [1]
     assert removed_replicas == [(0, 0), (0, 1)]
+
+
+@pytest.mark.asyncio
+async def test_unregister_awaits_async_removal_handler_before_request_cleanup(monkeypatch):
+    pool = FakePool(stage_id=0)
+    pool.replica_ids["tcp://replica-0"] = 0
+    controller = _controller(monkeypatch, pool, FakeHub())
+    order: list[str] = []
+
+    async def on_removed(stage_id: int, replica_id: int) -> None:
+        await asyncio.sleep(0)
+        order.append(f"removed:{stage_id}:{replica_id}")
+
+    async def cleanup(request_ids: list[str]) -> None:
+        order.append("cleanup:" + ",".join(request_ids))
+
+    controller.install_membership_handlers(
+        output_queue=asyncio.Queue(),
+        cleanup_callback=cleanup,
+        replica_removed_callback=on_removed,
+    )
+
+    await controller.handle_unregister(0, "tcp://replica-0", cleanup_callback=cleanup)
+
+    # The session owner closes its sessions before the generic per-request
+    # cleanup runs, so the client observes a session close, not a bare abort.
+    assert order == ["removed:0:0", "cleanup:req-1,req-2"]
 
 
 @pytest.mark.asyncio
@@ -502,7 +529,7 @@ async def test_up_observed_before_attach_does_not_qualify_attachment(monkeypatch
         ]
     )
     shutdown_calls = []
-    sleep_gates = asyncio.Queue()
+    sleep_gates: asyncio.Queue[asyncio.Event] = asyncio.Queue()
 
     async def _controlled_sleep(_delay):
         gate = asyncio.Event()

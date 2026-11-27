@@ -88,7 +88,7 @@ guide: |
 
   ```bash
   uv venv && source .venv/bin/activate
-  uv pip install vllm==0.31.0 --torch-backend=auto
+  uv pip install vllm==0.33.0 --torch-backend=cu130
   uv pip install git+https://github.com/vllm-project/vllm-omni.git
   ```
 

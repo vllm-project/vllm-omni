@@ -9,18 +9,23 @@ import concurrent.futures
 import time
 from typing import Any
 
+import psutil
 import pytest
 
 from tests.dfx.conftest import assert_fault_exception
 from tests.dfx.reliability.helpers import (
     INFLIGHT_INJECTION_REQUEST_COUNT,
     INFLIGHT_INJECTION_REQUEST_RATE,
+    SIGTERM_CLEANUP_GRACE_SEC,
     FaultModel,
     FaultScenario,
+    _list_server_process_tree,
+    _safe_proc_info,
     assert_api_still_listening,
     assert_no_server_tree_process_residual_and_gpu_release,
     assert_post_fault_api_unreachable,
     assert_post_fault_health_503,
+    capture_exclusive_fifo_objects,
     make_process_kill_fault_injector,
     make_server_root_kill_fault_injector,
     make_server_tree_kill_fault_injector,
@@ -105,16 +110,26 @@ def _assert_health_503(model: FaultModel, client: Any) -> None:
 
 
 def _assert_cleanup(server: Any, *, scenario: str, signal_name: str) -> None:
+    snapshot = getattr(server, "reliability_fault_snapshot", {})
+    root_fifos = (
+        snapshot.get("killed_root_fifo_objects", ())
+        if signal_name == "SIGKILL" and scenario.startswith("kill_serve_root_")
+        else ()
+    )
     assert_no_server_tree_process_residual_and_gpu_release(
         server,
         scenario=scenario,
         timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+        allow_fifo_residual=signal_name == "SIGKILL" and scenario.startswith("kill_serve_tree_"),
+        allowed_fifo_objects=root_fifos,
     )
 
 
 def _require_signal(signal_name: str | None) -> str:
     if signal_name is None:
         raise RuntimeError("process-kill scenario requires a signal name")
+    if signal_name != "SIGKILL":
+        raise ValueError("crash scenarios require SIGKILL; use GracefulShutdown for SIGTERM")
     return signal_name
 
 
@@ -123,6 +138,11 @@ class ProcessKillWorkerNoLoad(FaultScenario):
 
     ``assert_fast_fail`` uses ``err_code=500``. A client timeout raises and fails the
     test. The concurrent checker runs only after that probe, then ``/health`` must end at 503.
+
+    In a serial model-suite run, teardown releases this function-scoped server
+    and the next selected case starts a fresh instance and checks its workload.
+    This provides suite-level whole-instance restart coverage, not an explicit
+    recovery assertion in this case. No individual stage replacement is tested.
     """
 
     signals_attr = "worker_signals"
@@ -158,6 +178,13 @@ class ProcessKillWorkerWithLoad(FaultScenario):
 
 
 class ProcessKillServeRootNoLoad(FaultScenario):
+    """Kill an idle serve root and verify API disappearance and resource cleanup.
+
+    In a serial model-suite run, the next selected case starts a fresh
+    function-scoped server and checks its own workload. This is suite-level
+    startup coverage; this scenario alone does not assert restart success.
+    """
+
     signals_attr = "serve_root_signals"
 
     def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
@@ -170,6 +197,15 @@ class ProcessKillServeRootNoLoad(FaultScenario):
 
 
 class ProcessKillServeRootWithLoad(FaultScenario):
+    """Kill the serve root under load and verify request failure and cleanup.
+
+    In a serial model-suite run, the next selected case starts a fresh
+    function-scoped server and checks its own workload. This is suite-level
+    startup coverage; this scenario alone does not assert restart success.
+    Load checks require an exception and bounded completion, not a specific
+    in-flight HTTP error contract.
+    """
+
     signals_attr = "serve_root_with_load_signals"
 
     def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
@@ -192,6 +228,13 @@ class ProcessKillServeRootWithLoad(FaultScenario):
 
 
 class ProcessKillTreeNoLoad(FaultScenario):
+    """Kill an idle process tree and verify API disappearance and resource cleanup.
+
+    In a serial model-suite run, the next selected case starts a fresh
+    function-scoped server and checks its own workload. This is suite-level
+    startup coverage; this scenario alone does not assert restart success.
+    """
+
     signals_attr = "tree_signals"
 
     def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
@@ -208,6 +251,15 @@ class ProcessKillTreeNoLoad(FaultScenario):
 
 
 class ProcessKillTreeWithLoad(FaultScenario):
+    """Kill the process tree under load and verify request failure and cleanup.
+
+    In a serial model-suite run, the next selected case starts a fresh
+    function-scoped server and checks its own workload. This is suite-level
+    startup coverage; this scenario alone does not assert restart success.
+    Load checks require an exception and bounded completion, not a specific
+    in-flight HTTP error contract.
+    """
+
     signals_attr = "tree_with_load_signals"
 
     def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
@@ -233,8 +285,72 @@ class ProcessKillTreeWithLoad(FaultScenario):
         _assert_cleanup(server, scenario=scenario, signal_name=signal)
 
 
+def _shutdown_with_killed_targets(
+    server: Any, client: Any, targets: list[Any], tree_pids: list[int], *, scenario: str
+) -> None:
+    """Start graceful shutdown, kill selected children, and enforce one deadline."""
+    killed_fifos = capture_exclusive_fifo_objects([process.pid for process in targets], tree_pids)
+    deadline = time.monotonic() + SIGTERM_CLEANUP_GRACE_SEC
+    make_server_root_kill_fault_injector(signal_name="SIGTERM", post_kill_wait_seconds=0.0)(server)
+    target_kind = "replica" if scenario == "replica_crash_at_exit" else "stage"
+    for process in targets:
+        assert time.monotonic() < deadline, f"[{scenario}] shutdown exceeded its grace period before fault injection"
+        try:
+            assert process.is_running() and process.status() != psutil.STATUS_ZOMBIE, (
+                f"[{scenario}] target {target_kind} exited before shutdown-time fault injection: pid={process.pid}"
+            )
+            process.kill()
+        except psutil.NoSuchProcess as exc:
+            raise AssertionError(f"[{scenario}] target {target_kind} disappeared before fault injection") from exc
+        print(f"[{scenario}] SIGKILL target pid={process.pid} after serve-root SIGTERM", flush=True)
+    remaining = deadline - time.monotonic()
+    assert remaining > 0, f"[{scenario}] shutdown exceeded its grace period before cleanup checks"
+    assert_no_server_tree_process_residual_and_gpu_release(
+        server, scenario=scenario, timeout_sec=remaining, allowed_fifo_objects=killed_fifos
+    )
+    assert time.monotonic() <= deadline, f"[{scenario}] shutdown did not finish within its grace period"
+    assert_post_fault_api_unreachable(client, scenario=scenario)
+
+
+class PartialCrashAtExit(FaultScenario):
+    """SIGTERM the serve root, then kill one stage while shutdown is in progress.
+
+    Shutdown and resource cleanup must finish within the SIGTERM grace period.
+    There is no passing escalation path: a timeout fails this scenario, and the
+    fixture's teardown handles any emergency cleanup after that failure.
+    Subsequent selected serial cases provide fresh-start recovery coverage
+    only when their business preflight succeeds; this case does not restart
+    the instance or independently verify restart recovery.
+    """
+
+    server_set = "lifecycle"
+
+    def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
+        del signal_name
+        scenario = "stage_crash_at_exit"
+        model.warmup(client, server)
+        # Resolve a descendant before SIGTERM: the root can exit and reparent
+        # its workers during shutdown. psutil.Process.kill guards PID reuse.
+        tree = _list_server_process_tree(server)
+        target_pid: int | None = None
+        for pid in tree[1:]:
+            name, cmdline = _safe_proc_info(pid)
+            if model.isolation_pattern in f"{name} {cmdline}":
+                target_pid = pid
+                break
+        assert target_pid is not None, f"[{scenario}] no stage matched {model.isolation_pattern!r}"
+        worker = psutil.Process(target_pid)
+        _shutdown_with_killed_targets(server, client, [worker], tree, scenario=scenario)
+
+
 class PartialStageIsolation(FaultScenario):
-    """Kill one stage or one worker. Requests bound to it fail, and one SIGTERM still exits the API."""
+    """Kill one stage or one worker, check isolation, then exit with one SIGTERM.
+
+    In a serial model-suite run, the next selected case starts a fresh
+    function-scoped instance and checks its workload after this instance exits.
+    This provides suite-level whole-instance restart coverage, not an explicit
+    recovery assertion in this case. No individual stage replacement is tested.
+    """
 
     server_set = "lifecycle"
 
@@ -250,3 +366,31 @@ class PartialStageIsolation(FaultScenario):
         model.isolation_after(client, server)
         assert_api_still_listening(client, scenario=scenario)
         sigterm_serve_root_and_assert_cleanup(server, scenario=scenario)
+
+
+class GracefulShutdown(FaultScenario):
+    """SIGTERM only the root; all descendants and resources must clear in time.
+
+    No crash injection, passing escalation, or restart is part of this case.
+    Fixture emergency cleanup cannot turn a shutdown timeout into success.
+    """
+
+    server_set = "lifecycle"
+
+    def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
+        del signal_name
+        scenario = "graceful_shutdown"
+        model.warmup(client, server)
+        deadline = time.monotonic() + SIGTERM_CLEANUP_GRACE_SEC
+        make_server_root_kill_fault_injector(signal_name="SIGTERM", post_kill_wait_seconds=0.0)(server)
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"[{scenario}] shutdown exceeded its grace period before cleanup"
+        assert_no_server_tree_process_residual_and_gpu_release(server, scenario=scenario, timeout_sec=remaining)
+        assert time.monotonic() <= deadline, f"[{scenario}] shutdown did not finish within its grace period"
+        assert_post_fault_api_unreachable(client, scenario=scenario)
+
+
+class ReplicaGracefulShutdown(GracefulShutdown):
+    """Normal SIGTERM shutdown with all configured replicas initially healthy."""
+
+    server_set = "replica"

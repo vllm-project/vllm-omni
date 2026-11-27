@@ -11,7 +11,7 @@ from tests.model_executor.models.cosyvoice3.test_cosyvoice3_incremental_hift imp
 pytestmark = [pytest.mark.core_model]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("finalize", [False, True])
 @torch.inference_mode()
 def test_hift_graph_preserves_current_and_previous_request(finalize):

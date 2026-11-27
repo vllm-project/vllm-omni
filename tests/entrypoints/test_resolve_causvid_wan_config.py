@@ -15,6 +15,6 @@ def test_causvid_wan_registered_in_pipeline_registry():
     pipeline = resolve_pipeline_config("causvid_wan")
     assert pipeline is not None
     assert pipeline.model_arch == "CausVidWanPipeline"
-    assert pipeline.default_deploy_config_name == "causvid_wan.yaml"
+    assert pipeline.default_deploy_config_name == "causvid_wan_self_forcing.yaml"
     cls = DiffusionModelRegistry._try_load_model_cls("CausVidWanPipeline")
     assert cls is CausVidWanPipeline

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E online serving tests for DreamZero OpenPI websocket serving."""
 
@@ -27,10 +27,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "GEAR-Dreams/DreamZero-DROID"
+DREAMZERO_INIT_TIMEOUT_S = 1800
 
 test_params = [
     OmniServerParams(
         model=MODEL,
+        init_timeout=DREAMZERO_INIT_TIMEOUT_S,
         stage_config_path=get_deploy_config_path("dreamzero_tp1_cfg2.yaml"),
         env_dict={
             "ATTENTION_BACKEND": "torch",
@@ -71,7 +73,10 @@ def _validate_dreamzero_openpi_session(response: OpenPIWebSocketResponse) -> Non
     assert metadata["needs_stereo_camera"] is False
     assert metadata["needs_session_id"] is True
     assert metadata["action_space"] == "joint_position"
-    assert response.operation_responses[-1]["status"] == "reset successful"
+    # Session order is infer, infer, reset, infer. Reset is not the last frame.
+    reset_responses = [item for item in response.operation_responses if isinstance(item, dict) and "status" in item]
+    assert reset_responses, "expected a reset response in the DreamZero OpenPI session"
+    assert reset_responses[-1]["status"] == "reset successful"
 
     action_tensors = response.action_tensors
     assert action_tensors is not None
@@ -84,7 +89,7 @@ def _validate_dreamzero_openpi_session(response: OpenPIWebSocketResponse) -> Non
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_dreamzero_openpi_online(omni_server, openai_client, tmp_path: Path) -> None:
     video_dir = tmp_path / "dreamzero_videos"

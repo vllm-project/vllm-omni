@@ -26,7 +26,7 @@ def main():
         if "VLLM_LOGGING_COLOR" not in os.environ:
             os.environ["VLLM_LOGGING_COLOR"] = "1"
 
-        from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+        from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
         from vllm.logger import configure_logging_from_args
 
         import vllm_omni.entrypoints.cli.benchmark.main

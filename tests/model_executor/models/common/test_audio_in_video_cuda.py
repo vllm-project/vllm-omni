@@ -15,7 +15,7 @@ from vllm_omni.model_executor.models.common.audio_in_video import check_interlea
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}),
 ]
 
 

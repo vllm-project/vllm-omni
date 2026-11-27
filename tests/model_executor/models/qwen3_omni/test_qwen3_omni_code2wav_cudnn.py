@@ -6,9 +6,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeCode2WavConfig
+from vllm.config import DeviceConfig
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
     pytest.mark.core_model,
@@ -17,7 +21,7 @@ pytestmark = [
 ]
 
 
-def _codec(enabled):
+def _codec(enabled, dtype=torch.float32, *, fp32_fallback=True, fused_snake=False):
     config = Qwen3OmniMoeCode2WavConfig(
         hidden_size=32,
         intermediate_size=64,
@@ -34,12 +38,55 @@ def _codec(enabled):
     config._attn_implementation = "sdpa"
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_config=config, stage_connector_config={"extra": {"codec_cudnn_benchmark": enabled}}
-        )
+            hf_config=config,
+            stage_connector_config={
+                "extra": {
+                    "codec_cudnn_benchmark": enabled,
+                    "codec_cudnn_fp32_fallback": fp32_fallback,
+                    "codec_fused_snake": fused_snake,
+                }
+            },
+        ),
+        device_config=DeviceConfig(device="cuda"),
+        quant_config=None,
     )
-    model = Qwen3OmniMoeCode2Wav(vllm_config=vllm_config).cuda().eval()
+    with set_default_torch_dtype(dtype), torch.device("cuda"):
+        model = Qwen3OmniMoeCode2Wav(vllm_config=vllm_config).eval()
     model.precompute_snake_caches()
     return model
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fp32_fallback", [False, True])
+@torch.inference_mode()
+def test_dtype_policy_matches_reference_with_cuda_graph(mocker, dtype, fp32_fallback):
+    # Exercise the workaround on CI GPUs too. This checks execution and graph
+    # compatibility, not reproduction of the SM100/SM103 cuDNN numerical bug.
+    mocker.patch.object(torch.backends.cudnn, "version", return_value=92000)
+    mocker.patch.object(current_omni_platform, "get_device_capability", return_value=DeviceCapability(10, 3))
+    torch.manual_seed(8935)
+    expected_dtype = torch.float32 if fp32_fallback else dtype
+    reference = _codec(False, expected_dtype, fp32_fallback=False, fused_snake=True)
+    checkpoint = [("code2wav." + name, p.to(dtype)) for name, p in reference.named_parameters()]
+    model = _codec(False, dtype, fp32_fallback=fp32_fallback, fused_snake=True)
+    assert model.load_weights(checkpoint) == reference.load_weights(checkpoint)
+    model.precompute_snake_caches()
+    reference.precompute_snake_caches()
+    assert {p.dtype for p in model.parameters()} == {expected_dtype}
+
+    for frames in (4, 29, 50):
+        codes = torch.randint(0, 16, (1, 2, frames), device="cuda")
+        for _ in range(3):
+            actual = model(codes)
+        torch.testing.assert_close(actual, reference(codes))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = model(codes)
+        codes.random_(0, 16)
+        graph.replay()
+        assert captured.dtype == expected_dtype
+        assert torch.isfinite(captured).all()
+        torch.testing.assert_close(captured, reference(codes))
 
 
 def _flags():

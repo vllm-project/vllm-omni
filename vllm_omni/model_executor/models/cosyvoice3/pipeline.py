@@ -17,6 +17,7 @@ from dataclasses import replace
 
 from transformers import PretrainedConfig
 
+from vllm_omni.config.endpoint_policy import speech_only_endpoint_restrictions
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -30,11 +31,13 @@ COSYVOICE3_PIPELINE = PipelineConfig(
     model_type="cosyvoice3",
     default_deploy_config_name="cosyvoice3.yaml",
     model_arch="CosyVoice3Model",
+    endpoint_restrictions=speech_only_endpoint_restrictions("CosyVoice3"),
     stages=(
         StagePipelineConfig(
             stage_id=0,
             model_stage="cosyvoice3_talker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -50,6 +53,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="cosyvoice3_code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

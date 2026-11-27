@@ -188,6 +188,9 @@ async def test_tool_recovery_through_realtime_asgi_route(monkeypatch, interrupti
                 }
             )
             await wire.expect("session.created")
+            # The open echoes the session as session.updated too; drain it so each
+            # append_frame barrier waits for its own update, not this one.
+            await wire.expect("session.updated")
             assert control.handle is not None
             runner = control.manager.runners[control.handle.session_id]
             timers = FakeTimerScheduler()
@@ -228,7 +231,10 @@ async def test_tool_recovery_through_realtime_asgi_route(monkeypatch, interrupti
                 event["type"] in {"response.created", "response.audio.delta", "response.output_audio.delta"}
                 for event in wire.events[event_start:]
             )
-            assert not runner.session.runtime_config.get("nvc_function_response_batches")
+            # A timeout queues the session's notice on the open request. A
+            # cancellation replaced that request, and neither queues the result.
+            queued = runner.session.runtime_config.get("nvc_function_response_batches") or []
+            assert len(queued) == (1 if interruption == "timeout" else 0)
             await wire.append_frame()
             push_model_output(runner, token_id=7)
             created = await wire.expect("response.created")

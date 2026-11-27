@@ -85,6 +85,7 @@ repos:
         require_serial: true
         additional_dependencies:
           - mypy==1.11.1
+          - msgspec
           - regex
           - types-cachetools
           - types-setuptools

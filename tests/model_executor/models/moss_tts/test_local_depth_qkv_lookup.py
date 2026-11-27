@@ -113,7 +113,7 @@ def test_generate_rejects_different_prepared_depth():
         model.generate_frame(torch.randn(1, 32), heads, embeddings, stop_head, n_vq=11)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_lookup_cuda_graph_replay():

@@ -26,6 +26,7 @@ AUDIO8_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="audio8_tts_slow_ar",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -34,12 +35,17 @@ AUDIO8_TTS_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [AUDIO8_TTS_EOS_TOKEN_ID],
             },
+            # talker_mtp folds the sampled codebook embeddings into this
+            # step's inputs_embeds; a replay rebuilds only the text part and
+            # pads the rest (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
             model_stage="audio8_tts_codec_decoder",
             model_arch="Audio8TTSCodecDecoder",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

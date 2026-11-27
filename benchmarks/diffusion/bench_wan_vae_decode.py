@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-path", default=",".join(VAE_FAST_PATH_LEVELS), help="Comma-separated levels")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=2)
+    parser.add_argument("--tiling", action="store_true", help="Decode with the VAE's spatial tiling (single GPU)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--profile", action="store_true", help="Print a torch.profiler CUDA kernel table")
     parser.add_argument("--profile-rows", type=int, default=25)
@@ -132,6 +133,8 @@ def load_vae(
             vae.init_distributed()
     else:
         vae = cls.from_pretrained(args.model, subfolder=args.subfolder, torch_dtype=dtype).to(device).eval()
+    if args.tiling:
+        vae.use_tiling = True
     if parallel:
         # Same setup as the registry: parallel decode needs tiling on.
         vae.use_tiling = True
@@ -248,7 +251,8 @@ def run_level(
         "reason": report.reason,
         "fused_silu": report.fused_silu_dtypes,
         "patched": dict(report.patched),
-        "time_s": min(timings),
+        "time_s": statistics.median(timings),
+        "times_s": timings,
         "peak_gib": peak.item(),
     }
     if args.profile:
@@ -354,8 +358,11 @@ def main() -> None:
     args = parse_args()
     if args.latents and not args.first_frame_ablation:
         raise SystemExit("--latents requires --first-frame-ablation")
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA device required")
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None or accelerator.type not in ("cuda", "xpu"):
+        raise SystemExit("CUDA or XPU device required")
+    if args.profile and accelerator.type != "cuda":
+        raise SystemExit("--profile requires CUDA")
     rank, world_size = init_distributed()
     parallel = args.vae_patch_parallel_size > 1
     if parallel and world_size < args.vae_patch_parallel_size:
@@ -363,7 +370,7 @@ def main() -> None:
             f"--vae-patch-parallel-size {args.vae_patch_parallel_size} needs torchrun with at least that many "
             f"processes (WORLD_SIZE={world_size})"
         )
-    device = torch.device("cuda", torch.accelerator.current_device_index()) if world_size > 1 else torch.device("cuda")
+    device = torch.device(accelerator.type, torch.accelerator.current_device_index())
     dtype = DTYPES[args.dtype]
     if args.first_frame_ablation:
         if world_size != 1 or parallel:
@@ -401,8 +408,11 @@ def main() -> None:
                 del output
                 continue
             speedup = baseline_time / stats["time_s"] if baseline_time else float("nan")
+            times = stats["times_s"]
             line = (
-                f"[{level:13s}] decode {stats['time_s'] * 1e3:9.1f} ms  speedup {speedup:5.2f}x  "
+                f"[{level:13s}] decode median {stats['time_s'] * 1e3:9.1f} ms  "
+                f"min {min(times) * 1e3:9.1f}  max {max(times) * 1e3:9.1f}  "
+                f"stdev {statistics.pstdev(times) * 1e3:7.1f} (n={len(times)})  speedup {speedup:5.2f}x  "
                 f"peak {stats['peak_gib']:5.2f} GiB  installed={stats['installed']}"
             )
             if level != "off":
@@ -417,6 +427,7 @@ def main() -> None:
                 else:
                     line += f"  reason={stats['reason']}"
             print(line)
+            print(f"[{level:13s}] raw_ms " + json.dumps([round(t * 1e3, 1) for t in times]))
             del output
             torch.accelerator.empty_cache()
     finally:

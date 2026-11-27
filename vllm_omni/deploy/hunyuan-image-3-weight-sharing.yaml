@@ -1,0 +1,40 @@
+# Single-host BF16 sharing on four colocated NVIDIA GPUs; one replica/stage.
+# Startup measures weights and private peaks against the group ratio below.
+# This is not a CUDA allocation cap or a guarantee for every request size.
+# Requests execute FIFO across the whole group: AR1 -> DiT1 -> AR2 -> DiT2.
+# Disabling weight_sharing restores ordinary concurrent stage scheduling.
+# Requires the normal Hunyuan/Mooncake dependencies and an immutable checkpoint.
+# vllm serve <checkpoint> --omni --deploy-config <this-file> \
+#   --stage-init-timeout 1800 --init-timeout 3600
+# Set weight_sharing: null to use ordinary loading (requires more GPU memory).
+base_config: hunyuan-image-3-mooncakeconnector.yaml
+model_runner: v2
+dtype: bfloat16
+distributed_executor_backend: mp
+
+weight_sharing:
+  provider_stage: 0
+  consumer_stage: 1
+  # One shared backbone + both stages' private peaks and fixed KV caches.
+  gpu_memory_utilization: 0.95
+
+stages:
+  - stage_id: 0
+    num_replicas: 1
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    enable_expert_parallel: false
+    enforce_eager: true
+    enable_sleep_mode: false
+    kv_cache_memory_bytes: 2147483648
+    moe_backend: triton
+  - stage_id: 1
+    num_replicas: 1
+    devices: "0,1,2,3"
+    enforce_eager: true
+    enable_sleep_mode: false
+    kv_cache_memory_bytes: 1073741824
+    moe_backend: triton
+    parallel_config:
+      tensor_parallel_size: 4
+      enable_expert_parallel: false

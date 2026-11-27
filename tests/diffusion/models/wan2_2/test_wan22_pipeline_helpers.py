@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 from contextlib import contextmanager
@@ -18,6 +18,9 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_wan_vae_scale_factors,
     retrieve_latents,
 )
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import Wan22S2VPipeline
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import Wan22VACEPipeline
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -50,6 +53,16 @@ class _LatentDist:
 
     def mode(self):
         return torch.tensor([2.0])
+
+
+@pytest.mark.parametrize(
+    ("pipeline_cls", "expected_steps"),
+    [(Wan22Pipeline, 40), (Wan22I2VPipeline, 40), (Wan22S2VPipeline, 40), (Wan22VACEPipeline, 50)],
+)
+def test_wan22_pipelines_advertise_forward_default_step_count(pipeline_cls, expected_steps) -> None:
+    # The model runner sizes the cache backend's context from this before forward()
+    # runs; without it a request that omits num_inference_steps skips the refresh.
+    assert pipeline_cls.default_num_inference_steps == expected_steps
 
 
 def test_wan22_postprocess_honors_request_output_type() -> None:

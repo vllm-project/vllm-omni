@@ -7,8 +7,8 @@ Same harness as ``test_session_runner.py`` (recording stage port, typed
 commands through the manager, stage outputs pushed by hand), plugin swapped:
 this pins the lockstep contract -- one Stage 0 submission per 80 ms frame,
 prefill slots only on the first append of an epoch, auto-response implied by
-``supports_client_commit=False``, cumulative Code2Wav output projected as
-24 kHz deltas, and a cancel restarting the epoch.
+``supports_client_commit=False``, DELTA Code2Wav output passed through as
+24 kHz audio deltas, and a cancel restarting the epoch.
 """
 
 from __future__ import annotations
@@ -105,7 +105,10 @@ def frame(samples: int = FRAME_SIZE, *, value: float = 0.05) -> commands.AppendA
 
 
 def code2wav_output(request_id: str, *, samples: int, text: str) -> SimpleNamespace:
-    """A cumulative Stage 1 (Code2Wav) output the way the orchestrator hands it to the runner."""
+    """A DELTA Stage 1 (Code2Wav) output the way the orchestrator hands it to the runner.
+
+    ``samples`` is the new chunk only; ``text`` stays cumulative.
+    """
     return SimpleNamespace(
         request_id=request_id,
         finished=False,
@@ -203,16 +206,14 @@ async def test_a_wrong_rate_append_is_refused_without_a_submission() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cumulative_code2wav_output_becomes_24k_audio_and_text_deltas() -> None:
+async def test_delta_code2wav_output_becomes_24k_audio_and_text_deltas() -> None:
     h = await open_personaplex_harness()
     try:
         await h.run(frame())
         request_id = h.stage0_request_id(epoch=0)
 
         first = await h.deliver_and_settle(code2wav_output(request_id, samples=FRAME_SIZE, text="he"), stage_id=1)
-        second = await h.deliver_and_settle(
-            code2wav_output(request_id, samples=2 * FRAME_SIZE, text="hello"), stage_id=1
-        )
+        second = await h.deliver_and_settle(code2wav_output(request_id, samples=FRAME_SIZE, text="hello"), stage_id=1)
 
         assert types(first)[0] == "response.created"
         delta = find(first, "response.output_audio.delta")

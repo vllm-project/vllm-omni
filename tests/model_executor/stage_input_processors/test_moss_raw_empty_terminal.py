@@ -32,6 +32,14 @@ def _request(tokens):
     )
 
 
+def _request_metadata(payload, model_mode="generation"):
+    transport = Transport.__new__(Transport)
+    transport._async_chunk = True
+    transport._model_mode = model_mode
+    update = transport._extract_scheduling_metadata_update(payload)
+    return {"r": update} if update is not None else {}
+
+
 @pytest.mark.parametrize("after_audio", [False, True])
 def test_empty_terminal_clears_native_codec_prompt(after_audio):
     manager = SimpleNamespace(
@@ -51,10 +59,10 @@ def test_empty_terminal_clears_native_codec_prompt(after_audio):
     )
     payload = to_dict(terminal)
     assert not Transport._payload_is_consumable(payload)
-    metadata = Transport._extract_scheduling_metadata(payload)
+    metadata = _request_metadata(payload)
     receiver = _request(previous)
     coordinator = OmniSchedulingCoordinator(stage_id=1)
-    coordinator.update_request_metadata({"r": receiver}, {"r": metadata}, model_mode="generation")
+    coordinator.update_request_metadata({"r": receiver}, metadata)
     assert receiver.prompt_token_ids == []
     assert receiver._all_token_ids == []
     assert receiver.num_prompt_tokens == receiver.num_computed_tokens == 0
@@ -69,18 +77,18 @@ def test_explicit_empty_codes_clear_generation_prompt(empty):
     request.num_computed_tokens = 3
     coordinator = OmniSchedulingCoordinator(stage_id=1)
     coordinator.update_request_metadata(
-        {"r": request}, {"r": {"code_predictor_codes": empty, "input_terminal": True}}, model_mode="generation"
+        {"r": request}, _request_metadata({"codes": {"audio": empty}, "meta": {"finished": True}})
     )
     assert request.prompt_token_ids == request._all_token_ids == request._output_token_ids == []
     assert request.num_prompt_tokens == request.num_computed_tokens == 0
     assert "r" in coordinator.input_terminal_req_ids
 
 
-@pytest.mark.parametrize("metadata", [{"input_terminal": True}, {"code_predictor_codes": None}])
-def test_absent_codes_preserve_generation_prompt(metadata):
+@pytest.mark.parametrize("payload", [{"meta": {"finished": True}}, {"codes": {"audio": None}}])
+def test_absent_codes_preserve_generation_prompt(payload):
     request = _request([17, 18, 19])
     coordinator = OmniSchedulingCoordinator(stage_id=1)
-    coordinator.update_request_metadata({"r": request}, {"r": metadata}, model_mode="generation")
+    coordinator.update_request_metadata({"r": request}, _request_metadata(payload))
     assert request.prompt_token_ids == request._all_token_ids == [17, 18, 19]
 
 
@@ -88,6 +96,6 @@ def test_ar_prompt_is_not_replaced_by_empty_audio_codes():
     request = _request([17, 18, 19])
     coordinator = OmniSchedulingCoordinator(stage_id=1)
     coordinator.update_request_metadata(
-        {"r": request}, {"r": {"code_predictor_codes": [], "input_terminal": True}}, model_mode="ar"
+        {"r": request}, _request_metadata({"codes": {"audio": []}, "meta": {"finished": True}}, model_mode="ar")
     )
     assert request.prompt_token_ids == request._all_token_ids == [17, 18, 19]

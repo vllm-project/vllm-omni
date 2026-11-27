@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.engine_session import (
     RESPONSE_REQUEST_MEASUREMENT_ORIGIN,
     DuplexEngineSession,
@@ -474,12 +475,74 @@ def test_truncate_history_item_uses_response_alignment_marks():
     item_id = f"item_{response_id}"
     session.register_history_item(item_id, committed)
 
+    revision = session.history_revision
     assert session.truncate_history_item(item_id, audio_end_ms=1_000) is True
+    assert session.history_revision > revision
 
     assert session.history[-1] == {"role": "assistant", "content": "hello"}
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}
+    revision = session.history_revision
     assert session.delete_history_item(item_id) is True
+    assert session.history_revision > revision
     assert session.history == ()
+
+
+def test_settings_revision_preserves_runtime_generation_and_rolls_back():
+    session = _session()
+    previous = session.config
+    revision = session.config_revision
+    generation = session.config_generation
+    session.replace_runtime_config({"internal_chunk": "next"})
+    assert session.config_revision == revision
+    assert session.config_generation == generation + 1
+    session.replace_config(DuplexSessionConfig(instructions="New instructions"))
+    assert session.config_revision == revision + 1
+    assert session.config_generation == generation + 2
+    session.restore_config(previous)
+    assert session.config is previous
+    assert session.config_revision == revision
+    assert session.config_generation == generation + 1
+
+
+def test_history_revision_tracks_append_and_same_length_edit():
+    session = _session()
+    revision = session.history_revision
+    message = {"role": "user", "content": "first"}
+    session.append_history_message(message)
+    assert session.history_revision > revision
+    session.register_history_item("input-1", message)
+    revision = session.history_revision
+    session.register_history_item("input-1", {"role": "user", "content": "other"})
+    assert session.history_revision > revision
+    assert session.history == ({"role": "user", "content": "other"},)
+
+
+def test_history_snapshot_aligns_item_identity_across_late_playback_materialization():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = {"role": "user", "content": "same question"}
+    session.append_history_message(first)
+    session.register_history_item("q1", first)
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.reserve_history_item(item_id)
+    session.append_assistant_text("played answer")
+    session.mark_audio_sent(duration_ms=1_000, text_chars=13)
+    assert session.end_response(commit_text=True) is None
+    second = {"role": "user", "content": "same question"}
+    session.append_history_message(second)
+    session.register_history_item("q2", second)
+    session.append_history_message({"role": "user", "content": "anonymous"})
+    snapshot = session.history_snapshot()
+    assert snapshot.messages == session.history
+    assert snapshot.item_ids == ("q1", "q2", None)
+
+    apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000})
+    snapshot = session.history_snapshot()
+    assert snapshot.messages == session.history
+    assert snapshot.item_ids == ("q1", item_id, "q2", None)
+    assert snapshot.messages[1]["content"] == "played answer"
+    assert session.delete_history_item(item_id)
+    assert session.history_snapshot().item_ids == ("q1", "q2", None)
 
 
 @pytest.mark.parametrize("response_ended", [False, True])
@@ -519,8 +582,11 @@ def test_input_transcription_is_idempotent_and_does_not_restore_edited_items(edi
         session.register_history_item("spoken-input", replacement.message)
         assert session.input_audio_part("spoken-input") == audio_part
         assert session.input_audio_part("spoken-input") is not audio_part
+    revision = session.history_revision
     assert session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part) is (edit is None)
+    assert session.history_revision == revision + int(edit is None)
     assert not session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part)
+    assert session.history_revision == revision + int(edit is None)
     if edit is None:
         assert session.history[0]["content"][0]["transcript"] == "Watch the pot."
     elif edit == "replace":
@@ -603,6 +669,21 @@ def test_accept_fence_rejects_stale_or_foreign_fences():
 
     session.accept_fence(DuplexFence("sid-fence", epoch=1, turn_id=0))
     assert session.accepted_fence == DuplexFence("sid-fence", epoch=1, turn_id=0)
+
+
+def test_append_fence_never_falls_behind_the_accepted_fence():
+    """The user talks over a reply: the reply's turn still owns the response
+    slot, but the accepted fence has moved on. Input must still be accepted."""
+    session = _session("sid-overlap")
+    session.complete_model_turn(0)
+    session.complete_model_turn(1)
+    session.begin_response(turn_id=1)
+    assert session.active_response_turn_id < session.accepted_fence.turn_id
+
+    fence = helpers.append_fence(session, None)
+
+    assert fence == session.accepted_fence
+    session.commit_append(session.prepare_append(fence))  # no DuplexFenceMismatchError
 
 
 def test_prepare_and_commit_append_sequence_chunks_per_turn_and_epoch():
@@ -706,6 +787,7 @@ def test_as_public_dict_exposes_identity_capabilities_and_playback():
     assert payload["id"] == "duplex-public"
     assert payload["model"] == "m"
     assert payload["voice"] == "alloy"
+    assert payload["watermarking"] is True
     assert payload["state"] == "open"
     assert payload["turn_state"] == "assistant_playing"
     assert payload["epoch"] == 0
@@ -769,7 +851,8 @@ def test_from_realtime_maps_wire_fields_and_stores_realtime_keys_in_extra_body()
     assert config.speed == 1.25
     assert config.max_tokens is None
     assert config.response_format == "pcm"
-    assert config.modalities == ["text", "audio"]
+    assert config.modalities is None
+    assert config.with_output_capabilities(DuplexCapabilities()).modalities == ["text", "audio"]
     assert config.extra_body["custom"] is True
     assert config.extra_body["realtime_tools"] == [{"type": "function", "name": "lookup"}]
     assert config.extra_body["realtime_tool_choice"] == "auto"
@@ -788,6 +871,20 @@ def test_from_realtime_uses_served_model_when_payload_has_none():
     assert config.model == "served-model"
     assert config.response_format == "pcm"
     assert config.idle_timeout_s == 300.0
+
+
+def test_realtime_session_watermarking_opt_out():
+    config = DuplexSessionConfig.from_realtime({"watermarking": False})
+    assert config.watermarking is False
+    assert config.normalized().watermarking is False
+
+    # Watermarking is fixed at open; updates may repeat or omit it, but not change it
+    config.apply_realtime_update({})
+    config.apply_realtime_update({"watermarking": False})
+    assert config.watermarking is False
+    with pytest.raises(DuplexConfigError, match="cannot change watermarking") as exc_info:
+        config.apply_realtime_update({"watermarking": True})
+    assert exc_info.value.code == "watermarking_update_unsupported"
 
 
 def test_from_realtime_ignores_client_chosen_session_ids():
@@ -1017,7 +1114,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
-    assert caps["input_modes"] == ["append_audio_chunk"]
+    assert caps["input_modes"] == ["append_audio_chunk", "append_text"]
     assert caps["adapter_patterns"] == ["scheduler_data_plane"]
     assert caps["supports_model_internal_state"] is True
     assert caps["requires_model_runner_kv"] is True
@@ -1530,3 +1627,32 @@ def test_deleting_a_live_item_preserves_its_output_playback_cursor(draining):
         )
         assert any(isinstance(event, ErrorEvent) and event.code == "playback_item_not_found" for event in events)
         assert response_id not in session._playback.by_response
+
+
+def test_rejected_user_sources_preserve_new_input_and_ignore_deleted_or_recreated_items():
+    session = _session()
+    session.register_history_item("answered", {"role": "user", "content": "old question"})
+    session.register_history_item("old-answer", {"role": "assistant", "content": "answered"})
+    rejected = session.commit_audio_input().message
+    session.register_history_item("rejected", rejected)
+    session.notify_new_user_item(rejected)
+    sources = session.pending_user_source_ids()
+    assert len(sources) == 1
+    session.reset_unanswered_user_items()
+    new = {"role": "user", "content": "new question"}
+    session.register_history_item("new", new)
+    session.notify_new_user_item(new)
+    session.restore_unanswered_user_sources(sources)
+    session.restore_unanswered_user_sources(sources)
+    assert session.unanswered_user_items() == 2
+    assert session.update_input_transcript(
+        "rejected", "corrected question", audio_part=session.input_audio_part("rejected")
+    )
+    assert session.unanswered_user_items() == 2
+    session.delete_history_item("rejected")
+    assert session.unanswered_user_items() == 1
+    session.register_history_item("rejected", {"role": "user", "content": "recreated"})
+    session.restore_unanswered_user_sources(sources)
+    assert session.unanswered_user_items() == 1
+    session.reset_unanswered_user_items()
+    assert session.unanswered_user_items() == 0

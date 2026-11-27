@@ -300,8 +300,8 @@ def test_forward_stops_peak_monitor_when_initial_synchronize_fails(monkeypatch):
     pipe.enable_diffusion_pipeline_profiler = True
     monitor = Mock(peak_bytes=0)
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.is_cuda",
-        lambda: True,
+        "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.device_type",
+        "cuda",
     )
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.is_available",

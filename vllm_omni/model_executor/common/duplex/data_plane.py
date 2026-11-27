@@ -1,19 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Data plane for models whose final stage streams cumulative audio and text.
+"""Data plane for models whose final stage streams audio and cumulative text.
 
-The stage runner re-sends the whole waveform (and transcript) it has produced
-so far for one request; the session needs only what is new. This data plane
-keeps one cursor per request, slices the delta, encodes it for the wire and
-reports it as one internal ``response.output_audio.delta``-shaped result.
-Model-specific constants (stage role, runtime metadata, default rate) are
-class attributes for a subclass to set.
+By default the stage runner re-sends the whole waveform (and transcript) it has
+produced so far for one request; the session needs only what is new. This data
+plane keeps one cursor per request, slices the delta, encodes it for the wire
+and reports it as one internal ``response.output_audio.delta``-shaped result.
+A subclass whose final stage runs with ``RequestOutputKind.DELTA`` sets
+``audio_output_is_delta``: each output then carries only the audio produced
+since the previous one, possibly as a list of chunks, which is joined and
+passed through unsliced. Model-specific constants (stage role, runtime
+metadata, default rate) are class attributes for a subclass to set.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+
+import numpy as np
+import torch
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
@@ -47,6 +53,9 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
     runner_kv_backed: bool = True
     owned_runtime: bool = False
     default_sample_rate_hz: int = 24000
+    # True when the final stage runs with ``RequestOutputKind.DELTA``: each
+    # output then carries only its new samples, so they pass through unsliced.
+    audio_output_is_delta: bool = False
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
@@ -99,10 +108,15 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
         state = self._requests.setdefault(request_id, _RequestCursor()) if request_id is not None else _RequestCursor()
         multimodal = multimodal_output(output, completion)
         audio = audio_value(multimodal)
-        audio_delta = slice_audio_delta(audio, state.audio_samples)
-        total_samples = audio_sample_count(audio)
-        if total_samples is not None:
-            state.audio_samples = total_samples
+        if self.audio_output_is_delta:
+            audio_delta = _join_audio_chunks(audio)
+            if not audio_sample_count(audio_delta):
+                audio_delta = None
+        else:
+            audio_delta = slice_audio_delta(audio, state.audio_samples)
+            total_samples = audio_sample_count(audio)
+            if total_samples is not None:
+                state.audio_samples = total_samples
 
         text = text_value(multimodal, completion)
         delta_text = text_delta(text, state.text)
@@ -133,3 +147,18 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
 
 
 __all__ = ["CumulativeAudioTextDataPlane"]
+
+
+def _join_audio_chunks(audio: object | None) -> object | None:
+    """One flat waveform for DELTA audio that arrived as several chunks.
+
+    In DELTA mode the output processor skips consolidation, so audio from more
+    than one step can reach the data plane as a list of tensors or arrays.
+    """
+    if not isinstance(audio, (list, tuple)):
+        return audio
+    if not audio:
+        return None
+    if all(isinstance(chunk, torch.Tensor) for chunk in audio):
+        return torch.cat([chunk.reshape(-1) for chunk in audio])
+    return np.concatenate([np.asarray(chunk, dtype=np.float32).reshape(-1) for chunk in audio])

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
-import math
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -11,7 +10,12 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
-from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTokensPrompt
+from vllm_omni.model_executor.models.glm_image.prompt import (
+    DEFAULT_TARGET_SIZE,
+    grid_token_layout,
+    propagate_target_size,
+)
 
 logger = init_logger(__name__)
 
@@ -57,7 +61,7 @@ def _first_source_image(mm_data: Any) -> Any:
     return images
 
 
-def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
+def compute_max_tokens(height: int | None, width: int | None, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
 
@@ -66,34 +70,28 @@ def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool =
     - text-to-image (t2i): small preview + large target + EOS
     - image-to-image (i2i): large target + EOS
 
+    This is the generation budget the reference implementation truncates at;
+    the online serving path sets it as the AR stage's per-request
+    ``max_tokens`` so requests stop at the grid's exact token count instead of
+    the deploy-YAML ceiling.
+
     Args:
-        height: Target image height in pixels
-        width: Target image width in pixels
+        height: Target image height in pixels; ``None`` resolves to the
+            processor's ``DEFAULT_TARGET_SIZE`` grid (the builder owns that
+            default so the serving layer stays model-agnostic).
+        width: Target image width in pixels; ``None`` as above.
         factor: Downsampling factor (32 for GLM-Image AR output)
         is_i2i: Whether the request is image-to-image mode
 
     Returns:
         Total number of tokens to generate for the specified mode
     """
-    # Large image tokens (target resolution)
-    token_h = height // factor
-    token_w = width // factor
-    large_tokens = token_h * token_w
-
-    # Small preview tokens (half resolution in each dimension)
-    import math
-
-    ratio = token_h / token_w if token_w > 0 else 1.0
-    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-    small_tokens = small_token_h * small_token_w
-
-    # Mode-dependent totals:
-    # - t2i: small + large + EOS
-    # - i2i: large + EOS
+    height = DEFAULT_TARGET_SIZE if height is None else height
+    width = DEFAULT_TARGET_SIZE if width is None else width
+    layout = grid_token_layout(height, width, factor)
     if is_i2i:
-        return large_tokens + 1
-    return small_tokens + large_tokens + 1
+        return layout.large_tokens + 1
+    return layout.small_tokens + layout.large_tokens + 1
 
 
 def _upsample_token_ids(token_ids: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
@@ -134,15 +132,13 @@ def _parse_generated_tokens(
                 generates only large image tokens (no small preview tokens).
     """
     # Calculate token dimensions for target image
-    token_h = height // factor
-    token_w = width // factor
-    large_image_tokens = token_h * token_w
-
-    # Calculate small preview image dimensions (used in text-to-image)
-    ratio = token_h / token_w if token_w > 0 else 1.0
-    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-    small_image_tokens = small_token_h * small_token_w
+    layout = grid_token_layout(height, width, factor)
+    small_image_tokens, large_image_tokens, token_h, token_w = (
+        layout.small_tokens,
+        layout.large_tokens,
+        layout.token_h,
+        layout.token_w,
+    )
 
     token_tensor = torch.tensor(token_ids, dtype=torch.long)
 
@@ -212,17 +208,79 @@ def _parse_generated_tokens(
     return prior_token_ids, height, width
 
 
+def _coerce_dim(v: Any, default: int) -> int:
+    try:
+        iv = int(v)
+        return iv if iv > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _target_size(prompt: Mapping[str, Any], sampling_params: Any | None) -> tuple[int, int]:
+    """Resolve the AR target size: mm_processor_kwargs (set by the serving layer),
+    then top-level fields, then the diffusion stage's sampling params, then
+    ``DEFAULT_TARGET_SIZE``."""
+    mm_processor_kwargs = prompt.get("mm_processor_kwargs")
+    if not isinstance(mm_processor_kwargs, Mapping):
+        mm_processor_kwargs = {}
+    default_h = _coerce_dim(getattr(sampling_params, "height", None), DEFAULT_TARGET_SIZE)
+    default_w = _coerce_dim(getattr(sampling_params, "width", None), DEFAULT_TARGET_SIZE)
+    height = _coerce_dim(mm_processor_kwargs.get("target_h"), _coerce_dim(prompt.get("height"), default_h))
+    width = _coerce_dim(mm_processor_kwargs.get("target_w"), _coerce_dim(prompt.get("width"), default_w))
+    return height, width
+
+
+def prepare_ar_prompt(prompt: Any, sampling_params_list: Any) -> Any:
+    """Stage-0 prompt transform: stamp the target size into the prompt, then
+    mirror it into the AR sampling params' ``extra_args`` (``propagate_target_size``)
+    so the serving budget and decode positions use the same grid."""
+    prompt = _stamp_target_size(prompt, sampling_params_list)
+    if sampling_params_list and hasattr(sampling_params_list[0], "clone"):
+        prompt = propagate_target_size(prompt, sampling_params_list)
+    return prompt
+
+
+def _stamp_target_size(prompt: Any, sampling_params_list: Any) -> Any:
+    """Make sure the AR stage prompt carries its target size.
+
+    Text-only prompts reach GLM-Image's multimodal processor, which appends the
+    ``<sop>H W<eop>`` grid scaffold, only when they carry ``mm_processor_kwargs``
+    (``OmniRenderer._routes_no_media_kwargs``). The OpenAI server sets them when
+    the request has a size; for everything else (offline ``Omni.generate("...")``,
+    served requests without ``size``) derive them the same way ``ar2diffusion``
+    does, so the AR grid and the prior-token slice agree.
+    """
+    if isinstance(prompt, str):
+        prompt = {"prompt": prompt}
+    if not isinstance(prompt, dict) or "prompt_embeds" in prompt:
+        return prompt
+    mm_processor_kwargs = prompt.get("mm_processor_kwargs") or {}
+    if "target_h" in mm_processor_kwargs and "target_w" in mm_processor_kwargs:
+        return prompt
+    diffusion_params = next(
+        (sp for sp in sampling_params_list or () if isinstance(sp, OmniDiffusionSamplingParams)),
+        None,
+    )
+    height, width = _target_size(prompt, diffusion_params)
+    return {**prompt, "mm_processor_kwargs": {**mm_processor_kwargs, "target_h": height, "target_w": width}}
+
+
 def ar2diffusion(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
+    sampling_params: Any | None = None,
 ) -> dict[str, Any] | None:
     """Process AR stage outputs to create Diffusion stage inputs.
 
     GLM-Image only produces one downstream diffusion request per AR request.
     ``source_outputs`` may still include CFG companion outputs, but only the
     first AR output is used to build the diffusion payload.
+
+    ``prompt`` is the request's original prompt (before ``prepare_ar_prompt``),
+    so the target size is resolved again from it plus the diffusion stage's
+    ``sampling_params`` (passed by the orchestrator when this parameter exists).
     """
     del streaming_context
 
@@ -244,6 +302,9 @@ def ar2diffusion(
 
     if isinstance(original_prompt, dict):
         pass
+    elif isinstance(original_prompt, str):
+        # Offline Omni.generate("<text>") passes the caption as a bare string.
+        original_prompt = {"prompt": original_prompt}
     elif hasattr(original_prompt, "_asdict"):
         original_prompt = original_prompt._asdict()
     elif hasattr(original_prompt, "__dict__"):
@@ -251,25 +312,7 @@ def ar2diffusion(
     else:
         original_prompt = {}
 
-    mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
-
-    def _coerce_dim(v: Any, default: int) -> int:
-        try:
-            iv = int(v)
-            return iv if iv > 0 else default
-        except (TypeError, ValueError):
-            return default
-
-    # Prefer GLM-Image target size from mm_processor_kwargs (set by serving layer),
-    # then fall back to top-level fields for backward compatibility.
-    height = _coerce_dim(
-        mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("height"), 1024),
-    )
-    width = _coerce_dim(
-        mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("width"), 1024),
-    )
+    height, width = _target_size(original_prompt, sampling_params)
     text_prompt = original_prompt.get("prompt", "")
 
     # Detect i2i mode.

@@ -14,8 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from transformers.configuration_utils import PretrainedConfig, layer_type_validation
-from transformers.modeling_rope_utils import rope_config_validation
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -241,14 +240,15 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
+        if self.rope_parameters is not None and "type" in self.rope_parameters:
+            self.rope_parameters["rope_type"] = self.rope_parameters["type"]
+        self.standardize_rope_params()
+        self.validate_rope()
 
         self.layer_types = layer_types
         if self.layer_types is None:
@@ -258,7 +258,7 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
+        self.validate_layer_type()
         self.num_code_groups = num_code_groups
 
 
@@ -428,13 +428,15 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_scaling
+        if self.rope_parameters is not None:
+            self.standardize_rope_params()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+        if self.rope_parameters is not None and "type" in self.rope_parameters:
+            self.rope_parameters["rope_type"] = self.rope_parameters["type"]
 
         if code_predictor_config is None:
             self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig()

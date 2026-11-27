@@ -12,10 +12,12 @@ import pytest
 from fastapi import FastAPI, WebSocket
 from omegaconf import OmegaConf
 from starlette.testclient import TestClient
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -184,6 +186,45 @@ def test_policy_server_config_reads_omegaconf_stage_config():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
 
     assert serving.policy_server_config.to_dict() == {"custom_model_key": "from-omegaconf"}
+
+
+@pytest.mark.parametrize(
+    "config,message",
+    [
+        ({"action_horizon": 50, "max_action_horizon": 30}, "exceeds"),
+        ({"action_horizon": 0}, "action_horizon"),
+        ({"max_action_horizon": True}, "max_action_horizon"),
+        ({"action_dim": 3.0}, "action_dim"),
+        ({"action_keys": "arm"}, "list of strings"),
+        ({"action_keys": ["arm", 1]}, "list of strings"),
+        ({"action_keys": ["arm", "arm"]}, "duplicate"),
+        ({"action_keys": ["arm", "gripper"], "action_dim": 3}, "ambiguous"),
+        ({"action_space": " "}, "action_space"),
+    ],
+)
+@pytest.mark.parametrize("factory", ["__init__", "create_policy_server"])
+def test_invalid_action_config_fails_before_serving(config, message, factory):
+    engine = _engine_with_policy_config(config)
+    # Also exercise the factory: invalid capabilities must raise, not silently
+    # disable the endpoint as a missing policy_server_config would.
+    build = openpi_serving.ServingRealtimeRobotOpenPI
+    if factory == "create_policy_server":
+        build = build.create_policy_server
+    with pytest.raises(ValueError, match=message):
+        build(engine_client=engine)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"action_keys": ["default"], "action_dim": 80},
+        {"action_keys": ["arm", "gripper"], "custom": "preserved"},
+    ],
+)
+def test_valid_action_config_is_preserved_at_startup(config):
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config(config))
+    assert serving.policy_server_config.to_dict() == config
 
 
 def test_policy_server_config_is_required():
@@ -508,6 +549,123 @@ def test_infer_preserves_dict_actions_from_multimodal_output():
     assert actions["right_arm"].dtype == np.float32
 
 
+class FakePromptBuilder:
+    def __init__(self, model_config, policy_server_config):
+        self.model_config = model_config
+        self.policy_server_config = policy_server_config
+
+    def build_prompt(self, obs):
+        return {"prompt_token_ids": [1, 2], "obs_keys": sorted(obs)}
+
+
+class MultiStageEngine:
+    """Autoregressive stage 0, diffusion stage 1 that returns the actions."""
+
+    def __init__(self, model_config=None):
+        if model_config is None:
+            model_config = {
+                "policy_server_config": TEST_POLICY_SERVER_CONFIG,
+                "openpi_prompt_builder": "tests.fake.FakePromptBuilder",
+            }
+        self.od_config = SimpleNamespace(model_config=model_config)
+        self.model_config = SimpleNamespace(model="reasoning-model")
+        self.stage_configs = [SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")]
+        self.default_sampling_params_list = [
+            SamplingParams(temperature=0.6, max_tokens=8),
+            OmniDiffusionSamplingParams(),
+        ]
+        self.generate_calls = []
+
+    def get_diffusion_od_config(self):
+        return self.od_config
+
+    def generate(self, *, prompt, request_id, sampling_params_list):
+        async def _generate():
+            self.generate_calls.append({"prompt": prompt, "sampling_params_list": sampling_params_list})
+            yield SimpleNamespace(multimodal_output={"actions": [1.0, 2.0]})
+            # The reasoning stage's final output can arrive after the actions.
+            yield SimpleNamespace(multimodal_output={})
+
+        return _generate()
+
+
+def test_multi_stage_policy_gets_prompt_and_params_for_every_stage(monkeypatch):
+    monkeypatch.setattr(openpi_serving, "resolve_obj_by_qualname", lambda path: FakePromptBuilder)
+    engine = MultiStageEngine()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    assert serving.prompt_builder.model_config is engine.model_config
+    assert serving.prompt_builder.policy_server_config == serving.policy_server_config.to_dict()
+
+    actions = asyncio.run(serving.infer({"state": np.zeros(2), "seed": 7}, session_id="s", reset=False))
+
+    np.testing.assert_array_equal(actions, np.array([1.0, 2.0], dtype=np.float32))
+    (call,) = engine.generate_calls
+    assert call["prompt"] == {"prompt_token_ids": [1, 2], "obs_keys": ["state"]}
+    reasoning, diffusion = call["sampling_params_list"]
+    assert isinstance(reasoning, SamplingParams) and reasoning.temperature == 0.6 and reasoning.seed == 7
+    assert isinstance(diffusion, OmniDiffusionSamplingParams) and diffusion.seed == 7
+    assert sorted(diffusion.extra_args["robot_obs"]) == ["state"]
+    # Stage defaults are cloned, not mutated.
+    assert engine.default_sampling_params_list[0].seed is None
+
+
+def test_multi_stage_policy_samples_n_on_the_first_stage(monkeypatch):
+    monkeypatch.setattr(openpi_serving, "resolve_obj_by_qualname", lambda path: FakePromptBuilder)
+    engine = MultiStageEngine()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    asyncio.run(
+        serving.infer({"state": np.zeros(2), "seed": 7, "sampling_params": {"n": 3}}, session_id="s", reset=False)
+    )
+
+    (call,) = engine.generate_calls
+    reasoning, diffusion = call["sampling_params_list"]
+    assert reasoning.n == 3 and reasoning.seed == 7 and diffusion.seed == 7
+    assert sorted(diffusion.extra_args["robot_obs"]) == ["state"]
+    assert engine.default_sampling_params_list[0].n == 1  # stage defaults are not mutated
+
+
+@pytest.mark.parametrize("n", [0, -1, 1.5, "2", True])
+def test_infer_rejects_an_invalid_n(n):
+    engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    with pytest.raises(ValueError, match="sampling_params.n"):
+        asyncio.run(serving.infer({"sampling_params": {"n": n}}, session_id="s", reset=False))
+    assert not engine.generate_calls
+
+
+def test_single_stage_policy_rejects_n():
+    engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+    engine.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    with pytest.raises(ValueError, match="multi-stage"):
+        asyncio.run(serving.infer({"sampling_params": {"n": 2}}, session_id="s", reset=False))
+    assert not engine.generate_calls
+
+
+def test_multi_stage_policy_without_prompt_builder_keeps_observation_prompt():
+    engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    asyncio.run(serving.infer({"prompt": "pick up the cube"}, session_id="s", reset=False))
+
+    (call,) = engine.generate_calls
+    assert call["prompt"] == "pick up the cube"
+    reasoning, diffusion = call["sampling_params_list"]
+    # Without an observation seed every stage shares the request's random seed.
+    assert diffusion.seed is not None and reasoning.seed == diffusion.seed
+
+
+def test_unloadable_prompt_builder_names_the_setting():
+    engine = MultiStageEngine(
+        model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG, "openpi_prompt_builder": "no.such.Builder"}
+    )
+    with pytest.raises(RuntimeError, match="openpi_prompt_builder"):
+        openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+
 def test_extract_actions_does_not_iterate_result_object():
     class IterableResult:
         multimodal_output = {"actions": [[1.0, 2.0, 3.0]]}
@@ -520,6 +678,62 @@ def test_extract_actions_does_not_iterate_result_object():
     actions = serving._extract_actions(IterableResult())
 
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+
+@pytest.mark.parametrize("metadata", [{"actions": {"horizon": 2}}, {"actions": []}, []])
+def test_extract_actions_rejects_invalid_action_metadata(metadata):
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+    result = OmniRequestOutput.from_diffusion(
+        request_id="contract-test", images=[], multimodal_output={"actions": [[1.0, 2.0]], "metadata": metadata}
+    )
+    with pytest.raises(ValueError):
+        serving._extract_actions(result)
+
+
+def test_extract_actions_checks_handshake_constraints():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_engine_with_policy_config({"action_horizon": 2, "action_dim": 2})
+    )
+    with pytest.raises(ValueError, match="horizon"):
+        serving._extract_actions(
+            OmniRequestOutput.from_diffusion(
+                request_id="contract-test", images=[], multimodal_output={"actions": [[1.0, 2.0]]}
+            )
+        )
+
+
+@pytest.mark.parametrize("horizon", [2, 3])
+def test_websocket_action_contract_preserves_response_and_generic_errors(monkeypatch, horizon):
+    monkeypatch.setattr(openpi_connection, "_pack", _json_pack)
+    monkeypatch.setattr(openpi_connection, "_unpack", _json_unpack)
+
+    class ContractEngine(RecordingEngine):
+        async def generate(self, **kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id=kwargs["request_id"],
+                images=[],
+                multimodal_output={
+                    "actions": [[1.0, 2.0], [3.0, 4.0]],
+                    "metadata": {"actions": {"horizon": horizon, "valid_steps": 1}},
+                },
+            )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=ContractEngine())
+    app = FastAPI()
+
+    @app.websocket("/v1/realtime/robot/openpi")
+    async def endpoint(websocket: WebSocket):
+        await openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection()
+
+    with TestClient(app) as client, client.websocket_connect("/v1/realtime/robot/openpi") as websocket:
+        assert _json_unpack(websocket.receive_bytes()) == serving.policy_server_config.to_dict()
+        websocket.send_bytes(_json_pack({"prompt": "pick"}))
+        response = _json_unpack(websocket.receive_bytes())
+        if horizon == 2:
+            # Keep all generated steps and the existing actions-only wire response.
+            assert response == [[1.0, 2.0], [3.0, 4.0]]
+        else:
+            assert response == {"type": "error", "message": "Internal inference error"}
 
 
 def test_drop_session_calls_dreamzero_close_hook():
