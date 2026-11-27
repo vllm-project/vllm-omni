@@ -2843,6 +2843,81 @@ class TestStepScheduler:
         assert sched_output.num_running_reqs == 1
         assert sched_output.num_waiting_reqs == 1
 
+    def test_drr_runs_aged_oversized_request_alone_without_starving(self) -> None:
+        """An aged over-budget waiter drains the batch, then runs alone."""
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=4096,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        def add(name: str, height: int, width: int) -> str:
+            return scheduler.add_request(
+                _make_step_request(
+                    name,
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=height,
+                        width=width,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+
+        req_running = add("running", 512, 512)
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_running]
+
+        # 1280x1024 costs 5120 packed tokens, over the whole 4096-token
+        # budget, and is aged past the reserve threshold: it can only ever
+        # run alone, so the running batch must not be extended for it.
+        req_oversized = add("oversized", 1280, 1024)
+        self._age_request(scheduler, req_oversized, 120.0)
+        req_small = add("small", 512, 512)
+        req_new = add("new-arrival", 512, 512)
+
+        # Admitting the fitting waiters would keep the batch non-empty and
+        # postpone the oversized request every cycle.
+        second = scheduler.schedule()
+        assert _new_ids(second) == []
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 3
+
+        # Repeated scheduling is stable: continuous arrivals, including the
+        # one just queued, cannot extend the drain window.
+        third = scheduler.schedule()
+        assert _new_ids(third) == []
+        assert third.num_waiting_reqs == 3
+
+        # Once the batch drains, the aged oversized request runs alone.
+        scheduler.update_from_output(
+            first,
+            _make_step_output(req_running, step_index=4, finished=True),
+        )
+        fourth = scheduler.schedule()
+        assert _new_ids(fourth) == [req_oversized]
+        assert fourth.num_running_reqs == 1
+        assert fourth.num_waiting_reqs == 2
+
+        # While it runs, no smaller request can join it.
+        fifth = scheduler.schedule()
+        assert _new_ids(fifth) == []
+        assert fifth.num_running_reqs == 1
+        assert fifth.num_waiting_reqs == 2
+
+        # After it finishes, admission resumes and fills the batch again.
+        scheduler.update_from_output(
+            fourth,
+            _make_step_output(req_oversized, step_index=4, finished=True),
+        )
+        sixth = scheduler.schedule()
+        assert set(_new_ids(sixth)) == {req_small, req_new}
+        assert sixth.num_running_reqs == 2
+        assert sixth.num_waiting_reqs == 0
+
     def test_profile_batching_policy_ramps_batch_size(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(

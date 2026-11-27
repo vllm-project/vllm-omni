@@ -424,8 +424,7 @@ class BaseScheduler(ABC):
         # when nothing is running there is no batch left to budget, so admit the
         # cheapest waiting request regardless of its cost. This also covers a
         # budget calibrated from cheaper reference requests (no CFG, single
-        # frame) than the ones the server actually serves. When the cheapest
-        # request fits, the normal loop below admits it with the rest.
+        # frame) than the ones the server actually serves.
         if budget is not None and not self._running:
             cheapest = min(candidates, key=policy.request_tokens)
             if policy.request_tokens(cheapest) > budget:
@@ -435,10 +434,42 @@ class BaseScheduler(ABC):
                 if outcome == "admitted":
                     running_tokens += policy.request_tokens(cheapest)
                 candidates = [state for state in candidates if state is not cheapest]
+            else:
+                # Cheaper requests fit, so the oversize escape above does not
+                # apply. An aged request costlier than the whole budget can
+                # never fit any batch, so no gap held for it can ever be
+                # honored: run it alone now instead of letting younger cheaper
+                # requests take the slot cycle after cycle.
+                target = policy.oversized_aged_target(candidates, now, budget)
+                if target is not None:
+                    outcome = self._admission_scan_outcome(
+                        target, scheduled_new_reqs, scheduled_cached_request_ids, now
+                    )
+                    if outcome == "stop":
+                        return
+                    if outcome == "admitted":
+                        # Over budget, so it can never share a batch: let it
+                        # own this one alone and resume admission after it.
+                        return
+
+        if budget is not None and self._running:
+            if policy.oversized_aged_target(candidates, now, budget) is not None:
+                # An aged request costlier than the whole budget cannot fit
+                # beside running work. Stop admitting anything and let this
+                # batch drain: otherwise continuous arrivals can keep it
+                # non-empty forever and that request never gets a batch.
+                return
 
         if budget is not None:
             remaining = budget - running_tokens
-            reserved = policy.reservation_target(candidates, now)
+            # A reservation can only pay off if its target could fit a whole
+            # batch by itself at some point. A request costlier than the
+            # entire budget never can: with a non-empty batch the gap for it
+            # would be negative and stall every other waiter indefinitely. The
+            # empty-batch handling above runs it alone; here it is left out of
+            # the reservable set so fitting requests still fill the batch.
+            reservable = [state for state in candidates if policy.request_tokens(state) <= budget]
+            reserved = policy.reservation_target(reservable, now)
             if reserved is not None:
                 reserved_tokens = policy.request_tokens(reserved)
                 if reserved_tokens > remaining or not self._can_schedule_waiting(reserved):

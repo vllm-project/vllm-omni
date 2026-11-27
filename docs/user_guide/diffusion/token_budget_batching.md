@@ -182,3 +182,13 @@ becomes the reservation target: while it cannot join the running batch yet,
 only candidates that fit the gap left after reserving its tokens are admitted,
 and admission stops there so the gap survives. Once it fits, it is admitted
 first, so younger cheaper requests cannot keep taking the slot ahead of it.
+A request costlier than the entire budget can never share a batch with any
+other request, so it is never a reservation target and no gap is held for it.
+Until it has aged past `drr_reserve_time_s` it waits while fitting requests
+fill the batch. Once it has aged, admission stops and the running batch is
+allowed to drain; while the batch remains non-empty, new arrivals cannot
+extend it. When the batch empties, the request is admitted alone over the
+budget, and later requests resume once it finishes. Its wait is therefore
+bounded by the batch it aged during instead of growing with every arrival.
+When every waiter exceeds the budget, the empty-batch rule above still admits
+the cheapest one first.

@@ -66,6 +66,19 @@ class DiffusionBatchingPolicy:
         """Return a candidate whose budget gap must be held this step, if any."""
         return None
 
+    def oversized_aged_target(
+        self,
+        candidates: list[SchedulerRequestState],
+        now: float,
+        budget: int,
+    ) -> SchedulerRequestState | None:
+        """Return an aged candidate that can never fit ``budget``, if any.
+
+        Such a request can only ever run alone, so callers stop admitting new
+        work and let the running batch drain for it.
+        """
+        return None
+
     def count_cap(self, hard_cap: int) -> int:
         """Request-count cap for this step, given the configured ``max_num_seqs``."""
         return max(1, int(hard_cap))
@@ -165,6 +178,23 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         reserve_time = max(0.0, float(self.config.drr_reserve_time_s))
         target: SchedulerRequestState | None = None
         for state in candidates:
+            age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
+            if age > reserve_time and (target is None or (state.queued_at or 0.0) < (target.queued_at or 0.0)):
+                target = state
+        return target
+
+    def oversized_aged_target(
+        self,
+        candidates: list[SchedulerRequestState],
+        now: float,
+        budget: int,
+    ) -> SchedulerRequestState | None:
+        """Oldest aged candidate costlier than ``budget``; it can only run alone."""
+        reserve_time = max(0.0, float(self.config.drr_reserve_time_s))
+        target: SchedulerRequestState | None = None
+        for state in candidates:
+            if self.request_tokens(state) <= budget:
+                continue
             age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
             if age > reserve_time and (target is None or (state.queued_at or 0.0) < (target.queued_at or 0.0)):
                 target = state
