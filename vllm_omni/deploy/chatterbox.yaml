@@ -20,6 +20,10 @@ connectors:
       codec_stream_scale_factor: 2
       # Played tokens stage 1 decodes each chunk with again (two seconds).
       codec_left_context_frames: 50
+      # Batch ready decoder chunks, bounded so lightly loaded streams do not
+      # wait indefinitely for the high-concurrency performance target.
+      generation_min_batch_size: 16
+      generation_max_wait_ms: 6
 stages:
   - stage_id: 0
     hf_overrides:

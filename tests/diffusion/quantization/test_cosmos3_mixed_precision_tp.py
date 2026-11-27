@@ -361,6 +361,16 @@ def _run_parallel(
         destroy_distributed_environment()
 
 
+def _hardware_marks(backend: str | None, num_cards: int) -> list:
+    # FlashInfer CuTe DSL is NVIDIA-only. FP8 and NVFP4 emulation are validated
+    # on one MI300; multi-card variants stay CUDA-only for now.
+    if backend == "flashinfer_cutedsl":
+        return hardware_marks(res={"cuda": "B200"}, num_cards=num_cards)
+    if num_cards == 1:
+        return hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=num_cards)
+    return hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=num_cards)
+
+
 @pytest.mark.parametrize(
     "precision,backend,topology",
     [
@@ -369,10 +379,7 @@ def _run_parallel(
             backend,
             *case.values,
             id=f"{precision}-{backend or 'native'}-{case.id}",
-            marks=hardware_marks(
-                res={"cuda": "B200" if backend == "flashinfer_cutedsl" else ["H100", "B200"]},
-                num_cards=prod(case.values[0]),
-            ),
+            marks=_hardware_marks(backend, prod(case.values[0])),
         )
         for precision, backend in (("fp8", None), ("nvfp4", "emulation"), ("nvfp4", "flashinfer_cutedsl"))
         for case in TOPOLOGIES

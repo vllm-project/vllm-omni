@@ -23,6 +23,13 @@ control on device. Code2Wav reuses mainline Whole-Euler Flow graphs and shared
 prompt state. The previous experimental block compilation, tiled attention,
 channels-last and merged-CFM implementations are removed.
 
+## Ascend two-card profile
+
+The [Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+keeps Thinker 40960, Talker 4096, two Talker and two Code2Wav replicas, and
+five-step CFM. Eligible graphs qualify against reference results before
+replay. Failed qualification keeps the reference path.
+
 ## Turn prefix-cache memory
 
 The persistent stage-output cache is a pageable CPU mirror, not a second
@@ -160,13 +167,13 @@ stages:
 vLLM 0.34 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
 layers use the Thinker MRv2 auxiliary-hidden-state interface.
-Validation covers CUDA turn sessions with greedy text and speech output.
-Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
-MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
-the deferred V1 default and cannot run it with vLLM 0.34.
+CUDA turn sessions support DSpark with greedy text and speech output. Ascend
+MRv2 also supports DSpark for ordinary chat, including chat served by a duplex
+deployment. Native duplex requests keep their own sampler and skip drafts.
+ROCm uses MRv2. XPU and MUSA retain the deferred V1 default.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
-The default single-card and two-card Ascend profiles use synchronous MRv2
+The default single-card and two-card Ascend YAMLs use synchronous MRv2
 with seven Ngram draft tokens for greedy Thinker requests. The scheduler
 drafts from committed token history and the NPU verifies the drafts. When
 a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
@@ -184,9 +191,12 @@ To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
 `platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
 to restore asynchronous scheduling for ordinary decoding.
 
-The Ascend `minicpmo_4_5_npu_2card.yaml` profile colocates Thinker and
-Talker and gives Code2Wav its own NPU. The `minicpmo_4_5_2gpu.yaml`
-profile gives Thinker its own device and colocates Talker and Code2Wav.
+The Ascend `minicpmo_4_5_2gpu.yaml` profile puts Thinker on the second
+visible NPU and one replica of Talker and Code2Wav on each NPU. It inherits
+the common stage settings from `minicpmo_4_5.yaml`. The
+[Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+uses the original checkpoint and Ngram by default. It documents optional
+Thinker DSpark.
 
 ## Thinker prefix cache with drafts
 

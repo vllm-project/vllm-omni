@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import SPEECH_FLUSH_KEY, TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     VOCAB_SIZE,
@@ -503,12 +504,12 @@ def _binding_model():
     )
 
 
-def _duplex_info(request_id, *, epoch, turn_id, condition_seq, text):
+def _duplex_info(request_id, *, epoch, turn_id, condition_seq, text, **meta):
     return {
         "request_id": request_id,
         "native_duplex": True,
         "duplex": {"epoch": epoch, "turn_id": turn_id},
-        "meta": {"streaming_condition_seq": condition_seq, "native_duplex_segment_text": text},
+        "meta": {"streaming_condition_seq": condition_seq, "native_duplex_segment_text": text, **meta},
     }
 
 
@@ -527,7 +528,7 @@ def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
     hidden = torch.zeros(2, 4)
     infos = [
         _duplex_info("a", epoch=1, turn_id=3, condition_seq=5, text="hi"),
-        _duplex_info("b", epoch=0, turn_id=0, condition_seq=2, text="\u4f60\u597d"),
+        _duplex_info("b", epoch=0, turn_id=0, condition_seq=2, text="\u4f60\u597d", text_without_audio=True),
     ]
     kwargs = {"model_intermediate_buffer": infos, "request_token_spans": [(0, 1), (1, 2)]}
     state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(model, hidden, 2, **kwargs)
@@ -543,6 +544,8 @@ def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
     assert [v.item() for v in meta["streaming_condition_seq"]] == [5, 2]
     assert [bytes(v.tolist()).decode("utf-8") for v in meta["llm_output_text_utf8"]] == ["hi", "\u4f60\u597d"]
     assert [v.item() for v in meta["turn_end"]] == [False, False]
+    assert [v.item() for v in meta[SPEECH_FLUSH_KEY]] == [False, False]
+    assert [v.item() for v in meta[TEXT_WITHOUT_AUDIO_KEY]] == [False, True]
     assert [d.flatten().tolist() for d in output.multimodal_outputs["codes"]["audio"]] == [[3, 5], [4, 6]]
 
 
