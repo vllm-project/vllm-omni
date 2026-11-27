@@ -422,6 +422,13 @@ L3 level testing executes after code is merged into the main branch. Its core pu
     - **Diffusion** (`assert_*_diffusion_response`): image/video dimension and frame-count parity with request parameters where configured.
     - **Accuracy suites**: pixel/video similarity and metric baselines under `/tests/e2e/accuracy/` (separate from inline helper assertions).
 
+The PCM HNR helper normalizes correlation by the energies of the overlapping
+sample segments at each lag. This avoids penalizing lower-pitched voices merely
+because fewer samples overlap at their fundamental period. Its calibration tests
+cover known harmonic/noise power ratios across pitches and sample rates, plus
+silence, noise-dominant and shuffled signals. HNR is a periodicity check; it does
+not replace transcript validation or a perceptual audio-quality evaluation.
+
 #### 2.3 Test Directory and Execution Files
 
 - ***Functional / model E2E***:

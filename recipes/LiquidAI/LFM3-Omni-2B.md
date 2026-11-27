@@ -34,11 +34,11 @@ From the repository root, in an installed vLLM-Omni Ascend environment:
 vllm serve LiquidAI/LFM3-Omni-2B --omni --trust-remote-code \
   --revision 21d75123f86c1f7ffb4bef1ea202710c4e7ebe67 \
   --deploy-config vllm_omni/deploy/lfm3_omni.yaml --async-chunk \
-  --hf-overrides '{"lfm3_depth_graph":true,"lfm3_vectorized_greedy":true}' \
+  --stage-overrides '{"0":{"hf_overrides":{"lfm3_depth_graph":true,"lfm3_vectorized_greedy":true}}}' \
   --port 8091
 ```
 
-On CUDA, use the same command without `--hf-overrides`.
+On CUDA, omit the `--stage-overrides` argument.
 `lfm3_depth_graph` captures NPU graphs only. On the RTX 4090,
 `lfm3_vectorized_greedy` measured within run-to-run noise; see the measured CUDA
 performance below.

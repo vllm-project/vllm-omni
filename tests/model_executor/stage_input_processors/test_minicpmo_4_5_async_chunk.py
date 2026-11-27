@@ -74,6 +74,89 @@ def _codes(payload) -> list[int]:
     return payload.codes.audio.tolist()
 
 
+def test_venus_delegate_flush_drains_pending_codes_without_closing_dialogue():
+    manager = _manager()
+    request = _request("delegate")
+    request.sampling_params = SimpleNamespace(stop_token_ids=[1])
+    request.sampled_token_ids = [1]
+    # A short previous unit is still held for the vocoder's minimum body size.
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(11, 12), request)
+    assert first.meta.codec_chunk_frames == 0
+    tail = _duplex_delta(13, 14)
+    tail["meta"]["speech_flush"] = torch.tensor(True)
+    flushed = tts2code2wav_async_chunk(manager, tail, request)
+    assert _codes(flushed) == [4218, 4218, 4218, 11, 12, 13, 14]
+    assert flushed.meta.last_chunk is True
+    assert flushed.meta.turn_end is False
+    assert flushed.meta.finished.item() is False
+    # A real turn EOS still propagates after the speech-only flush.
+    terminal = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request)
+    assert terminal.meta.turn_end is True
+    assert terminal.meta.cache_epoch == 1
+    assert terminal.meta.code_flat_numel == 0
+
+
+def test_venus_zero_frame_speech_flush_reaches_generation_receiver():
+    from vllm.sampling_params import SamplingParams
+
+    from tests.worker.test_omni_connector_mixin import MixinHost, MockConnector, _make_model_config, _make_request
+    from vllm_omni.data_entry_keys import to_dict
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    manager = _manager()
+    state = _NativeRequestState(
+        request_id="delegate",
+        external_req_id="delegate",
+        prompt_token_ids=[0],
+        resumable=True,
+        sampling_params=SamplingParams(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    request = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
+    # Both the audible unit and its speech-only flush may stop at codec EOS
+    # without emitting a frame. The resumable request is still alive.
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(text="Let me check."), request)
+    assert first.meta.code_flat_numel == 0
+    muted = _duplex_delta(text="<delegate>lookup</delegate>")
+    muted["meta"].update(speech_flush=torch.tensor(True), text_without_audio=torch.tensor(True))
+    payload = tts2code2wav_async_chunk(manager, muted, request)
+    assert payload.meta.last_chunk is True
+    assert payload.meta.finished.item() is False
+    assert payload.meta.code_flat_numel == 0
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=True, worker_type="generation"))
+    host._stage_id = 2
+    connector = MockConnector()
+    host._omni_connector = connector
+    host.register_chunk_recv(_make_request("delegate"))
+    try:
+        connector.put("1", "2", "delegate_1_0", to_dict(payload))
+        assert host._poll_single_request("delegate")
+        received = host.get_local_stage_payload("delegate")
+        assert received["codes"]["audio"].tolist() == [0]
+        assert received["meta"]["code_flat_numel"] == 0
+        assert received["meta"]["codec_chunk_frames"] == 0
+        assert b"<delegate>lookup</delegate>" in bytes(received["meta"]["llm_output_text_utf8"].tolist())
+        assert "delegate" in host._finished_load_reqs
+        assert "delegate" not in host._chunk_stream_completed
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_venus_muted_text_is_delivered_without_waiting_for_or_replaying_in_speech():
+    manager = _manager()
+    request = _request("delegate")
+    muted = _duplex_delta(text="secret")
+    muted["meta"]["text_without_audio"] = torch.tensor(True)
+    first = tts2code2wav_async_chunk(manager, muted, request, True)
+    assert first.meta.code_flat_numel == 0
+    assert first.meta.text_without_audio is True
+    assert bytes(first.meta.llm_output_text_utf8.tolist()) == b"secret"
+    spoken = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="spoken"), request)
+    assert bytes(spoken.meta.llm_output_text_utf8.tolist()) == b"spoken"
+    assert spoken.meta.text_without_audio is False
+
+
 def test_empty_full_payload_releases_consumer_wait_gate() -> None:
     payload = tts2code2wav_full_payload(_manager(), None, _request("req"))
 
@@ -470,6 +553,35 @@ def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
         second.meta.llm_output_text_utf8,
         torch.tensor(list(b"firstfirst"), dtype=torch.uint8),
     )
+
+
+@pytest.mark.parametrize("unit_frames", [1, 4, 5, 24, 25, 26, 29, 30, 50, 54])
+def test_duplex_unit_flag_leaves_at_most_a_short_tail_and_the_turn_end_flushes_it(unit_frames: int) -> None:
+    """The bound input-clocked sessions document for MiniCPM-o (realtime_duplex_api.md, model note).
+
+    When a non-final speaking unit's chunk flagged ``tts_is_last_chunk`` goes
+    out, fewer than 5 of the unit's codec frames may still be held (they go
+    out with the next unit's first chunk, as in real time); the chunk that
+    ends the turn sends every frame left.
+    """
+    manager = _manager()
+    request = _request("req-duplex")
+    sent = 0
+    for start in range(0, unit_frames, 25):
+        payload = tts2code2wav_async_chunk(
+            manager, _duplex_delta(*range(start, min(start + 25, unit_frames))), request, False
+        )
+        if payload is not None:
+            assert payload.meta.tts_is_last_chunk is False
+            sent += payload.meta.codec_chunk_frames
+    flagged = tts2code2wav_async_chunk(manager, _duplex_delta(), request, True)
+    assert flagged is not None and flagged.meta.tts_is_last_chunk is True and flagged.meta.last_chunk is False
+    sent += flagged.meta.codec_chunk_frames
+    assert 0 <= unit_frames - sent < 5
+
+    turn_end = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert turn_end is not None and turn_end.meta.last_chunk is True
+    assert sent + turn_end.meta.codec_chunk_frames == unit_frames
 
 
 def test_duplex_empty_finish_callback_does_not_replay_previous_text() -> None:

@@ -62,6 +62,7 @@ class BatchedStreamingVAEDecoder:
         max_streams: int,
         kv_block_size: int = 64,
         ring_blocks: int = 4,
+        packed_graph_tokens: tuple[int, ...] = PACKED_GRAPH_TOKENS,
     ):
         self.decoder = decoder
         qwen = decoder.decoder
@@ -70,6 +71,9 @@ class BatchedStreamingVAEDecoder:
             raise ValueError("Batched Ming3 VAE decode expects a sliding-window decoder")
         if any(layer_type != "sliding_attention" for layer_type in getattr(config, "layer_types", [])):
             raise ValueError("Batched Ming3 VAE decode expects sliding attention in every layer")
+        self._packed_graph_tokens = tuple(sorted(set(packed_graph_tokens)))
+        if not self._packed_graph_tokens or self._packed_graph_tokens[0] <= 0:
+            raise ValueError("packed_graph_tokens must contain positive token counts")
         self.layers = qwen.layers
         self.norm = qwen.norm
         self.rotary = qwen.rotary_emb
@@ -107,7 +111,7 @@ class BatchedStreamingVAEDecoder:
             first = torch.arange(max_streams, device=parameter.device)[:, None] * ring_blocks
             block_table = (first + logical[None, :] % ring_blocks).to(torch.int32)
             self._paged = (keys, values, block_table)
-            self._token_stager = DeviceStager(torch.long, capacity=2 * PACKED_GRAPH_TOKENS[-1])
+            self._token_stager = DeviceStager(torch.long, capacity=2 * self._packed_graph_tokens[-1])
             self._row_stager = DeviceStager(torch.int32, capacity=2 * max_streams + 1)
             self._packed_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
             self._packed_static: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
@@ -126,13 +130,17 @@ class BatchedStreamingVAEDecoder:
         self,
         batch_sizes: tuple[int, ...] = GRAPH_BATCH_SIZES,
         lengths: tuple[int, ...] = GRAPH_LENGTHS,
+        packed_tokens: tuple[int, ...] | None = None,
     ) -> None:
         """Capture the layer stack for each (batch, length) bucket; other shapes run eagerly."""
         parameter = next(self.decoder.parameters())
         if parameter.device.type != "cuda":
             return
         if self._packed is not None:
-            self._capture_packed_graphs()
+            tokens = self._packed_graph_tokens if packed_tokens is None else tuple(sorted(set(packed_tokens)))
+            if not tokens or tokens[0] <= 0:
+                raise ValueError("packed_tokens must contain positive token counts")
+            self._capture_packed_graphs(tokens)
             return
         batch_sizes = tuple(sorted({size for size in batch_sizes if size <= self._scratch_slot}))
         lengths = tuple(sorted(set(lengths)))
@@ -282,23 +290,40 @@ class BatchedStreamingVAEDecoder:
             self._free.append(state.slot)
 
     @torch.inference_mode()
-    def decode(self, items: list[tuple[str, torch.Tensor, bool]]) -> list[torch.Tensor]:
-        """Decode ``(request_id, latents [Patches, PatchSize, Dim], finished)``; return flat waveforms."""
+    def decode(self, items: list[tuple[str, torch.Tensor | None, bool]]) -> list[torch.Tensor]:
+        """Decode ``(request_id, latents [Patches, PatchSize, Dim] | None, finished)``; return flat waveforms."""
         decoder = self.decoder
+        empty = next(decoder.parameters()).new_zeros((0,), dtype=torch.float32)
         rows: list[tuple[int, _StreamState, torch.Tensor]] = []
-        waveforms: list[torch.Tensor | None] = [None] * len(items)
-        # One projection for every row's latents.
-        flat = [latent.reshape(-1, latent.shape[-1]) for _, latent, _ in items]
-        projected = decoder.fc1(torch.cat(flat)).split([rows.shape[0] for rows in flat])
-        for index, ((request_id, latent, finished), hidden) in enumerate(zip(items, projected, strict=True)):
+        waveforms: list[torch.Tensor] = [empty] * len(items)
+        # One projection for every non-empty row's latents.
+        non_empty = [(i, lat.reshape(-1, lat.shape[-1])) for i, (_, lat, _) in enumerate(items) if lat is not None]
+        projected = (
+            dict(
+                zip(
+                    (i for i, _ in non_empty),
+                    decoder.fc1(torch.cat([flat for _, flat in non_empty])).split([f.shape[0] for _, f in non_empty]),
+                    strict=True,
+                )
+            )
+            if non_empty
+            else {}
+        )
+        for index, (request_id, _, finished) in enumerate(items):
+            hidden_in = projected.get(index)
             state = self._streams.get(request_id)
-            if state is None:
-                state = _StreamState(slot=self._free.pop())
-                self._streams[request_id] = state
-            hidden, state.upsample = decoder.upsampling(hidden.unsqueeze(0), state=state.upsample, is_last=finished)
-            if hidden is None or hidden.shape[1] == 0:
-                waveforms[index] = latent.new_zeros((0,), dtype=torch.float32)
+            if hidden_in is None:
+                if not finished or state is None or state.upsample is None:
+                    continue
+                hidden, state.upsample = decoder.upsampling(None, state=state.upsample, is_last=True)
             else:
+                if state is None:
+                    state = _StreamState(slot=self._free.pop())
+                    self._streams[request_id] = state
+                hidden, state.upsample = decoder.upsampling(
+                    hidden_in.unsqueeze(0), state=state.upsample, is_last=finished
+                )
+            if hidden is not None and hidden.shape[1] > 0:
                 rows.append((index, state, hidden[0]))
 
         if rows:

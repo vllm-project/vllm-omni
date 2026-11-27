@@ -130,20 +130,47 @@ def _speaker_embedding(
         return encoder(mels.to(device=device, dtype=torch.bfloat16))[0].float().cpu().contiguous()
 
 
+def _load_speech_tokenizer_encoder(tok: Any, tokenizer_dir: Path, device: torch.device) -> None:
+    """Load the codec encoder weights through vLLM-Omni's checkpoint mapper.
+
+    ``Qwen3TTSTokenizer.from_pretrained`` loads with the Transformers loader. With
+    a Transformers release whose Mimi encoder nests SEANet, the transformer and
+    the downsampler under ``encoder.*``, the flat checkpoint keys no longer match
+    the module and those tensors stay randomly initialized, which yields unusable
+    reference codes. The serving path loads the same encoder with
+    ``Qwen3TTSTokenizerV2Encoder.load_weights``, which maps the flat keys.
+    """
+    weights: dict[str, torch.Tensor] = {}
+    for shard in sorted(tokenizer_dir.glob("*.safetensors")):
+        with safe_open(str(shard), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.startswith("encoder."):
+                    weights[key.removeprefix("encoder.")] = f.get_tensor(key)
+    if not weights:
+        raise RuntimeError(f"No encoder.* tensors found under {tokenizer_dir}")
+    encoder = tok.model.encoder
+    loaded = encoder.load_weights(weights.items())
+    missing = set(encoder.state_dict()) - set(loaded)
+    if missing:
+        raise RuntimeError(
+            f"Speech tokenizer encoder is missing {len(missing)} tensors after loading "
+            f"{tokenizer_dir}, for example {sorted(missing)[:3]}"
+        )
+    encoder.to(device=device, dtype=torch.bfloat16)
+
+
 def _ref_code(model_dir: str, wav: np.ndarray, sr: int, device: torch.device) -> torch.Tensor:
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
+    tokenizer_dir = Path(model_dir) / "speech_tokenizer"
     tok = Qwen3TTSTokenizer.from_pretrained(
-        str(Path(model_dir) / "speech_tokenizer"),
+        str(tokenizer_dir),
         torch_dtype=torch.bfloat16,
     )
-    try:
-        del tok.model.decoder
-        tok.model.decoder = None
-        tok.model.encoder.to(device)
-        tok.device = device
-    except Exception:
-        tok.device = device
+    del tok.model.decoder
+    tok.model.decoder = None
+    _load_speech_tokenizer_encoder(tok, tokenizer_dir, device)
+    tok.device = device
     with torch.inference_mode():
         enc = tok.encode(wav, sr=int(sr), return_dict=True)
     codes = getattr(enc, "audio_codes", None)

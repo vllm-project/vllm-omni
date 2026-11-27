@@ -1,0 +1,362 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Batched single-query graph replay for the MiniCPM-o Talker."""
+
+from contextlib import contextmanager
+from copy import copy
+
+import torch
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
+from vllm.logger import init_logger
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+from vllm_omni.platforms.npu.attention import static_shape_decode
+from vllm_omni.platforms.npu.attention.static_shape_backend import OmniStaticShapeAttentionBackendImpl
+from vllm_omni.platforms.npu.worker.talker_context import (
+    SHORT_CONTEXT,
+    hybrid_enabled,
+    scheduled_length,
+)
+
+logger = init_logger(__name__)
+
+
+class CompactGraph:
+    def __init__(
+        self,
+        runner,
+        model,
+        first,
+        metadata,
+        embeds,
+        positions,
+        rows,
+        capacity,
+        wide_rows,
+    ):
+        self.embed = torch.empty_like(embeds[:rows])
+        self.positions = torch.empty_like(positions[:rows])
+        self.slots = torch.empty_like(first.slot_mapping[:rows])
+        self.lengths = first.seq_lens_device.new_empty((rows,))
+        self.first_length = torch.empty_like(self.lengths)
+        self.blocks = first.block_tables.new_empty((rows, capacity // runner.vllm_config.cache_config.block_size))
+        heads = model._tts_config.num_attention_heads
+        self.bias = torch.empty((rows, heads, 1, capacity), dtype=embeds.dtype, device=embeds.device)
+        self.lse = torch.empty(1, dtype=embeds.dtype, device=embeds.device)
+        static = copy(first)
+        static.attn_state = AscendAttentionState.DecodeOnly
+        static.num_actual_tokens = static.num_decode_tokens = static.num_decodes = rows
+        static.num_prefills = 0
+        static.slot_mapping, static.block_tables = self.slots, self.blocks
+        static.seq_lens_device = self.lengths
+        static.actual_seq_lengths_q = list(range(1, rows + 1))
+        static.talker_fused_frame = self.bias, self.lse, capacity
+        self.metadata = dict.fromkeys(metadata, static)
+        self.kv = []
+        registered = runner.vllm_config.compilation_config.static_forward_context
+        for name in metadata:
+            impl = getattr(registered.get(name), "impl", None)
+            if not isinstance(impl, OmniStaticShapeAttentionBackendImpl) or impl.use_bnsd_kv_cache:
+                raise ValueError("The narrow path needs static paged TND attention")
+            for cache in (impl.key_cache, impl.value_cache):
+                if cache is None or cache.ndim != 4 or not cache.is_contiguous():
+                    raise ValueError("The narrow path needs the layer's actual contiguous paged KV")
+                self.kv.append(cache.flatten(0, 1))
+        self.runner = runner
+        self.model = model
+        self.rows = rows
+        self.capacity = capacity
+        self.desc = BatchDescriptor(num_tokens=rows)
+        self.graph = None
+        self.down_projections: tuple[torch.nn.Module, ...] = ()
+        if rows > 4:
+            if runner.vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise ValueError("Talker hybrid replay needs TP=1")
+            down = tuple(layer.mlp.down_proj for layer in model.tts_model.layers)
+            widths = {layer.input_size_per_partition for layer in down}
+            if len(widths) != 1 or any(layer.bias is not None for layer in down):
+                raise ValueError("Talker hybrid replay needs a uniform, bias-free MLP")
+            self.down_projections = down
+            self.down_input = embeds.new_zeros((wide_rows, widths.pop()))
+
+    @contextmanager
+    def _original_down_shapes(self):
+        # The Ascend BF16 down-projection changes numerical results at some
+        # M shapes. Keep its original row count and locations while compiling
+        # this graph; attention and the other MLP/GEMM operators stay narrow.
+        replaced = []
+        try:
+            for projection in self.down_projections:
+                old = projection.forward
+                had_local = "forward" in projection.__dict__
+                replaced.append((projection, old, had_local))
+
+                def project(x, call=old):
+                    live = slice(0, self.rows * 16, 16)
+                    self.down_input[live].copy_(x)
+                    result, bias = call(self.down_input)
+                    return result[live].contiguous(), bias
+
+                projection.forward = project
+            yield
+        finally:
+            for projection, old, had_local in replaced:
+                if had_local:
+                    projection.forward = old
+                else:
+                    del projection.forward
+
+    def prepare_step(self, first, width, active_rows):
+        torch.sub(first.seq_lens_device.reshape(-1)[:active_rows], width - 1, out=self.first_length[:active_rows])
+        self.blocks[:active_rows].copy_(first.block_tables[:active_rows, : self.blocks.shape[1]])
+        if active_rows < self.rows:
+            # FIA still needs valid pages for every row in the captured batch.
+            self.blocks[active_rows:].copy_(self.blocks[:1])
+
+    def bind(self, first, embeds, positions, width, frame, active_rows):
+        end = active_rows * width
+        self.embed[:active_rows].copy_(embeds[frame:end:width])
+        self.positions[:active_rows].copy_(positions[frame:end:width])
+        self.slots[:active_rows].copy_(first.slot_mapping[frame:end:width])
+        torch.add(self.first_length[:active_rows], frame, out=self.lengths[:active_rows])
+        if active_rows < self.rows:
+            self.embed[active_rows:].zero_()
+            self.positions[active_rows:].zero_()
+            self.slots[active_rows:].fill_(-1)
+            self.lengths[active_rows:].fill_(1)
+
+    def forward(self):
+        static_shape_decode.emit_mask_refresh(self.bias, self.lengths, self.bias.shape[1], self.capacity)
+        with (
+            self._original_down_shapes(),
+            self.runner._forward_context(
+                self.metadata,
+                self.runner.vllm_config,
+                num_tokens=self.rows,
+                num_actual_tokens=self.rows,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=self.desc,
+                skip_compiled=True,
+            ),
+        ):
+            return self.model.tts_model(
+                input_ids=None,
+                positions=self.positions,
+                intermediate_tensors=None,
+                inputs_embeds=self.embed,
+            )
+
+    def replay(self):
+        if self.graph is None:
+            current = torch.npu.current_stream()
+            warmup = self.runner._talker_compact_warmup
+            warmup.wait_stream(current)
+            try:
+                with torch.npu.stream(warmup):
+                    template = self.forward()
+            finally:
+                current.wait_stream(warmup)
+            # Keep frame outputs outside the capture pool: variant graphs use
+            # common scratch and replay serially on the Talker runner.
+            self.output = torch.empty_like(template)
+            self.graph = torch.npu.NPUGraph()
+            with torch.npu.graph(
+                self.graph,
+                pool=self.runner._talker_compact_shared_capture_pool,
+                stream=self.runner._talker_compact_capture_stream,
+            ):
+                self.output.copy_(self.forward())
+        self.graph.replay()
+        return self.output
+
+
+def _compare_padded_frame(actual, reference, kv, expected_kv, slots):
+    hidden_ok = (
+        actual.eq(reference).all() if actual.shape == reference.shape else reference.new_zeros((), dtype=torch.bool)
+    )
+    if not expected_kv:
+        return bool(hidden_ok.item()), True
+
+    actual_values = torch.stack([cache.index_select(0, slots) for cache in kv])
+    expected_values = torch.stack(expected_kv)
+    kv_ok = actual_values.eq(expected_values).all()
+    # Transfer both results together so the shadow frame only waits once.
+    hidden_ok, kv_ok = torch.stack((hidden_ok, kv_ok)).tolist()
+    return hidden_ok, kv_ok
+
+
+def prepare(runner, talker, model_inputs, input_batch, width):
+    rows = input_batch.num_reqs
+    if width != 16 or input_batch.has_prefill or not 2 <= rows <= 16:
+        return None
+    if model_inputs.get("intermediate_tensors") is not None:
+        return None
+    padded = 8 < rows < 16
+    spans = runner.model_state._request_token_spans(input_batch)
+    if spans != [(i * width, (i + 1) * width) for i in range(rows)]:
+        return None
+    infos = model_inputs.get("model_intermediate_buffer") or []
+    if len(infos) != rows or any(not isinstance(item, dict) or item.get("native_duplex") for item in infos):
+        return None
+    metadata = runner.model_state.attn_metadata
+    if not isinstance(metadata, dict) or not metadata:
+        return None
+    first = next(iter(metadata.values()))
+    if not all(
+        getattr(x, "seq_lens_device", None) is not None
+        and x.seq_lens_device is first.seq_lens_device
+        and x.block_tables is first.block_tables
+        and x.slot_mapping is first.slot_mapping
+        for x in metadata.values()
+    ):
+        return None
+
+    full_capacity = SHORT_CONTEXT
+    model_len = runner.model_config.max_model_len
+    hybrid = hybrid_enabled(runner)
+    if model_len != full_capacity and not hybrid:
+        return None
+    length = scheduled_length(input_batch, rows, width)
+    if hybrid and (length is None or length > full_capacity):
+        return None
+    block = runner.vllm_config.cache_config.block_size
+    embeds, positions = model_inputs.get("inputs_embeds"), model_inputs.get("positions")
+    if (
+        block != 128
+        or embeds is None
+        or embeds.dtype != torch.bfloat16
+        or embeds.shape[0] < rows * width
+        or positions is None
+        or positions.ndim != 1
+        or positions.shape[0] < rows * width
+        or first.slot_mapping.ndim != 1
+        or first.slot_mapping.numel() < rows * width
+        or first.block_tables.shape[0] < rows
+        or first.block_tables.shape[1] < full_capacity // block
+        or first.seq_lens_device.numel() < rows
+    ):
+        return None
+    wide_rows = embeds.shape[0]
+    if rows == 16 and wide_rows != rows * width:
+        return None
+    graph_rows = 16 if padded else rows
+    graph_wide_rows = graph_rows * width if padded else wide_rows
+    if wide_rows > graph_wide_rows:
+        return None
+    if not hasattr(runner, "_talker_compact_graphs"):
+        runner._talker_compact_graphs = {}
+        runner._talker_compact_ready = set()
+        runner._talker_compact_rejected = set()
+        runner._talker_compact_warmup = torch.npu.Stream()
+        runner._talker_compact_capture_stream = torch.npu.Stream()
+        runner._talker_compact_shared_capture_pool = torch.npu.graph_pool_handle()
+    graphs = runner._talker_compact_graphs
+    ready = runner._talker_compact_ready
+    rejected = runner._talker_compact_rejected
+    # The host length includes all slots reserved by this K-step.
+    preferred = full_capacity
+    # Keep one 16-row capture. A longer sequence takes the existing full-context path.
+    if graph_rows == 16:
+        extra = getattr(runner.vllm_config, "additional_config", None)
+        short_capacity = full_capacity
+        if isinstance(extra, dict):
+            short_capacity = extra.get("minicpmo_talker_wide_graph_capacity", full_capacity)
+        if not isinstance(short_capacity, int) or short_capacity not in (256, full_capacity):
+            raise ValueError("minicpmo_talker_wide_graph_capacity must be 256 or 512")
+        if short_capacity != full_capacity:
+            if length is None or length > short_capacity:
+                return None
+            preferred = full_capacity = short_capacity
+    elif length is not None:
+        preferred = static_shape_decode.select_bucket(length, (128, 256, full_capacity))
+    candidate_capacities = (preferred, full_capacity) if preferred != full_capacity else (full_capacity,)
+    for capacity in candidate_capacities:
+        graph_key = (graph_rows, graph_wide_rows, capacity)
+        qualification = (*graph_key, rows, wide_rows) if padded else graph_key
+        if qualification not in rejected:
+            break
+    else:
+        return None
+    compact = graphs.get(graph_key)
+    if compact is None:
+        try:
+            compact = graphs[graph_key] = CompactGraph(
+                runner,
+                talker,
+                first,
+                metadata,
+                embeds,
+                positions,
+                graph_rows,
+                capacity,
+                graph_wide_rows,
+            )
+        except ValueError:
+            rejected.add(qualification)
+            logger.exception("[talker-compact-decode] unsupported geometry rows=%d", rows)
+            return None
+    if tuple(compact.metadata) != tuple(metadata):
+        return None
+    # Keep the complete first K-step on the reference path while comparing
+    # every frame; only subsequent steps may use the qualified graph.
+    shadow = qualification not in ready
+
+    def frame_forward(frame, wide_forward):
+        if frame == 0 and qualification not in rejected:
+            compact.prepare_step(first, width, rows)
+        if not shadow and qualification not in rejected:
+            try:
+                compact.bind(first, embeds, positions, width, frame, rows)
+                logger.info_once(
+                    "[talker-compact-decode] active replay rows=%d capacity=%d",
+                    rows,
+                    capacity,
+                )
+                output = compact.replay()[:rows]
+                return output
+            except (RuntimeError, TypeError, ValueError):
+                rejected.add(qualification)
+                logger.exception("[talker-compact-decode] replay failed rows=%d", rows)
+        reference = wide_forward()[frame : rows * width : width].clone()
+        if qualification in rejected or not shadow:
+            return reference
+        compact.bind(first, embeds, positions, width, frame, rows)
+        slots = compact.slots[:rows].long()
+        expected_kv = [cache.index_select(0, slots) for cache in compact.kv]
+        try:
+            actual = compact.replay()[:rows]
+            if padded:
+                hidden_ok, kv_ok = _compare_padded_frame(actual, reference, compact.kv, expected_kv, slots)
+            else:
+                hidden_ok = torch.equal(actual, reference)
+                kv_ok = all(
+                    torch.equal(old, cache.index_select(0, slots))
+                    for old, cache in zip(expected_kv, compact.kv, strict=True)
+                )
+        except (RuntimeError, TypeError, ValueError):
+            logger.exception("[talker-compact-decode] shadow capture failed rows=%d", rows)
+            hidden_ok = kv_ok = False
+        if not (hidden_ok and kv_ok):
+            ready.discard(qualification)
+            rejected.add(qualification)
+            for cache, old in zip(compact.kv, expected_kv, strict=True):
+                cache.index_copy_(0, slots, old)
+            logger.warning(
+                "[talker-compact-decode] shadow mismatch rows=%d capacity=%d frame=%d hidden=%s kv=%s",
+                rows,
+                capacity,
+                frame,
+                hidden_ok,
+                kv_ok,
+            )
+        elif frame == width - 1 and qualification not in ready:
+            ready.add(qualification)
+            logger.info(
+                "[talker-compact-decode] shadow exact all frames rows=%d capacity=%d",
+                rows,
+                capacity,
+            )
+        return reference
+
+    return frame_forward
