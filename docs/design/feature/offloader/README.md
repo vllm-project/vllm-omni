@@ -1,13 +1,14 @@
 # CPU Offloading
 
 This document defines the shared architecture for diffusion CPU offloading.
-The three strategies have separate user and design pages:
+The offload strategies have separate user and design pages:
 
 | Strategy | User guide | Design contract |
 | --- | --- | --- |
 | Model-level | [Guide](../../../user_guide/diffusion/offloader/module_offload.md) | [Design](module_offload.md) |
 | Layerwise | [Guide](../../../user_guide/diffusion/offloader/layerwise_offload.md) | [Design](layerwise_offload.md) |
 | Distributed layerwise | [Guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md) | [Design](distributed_layerwise_offload.md) |
+| Submodule (MiniMax-H3 only) | [Guide](../../../user_guide/diffusion/offloader/submodule_offload.md) | Reuses the [DLO design](distributed_layerwise_offload.md) |
 
 ## Strategy selection
 
