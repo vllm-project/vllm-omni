@@ -369,6 +369,20 @@ def test_build_request_forwards_seed_to_sampling_params():
     assert isinstance(unseeded.sampling_params.seed, int)
 
 
+def test_openpi_session_rng_preserves_omission_and_explicit_zero():
+    engine = _engine_with_policy_config()
+    engine.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(seed=17, extra_args={"openpi_session_rng": True})
+    ]
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    omitted = serving._build_request({}, session_id="s", reset=False).sampling_params
+    assert omitted.extra_args["openpi_session_seed"] == 17
+    for obs in ({"seed": 0}, {"sampling_params": {"seed": 0}}, {"seed": 0, "sampling_params": {"seed": 7}}):
+        explicit = serving._build_request(obs, session_id="s", reset=False).sampling_params
+        assert explicit.seed == 0
+        assert "openpi_session_seed" not in explicit.extra_args
+
+
 # Per-request inference parameters live in their own namespace so robot feature
 # names stay open-ended. Unknown keys inside it are ignored rather than rejected.
 def test_build_request_forwards_num_inference_steps():
@@ -518,6 +532,20 @@ def test_infer_extracts_actions_from_generic_multimodal_output():
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
     assert engine_client.generate_kwargs["prompt"] == "pick up"
     assert engine_client.generate_kwargs["request_id"] == "robot-session-a-0"
+
+
+def test_native_reply_is_opt_in_and_preserves_array_dtypes():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+    payload = {"actions": np.array([[0.25]], dtype=np.float64)}
+    result = SimpleNamespace(multimodal_output=payload)
+    # Existing policies can continue to return ordinary action arrays.
+    assert serving._extract_actions(result, return_native_outputs=True).dtype == np.float32
+    native = {"action": payload["actions"], "decoded_valid": np.array([[True]])}
+    result.multimodal_output = {**payload, "native_outputs": native}
+    assert serving._extract_actions(result).dtype == np.float32
+    reply = serving._extract_actions(result, return_native_outputs=True)
+    assert reply["action"].dtype == np.float64
+    assert reply["decoded_valid"].dtype == np.bool_
 
 
 def test_infer_preserves_dict_actions_from_multimodal_output():

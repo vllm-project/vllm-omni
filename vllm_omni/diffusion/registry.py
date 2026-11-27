@@ -279,6 +279,11 @@ _DIFFUSION_MODELS = {
         "pipeline_pi05",
         "Pi05Pipeline",
     ),
+    "Motubrain2Pipeline": (
+        "motubrain2",
+        "pipeline_motubrain2",
+        "Motubrain2Pipeline",
+    ),
     # SAM3 image checkpoints report ``Sam3Model``; the released combined
     # image/video checkpoint reports ``Sam3VideoModel``. Both carry the detector.
     "Sam3Model": (
@@ -564,6 +569,7 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    "Motubrain2Pipeline",
     # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
     # transferred KV prefix, with no DiT block list.
     "Alpamayo2SuperPipeline",

@@ -133,6 +133,9 @@ EXCLUDED_MODELS = [
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # Robot action arrays use an OpenPI observation and an external policy
+    # runtime. Dedicated tiny action parity and OpenPI serving tests cover it.
+    "Motubrain2Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
