@@ -4806,7 +4806,13 @@ def test_minicpmo_daily_omni_uses_deterministic_half_sample() -> None:
         for target in statement.targets
         if isinstance(target, ast.Name)
     }
-    assert ast.literal_eval(assignments["_DAILY_OMNI_NUM_PROMPTS"]) == 599
+    num_prompts = ast.literal_eval(assignments["_DAILY_OMNI_NUM_PROMPTS"])
+    accuracy_floor = ast.literal_eval(assignments["_MIN_DAILY_OMNI_ACCURACY"])
+    assert num_prompts == 599
+    assert accuracy_floor == 0.75
+    assert 455 / num_prompts >= accuracy_floor
+    assert 450 / num_prompts >= accuracy_floor
+    assert 449 / num_prompts < accuracy_floor
 
     test_function = next(
         statement
