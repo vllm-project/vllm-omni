@@ -3945,9 +3945,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 9,
             "artifact_name": "rocm-voxcpm2-tts-weekly",
             "dependency": "tts_voxcpm2_weekly",
-            "env": {
-                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
-            },
+            "env": {},
             "files": (
                 "tests/e2e/offline_inference/test_voxcpm2_tts.py",
                 "tests/e2e/online_serving/test_voxcpm2_tts.py",
@@ -3961,9 +3959,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 10,
             "artifact_name": "rocm-voxtral-tts-weekly",
             "dependency": "tts_voxtral_weekly",
-            "env": {
-                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
-            },
+            "env": {},
             "files": (
                 "tests/e2e/offline_inference/test_voxtral_tts_expansion.py",
                 "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
@@ -5686,7 +5682,6 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
         "tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py",
         "tests/assets/minicpmo_4_5/",
         "vllm_omni/deploy/qwen3_omni_duplex.yaml",
-        "vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml",
         "vllm_omni/engine/duplex/",
         "vllm_omni/model_executor/models/qwen3_omni/",
     } <= qwen_paths

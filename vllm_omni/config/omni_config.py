@@ -42,6 +42,7 @@ from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
     _STAGE_OVERRIDE_PATTERN,
+    _STAGE_RUNNER_FIELDS,
     NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     SERVE_CLI_SCOPE_KEY,
@@ -60,13 +61,13 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
-    merge_sampling_constraints,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
     resolve_stage_async_chunk,
-    resolve_stage_model_runner,
+    resolve_stage_runner_args,
+    resolve_stage_sampling_defaults,
     update_deploy_config_async_chunk_enabled,
-    validate_native_mrv2_session,
+    validate_stage_runner_overrides,
 )
 from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -212,8 +213,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     media_io_kwargs: dict[str, Any]
     final_output: bool
     active_stream_window: int
-    use_v2_model_runner: bool
-    supports_native_mrv2_data_plane: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
@@ -1006,7 +1005,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                         f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
                         f"({self.world_size}), but got {self.data_parallel_size}"
                     )
-                self.data_parallel_size = self.world_size
+                self.data_parallel_size: int = self.world_size
         else:
             if self.hsdp_data_parallel:
                 raise ValueError("hsdp_data_parallel requires use_hsdp=True")
@@ -1670,6 +1669,7 @@ _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
     {
         # Serialized shared model settings are consumed outside the terminal
         # diffusion config; accepting them here does not widen raw ingress.
+        *_STAGE_RUNNER_FIELDS,
         "duplex_max_sessions",
         "has_sampling_extra_args",
         "inline_diffusion",
@@ -1881,6 +1881,7 @@ def _stage_engine_values(
                 engine[key] = _get_recursively_merged_dict(existing, dict(value))
             else:
                 engine[key] = _copy_value(value)
+    validate_stage_runner_overrides(topology.stage_id, engine)
     if topology.execution_type == StageExecutionType.DIFFUSION:
         diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine, stage_id=topology.stage_id)
     else:
@@ -1940,17 +1941,6 @@ def _stage_engine_values(
         speculative_config=_copy_value(engine.get("speculative_config")),
         weight_transfer_config=_copy_value(engine.get("weight_transfer_config")),
     )
-
-
-def _stage_sampling_params(
-    stage_deploy: StageDeployConfig | None,
-    topology: StagePipelineConfig,
-) -> dict[str, Any] | None:
-    sampling = merge_sampling_constraints(
-        _copy_value(stage_deploy.default_sampling_params) if stage_deploy is not None else None,
-        _copy_value(topology.sampling_constraints),
-    )
-    return sampling or None
 
 
 def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -2352,7 +2342,7 @@ def _build_model_config(
     duplex_max_sessions: int,
     model: str | None,
 ) -> OmniStageModelConfig:
-    default_sampling_params = _stage_sampling_params(stage_deploy, topology)
+    default_sampling_params = _copy_value(resolve_stage_sampling_defaults(topology, stage_deploy)) or None
     kwargs = _config_kwargs(engine)
     kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
@@ -2376,16 +2366,7 @@ def _build_model_config(
         kwargs["recompute_preemption"] = topology.recompute_preemption
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
-    stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
-    validate_native_mrv2_session(deploy, topology, stage_runner)
-    kwargs.setdefault(
-        "use_v2_model_runner",
-        stage_runner == "v2" and topology.execution_type is not StageExecutionType.DIFFUSION,
-    )
-    kwargs.setdefault(
-        "supports_native_mrv2_data_plane",
-        topology.supports_native_mrv2_data_plane,
-    )
+    kwargs.update(resolve_stage_runner_args(deploy, topology))
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:
@@ -2659,11 +2640,43 @@ class VllmOmniConfig:
         if cli_async_chunk is not None:
             deploy.async_chunk = bool(cli_async_chunk)
 
+        deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        pipeline_stage_ids = {stage.stage_id for stage in pipeline_cfg.stages}
+        sampling_defaults = cli_overrides.get("default_sampling_params")
+        if isinstance(sampling_defaults, str):
+            sampling_defaults = json.loads(sampling_defaults)
+        for stage_key, overrides in (sampling_defaults or {}).items():
+            try:
+                stage_id = int(stage_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid default_sampling_params stage key {stage_key!r}: expected an integer stage ID"
+                ) from exc
+            if stage_id not in pipeline_stage_ids:
+                logger.warning(
+                    f"Ignoring default_sampling_params for unknown stage ID {stage_id}; "
+                    f"pipeline stages are {sorted(pipeline_stage_ids)}"
+                )
+                continue
+            if stage_id not in deploy_by_id:
+                stage_deploy = StageDeployConfig(stage_id=stage_id)
+                deploy.stages.append(stage_deploy)
+                deploy_by_id[stage_id] = stage_deploy
+            stage_deploy = deploy_by_id[stage_id]
+            defaults = stage_deploy.default_sampling_params or {}
+            merged = {**defaults, **overrides}
+            if "extra_args" in overrides:
+                merged["extra_args"] = {**defaults.get("extra_args", {}), **overrides["extra_args"]}
+            stage_deploy.default_sampling_params = merged
+
         strategy_result = None
         if strategy_specs:
             from vllm_omni.config.composable_parallel import apply_strategy_specs
 
-            strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy))
+            # The deploy already contains platform settings and the higher-priority CLI defaults.
+            strategy_deploy = copy.deepcopy(deploy)
+            strategy_deploy.platforms = None
+            strategy_stages = merge_pipeline_deploy(pipeline_cfg, strategy_deploy)
             # Device counts are checked below, once CLI overrides are applied.
             strategy_result = apply_strategy_specs(strategy_stages, strategy_specs, check_devices=False)
             strategy_overrides: dict[str, Any] = {}
@@ -2715,34 +2728,6 @@ class VllmOmniConfig:
             if strategy_result.omni_lb_policy is not None and cli_overrides.get("omni_lb_policy") is None:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
-        deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
-        pipeline_stage_ids = {stage.stage_id for stage in pipeline_cfg.stages}
-        sampling_defaults = cli_overrides.get("default_sampling_params")
-        if isinstance(sampling_defaults, str):
-            sampling_defaults = json.loads(sampling_defaults)
-        for stage_key, overrides in (sampling_defaults or {}).items():
-            try:
-                stage_id = int(stage_key)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid default_sampling_params stage key {stage_key!r}: expected an integer stage ID"
-                ) from exc
-            if stage_id not in pipeline_stage_ids:
-                logger.warning(
-                    f"Ignoring default_sampling_params for unknown stage ID {stage_id}; "
-                    f"pipeline stages are {sorted(pipeline_stage_ids)}"
-                )
-                continue
-            if stage_id not in deploy_by_id:
-                stage_deploy = StageDeployConfig(stage_id=stage_id)
-                deploy.stages.append(stage_deploy)
-                deploy_by_id[stage_id] = stage_deploy
-            stage_deploy = deploy_by_id[stage_id]
-            defaults = stage_deploy.default_sampling_params or {}
-            merged = {**defaults, **overrides}
-            if "extra_args" in overrides:
-                merged["extra_args"] = {**defaults.get("extra_args", {}), **overrides["extra_args"]}
-            stage_deploy.default_sampling_params = merged
         update_deploy_config_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 

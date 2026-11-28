@@ -55,7 +55,7 @@ def _engine_config():
         mm_encoder_attn_dtype=None,
     )
     return SimpleNamespace(
-        model_config=SimpleNamespace(multimodal_config=mm, max_model_len=256),
+        model_config=SimpleNamespace(multimodal_config=mm, max_model_len=256, use_v2_model_runner=False),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,

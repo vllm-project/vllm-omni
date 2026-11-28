@@ -1727,6 +1727,7 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
+        stage_config=stage_cfg,
         async_chunk=bool(
             getattr(getattr(stage_cfg, "connector_config", None), "async_chunk", None)
             if hasattr(stage_cfg, "connector_config")

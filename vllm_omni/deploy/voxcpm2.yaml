@@ -68,7 +68,6 @@ stages:
 
 platforms:
   cuda:
-    model_runner: v2
     stages:
       - stage_id: 0
         engine_extras:
@@ -80,5 +79,3 @@ platforms:
               enable_exact_patch_batch: false
               # Incremental unified graphs batch VAE internally.
               enable_batched_vae_decode: false
-  npu:
-    model_runner: v2

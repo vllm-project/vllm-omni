@@ -86,7 +86,9 @@ def _config(stage="thinker", *, embeds=False):
     )
     hf = Qwen3OmniMoeConfig(tts_bos_token_id=1, tts_eos_token_id=2, tts_pad_token_id=3)
     cfg = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=hf, multimodal_config=mm, model_stage=stage, max_model_len=32),
+        model_config=SimpleNamespace(
+            hf_config=hf, multimodal_config=mm, model_stage=stage, max_model_len=32, use_v2_model_runner=False
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,

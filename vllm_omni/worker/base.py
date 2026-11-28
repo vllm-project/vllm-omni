@@ -17,7 +17,6 @@ from vllm import envs
 from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
-from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from vllm_omni.diffusion.data import (
@@ -103,6 +102,7 @@ class OmniGPUWorkerBase(GPUWorker):
     """
 
     use_v2_model_runner = True
+    _weight_update_id: str | None
 
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
@@ -143,10 +143,12 @@ class OmniGPUWorkerBase(GPUWorker):
         )
         return auxiliary_graph_memory
 
-    def compile_or_warm_up_model(self) -> CompilationTimes:
-        result = super().compile_or_warm_up_model()
+    def _maybe_activate_jit_monitor(self) -> None:
+        # vLLM reaches this boundary after kernel and sampler warmup, even
+        # when JIT monitoring is disabled. Finish model-owned warmup here so
+        # the subsequent extensible KV measurement sees the serving pools.
         self._capture_auxiliary_graphs()
-        return result
+        super()._maybe_activate_jit_monitor()
 
     def load_model(self, *args, **kwargs):
         weight_transfer = self.vllm_config.weight_transfer_config
@@ -196,7 +198,7 @@ class OmniGPUWorkerBase(GPUWorker):
                 incomplete.discard(is_draft)
             raise
         self._merged_lora_prior_incomplete: bool | None = prior_incomplete
-        self._weight_update_id: str | None = update_id
+        self._weight_update_id = update_id
         engine = getattr(self, "weight_transfer_engine", None)
         if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
             engine._update_id = update_id
@@ -216,7 +218,7 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def _end_weight_update(self, refresh: bool) -> None:
         engine = getattr(self, "weight_transfer_engine", None)
-        if not refresh and getattr(engine, "_skip_next_end_weight_update", False):
+        if not refresh and engine is not None and getattr(engine, "_skip_next_end_weight_update", False):
             engine._skip_next_end_weight_update = False
             return
         super()._end_weight_update(refresh=refresh)

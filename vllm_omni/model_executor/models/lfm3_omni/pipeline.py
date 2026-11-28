@@ -16,6 +16,10 @@ LFM3_OMNI_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="lfm3_temporal",
+            unsupported_runner_reason=(
+                "Model Runner V2 warmup cannot initialize the LFM3 temporal stage's per-request state. "
+                "Speech and text serving are unavailable."
+            ),
             execution_type=StageExecutionType.LLM_AR,
             supports_native_mrv2_data_plane=True,
             input_sources=(),

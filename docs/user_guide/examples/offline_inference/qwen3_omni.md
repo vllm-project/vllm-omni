@@ -7,11 +7,9 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 Use `--deploy-config` for deployment overrides such as stage memory allocation.
 See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/).
 
-For experimental DFlash Thinker decoding, follow the
-[DFlash configuration requirements and limitations](../online_serving/qwen3_omni.md#experimental-dflash-thinker-decoding).
-They also apply to offline inference: use MRv1 with Thinker prefix caching
-disabled, and run both Thinker and drafter eagerly for speech output.
-CUDA Graph DFlash speech is outside the supported scope.
+Offline DFlash speech uses MRv2 with Thinker prefix caching disabled and
+both the Thinker and drafter running eagerly. See the
+[DFlash configuration requirements and validation limits](../online_serving/qwen3_omni.md#dflash-thinker-decoding).
 
 ## Run examples
 

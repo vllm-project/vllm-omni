@@ -47,9 +47,9 @@ cached across requests.
 With `async_chunk: false`, codec v2 uses eager whole-sequence decoding; the
 legacy offline CUDA Graph wrapper supports codec v1 only.
 
-For the CUDA MRV2 runner and platform fallbacks, see the
+For the supported deployment platforms, see the
 [Local 1.5 deployment profile](../../docs/configuration/stage_configs.md#moss-tts-local-15-with-model-runner-v2).
-Local 1.5 defaults to MRV2 on CUDA and retains V1 on other platforms.
+Local 1.5 uses MRV2 on CUDA and NPU.
 
 ## References
 
@@ -173,7 +173,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 #### 1x Ascend A3 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
 
-`moss_tts_local_npu_mrv2.yaml` is an opt-in profile with both stages on
+The default `moss_tts_local.yaml` runs both NPU stages on
 Model Runner V2. Stage0 (Talker) uses ACL graphs and builds Ascend attention
 metadata; Stage1 (codec) uses streaming NPUGraphs. Stage0 does not send the
 first audio frame itself on NPU; Stage1 delivers every chunk.
@@ -181,7 +181,7 @@ first audio frame itself on NPU; Stage1 delivers every chunk.
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni --port 8091 \
-  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml \
+  --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
 
@@ -207,9 +207,7 @@ file, `moss_tts_local.yaml`. The CUDA settings use MRV2, 128 stream slots per
 stage, full-quota private MPS, prefix caching and Triton backbone attention.
 These settings replace the former C64, high-concurrency, low-latency and
 optimized presets. Pipeline selection no longer probes GPU memory or MPS.
-Non-CUDA platforms retain V1 through the same file's platform overrides, and
-NPU has an opt-in MRV2 profile (see the NPU section above); the separate 2/3-NPU
-files describe different device placements.
+NPU uses the same profile. The separate 2/3-NPU files describe different device placements.
 
 Both stages share one GPU, with a 32 GiB Talker KV budget. The CUDA settings
 are validated on H200 and require room for codec state and graphs, plus

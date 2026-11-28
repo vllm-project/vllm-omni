@@ -520,7 +520,7 @@ class OmniEngineArgs(EngineArgs):
 
     def __post_init__(self) -> None:
         if not self.use_v2_model_runner:
-            raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
+            raise ValueError("Model Runner V1 is not supported with vLLM 0.34")
         if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()

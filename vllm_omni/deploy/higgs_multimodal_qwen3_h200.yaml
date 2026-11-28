@@ -167,4 +167,3 @@ stages:
     - 8
     - 33
 cuda_mps: true
-model_runner: v2

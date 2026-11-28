@@ -68,7 +68,6 @@ _SERVER_PARAMS = [
                 updates={
                     "stages": {
                         0: {
-                            "model_runner": "v2",
                             "max_num_seqs": 2,
                             "max_model_len": 4096,
                             "hf_overrides": {"cosyvoice3_sampling_mode": "standard"},

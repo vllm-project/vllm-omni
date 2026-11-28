@@ -20,14 +20,13 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml",
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml",
         "--stage-init-timeout",
         "1200",
         "--init-timeout",
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -235,14 +234,13 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml",
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml",
         "--stage-init-timeout",
         "1200",
         "--init-timeout",
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -251,7 +249,6 @@
         },
         "duplex_session.max_sessions": 8,
         "duplex_session.collect_stats": true,
-        "platforms.npu.model_runner": "v2",
         "platforms.npu.stages.0.enable_prefix_caching": true
       }
     },

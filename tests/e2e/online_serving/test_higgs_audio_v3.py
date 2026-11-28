@@ -48,7 +48,7 @@ TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3_mrv2_h200.yaml"),
+            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3_h200.yaml"),
             server_args=SERVER_ARGS,
             env_dict=SERVER_ENV,
         ),

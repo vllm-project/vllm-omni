@@ -45,8 +45,8 @@ file lists the ones multi-stage omni models normally set.
 | `requires_full_payload_input` | `True` on downstream stages | Non-async path waits for the complete connector payload before scheduling |
 | `async_chunk_prewarm_payload_func` | Optional | Lets a receiving stage warm up before chunk 0 (MiniCPM-o code2wav) |
 | `retains_state_across_chunks` | `True` when the model keeps per-request state between chunks | Parked request still consumes capacity |
-| `supports_native_mrv2_data_plane` | `True` only after MRv2 validation | Takes effect only when deploy sets `model_runner: v2` |
-| `supports_duplex_mrv2` | `True` only after duplex MRv2 validation | Required by `validate_native_mrv2_session` for a downstream native-data-plane stage on `model_runner: v2` with `session_mode: duplex`; defaults to `False` |
+| `supports_native_mrv2_data_plane` | `True` only after MRv2 validation | Enables the native inter-stage data plane |
+| `supports_duplex_mrv2` | `True` only after duplex MRv2 validation | Required by `validate_native_mrv2_session` for a downstream native-data-plane stage with `session_mode: duplex`; defaults to `False` |
 
 `_select_processor_funcs` (same file) resolves the active pair: with
 `async_chunk` on, `async_chunk_process_next_stage_input_func` replaces

@@ -1,17 +1,16 @@
 # Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
 # Auto-discovered default for model_type=higgs_multimodal_qwen3. The MRV2
-# feature switches self-enable from the runner selection. The CUDA default
+# feature switches are enabled by default. The CUDA default
 # uses the graph shape below; other platforms keep their eager configuration.
-# vLLM 0.34 only supports model_runner: v2. The H200-tuned profile is
-# higgs_multimodal_qwen3_mrv2_h200.yaml.
+# vLLM 0.34 uses Model Runner V2. The H200-tuned profile is
+# higgs_multimodal_qwen3_h200.yaml.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
 # worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
 # so the per-chunk codec windows stitch into a coherent PCM stream.
 async_chunk: true
-model_runner: v2
 
 connectors:
   connector_of_shared_memory:
@@ -25,7 +24,7 @@ connectors:
       #   codec_right_holdback_frames trailing frames held back so the codec
       #                              has future context for emit-region tail samples
       #   initial_codec_chunk_frames smaller first chunk to minimize TTFA
-      # Under model_runner: v2 the Stage-1 codec CUDA graph windows are sized
+      # The Stage-1 codec CUDA graph windows are sized
       # to this shape (25 + 8 left context = 33 frames) and the first chunk is
       # one 8-frame window (~320 ms; the previous default used a 1-frame first chunk).
       codec_chunk_frames: 25

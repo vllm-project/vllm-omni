@@ -51,7 +51,6 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
 
 def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None:
     config, stages = _resolve_stages(monkeypatch, "rocm")
-    assert config.model_runner == "v2"
     assert config.session_mode == "duplex"
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
@@ -62,23 +61,6 @@ def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None
     structured = VllmOmniConfig.from_pipeline_config(MINICPMO_4_5_PIPELINE, user_deploy_config=config)
     assert [s.model_config.use_v2_model_runner for s in structured.stage_configs] == [True, True, True]
     assert structured.stage_by_id(2).model_config.enforce_eager is True
-
-
-@pytest.mark.parametrize("platform", ["musa"])
-def test_duplex_mrv2_profile_keeps_deferred_platforms_on_v1(monkeypatch, platform) -> None:
-    monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
-    assert config.model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-
-
-def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
-    # PR #10062 enables full-MRv2 three-stage serving on NPU.
-    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="npu")
-    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
 
 
 def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
@@ -171,14 +153,6 @@ def test_two_card_deploy_accepts_single_vocoder_stage_override(monkeypatch) -> N
         ("1,0", 2),
         ("0", 1),
     ]
-
-
-def test_duplex_mrv2_profile_xpu_full_mrv2(monkeypatch) -> None:
-    monkeypatch.setattr(current_omni_platform, "device_name", "xpu")
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="xpu")
-    assert config.model_runner == "v2"
-    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
 
 
 @pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])

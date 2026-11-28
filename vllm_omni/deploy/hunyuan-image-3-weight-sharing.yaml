@@ -8,7 +8,6 @@
 #   --stage-init-timeout 1800 --init-timeout 3600
 # Set weight_sharing: null to use ordinary loading (requires more GPU memory).
 base_config: hunyuan-image-3-mooncakeconnector.yaml
-model_runner: v2
 dtype: bfloat16
 distributed_executor_backend: mp
 

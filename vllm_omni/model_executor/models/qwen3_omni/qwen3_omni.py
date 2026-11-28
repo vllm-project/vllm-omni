@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -512,12 +512,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
         logger.info("Qwen3-Omni Talker decodes first-frame audio in-stage")
         return Qwen3OmniFirstFrameDecoder(code2wav, defs.resolve_audio_sample_rate(code2wav_config))
-
-    def capture_first_frame_graphs(self) -> None:
-        """Called by the MRv2 runner after its own graph capture."""
-        decoder = getattr(self, "first_frame_decoder", None)
-        if decoder is not None:
-            decoder.capture()
 
     def _apply_subtalker_sampling_params(self, params: Any) -> None:
         """Apply the deploy's ``subtalker_sampling_params`` to the residual-codebook predictor.
@@ -1970,15 +1964,28 @@ class Qwen3OmniMoeForConditionalGeneration(
     _code2wav_capture_pending: bool = False
     _code2wav_warmup_done: bool = False
 
+    @property
+    def release_auxiliary_graphs(self) -> Callable[[], None] | None:
+        """Expose the worker's profiling hook only for releasable Talker graphs."""
+        decoder = getattr(self, "first_frame_decoder", None)
+        if decoder is not None and not self.vllm_config.model_config.enforce_eager:
+            return decoder.release
+        return None
+
     def capture_auxiliary_graphs(self) -> None:
-        """Capture the Code2Wav CUDA graphs the stage's load deferred.
+        """Capture the Talker's first-frame graphs or the deferred Code2Wav graphs.
 
         The worker calls this once ``load_model`` has returned, before the stage
         serves. vLLM's ``load_model`` limits the caching allocator to
         ``max_split_size_mb:20``; graphs captured under it cannot reuse the
         blocks an earlier capture freed in their shared pool, so each capture
-        grows the pool. Stages without Code2Wav have nothing to capture.
+        grows the pool.
         """
+        decoder = getattr(self, "first_frame_decoder", None)
+        if decoder is not None:
+            if not self.vllm_config.model_config.enforce_eager:
+                decoder.capture()
+            return
         self._code2wav_warmup_done = True
         if self._code2wav_capture_pending:
             self._code2wav_capture_pending = False

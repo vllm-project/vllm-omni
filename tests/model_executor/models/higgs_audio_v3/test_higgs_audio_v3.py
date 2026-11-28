@@ -64,14 +64,13 @@ class TestHiggsAudioV3Config:
         assert config.num_real_codes == 1024
         assert config.tie_modality_embeddings is True
 
-    def test_mrv2_flags_follow_runner_by_default(self):
-        """Tri-state resolution: None follows the runner; v1 turns all off."""
+    def test_mrv2_flags_default_to_enabled(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
         config = HiggsAudioV3Config()
-        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        v2 = config.resolve_mrv2_defaults()
         assert all(
             getattr(v2, name) is True
             for name in (
@@ -85,8 +84,6 @@ class TestHiggsAudioV3Config:
                 "audio_mrv2_fused_state",
             )
         )
-        v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
-        assert all(getattr(v1, name) is False for name in v2.__dataclass_fields__)
 
     def test_mrv2_structural_flags_cannot_be_disabled_under_v2(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
@@ -96,7 +93,7 @@ class TestHiggsAudioV3Config:
         for name in ("audio_async_payload", "audio_async_prompt_mode"):
             config = HiggsAudioV3Config(**{name: False})
             with pytest.raises(ValueError, match=name):
-                config.resolve_mrv2_defaults(use_v2_model_runner=True)
+                config.resolve_mrv2_defaults()
 
     def test_mrv2_non_structural_flags_overridable(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
@@ -104,30 +101,9 @@ class TestHiggsAudioV3Config:
         )
 
         config = HiggsAudioV3Config(audio_mrv2_static_inputs=False)
-        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        v2 = config.resolve_mrv2_defaults()
         assert v2.audio_mrv2_static_inputs is False
         assert v2.audio_async_payload is True
-
-    def test_mrv2_explicit_flags_warn_when_ignored_under_v1(self, caplog):
-        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
-            HiggsAudioV3Config,
-        )
-
-        config = HiggsAudioV3Config(audio_mrv2_static_inputs=True, audio_mrv2_fused_state=True)
-        with caplog.at_level("WARNING", logger="vllm_omni.transformers_utils.configs.higgs_audio_v3"):
-            v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
-        assert v1.audio_mrv2_static_inputs is False
-        assert v1.audio_mrv2_fused_state is False
-        assert any(
-            "audio_mrv2_static_inputs" in message and "audio_mrv2_fused_state" in message for message in caplog.messages
-        )
-
-        # The same explicit values are honored, not warned about, under v2.
-        caplog.clear()
-        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
-        assert v2.audio_mrv2_static_inputs is True
-        assert v2.audio_mrv2_fused_state is True
-        assert not caplog.records
 
     def test_custom_audio_encoder_config(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
@@ -1689,7 +1665,6 @@ class TestRegistry:
 
         yaml_path = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
         deploy = _apply_platform_overrides(load_deploy_config(yaml_path), platform="cuda")
-        assert deploy.model_runner == "v2"
         assert deploy.async_chunk is True
         stage0, stage1 = deploy.stages
         assert stage0.attention_backend == "FLASH_ATTN"

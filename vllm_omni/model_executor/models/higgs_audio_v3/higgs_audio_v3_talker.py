@@ -241,14 +241,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config = hf_config
         else:
             self.config = HiggsAudioV3Config(**hf_config.to_dict())
-        use_v2_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        self.mrv2_options = self.config.resolve_mrv2_defaults(use_v2_model_runner=use_v2_runner)
-        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults(use_v2_model_runner=use_v2_runner)
+        self.mrv2_options = self.config.resolve_mrv2_defaults()
+        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults()
         self.use_async_omni_output = self.mrv2_options.audio_async_payload
         self.supports_async_whole_payload = self.use_async_omni_output
         if self.use_async_omni_output and not vllm_config.scheduler_config.async_scheduling:
             raise ValueError(
-                "Higgs Audio v3 model_runner: v2 requires async_scheduling: true on the talker stage; "
+                "Higgs Audio v3 Model Runner V2 requires async_scheduling: true on the talker stage; "
                 "enable it in the deploy profile"
             )
         self._async_audio_gpu_staging = None

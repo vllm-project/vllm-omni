@@ -200,17 +200,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
             apply_qwen3_tts_patches()
 
-        if (
-            current_omni_platform.is_npu()
-            and not getattr(vllm_config.model_config, "use_v2_model_runner", False)
-            and not vllm_config.model_config.enforce_eager
-            and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        ):
-            raise ValueError(
-                "Qwen3-TTS on NPU with Model Runner V1 does not support full decode graphs. "
-                "Set stage 0 compilation_config.cudagraph_mode to PIECEWISE (or NONE), "
-                "or select model_runner: v2."
-            )
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
         self.config: Qwen3TTSConfig = vllm_config.model_config.hf_config  # type: ignore[assignment]

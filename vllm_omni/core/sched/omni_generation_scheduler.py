@@ -348,7 +348,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_scheduled_tokens: dict[str, int],
         scheduled_spec_decode_tokens: dict[str, list[int]],
         scheduled_encoder_inputs: dict[str, list[int]],
-        num_common_prefix_blocks: list[int],
     ) -> SchedulerOutput:
         """Build the worker output and consume scheduler-only connector state."""
         # Dynamic speculative decoding: optimal K chosen by scheduler
@@ -383,9 +382,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
-            # vLLM 0.34 removed num_common_prefix_blocks and ec_manager_metadata
-            # from SchedulerOutput; the parameter stays for callers, and the
-            # encoder-cache manager no longer publishes per-step metadata.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             # Preemptions accumulated since the previous step; cleared by
@@ -397,7 +393,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
-        del num_common_prefix_blocks
 
         # KVTransfer: package metadata
         if self.connector is not None:
@@ -792,27 +787,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._postprocess_omni_schedule_output(res)
                 return self._wrap_omni_scheduler_output(res)
 
-        # Compute common prefix blocks (aligned with v1). vLLM 0.34 removed
-        # KVCacheManager.get_num_common_prefix_blocks and the SchedulerOutput
-        # field, so the fast path keeps the placeholder the builder drops.
-        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
-
-        # Assemble the current SchedulerOutput contract.
-        if self.use_v2_model_runner:
-            # No resumed reqs in fast path; pass prefill_token_ids for new reqs.
-            new_reqs_data = [
-                OmniNewRequestData.from_request(
-                    req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    getattr(req, "_all_token_ids", None),
-                )
-                for req in scheduled_new_reqs
-            ]
-        else:
-            new_reqs_data = [
-                OmniNewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
-                for req in scheduled_new_reqs
-            ]
+        new_reqs_data = [
+            OmniNewRequestData.from_request(
+                req, req_to_new_blocks[req.request_id].get_block_ids(), req.prefill_token_ids
+            )
+            for req in scheduled_new_reqs
+        ]
         # No running/resumed reqs scheduled in our fast path
         cached_reqs_data = self._make_cached_request_data(
             running_reqs=scheduled_running_reqs,
@@ -831,15 +811,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             additional_information=cached_additional_information,
         )
 
-        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-
         scheduler_output = self._build_generation_scheduler_output(
             new_reqs_data,
             cached_reqs_data,
             num_scheduled_tokens,
             scheduled_spec_decode_tokens,
             scheduled_encoder_inputs,
-            num_common_prefix_blocks,
         )
 
         # Advance the fence only for non-empty steps (those that actually
@@ -849,7 +826,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # half drains in update_from_output. The fallback path above gets
         # both halves from super().schedule(). getattr: __new__-constructed
         # test schedulers carry no defer_block_free attribute.
-        if getattr(self, "defer_block_free", False) and total_num_scheduled_tokens > 0:
+        if getattr(self, "defer_block_free", False) and num_scheduled_tokens:
             self.sched_step_seq += 1
 
         # Update internal state (advance num_computed_tokens, free encoder inputs,

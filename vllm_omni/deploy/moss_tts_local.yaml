@@ -1,9 +1,8 @@
 # MOSS-TTS-Local-Transformer-v1.5: one single-GPU deploy profile.
 # CUDA: MRV2, 128 stream slots, full-quota private MPS, 32 GiB Talker KV.
 # Validated on H200; budget room for the codec and first-audio graphs.
-# Other platforms use V1; NPU retains its codec graph override.
+# NPU uses its codec graph override.
 # Stage0 sends the first frame directly; Stage1 streams subsequent chunks.
-model_runner: v1
 dtype: bfloat16
 async_chunk: true
 speech_cache:
@@ -66,7 +65,6 @@ stages:
       repetition_penalty: 1.0
 platforms:
   cuda:
-    model_runner: v2
     stages:
       - stage_id: 0
         max_num_batched_tokens: 512
@@ -102,4 +100,3 @@ platforms:
           cudagraph_mode: PIECEWISE
           cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
           cudagraph_num_of_warmups: 1
-    model_runner: v1

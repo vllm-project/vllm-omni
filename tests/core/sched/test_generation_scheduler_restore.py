@@ -65,7 +65,7 @@ class FakeAdapter:
         self.requests_with_ready_chunks.discard(request_id)
 
 
-def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
+def _make_generation_scheduler(waiting_request):
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
     scheduler.max_num_scheduled_tokens = 8
     scheduler.max_num_active_reqs = 1
@@ -91,12 +91,10 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler.kv_cache_manager = SimpleNamespace(
         new_step_starts=lambda: None,
         allocate_slots=lambda *args, **kwargs: SimpleNamespace(get_block_ids=lambda: ([1],)),
-        get_num_common_prefix_blocks=lambda request_id: [0],
         take_new_block_ids=lambda: [],
         take_boundary_state_offloads=lambda: {},
     )
     scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
-    scheduler.use_v2_model_runner = use_v2_model_runner
     scheduler._retains_state_across_chunks = False
     scheduler.needs_kv_cache_zeroing = False
     scheduler.finished_req_ids = set()
@@ -128,7 +126,7 @@ def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
     # Hashes are emitted only for a completed hash block. One scheduled token
     # does not cover the default 16-token block, so count a full block computed.
     request.num_computed_tokens = 16
-    scheduler = _make_generation_scheduler(request, use_v2_model_runner=True)
+    scheduler = _make_generation_scheduler(request)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(make_kv_cache_manager(block_size=16))
 
     output = scheduler._build_generation_scheduler_output(
@@ -137,13 +135,32 @@ def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
         num_scheduled_tokens={request.request_id: 1},
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[0],
     )
 
     metadata = output.aux_output_connector_metadata
     assert metadata is not None
     assert metadata.requests == {request.request_id: 0}
     assert list(metadata.block_hashes[request.request_id]) == request.block_hashes
+
+
+@pytest.mark.parametrize("kind", ["plain", "mixed", "resumed"])
+def test_generation_dispatches_the_v2_prefill_tokens(kind):
+    mixed = kind == "mixed"
+    request = Request(
+        "prefill",
+        [1, 2],
+        SamplingParams(max_tokens=4),
+        pooling_params=None,
+        prompt_is_token_ids=[True, False] if mixed else None,
+    )
+    if kind == "resumed":
+        request.append_output_token_ids(3)
+
+    (data,) = _make_generation_scheduler(request).schedule().scheduled_new_reqs
+    if kind == "plain":
+        assert data.prefill_token_ids is data.prompt_token_ids
+    else:
+        assert list(data.prefill_token_ids) == ([1, 0] if mixed else [1, 2, 3])
 
 
 @pytest.mark.parametrize(("runner_slots", "active_limit"), [(1, 2), (2, 1)])
@@ -188,6 +205,10 @@ def _chunk_request(request_id, **kwargs):
 
 
 class _HashableChunkRequest(SimpleNamespace):
+    @property
+    def prefill_token_ids(self):
+        return self.prompt_token_ids
+
     # Deferred queues require identity hashing; SimpleNamespace types it as None.
     __hash__ = object.__hash__  # type: ignore[assignment]
     __eq__ = object.__eq__
@@ -373,7 +394,7 @@ def test_first_chunk_express_slack_guard_tracks_emitted_audio(monkeypatch):
 def _express_scheduler():
     continuation = Request("continuation", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
     first = Request("first", [1], SamplingParams(max_tokens=4), pooling_params=None)
-    scheduler = _make_generation_scheduler(continuation, use_v2_model_runner=True)
+    scheduler = _make_generation_scheduler(continuation)
     scheduler.waiting.add_request(first)
     scheduler.requests[first.request_id] = first
     scheduler.max_num_active_reqs = 4

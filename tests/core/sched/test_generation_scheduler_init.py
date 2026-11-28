@@ -32,7 +32,6 @@ def construct_scheduler(monkeypatch, mocker):
 def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128):
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            use_v2_model_runner=True,
             supports_native_mrv2_data_plane=native,
             retains_state_across_chunks=stateful,
             async_chunk=True,
@@ -53,6 +52,7 @@ def test_legacy_custom_readiness_enables_batch_waiting(construct_scheduler):
     config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
     config.model_config.async_chunk = False
     scheduler = OrchestratorScheduler(config)
+    assert scheduler.use_v2_model_runner
     assert scheduler.chunk_transfer_adapter is None
     assert scheduler._generation_min_batch_size == 4
     assert scheduler._generation_max_wait_s == 0.012
@@ -98,10 +98,6 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
-    if platform != "cuda":
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-            merge_pipeline_deploy(pipeline, deploy)
-        return
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     extras = deploy.connectors["shm"]["extra"]
     config = _config(
@@ -112,10 +108,10 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     )
     warning = mocker.patch("vllm_omni.core.sched.omni_generation_scheduler.logger.warning")
     scheduler = construct_scheduler(config)
-    # The raw extras persist through fallback; the live constructor must cope.
+    # The codec scheduler receives the shared batching settings on every platform.
     assert extras["generation_min_batch_size"] == 16
     assert extras["generation_max_wait_ms"] == 6
-    assert scheduler._native_data_plane is (platform == "cuda")
+    assert scheduler._native_data_plane is True
     assert scheduler._generation_min_batch_size == 16
     assert scheduler._generation_max_wait_s == 0.006
     assert scheduler._generation_max_regular_batch == 0
@@ -135,7 +131,7 @@ def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(constr
 def test_personaplex_native_decoder_enables_batch_waiting(construct_scheduler, monkeypatch, policy):
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     pipeline = resolve_pipeline_config("personaplex")
-    deploy = load_deploy_config(get_deploy_config_path("personaplex_duplex_mrv2.yaml"))
+    deploy = load_deploy_config(get_deploy_config_path("personaplex.yaml"))
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     config = _config(
         native=codec.yaml_engine_args["use_v2_model_runner"],

@@ -196,7 +196,6 @@ class CacheConfigSeam:
 @dataclass
 class ServingConfigSeam:
     kv_transfer_config: KVTransferConfig
-    use_v2_model_runner: bool = True
     model_config: ModelConfigSeam = field(default_factory=ModelConfigSeam)
     parallel_config: ParallelConfigSeam = field(default_factory=ParallelConfigSeam)
     cache_config: CacheConfigSeam = field(default_factory=CacheConfigSeam)
@@ -1029,7 +1028,6 @@ def test_duplex_sessions_pass_startup_guard(supported_config):
 @pytest.mark.parametrize(
     ("owner", "field", "value", "message"),
     [
-        (None, "use_v2_model_runner", False, "Model Runner V2"),
         ("parallel_config", "tensor_parallel_size", 2, "single TP=1"),
         ("parallel_config", "pipeline_parallel_size", 2, "single TP=1"),
         ("parallel_config", "data_parallel_size", 2, "single TP=1"),

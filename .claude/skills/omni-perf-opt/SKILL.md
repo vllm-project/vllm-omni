@@ -132,9 +132,8 @@ only on P0 measurement or instrumentation fixes.
   When the talker saturates, add talker replicas before raising thinker batch
   limits.
 - Prefix caching is stage- and profile-specific. Default `qwen3_omni_moe.yaml`
-  uses MRv2 on CUDA with Thinker prefix caching on; Talker and Code2Wav keep it
-  off. The specialized `qwen3_omni_moe_mrv2.yaml` overlay and non-CUDA platform
-  sections disable Thinker caching. Talker first-frame and fused MTP fast paths
+  uses MRv2 and keeps prefix caching off on Thinker, Talker and Code2Wav.
+  The duplex and H200 profiles inherit these defaults. Talker first-frame and fused MTP fast paths
   require caching off on the Talker, independently of Thinker caching.
   MiniCPM-o's default duplex deploy keeps caching off; its CUDA turn profile
   enables it for `llm` (stage 0), while the turn MRv2 overlay disables it again.

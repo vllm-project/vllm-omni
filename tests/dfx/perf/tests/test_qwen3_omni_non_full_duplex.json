@@ -27,7 +27,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": false,
         "stages": {
           "0": {
@@ -143,7 +142,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -253,7 +251,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -567,7 +564,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": false,
         "stages": {
           "0": {
@@ -580,7 +576,6 @@
             "enable_prefix_caching": false
           }
         },
-        "platforms.npu.model_runner": "v2",
         "platforms.npu.stages.0.enable_prefix_caching": false
       }
     },
@@ -676,7 +671,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -689,7 +683,6 @@
             "enable_prefix_caching": false
           }
         },
-        "platforms.npu.model_runner": "v2",
         "platforms.npu.stages.0.enable_prefix_caching": true
       }
     },

@@ -1,7 +1,7 @@
 # VibeVoice-1.5B offline text-to-speech — H100
 
-> Single-speaker VibeVoice-1.5B TTS with an optional reference voice, run as
-> one eager `LLM_AR` stage through offline `Omni` on one H100.
+> This recipe records the H100 setup for Model Runner V1. The offline decoder
+> depends on V1 post-sampling hooks. VibeVoice inference is unavailable with vLLM 0.34.
 
 ## Summary
 

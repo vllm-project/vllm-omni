@@ -33,7 +33,6 @@ rejected. Do not write new configs in that shape.
 | `pipeline` | – | Override the pipeline registry key (e.g. a thinker-only variant) |
 | `async_chunk` | resolved from pipeline | Streaming hand-off between stages |
 | `session_mode` | `turn` | `turn` (HTTP request/response) or `duplex` |
-| `model_runner` | `v1` | `v2` enables MRv2 runners (`vllm_omni/worker_v2/`) |
 | `connectors` | – | Named connector specs: `{name: ConnectorClass, extra: {...}}` |
 | `stages` | `[]` | Per-stage settings, matched by `stage_id` |
 | `platforms` | – | `cuda` / `rocm` / `npu` / `xpu` / `musa` → nested `stages:` overrides |
@@ -51,7 +50,6 @@ rejected. Do not write new configs in that shape.
 | `max_num_seqs`, `max_num_batched_tokens`, `max_model_len` | Usual vLLM limits |
 | `enforce_eager` | Disable CUDA graphs for this stage |
 | `tensor_parallel_size` | TP within the stage |
-| `model_runner` | Per-stage v1/v2 override |
 | `async_chunk` | `false` opts a stage out |
 | `input_connectors` / `output_connectors` | Connector names |
 | `default_sampling_params` | Stage sampling defaults |
@@ -92,7 +90,7 @@ stages:
     num_replicas: 2
 ```
 
-Single-GPU co-location is possible (see `qwen3_omni_moe_mrv2_h200.yaml`) when the
+Single-GPU co-location is possible (see `qwen3_omni_moe_h200.yaml`) when the
 utilization values sum to at most 1.0.
 
 ## Rules of thumb
@@ -102,10 +100,9 @@ utilization values sum to at most 1.0.
   usually share.
 - When the talker saturates under concurrency, add talker replicas before raising
   thinker batch limits.
-- Default `qwen3_omni_moe.yaml` uses MRv2 on CUDA with Thinker prefix caching
-  on; Talker and Code2Wav keep it off. The specialized
-  `qwen3_omni_moe_mrv2.yaml` overlay and non-CUDA platform sections disable
-  Thinker caching. Talker first-frame and fused MTP fast paths require caching
+- Default `qwen3_omni_moe.yaml` uses MRv2 with prefix caching off on Thinker,
+  Talker and Code2Wav; duplex and H200 inherit that setting.
+  Talker first-frame and fused MTP fast paths require caching
   off on the Talker only. MiniCPM-o's default duplex deploy keeps caching off;
   its CUDA turn profile enables it for `llm` (stage 0), while the turn MRv2
   overlay disables it again. Resolve the stage, profile, and platform overrides

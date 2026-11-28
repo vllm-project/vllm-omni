@@ -3,7 +3,6 @@
 # Only Stage 0 runs and replies are text. This standalone profile does not
 # inherit minicpmo_4_5.yaml's connectors or Stage 1/2 overrides.
 pipeline: minicpmo_4_5_thinker_only
-model_runner: v2
 async_chunk: false
 session_mode: duplex
 duplex_session:

@@ -37,8 +37,6 @@ stages:
   max_num_seqs: 64
   mm_processor_cache_gb: 0
   # The talker runs on Model Runner V2 (both RAS and standard sampling).
-  # The codec inherits the V2 default; V1 fallback is unavailable.
-  model_runner: v2
   output_connectors:
     to_stage_1: connector_of_shared_memory
   skip_mm_profiling: true

@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
@@ -73,18 +72,6 @@ def test_ming_tts_bundled_profiles_resolve_on_native_mrv2(
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in legacy_stages] == [True, True]
     assert [s.yaml_engine_args["supports_native_mrv2_data_plane"] for s in legacy_stages] == [True, True]
     assert legacy_stages[0].yaml_engine_args["recompute_preemption"] == "fail"
-
-
-@pytest.mark.parametrize("deploy_name, pipeline", _PROFILES)
-def test_ming_tts_v1_override_is_rejected(monkeypatch: pytest.MonkeyPatch, deploy_name: str, pipeline):
-    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    deploy = load_deploy_config(get_deploy_config_path(deploy_name))
-    deploy.model_runner = "v1"
-
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(pipeline, deploy)
 
 
 class _RecordingStage(nn.Module):

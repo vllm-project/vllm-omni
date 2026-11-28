@@ -311,7 +311,6 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     deploy_root = Path(__file__).parents[2] / "vllm_omni/deploy"
     deploy = load_deploy_config(deploy_root / "yue2.yaml")
     assert deploy.pipeline == "yue2"
-    assert deploy.model_runner == "v2"
     stages = merge_pipeline_deploy(pipeline, deploy)
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
     assert stages[0].yaml_engine_args.get("worker_cls", "auto") == "auto"

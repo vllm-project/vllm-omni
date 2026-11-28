@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The stage runner selection overrides the upstream environment default."""
+"""The Omni NPU worker always initializes the V2 runner."""
 
 from types import SimpleNamespace
 
@@ -14,12 +14,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("upstream_v2", [False, True])
-@pytest.mark.parametrize("stage_v2", [False, True, None])
-def test_stage_runner_overrides_upstream_default(monkeypatch, upstream_v2, stage_v2):
-    model_config = SimpleNamespace()
-    if stage_v2 is not None:
-        model_config.use_v2_model_runner = stage_v2
-    config = SimpleNamespace(model_config=model_config, profiler_config=None)
+def test_npu_worker_uses_v2(monkeypatch, upstream_v2):
+    config = SimpleNamespace(model_config=SimpleNamespace(), profiler_config=None)
 
     def init_upstream(worker):
         worker.vllm_config = config
@@ -27,4 +23,4 @@ def test_stage_runner_overrides_upstream_default(monkeypatch, upstream_v2, stage
 
     monkeypatch.setattr(NPUWorker, "__init__", init_upstream)
     worker = OmniNPUWorkerBase()
-    assert worker.use_v2_model_runner is (stage_v2 is True)
+    assert worker.use_v2_model_runner is True

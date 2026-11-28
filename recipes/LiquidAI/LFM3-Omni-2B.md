@@ -1,9 +1,8 @@
 # LFM3-Omni-2B on Ascend and CUDA
 
-> **Unavailable with vLLM 0.34 / V2-only execution.** Both speech and text profiles require the retired Model Runner V1.
-> The commands, configurations, and measurements below are historical reference,
-> not installation or serving instructions for this version. Configuration loading
-> rejects the V1 profile; changing its runner flag does not add V2 support.
+> **Unavailable with vLLM 0.34.** Configuration resolution rejects both speech and text profiles
+> before loading weights because V2 warmup cannot initialize the temporal stage's per-request state.
+> The commands and measurements below document the earlier runtime.
 
 ## Model and execution
 

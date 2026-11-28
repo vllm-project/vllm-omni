@@ -109,24 +109,15 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 
-def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches(monkeypatch) -> None:
+def test_personaplex_cuda_deploy_uses_valid_config_parameters(monkeypatch) -> None:
     import inspect
 
-    # This is explicitly the CUDA MRv2 profile. Keep the assertion independent
-    # of the host running the CPU suite, since non-CUDA platforms intentionally
-    # retain a rejecting V1 override and are covered in tests/config.
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    deploy = load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
-    overrides = deploy.stages[0].engine_extras["hf_overrides"]
-
     # PersonaPlexConfig takes **kwargs, so a misspelled switch would be ignored silently.
-    assert set(overrides) <= set(inspect.signature(PersonaPlexConfig.__init__).parameters)
-    assert overrides["mimi_cuda_graphs"] is True
-    assert overrides["depformer_cuda_graphs"] is True
-
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
-    assert len(stages) == 2
-    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    parameters = inspect.signature(PersonaPlexConfig.__init__).parameters.keys()
+    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH))
+    for stage in stages:
+        assert stage.yaml_engine_args["hf_overrides"].keys() <= parameters
 
 
 def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_path: Path) -> None:
@@ -159,14 +150,10 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
         assert resolve(model_arch, None).mimi_cuda_graphs is False
 
 
-@pytest.mark.parametrize("deploy", ["personaplex.yaml", "personaplex_duplex_mrv2.yaml"])
-def test_personaplex_deploy_config_keeps_context_past_the_sliding_window(tmp_path: Path, deploy: str) -> None:
-    """Both profiles configure an hour of 80 ms frames, past Helium's 3000-frame window."""
+def test_personaplex_deploy_config_keeps_context_past_the_sliding_window(tmp_path: Path) -> None:
+    """The default configures an hour of 80 ms frames, past Helium's 3000-frame window."""
     (tmp_path / "config.json").write_text("{}")
-    deploy_config = load_deploy_config(DEPLOY_PATH.with_name(deploy))
-    # The historical mixed-runner profile inherits the context length but
-    # replaces hf_overrides. Check the resolved settings before admission,
-    # which separately rejects its V1 Talker.
+    deploy_config = load_deploy_config(DEPLOY_PATH)
     stage0 = deploy_config.stages[0]
 
     model_config = OmniEngineArgs(

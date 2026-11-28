@@ -150,16 +150,13 @@ def test_hunyuan_ar_platform_runner_defaults(platform, deploy_name, pipeline_key
 
 
 def test_higgs_default_profile_enables_mrv2_async_audio_payload() -> None:
-    from vllm_omni.config.stage_config import resolve_stage_model_runner
     from vllm_omni.transformers_utils.configs import HiggsAudioV3Config
 
     deploy = load_deploy_config(_DEPLOY_DIR / "higgs_multimodal_qwen3.yaml")
     stage = deploy.stages[0]
 
     assert stage.async_scheduling is True
-    options = HiggsAudioV3Config(**stage.engine_extras.get("hf_overrides", {})).resolve_mrv2_defaults(
-        use_v2_model_runner=resolve_stage_model_runner(deploy, stage) == "v2"
-    )
+    options = HiggsAudioV3Config(**stage.engine_extras.get("hf_overrides", {})).resolve_mrv2_defaults()
     assert options.audio_async_prompt_mode is True
     assert options.audio_async_payload is True
 
@@ -446,11 +443,21 @@ def test_serve_counts_diffusion_flag_after_alias_normalization() -> None:
         )
 
 
-def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
+def test_personaplex_cuda_duplex_stage_settings(monkeypatch) -> None:
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", "cuda")
     omni_config = _from_pipeline_key("personaplex")
+    talker, codec = omni_config.stage_configs
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
+    assert talker.scheduler_config.async_scheduling is False
+    assert codec.scheduler_config.async_scheduling is True
+    assert talker.scheduler_config.max_num_seqs == 8
+    assert codec.scheduler_config.max_num_seqs == 10
+    assert talker.model_config.hf_overrides["mimi_cuda_graphs"] is True
+    assert talker.model_config.hf_overrides["depformer_cuda_graphs"] is True
+    assert codec.model_config.hf_overrides["mimi_cuda_graphs"] is True
+    assert codec.model_config.hf_overrides["mimi_decode_tf32"] is True
 
 
 @pytest.mark.parametrize(
@@ -583,16 +590,15 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
     pipeline = _resolve_pipeline_or_skip(model_type)
     legacy_deploy = _load_default_deploy(pipeline)
 
-    try:
-        legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
-    except ValueError as error:
-        if "Model Runner V1 is not supported" not in str(error):
-            raise
-        # These profiles explicitly select the retired runner. Both config
-        # paths must reject them, rather than silently switching algorithms.
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+    if model_type in {"lfm3_omni", "lfm3_omni_text", "lfm3_audio", "lfm3_audio_text"}:
+        reason = "Model Runner V2 warmup cannot initialize the LFM3 temporal stage"
+        with pytest.raises(ValueError, match=reason):
+            merge_pipeline_deploy(pipeline, legacy_deploy)
+        with pytest.raises(ValueError, match=reason):
             VllmOmniConfig.from_pipeline_config(pipeline)
         return
+
+    legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
     omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
 
     assert omni_config.pipeline_config is pipeline
@@ -665,7 +671,7 @@ def test_resolve_execution_mode_rejects_unknown_execution_type():
 
 def test_from_pipeline_config_preserves_current_pipeline_config_object():
     pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
-    omni_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=DeployConfig(model_runner="v2"))
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=DeployConfig())
 
     assert omni_config.pipeline_config is pipeline
     assert not hasattr(omni_config, "pipeline")
@@ -863,7 +869,7 @@ _MODEL_CLI_FLAGS = {
 def test_from_pipeline_config_owns_model_cli_fields(model_type, field, value):
     config = VllmOmniConfig.from_pipeline_config(
         _resolve_pipeline_or_skip(model_type),
-        user_deploy_config=DeployConfig(model_runner="v2"),
+        user_deploy_config=DeployConfig(),
         cli_overrides={field: value},
     )
 
@@ -879,7 +885,7 @@ def test_model_cli_fields_reach_typed_engine_args(monkeypatch):
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     config = VllmOmniConfig.from_pipeline_config(
         _resolve_pipeline_or_skip("minicpmo_4_5"),
-        user_deploy_config=DeployConfig(model_runner="v2"),
+        user_deploy_config=DeployConfig(),
         cli_overrides=dict(_MODEL_CLI_FLAGS),
     )
 
@@ -1518,78 +1524,55 @@ def test_joyai_asr_profile_topology():
     assert talker.custom_process_input_func.endswith("joyai_vl_interaction.joyai_action_to_tts")
 
 
-@pytest.mark.parametrize("model_runner", ["v1", "v2"])
-def test_deploy_model_runner_selection_propagates_to_every_stage(tmp_path: Path, model_runner: str):
-    deploy_path = tmp_path / "qwen3_tts_runner.yaml"
-    deploy_path.write_text(
-        f"""\
-pipeline: qwen3_tts
-model_runner: {model_runner}
-async_chunk: true
-stages:
-  - stage_id: 0
-  - stage_id: 1
-"""
-    )
-
-    deploy = load_deploy_config(deploy_path)
-    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
-    if model_runner == "v1":
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-            merge_pipeline_deploy(pipeline, deploy)
-        return
-    legacy_stages = merge_pipeline_deploy(pipeline, deploy)
-    structured = _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
-    expect_v2 = model_runner == "v2"
-
-    assert deploy.model_runner == model_runner
-    assert all(stage.yaml_engine_args["use_v2_model_runner"] is expect_v2 for stage in legacy_stages)
-    assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
+@pytest.mark.parametrize("path", sorted(_DEPLOY_DIR.glob("*.yaml")), ids=lambda path: path.name)
+def test_bundled_deploy_omits_runner_selection(path):
+    deploy = resolve_deploy_yaml(path)
+    for section in (deploy, *(deploy.get("platforms") or {}).values()):
+        section = section or {}
+        assert "model_runner" not in section
+        for stage in section.get("stages", []):
+            assert "model_runner" not in stage
+            assert "model_runner" not in (stage.get("engine_args") or {})
+            assert "model_runner" not in (stage.get("engine_extras") or {})
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-@pytest.mark.parametrize("stage_override", [False, True])
-def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
-    deploy = (
-        DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
-        if stage_override
-        else DeployConfig(model_runner="v2")
-    )
-    deploy = _apply_platform_overrides(deploy, platform=platform)
-    if stage_override:
-        assert deploy.stages[0].model_runner == "v2"
-    else:
-        assert deploy.model_runner == "v2"
-
-
-# PersonaPlex's talker is V1-only on every platform (excluded from the 0.34 move).
-_V1_ONLY_DEPLOYS = {"personaplex_duplex_mrv2.yaml"}
-
-
+@pytest.mark.parametrize("runner", ["v1", "v2"])
 @pytest.mark.parametrize(
-    "deploy_path",
-    [p for p in sorted(_DEPLOY_DIR.glob("*.yaml")) if p.name not in _V1_ONLY_DEPLOYS],
-    ids=lambda p: p.name,
+    "section",
+    [
+        "model_runner: RUNNER",
+        "stages: [{stage_id: 0, model_runner: RUNNER}]",
+        "platforms: {cuda: {model_runner: RUNNER}}",
+        "platforms: {cuda: {stages: [{stage_id: 0, model_runner: RUNNER}]}}",
+        "stages: [{stage_id: 0, engine_extras: {model_runner: RUNNER}}]",
+        "stages: [{stage_id: 0, engine_args: {model_runner: RUNNER}}]",
+    ],
 )
-def test_xpu_platform_sections_do_not_pin_model_runner_v1(deploy_path):
-    # vLLM 0.34 removed Model Runner V1, so an XPU V1 pin would only make the
-    # stage fail at startup instead of running on the XPU V2 runners.
-    deploy = load_deploy_config(deploy_path)
-    xpu = (deploy.platforms or {}).get("xpu") or {}
-    assert xpu.get("model_runner") != "v1"
-    assert all(stage.get("model_runner") != "v1" for stage in xpu.get("stages", []))
+def test_legacy_runner_pins_resolve_to_v2(tmp_path, runner, section, monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    path = tmp_path / "deploy.yaml"
+    # Give platform overrides a base stage to merge into.
+    base = "stages: [{stage_id: 0}]\n" if section.startswith("platforms:") else ""
+    path.write_text(base + section.replace("RUNNER", runner))
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, load_deploy_config(path))
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    assert all("model_runner" not in stage.yaml_engine_args for stage in stages)
+    config = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=str(path))
+    assert all(stage.model_config.use_v2_model_runner for stage in config.stage_configs)
 
 
 def test_fish_omni_npu_profile_is_mrv2_tp_ep():
     deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / "fish_omni.yaml"), platform="npu")
     stage0, stage1 = deploy.stages
-    assert stage0.model_runner == "v2"
     assert stage0.tensor_parallel_size == 2
     assert stage0.enable_expert_parallel is True
     assert stage0.enforce_eager is False
     assert stage0.gpu_memory_utilization == 0.72
     assert stage0.devices == "0,1"
-    assert stage1.model_runner == "v1"
     assert stage1.gpu_memory_utilization == 0.1
     assert stage1.devices == "1"
 
@@ -1601,101 +1584,136 @@ def _qwen3_omni_pipeline() -> PipelineConfig:
     return replace(pipeline, stages=tuple(replace(s, supports_native_mrv2_data_plane=True) for s in pipeline.stages))
 
 
-def test_stage_model_runner_overrides_deploy_runner(tmp_path: Path):
-    deploy_path = tmp_path / "qwen3_omni_mixed_runner.yaml"
-    deploy_path.write_text(
-        """\
-model_runner: v1
-async_chunk: true
-stages:
-  - stage_id: 0
-    model_runner: v2
-  - stage_id: 1
-    model_runner: v2
-  - stage_id: 2
-    model_runner: v2
-"""
-    )
-    deploy = load_deploy_config(deploy_path)
-    assert [stage.model_runner for stage in deploy.stages] == ["v2", "v2", "v2"]
-
-    pipeline = _qwen3_omni_pipeline()
-    legacy = merge_pipeline_deploy(pipeline, deploy)
-    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
-    # The test pipeline declares native support; only v2 stages use it.
-    assert [stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in legacy] == [True, True, True]
-
-    structured = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=str(deploy_path))
-    assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
-
-
-def test_platform_v1_fallback_overrides_stage_v2():
-    deploy = DeployConfig(
-        stages=[StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")],
-        platforms={"rocm": {"model_runner": "v1"}},
-    )
-    deploy = _apply_platform_overrides(deploy, platform="rocm")
-    assert deploy.model_runner == "v1"
-    assert deploy.stages[1].model_runner is None
-
-
 def test_qwen3_omni_downstream_mrv2_accepts_duplex_sessions():
     stages = [
         StageDeployConfig(stage_id=0),
-        StageDeployConfig(stage_id=1, model_runner="v2"),
-        StageDeployConfig(stage_id=2, model_runner="v2"),
+        StageDeployConfig(stage_id=1),
+        StageDeployConfig(stage_id=2),
     ]
     merged = merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
     assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in merged] == [True, True, True]
     assert [stage.yaml_engine_args["session_mode"] for stage in merged] == ["duplex", "duplex", "duplex"]
 
 
-def test_v1_downstream_stage_is_rejected():
-    deploy = DeployConfig(model_runner="v1", stages=[StageDeployConfig(stage_id=0)], session_mode="duplex")
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(_qwen3_omni_pipeline(), deploy)
+@pytest.mark.parametrize("mooncake", [None, {"config_file": "/store.json", "namespace": "turn-test"}])
+def test_mooncake_turn_acceptance_overrides_resolve(tmp_path, mooncake):
+    from tests.engine.test_mooncake_turn_consistency_qwen3 import REVISION, WORKER, _stage_overrides
+    from vllm_omni.config.resolver import resolve_omni_config
+
+    Qwen3OmniMoeConfig(architectures=["Qwen3OmniMoeForConditionalGeneration"]).save_pretrained(tmp_path)
+    resolution = resolve_omni_config(
+        str(tmp_path),
+        trust_remote_code=True,
+        deploy_config_path=str(_DEPLOY_DIR / "qwen3_omni_moe.yaml"),
+        cli_overrides={"revision": REVISION},
+        stage_overrides=_stage_overrides(mooncake),
+        strategy_config_path=None,
+    )
+    thinker = resolution.stage_by_id(0)
+    assert all(s.model_config.use_v2_model_runner for s in resolution.stage_configs)
+    assert thinker.runtime_config.worker_cls == WORKER
+    store = (thinker.connector_config.omni_kv_config or {}).get("kv_store_config", {})
+    assert store.get("mooncake_config") == mooncake
 
 
-def test_qwen3_tts_profiles_default_to_v2():
-    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml").model_runner == "v2"
-    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml").model_runner == "v2"
+@pytest.mark.parametrize(
+    ("talker_model", "overrides", "headless", "enabled"),
+    [
+        (None, {}, False, True),
+        (None, {"stage_1_revision": "rev-b", "stage_2_revision": "rev-b"}, False, True),
+        (None, {"stage_2_revision": "rev-b"}, False, False),
+        ("/alternate", {}, False, False),
+        (None, {"stage_2_model_subdir": "alternate"}, False, False),
+        (None, {"stage_2_dtype": "float32"}, False, False),
+        (None, {"stage_2_hf_overrides": {"code2wav_config": {"rms_norm_eps": 0.001}}}, False, False),
+        (None, {"hf_overrides": {"code2wav_config": {"rms_norm_eps": 0.001}}}, False, True),
+        (None, {"stage_2_hf_config_path": "/alternate-config"}, False, False),
+        (None, {"stage_2_trust_remote_code": False}, False, False),
+        (None, {"stage_2_quantization": "fp8"}, False, False),
+        (None, {"stage_2_devices": "3"}, False, False),
+        (None, {"stage_2_distributed_executor_backend": "ray"}, False, False),
+        (None, {"stage_2_distributed_executor_backend": "mp"}, False, True),
+        (None, {"load_format": "dummy"}, False, False),
+        (None, {"stage_2_weight_transfer_config": {"backend": "nccl"}}, False, False),
+        (None, {}, True, False),
+    ],
+)
+def test_qwen3_omni_first_frame_requires_matching_codec(tmp_path, talker_model, overrides, headless, enabled):
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec, load_omni_transfer_config_for_model
+
+    model = "/checkpoint"
+    deploy = tmp_path / "deploy.yaml"
+    base = _DEPLOY_DIR / "qwen3_omni_moe.yaml"
+    deploy.write_text(
+        f"base_config: {base}\n"
+        + (f"stages:\n  - stage_id: 1\n    engine_extras:\n      model: {talker_model}\n" if talker_model else "")
+    )
+    config = VllmOmniConfig.from_pipeline_config(
+        _qwen3_omni_pipeline(),
+        deploy_config_path=str(deploy),
+        cli_overrides={"model": model, "revision": "rev-a", **overrides},
+    )
+    transfer = load_omni_transfer_config_for_model(model, config.orchestrator_config.deploy_config_path)
+    talker = config.stage_configs[1]
+    spec = get_stage_connector_spec(
+        transfer,
+        talker.stage_id,
+        async_chunk=True,
+        stage_config=talker,
+        local_stages=() if headless else config.stage_configs,
+    )
+    assert spec["extra"]["talker_first_audio"] is enabled
+    assert spec["extra"]["codec_chunk_ramp"][0] == 1
 
 
-def test_qwen3_tts_default_profile_uses_mrv2_on_supported_platforms():
-    deploy_path = _DEPLOY_DIR / "qwen3_tts.yaml"
-    assert load_deploy_config(deploy_path).model_runner == "v2"
+@pytest.mark.parametrize(
+    "codec_options, enabled",
+    [
+        ({"codec_cudnn_fp32_fallback": False}, False),
+        ({"codec_cudnn_benchmark": True}, False),
+        ({"codec_fused_snake": False}, False),
+        ({"codec_cudnn_fp32_fallback": True, "codec_graph_batch_sizes": [4]}, True),
+    ],
+)
+def test_qwen3_omni_first_frame_checks_the_codec_incoming_connector(tmp_path, codec_options, enabled):
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec, load_omni_transfer_config_for_model
 
-    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
-    stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
-    assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in stages)
+    deploy = tmp_path / "separate-connectors.yaml"
+    deploy.write_text(
+        f"base_config: {_DEPLOY_DIR / 'qwen3_omni_moe.yaml'}\n"
+        "connectors:\n  codec_edge:\n    name: SharedMemoryConnector\n"
+        f"    extra: {json.dumps({'codec_fused_snake': True, **codec_options})}\n"
+        "stages:\n  - stage_id: 2\n    input_connectors:\n      from_stage_1: codec_edge\n"
+    )
+    config = VllmOmniConfig.from_pipeline_config(_qwen3_omni_pipeline(), deploy_config_path=str(deploy))
+    transfer = load_omni_transfer_config_for_model("/checkpoint", str(deploy))
+    talker = config.stage_by_id(1)
+    spec = get_stage_connector_spec(
+        transfer, 1, async_chunk=True, stage_config=talker, local_stages=config.stage_configs
+    )
+    assert spec["extra"]["talker_first_audio"] is enabled
 
-    # vLLM 0.34 removed Model Runner V1. MUSA remains explicitly deferred.
-    for platform in ("cuda", "npu", "xpu", "rocm"):
-        assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v2"
-    assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="musa").model_runner == "v1"
 
-
-def test_qwen3_tts_mrv2_retunes_do_not_change_base_profile():
+def test_qwen3_tts_b2_retunes_do_not_change_base_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
-    mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
+    tuned = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_b2.yaml")
     default_extra = default["connectors"]["connector_of_shared_memory"]["extra"]
-    mrv2_extra = mrv2["connectors"]["connector_of_shared_memory"]["extra"]
+    tuned_extra = tuned["connectors"]["connector_of_shared_memory"]["extra"]
 
     # B2 batch stays consistent with the graph buckets; the base profile is untouched.
     assert default_extra["decode_batch_max_size"] == 1
-    assert mrv2_extra["decode_batch_max_size"] == 2
-    assert mrv2_extra["decode_cudagraph_batch_sizes"] == [1, 2]
-    assert mrv2_extra["code_predictor_prefix_graphs"] is False
-    assert mrv2["stages"][1]["enforce_eager"] is False
+    assert tuned_extra["decode_batch_max_size"] == 2
+    assert tuned_extra["decode_cudagraph_batch_sizes"] == [1, 2]
+    assert tuned_extra["code_predictor_prefix_graphs"] is False
+    assert tuned["stages"][1]["enforce_eager"] is False
     assert default["stages"][1]["enforce_eager"] is True
 
 
 def test_qwen3_tts_high_concurrency_single_gpu_rocm_uses_mrv2_with_eager_code2wav():
-    deploy_path = _DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml"
+    deploy_path = _DEPLOY_DIR / "qwen3_tts_high_concurrency_single_gpu.yaml"
     deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
 
-    assert deploy.model_runner == "v2"
     assert deploy.cuda_mps is False
     assert deploy.stages[1].enforce_eager is True
 
@@ -3187,7 +3205,7 @@ def test_structured_diffusion_stage_rejects_explicit_shared_engine_field(field_n
 
 def test_mps_is_explicit_only_in_experimental_single_gpu_profile():
     assert not load_deploy_config(_DEPLOY_DIR / "qwen3_tts.yaml").cuda_mps
-    deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+    deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_single_gpu.yaml")
     assert deploy.cuda_mps
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     stages = merge_pipeline_deploy(pipeline, deploy)
@@ -3205,21 +3223,12 @@ def test_mps_stays_in_runtime_instead_of_engine_arguments():
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
     config = _from_pipeline_key(
-        "qwen3_tts", deploy_config_path=str(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+        "qwen3_tts", deploy_config_path=str(_DEPLOY_DIR / "qwen3_tts_high_concurrency_single_gpu.yaml")
     )
     for stage in config.stage_configs:
         assert stage.runtime_config.cuda_mps
         args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
         assert "cuda_mps" not in args
-
-
-def test_platform_stage_overlay_rejects_invalid_model_runner():
-    deploy = DeployConfig(
-        stages=[StageDeployConfig(stage_id=0)],
-        platforms={"cuda": {"stages": [{"stage_id": 0, "model_runner": "v3"}]}},
-    )
-    with pytest.raises(ValueError, match="model_runner must be 'v1' or 'v2'"):
-        _apply_platform_overrides(deploy, platform="cuda")
 
 
 def test_async_chunk_auto_disabled_without_processor():
@@ -3262,12 +3271,12 @@ def test_mrv2_duplex_session_validation():
     )
     # Allowed when supports_duplex_mrv2 is True
     deploy_duplex = DeployConfig(session_mode="duplex")
-    validate_native_mrv2_session(deploy_duplex, ps, "v2")
+    validate_native_mrv2_session(deploy_duplex, ps)
 
     # Rejected when supports_duplex_mrv2 is False
     ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
     with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
-        validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
+        validate_native_mrv2_session(deploy_duplex, ps_no_duplex)
 
 
 @pytest.mark.parametrize("execution_type", list(StageExecutionType))
@@ -3424,7 +3433,6 @@ def test_native_034_defaults_and_explicit_v1_rejection():
     from vllm_omni.config.model import OmniModelConfig
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
-    assert DeployConfig().model_runner == "v2"
     assert OmniModelConfig.__dataclass_fields__["use_v2_model_runner"].default is True
     assert OmniEngineArgs.__dataclass_fields__["use_v2_model_runner"].default is True
     with pytest.raises(ValueError, match="Model Runner V1 is not supported"):

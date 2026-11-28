@@ -30,6 +30,7 @@ from vllm.model_executor.models.utils import (  # type: ignore
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.model_executor.models.qwen3_omni.codec_config import codec_kernel_options
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
@@ -162,13 +163,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         self.config: Qwen3OmniMoeCode2WavConfig = vllm_config.model_config.hf_config
         connector = getattr(vllm_config.model_config, "stage_connector_config", None)
         extra = connector.get("extra", {}) if isinstance(connector, dict) else getattr(connector, "extra", {})
-        # Both the separate stage and the Talker's first-frame copy receive
-        # this connector config. Keep algorithm selection consistent between
-        # them, and leave other models' cuDNN settings unchanged.
-        self._cudnn_benchmark = (extra or {}).get("codec_cudnn_benchmark", False)
+        kernel_options = codec_kernel_options(extra or {})
+        self._cudnn_benchmark = kernel_options["codec_cudnn_benchmark"]
         if not isinstance(self._cudnn_benchmark, bool):
             raise ValueError("codec_cudnn_benchmark must be a boolean")
-        cudnn_fp32_fallback = (extra or {}).get("codec_cudnn_fp32_fallback", True)
+        cudnn_fp32_fallback = kernel_options["codec_cudnn_fp32_fallback"]
         if not isinstance(cudnn_fp32_fallback, bool):
             raise ValueError("codec_cudnn_fp32_fallback must be a boolean")
 
@@ -221,7 +220,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         self.decoder = nn.ModuleList(decoder)
         # Keep existing V1 and non-CUDA decoder blocks unchanged.
         if (
-            (extra or {}).get("codec_fused_snake", False)
+            kernel_options["codec_fused_snake"]
             and current_omni_platform.is_cuda()
             and torch.device(vllm_config.device_config.device).type == "cuda"
         ):

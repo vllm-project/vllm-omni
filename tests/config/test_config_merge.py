@@ -100,7 +100,7 @@ def test_single_stage_streaming_capability_uses_central_async_resolver():
 @pytest.mark.parametrize(
     "pipeline_key,profile,stage_count",
     [
-        ("qwen3_tts", "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml", 2),
+        ("qwen3_tts", "qwen3_tts_high_concurrency_single_gpu.yaml", 2),
         ("qwen3_tts_fused", "qwen3_tts_fused_single_gpu.yaml", 1),
     ],
 )

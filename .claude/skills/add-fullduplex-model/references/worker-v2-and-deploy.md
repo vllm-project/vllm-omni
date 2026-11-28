@@ -25,7 +25,7 @@ FINISHED                    (KV released; on_requests_finished() fired on all st
 
 ## 2. Stage 0 MRv2 Hooks (`vllm_omni/worker_v2/`)
 
-Model Runner V1 is rejected on vLLM 0.34 (`resolve_stage_model_runner()` in `vllm_omni/config/stage_config.py` requires `model_runner: v2`). While `vllm_omni/worker/` still holds shared helpers (`base.py`, `sparse_audio.py`, etc.), all AR/Generation stage execution runs through `vllm_omni/worker_v2/omni_model_runner.py`, `omni_ar_model_runner.py`, and `model_states/omni_model_state.py`.
+V2 is the only LLM runner on vLLM 0.34. While `vllm_omni/worker/` still holds shared helpers (`base.py`, `sparse_audio.py`, etc.), all AR/Generation stage execution runs through `vllm_omni/worker_v2/omni_model_runner.py`, `omni_ar_model_runner.py`, and `model_states/omni_model_state.py`.
 
 ### Real MRv2 Per-Step Execution Order
 
@@ -114,15 +114,15 @@ Verify in unit tests that releasing `req_a` never mutates or resets `req_b`'s st
 
 ## 3. Stage 1 / Stage 2 Streaming Codec Isolation & MRv2 Gate (Patterns A, B2)
 
-- **Mandatory MRv2 downstream gate (`supports_duplex_mrv2=True`)**: `validate_native_mrv2_session()` (`vllm_omni/config/stage_config.py:1379–1394`) rejects any downstream stage (`input_sources` non-empty) that has `supports_native_mrv2_data_plane=True` and runs on `model_runner: v2` under `session_mode: duplex` unless the stage explicitly declares `supports_duplex_mrv2=True` in `pipeline.py` (see `personaplex/pipeline.py:75`).
+- **Mandatory MRv2 downstream gate (`supports_duplex_mrv2=True`)**: `validate_native_mrv2_session()` (`vllm_omni/config/stage_config.py:1379–1394`) rejects any downstream stage (`input_sources` non-empty) that has `supports_native_mrv2_data_plane=True` under `session_mode: duplex` unless the stage explicitly declares `supports_duplex_mrv2=True` in `pipeline.py` (see `personaplex/pipeline.py:75`).
 - **One independent streaming codec per active request ID**: Size codec pools from `duplex_max_sessions` (propagated from `duplex_session.max_sessions` or `max_sessions_per_replica`). Never share convolution/transformer state across concurrent requests in a batch.
 - **Acoustic de-delaying**: Retain trailing raw code frames across connector chunk boundaries when the talker shifts acoustic codebooks relative to text/semantic tokens.
-- **Native talker vs vendored eager talker**: See `nemotron_labs_voicechat_duplex.yaml` (Stage 1 native Gemma3 talker on PagedAttention with `native_talker: true` and `async_chunk_prewarm_prompt_len`) and `personaplex_duplex_mrv2.yaml` (MRv2 Stage 0 `post_sample` + Stage 1 Mimi CUDA graphs).
+- **Native talker vs vendored eager talker**: See `nemotron_labs_voicechat_duplex.yaml` (Stage 1 native Gemma3 talker on PagedAttention with `native_talker: true` and `async_chunk_prewarm_prompt_len`) and `personaplex.yaml` (MRv2 Stage 0 `post_sample` + Stage 1 Mimi CUDA graphs).
 - **CUDA Graph boundary**: Never capture Python-owned per-request generators or dynamic H2D codec copies inside a full CUDA graph. Configure `enforce_eager: true` or `compilation_config: { cudagraph_mode: PIECEWISE }` directly in the shipped deploy YAML.
 
 ## 4. Deploy Config Reference (`vllm_omni/deploy/`)
 
-References: `haru.yaml` (Pattern B1), `personaplex_duplex_mrv2.yaml` & `nemotron_labs_voicechat_duplex.yaml` (Pattern B2), `minicpmo_4_5.yaml` / `minicpmo_4_5_duplex_h200.yaml` (Pattern A), `qwen3_omni_duplex_mrv2.yaml` (Pattern C).
+References: `haru.yaml` (Pattern B1), `personaplex.yaml` & `nemotron_labs_voicechat_duplex.yaml` (Pattern B2), `minicpmo_4_5.yaml` / `minicpmo_4_5_duplex_h200.yaml` (Pattern A), `qwen3_omni_duplex.yaml` (Pattern C).
 
 ```yaml
 pipeline: your_model

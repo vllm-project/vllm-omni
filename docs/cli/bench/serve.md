@@ -361,7 +361,7 @@ identities. With this option, `--num-prompts 0` selects exactly `N` samples,
 rather than the full dataset. The same pool behavior applies to OmniInteract;
 answer evaluation and oversampling with `--no-oversample` are rejected.
 
-For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml`,
+For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex.yaml`,
 use the same entrypoint with server-detected turns and no reference audio:
 
 ```bash
@@ -689,7 +689,7 @@ Serve with the duplex deployment, which needs the Silero VAD artifact in the Hug
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-  --deploy-config vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml
 
 vllm bench serve --omni \
   --backend openai-realtime-duplex \
@@ -870,9 +870,9 @@ signal, not a transport failure. Accuracy must finish with `status=ok`, `failed=
 IA-QTF1 floor; skipped sessions from the official eligibility policy do not fail the job.
 
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
-using the existing `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` via
+using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via
 `server_params.extra_cli_args`. Inline `server_params.update` values select
-`model_runner: v2`, `async_chunk: true`, Thinker prefix caching,
+Model Runner V2, `async_chunk: true`, Thinker prefix caching,
 `duplex_session.max_sessions: 8`, and `duplex_session.collect_stats: true`.
 The harness applies these settings to a temporary deploy copy, preserving base
 inheritance and removing the copy when pytest exits. No test-specific deploy
@@ -970,7 +970,7 @@ the accompanying text rather than transcribe or answer the audio. This is what m
 conversation turn rather than a TTS call. It requires `--backend openai-realtime-chat`.
 
 For Qwen3-Omni, use a server running the
-[`qwen3_omni_duplex_mrv2.yaml` deployment](gh-file:vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml) with async chunking enabled.
+[`qwen3_omni_duplex.yaml` deployment](gh-file:vllm_omni/deploy/qwen3_omni_duplex.yaml) with async chunking enabled.
 Each dataset entry uses an independent WebSocket session at `/v1/realtime?duplex=1` with one audio turn and one response.
 
 ```bash

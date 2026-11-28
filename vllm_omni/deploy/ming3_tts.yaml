@@ -4,7 +4,6 @@
 # pass; a request that halts runs one more step, in which its last latent is
 # flushed, and stops there.
 pipeline: ming3_tts
-model_runner: v2
 async_chunk: true
 trust_remote_code: false
 dtype: bfloat16

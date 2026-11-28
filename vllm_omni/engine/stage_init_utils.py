@@ -2071,8 +2071,47 @@ def get_stage_connector_spec(
     omni_transfer_config: Any,
     stage_id: int,
     async_chunk: bool,
+    *,
+    stage_config: Any = None,
+    local_stages: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Return the first connector spec for a stage data-plane edge."""
+    spec = _get_stage_edge_spec(omni_transfer_config, stage_id)
+    if isinstance(stage_config, BaseVllmOmniStageConfig):
+        model_arch = stage_config.model_config.model_arch
+        role = stage_config.model_stage
+    else:
+        args = getattr(stage_config, "engine_args", None)
+        model_arch = _get_attr_or_item(args, "model_arch")
+        role = _get_attr_or_item(args, "model_stage")
+    if model_arch != "Qwen3OmniMoeForConditionalGeneration" or role != "talker":
+        return spec
+
+    from vllm_omni.model_executor.models.qwen3_omni.codec_config import first_frame_decoders_match
+
+    # The Talker loads code2wav.* from its own checkpoint. A separately
+    # launched or independently updated codec must render the entire stream.
+    codec = next(
+        (
+            s
+            for s in local_stages
+            if isinstance(s, BaseVllmOmniStageConfig) and s.model_stage == "code2wav" and stage_id in s.input_sources
+        ),
+        None,
+    )
+    if (
+        isinstance(stage_config, BaseVllmOmniStageConfig)
+        and codec is not None
+        and first_frame_decoders_match(
+            stage_config, codec, spec, _get_stage_edge_spec(omni_transfer_config, codec.stage_id)
+        )
+    ):
+        return spec
+    spec["extra"] = {**spec.get("extra", {}), "talker_first_audio": False}
+    return spec
+
+
+def _get_stage_edge_spec(omni_transfer_config: Any, stage_id: int) -> dict[str, Any]:
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)

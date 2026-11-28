@@ -138,10 +138,10 @@ serving pipeline.
 
 ### Configuration
 
-Use an explicit Qwen3-Omni MRv2 deployment with CUDA and an unquantized
-Thinker at TP=1: `qwen3_omni_moe_codec.yaml` for turn serving or
-`qwen3_omni_duplex_mrv2.yaml` for duplex sessions. The V1 duplex profile,
-`qwen3_omni_duplex.yaml`, is not supported. Runtime quantization is rejected
+Use a Qwen3-Omni V2 deployment with CUDA and an unquantized
+Thinker at TP=1: `qwen3_omni_moe.yaml` for turn serving or
+`qwen3_omni_duplex.yaml` for duplex sessions. Both use the default V2 runner.
+Runtime quantization is rejected
 to prevent incompatible effective models from sharing cached KV and hidden
 states. Keep the deployment's normal async-chunk handoff and downstream stage
 settings. Set this on the Thinker stage:
@@ -149,7 +149,6 @@ settings. Set this on the Thinker stage:
 ```yaml
 stages:
   - stage_id: 0
-    model_runner: v2
     enable_prefix_caching: false
     omni_kv_config:
       kv_store_config:

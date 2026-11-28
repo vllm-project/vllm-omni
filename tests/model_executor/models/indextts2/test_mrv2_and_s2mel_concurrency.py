@@ -402,9 +402,6 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
         cfg = yaml.safe_load((deploy_dir / deploy_name).read_text(encoding="utf-8"))
         stage0 = next(s for s in cfg["stages"] if s["stage_id"] == 0)
         stage1 = next(s for s in cfg["stages"] if s["stage_id"] == 1)
-        assert cfg["model_runner"] == "v2"
-        assert stage0.get("model_runner", cfg["model_runner"]) == "v2"
-        assert stage1.get("model_runner", cfg["model_runner"]) == "v2"
         assert stage0["enable_prefix_caching"] is False
         assert stage0["enable_chunked_prefill"] is False
         assert stage0["max_num_batched_tokens"] >= stage0["max_model_len"]

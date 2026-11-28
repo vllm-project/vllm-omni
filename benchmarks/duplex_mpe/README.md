@@ -24,7 +24,7 @@ Auxiliary diagnostics `RP` (response presence, including continuations already a
    - Opens `/v1/realtime?duplex=1&autostart=0` with `turn_detection: null`, `extra_body.auto_response: true`, and `extra_body.silence_continuation: false` so the model hears only the benchmark's continuous audio stream.
    - Reports full `scored_full_duplex` metrics (`TR`, `AA`, `SP`, `AY`, `RP`, `WR`) under `evaluation_clock: "realtime_wall_clock"` (`1.0x` real-time streaming, where end-to-end serving latency and underruns count toward the `5.0 s` `T` onset and `2.0 s` `N4_R` yield windows, distinct from offline in-process `audio_samples_excluding_compute_time` adapters).
 2. **Unscored Turn-Based Probe (`--protocol turn_based` or `openai_turn`)**:
-   - Turn-committed deployments (`Qwen/Qwen3-Omni-30B-A3B-Instruct` on `qwen3_omni_duplex_mrv2.yaml` or `session_mode: turn` `/v1/realtime`).
+   - Turn-committed deployments (`Qwen/Qwen3-Omni-30B-A3B-Instruct` on `qwen3_omni_duplex.yaml` or `session_mode: turn` `/v1/realtime`).
    - Uses `turn_detection: {"type": "server_vad", "silence_duration_ms": 500}` and omits `TR`, `AY`, and `RP` (`evaluation_mode: "unscored_turn_based_probe"`), consistent with Duplex-MPE Section 3.4.
 
 ---

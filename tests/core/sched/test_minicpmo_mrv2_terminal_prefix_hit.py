@@ -79,7 +79,7 @@ def _scheduler(prefix_caching, num_spec=NUM_SPEC):
         supports_multimodal_inputs=False,
         return_sampling_mask=False,
         recompute_preemption="allow",
-        # Stage 0 of minicpmo_4_5_turn_mrv2.yaml, with a stage-0 draft unless num_spec is 0.
+        # Stage 0 of minicpmo_4_5_turn.yaml, with a stage-0 draft unless num_spec is 0.
         model_arch="MiniCPMO45OmniForConditionalGeneration",
         model_stage="llm",
         session_mode="turn",

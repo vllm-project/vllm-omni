@@ -27,7 +27,6 @@ stages:
     # Leave KV-cache headroom for the full 128K context after graph profiling.
     gpu_memory_utilization: 0.89
     enforce_eager: false
-    model_runner: v2
     async_scheduling: true
     enable_prefix_caching: false
     enable_chunked_prefill: true
@@ -56,7 +55,6 @@ stages:
     max_num_batched_tokens: 8192
     gpu_memory_utilization: 0.10
     enforce_eager: false
-    model_runner: v2
     enable_prefix_caching: false
     compilation_config:
       mode: 0

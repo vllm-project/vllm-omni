@@ -11,9 +11,9 @@ For deployment recipes (TTS and multimodal), see [recipes.vllm.ai](https://recip
 ## List of Supported Models
 
 With vLLM 0.34.0, profiles that require Model Runner V1 are unavailable,
-including Drama 3 / Fish-Omni serving and the LFM3-Omni profiles. Their
+including Drama 3 / Fish-Omni serving and the LFM3-Omni and LFM3-Audio profiles. Their
 implementation entries below do not imply runnable V2 deployments. See
-[stage-level runner selection](../configuration/stage_configs.md#stage-level-runner-selection)
+[Model Runner V2](../configuration/stage_configs.md#model-runner-v2)
 for the unavailable workflows and CI coverage limits.
 
 <style>
@@ -128,7 +128,7 @@ th {
 | `MossTTSRealtime` | MOSS-TTS-Realtime | `OpenMOSS-Team/MOSS-TTS-Realtime` | ✅︎ | | | | — |
 | `HiggsAudioV2ForConditionalGeneration` | Higgs-Audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✅︎ | | | | — |
 | `HiggsMultimodalQwen3ForConditionalGeneration` | Higgs-Audio v3 (TTS) | `bosonai/higgs-audio-v3-tts-4b` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/bosonai/higgs-audio-v3-tts-4b) |
-| `VibeVoiceForConditionalGeneration` | VibeVoice-1.5B (offline, eager, single speaker, optional voice clone) | `vibevoice/VibeVoice-1.5B-hf` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Microsoft/VibeVoice-1.5B-H100.md) |
+| `VibeVoiceForConditionalGeneration` | VibeVoice-1.5B (offline TTS unavailable with Model Runner V2) | `vibevoice/VibeVoice-1.5B-hf` | | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Microsoft/VibeVoice-1.5B-H100.md) |
 | `IndexTTS2TalkerForConditionalGeneration` | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✅︎ | | | | — |
 | `IndexTTS25TalkerForConditionalGeneration` | IndexTTS-2.5 | native `checkpoints/` bundle | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md) |
 | `NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` | ✅︎ | ✅︎ | | ✅︎ | — |

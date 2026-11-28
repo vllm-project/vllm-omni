@@ -1,2 +1,0 @@
-# Compatibility alias for existing turn-serving deployments.
-base_config: qwen3_omni_moe_codec.yaml

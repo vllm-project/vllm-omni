@@ -38,7 +38,7 @@ Check these at the end of every phase.
 - **I1. Topology in code, runtime in YAML.** `model_stage`, `execution_type`,
   input sources, processor functions, and final outputs live in `pipeline.py`.
   The deploy YAML only sets devices, memory, batch limits, graphs, connectors,
-  `async_chunk`, `session_mode`, and `model_runner`.
+  `async_chunk`, and `session_mode`.
 - **I2. One stage per process.** The unified class reads
   `vllm_config.model_config.model_stage` and builds only that stage's modules
   and weights. Never instantiate all stages in every process.
