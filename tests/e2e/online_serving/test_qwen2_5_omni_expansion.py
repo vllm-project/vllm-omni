@@ -13,6 +13,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -20,13 +21,24 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
 # Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
-# platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
+# qwen2_5_omni overlay's platforms: section in tests/helpers/stage_config.py.
+
+# The default 16384-token profiling step leaves the Thinker and the Talker too little KV cache on
+# 22 GiB L4 cards; no request in this file exceeds 8192 tokens, so the smaller step does not chunk any.
+_CUDA_BATCH = {"max_num_batched_tokens": 8192} if current_omni_platform.is_cuda() else {}
+
 stage_configs = [
     modify_stage_config(
         get_deploy_config_path("ci/qwen2_5_omni.yaml"),
         # This suite requests two cards. Share the Talker's card with
         # Code2Wav and leave room for its whole-sequence DiT workspace.
-        updates={"stages": {1: {"gpu_memory_utilization": 0.3}, 2: {"devices": "1"}}},
+        updates={
+            "stages": {
+                0: dict(_CUDA_BATCH),
+                1: {"gpu_memory_utilization": 0.3, **_CUDA_BATCH},
+                2: {"devices": "1"},
+            }
+        },
     )
 ]
 
