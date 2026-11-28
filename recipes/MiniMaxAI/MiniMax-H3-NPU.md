@@ -692,3 +692,52 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Independent VAE optimization validation
+
+Cross-chunk scheduling is opt-in. It packs complete native tile groups across
+replicated decoder ranks while preserving group membership, member order and
+shape-sensitive projection call batches. With native stacking enabled, FFN w1,
+attention to_out and the final decoder proj_out retain their native groups.
+With native stacking disabled, QKV and FFN w2 also retain the original sample
+batch. A tile limit of four is a tile packing limit, independent of latent
+sample batch. Unsupported modes and plans that reduce neither wave count nor
+maximum rank tile load retain native execution. To enable the scheduler, set
+`H3_VIDEO_DECODER_CROSS_CHUNK=1` before starting the server. Merge the decoder
+settings into the existing `--additional-config` JSON; for example:
+
+```bash
+--additional-config '{"video_vae_decode":{"tile_batch_size":4,"tile_size":288,"tile_min_overlap":16}}'
+```
+
+`tile_batch_size` is a positive integer and caps the scheduler's packed tiles
+per forward, subject to the native stacking limit. `1` disables packing. When
+omitted, the existing batch-size and batching environment controls still apply.
+The two geometry settings are in output pixels and apply to native Video VAE
+decode independently of cross-chunk scheduling. Omitted geometry uses the
+checkpoint values. The resolved pair must be divisible by the spatial VAE ratio
+and satisfy `0 < tile_min_overlap < tile_size`. Geometry can change decoded
+pixels and does not affect encoder tiling. A grid unsupported by cross-chunk
+scheduling stays on the native decode path.
+
+On eight 910B4-1 NPUs with main b7bbfbd and nightly/CANN 9.2.1, a 30-configuration
+matrix covers sample B=1/2/3/4, multiple chunk/tile grids and tile limits. Two
+independent launches use five warmups and five formal requests per arm: all
+complete Float32 video, stream RGB, plain RGB and independent repeats are
+bit-exact, including signed zero. Native-stack B=1/17 chunks/15 tiles measures
+3.646732 to 3.452430 s (5.328% reduction); unstacked B=1 measures 4.075196 to
+3.640769 s (10.660%). Gains depend on shape: tested unstacked B=2/3/4 cases
+regress by 8.272-11.907%, and six configurations retain native execution.
+
+Under separately frozen INT8 OPT/CANN 9.0.1 with native stack and tile limit
+four, the same repair is approximately unchanged at 480P (2.657499 to
+2.653006 s), but increases 768P latency from 5.000924 to 5.653384 s (+13.0468%)
+because 4/3-tile native groups cannot be combined within the limit. Those
+fixed OPT inputs are already bit-exact before repair. No universal speedup
+or E2E claim follows from these resident Video VAE measurements.
+
+See the [complete precision and performance report](../../benchmarks/diffusion/minimax_h3_vae_native_groups.md)
+for software, configuration, mathematical equivalence, the full positive and
+negative matrix, and reproduction. Compare complete saved pre-codec outputs
+with `benchmarks/diffusion/minimax_h3_vae_precision.py`; any differing raw byte
+fails the gate. MP4 codec equivalence is outside this validation.

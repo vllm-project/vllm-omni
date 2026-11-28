@@ -10,6 +10,7 @@ We use **Qwen-Image** as the reference implementation for decode parallel, and *
 - [Overview](#overview)
 - [Step-by-Step Implementation (Decode)](#step-by-step-implementation-decode)
 - [Encode Parallel Implementation](#encode-parallel-implementation)
+- [MiniMax H3 Video Decoder Overrides](#minimax-h3-video-decoder-overrides)
 - [Testing](#testing)
 - [Reference Implementations](#reference-implementations)
 - [Summary](#summary)
@@ -439,6 +440,22 @@ def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
 | `broadcast_result` | Often `False` (only rank 0 needs output) | `True` (all ranks need latents for diffusion) |
 | Patchify | Applied in merge (unpatchify) | Handled by parent `_encode()` before `tiled_encode()` |
 | Temporal chunking | Frame-by-frame | Chunk-based (e.g., 1 + 4n frames) |
+
+## MiniMax H3 Video Decoder Overrides
+
+The native MiniMax H3 Video VAE consumes `video_vae_decode` from
+`--additional-config` in the full diffusion pipeline and the separate decoder
+pipeline. `tile_size` and `tile_min_overlap` are output-pixel overrides for the
+decoder grid only. The resolved pair must be aligned to the checkpoint's
+spatial ratio, with `0 < tile_min_overlap < tile_size`. This configuration does
+not change encoder tiling or enable tiling on a checkpoint that disables it.
+
+With `H3_VIDEO_DECODER_CROSS_CHUNK=1`, `tile_batch_size` sets the cross-chunk
+packing limit for each rank. It overrides the legacy batch environment
+settings when present and does not change the original groups used by native
+fallback. Only a uniform grid enters the equal-shape cross-chunk collective;
+all ranks decide from the same grid. Omit `video_vae_decode` to use the native
+checkpoint geometry and legacy scheduling configuration.
 
 ## Testing
 

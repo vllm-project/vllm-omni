@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_reshape import configure_video_decode_tiles, install_cross_chunk_tiling
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -371,6 +372,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
         stack_decode_tiles: bool = True,
+        decode_tiling: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -388,6 +390,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         )
 
         decoder_path = resolve_video_decoder_checkpoint(decoder_source, device)
+        if decode_tiling and (self.encode_only or decoder_path is not None or lightvae_decoder_path is not None):
+            raise ValueError("video_vae_decode requires the native MiniMax-H3 video decoder")
         self._pixel_transform = released_decoder_pixels if decoder_path is not None else None
         if self.encode_only and decoder_path is not None:
             raise ValueError("An encode-only VAE cannot load a replacement video decoder")
@@ -473,6 +477,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
             )
         self.model = self.remote.model
+        tile_batch_size = configure_video_decode_tiles(self.model, decode_tiling)
+        if not self.encode_only:
+            install_cross_chunk_tiling(self, tile_batch_size=tile_batch_size)
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None
