@@ -75,6 +75,18 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
+def expand_timestep(t: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Broadcast a scheduler timestep to the batch without changing its dtype.
+
+    Stage-1/2 schedules are built with ``np.linspace`` and are fractional
+    (step ``(t1 - t0) / (n - 1)`` rarely divides evenly). Casting the
+    broadcast timestep to ``int64`` truncates it before the sinusoidal
+    embedding, so stage 2 used to embed a different timestep than stage 1
+    and than the reference schedule.
+    """
+    return t.expand(batch_size)
+
+
 def _block_noise_cholesky_factor(
     block_size: int,
     gamma: float,
@@ -757,7 +769,7 @@ class HeliosPipeline(
         batch_size = latents.shape[0]
         t = timesteps
         self._current_timestep = t
-        timestep = t.expand(batch_size)
+        timestep = expand_timestep(t, batch_size)
         transformer_kwargs = {
             "hidden_states": latents.to(extra["dtype"]),
             "timestep": timestep,
@@ -818,7 +830,7 @@ class HeliosPipeline(
         t = state.current_timestep
         assert t is not None
         self._current_timestep = t
-        timestep = t.expand(batch_size).to(torch.int64)
+        timestep = expand_timestep(t, batch_size)
         transformer_kwargs = {
             "hidden_states": latents.to(extra["dtype"]),
             "timestep": timestep,
@@ -1431,7 +1443,7 @@ class HeliosPipeline(
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 self._current_timestep = t
-                timestep = t.expand(batch_size)
+                timestep = expand_timestep(t, batch_size)
 
                 transformer_kwargs = {
                     "hidden_states": latents.to(transformer_dtype),
@@ -1597,7 +1609,7 @@ class HeliosPipeline(
             with self.progress_bar(total=len(timesteps)) as pbar:
                 for idx, t in enumerate(timesteps):
                     self._current_timestep = t
-                    timestep = t.expand(latents.shape[0]).to(torch.int64)
+                    timestep = expand_timestep(t, latents.shape[0])
 
                     transformer_kwargs = {
                         "hidden_states": latents.to(transformer_dtype),
