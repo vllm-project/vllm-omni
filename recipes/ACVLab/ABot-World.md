@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: ACVLab (Amap CV Lab)
-- Model: `acvlab/ABot-World-0-5B-LF`
+- Model: `acvlab/ABot-World-0-5B-LF`; `acvlab/ABot-World-0-5-5B-Iris` (see [ABot-World 0.5 Iris](#abot-world-05-iris))
 - Task: image-conditioned interactive world generation
 - Modes: offline generation and stepwise chunk output, with mid-generation camera keys over `WS /v1/realtime/video`
 - Maintainer: Community
@@ -34,7 +34,8 @@ FlashAttention paged-KV kernel requires this page size to be a multiple of 16.
 480x832 (390 tokens) and 448x832 (364 tokens) are therefore rejected before
 model execution.
 
-Offline whole-clip frame counts must be `9 + 12k`, up to 117 frames. This
+Offline whole-clip frame counts must be `9 + 12k`, up to 117 frames when
+decoding to pixels; `output_type="latent"` skips the decode and the cap. This
 whole-clip safeguard is not a ten-tick limit on stepwise rollouts, which
 decode 9 frames in the opening chunk and 12 in each subsequent chunk.
 
@@ -137,6 +138,31 @@ must be omitted or zero, and a request that carries `camera_action_script`
 rejects live camera updates. Chunk metadata acknowledges updates through
 `started_event_ids`, `active_event_ids` and `completed_event_ids`; an update
 replaced before any chunk used it is reported in `coalesced_event_ids`.
+
+## ABot-World 0.5 Iris
+
+`acvlab/ABot-World-0-5-5B-Iris` runs on the same pipeline. Its `config.json`
+sets `use_relative_rope`, which switches on relative RoPE, up to five
+512 px reference-image slots, and Iris's prompt layout: a 384-token global
+prompt row plus a 128-token local row, left empty for now. Iris is validated on
+AMD MI300X only.
+
+Iris uses 704x1280 (880 tokens per latent frame). It commits the source frame
+first, so every chunk adds 12 frames and a rollout has `1 + 12k` frames (13 for
+one chunk, 421 for 35). Offline requests pass `reference_images` (up to five
+images) in `multi_modal_data`; empty slots are masked.
+
+```bash
+vllm serve /path/to/ABot-World-0-5-5B-Iris \
+  --omni \
+  --deploy-config vllm_omni/deploy/abot_world_iris_stepwise.yaml \
+  --port 8000
+```
+
+`session.start` takes `width: 1280`, `height: 704` and `num_frames: 12k + 1`.
+`image_reference` carries the first frame only, so reference slots stay empty
+over WebSocket. Camera keys work as above. Prompt switch and local event
+prompts are not wired yet.
 
 ## Reproduce review evidence
 
@@ -308,7 +334,8 @@ by the existing Buildkite `tests/diffusion -m 'core_model and cpu'` sweep.
 
 ## Current limitations
 
-- Only the `ABot-World-0-5B-LF` causal student checkpoint is supported.
+- Only the `ABot-World-0-5B-LF` and `ABot-World-0-5-5B-Iris` causal student
+  checkpoints are supported; the Iris-BiT teacher and FantasyDecoder are not.
 - Mid-generation updates cover camera keys only; prompt updates are not wired
   on the stepwise path.
 - AR-Diffusion stages require one replica.

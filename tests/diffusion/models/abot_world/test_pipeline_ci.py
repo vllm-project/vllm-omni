@@ -4,13 +4,17 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
+    ABotAttentionCache,
     ABotSimpleAdapter,
+    ABotTransformerCache,
     ABotWorldCausalTransformer3DModel,
 )
 from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
@@ -18,6 +22,7 @@ from vllm_omni.diffusion.models.abot_world.interaction import ABotCameraSession
 from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     ABotWorldCausalPipeline,
     _ABotRequestInputs,
+    _build_shifted_flow_schedule,
     _wan_decode_cache_bytes,
 )
 from vllm_omni.diffusion.models.abot_world.taew2_2 import TAEW2Decoder
@@ -26,6 +31,9 @@ from vllm_omni.diffusion.offloader import sequential_backend
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
+from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -145,6 +153,7 @@ def test_ar_diffusion_spec_reserves_persistent_vae_state(monkeypatch) -> None:
                 num_layers=1,
                 attention_head_dim=8,
                 text_dim=4096,
+                use_relative_rope=False,
             ),
             dtype=torch.bfloat16,
         ),
@@ -270,11 +279,21 @@ def _bare_pipeline(**attributes) -> ABotWorldCausalPipeline:
 
 
 @pytest.mark.parametrize(
-    ("chunk_index", "fps", "expected"),
-    [(0, None, (9, 9.0)), (1, None, (12, 12.0)), (1, 16, (12, 16.0))],
+    ("relative", "chunk_index", "fps", "expected"),
+    [
+        (False, 0, None, (9, 9.0)),
+        (False, 1, None, (12, 12.0)),
+        (False, 1, 16, (12, 16.0)),
+        (True, 0, None, (13, 13.0)),
+        (True, 1, None, (12, 12.0)),
+    ],
 )
-def test_peek_chunk_media_reports_the_opening_and_steady_chunk_lengths(chunk_index, fps, expected) -> None:
-    pipeline = _bare_pipeline(_num_frame_per_block=3, vae_scale_factor_temporal=4)
+def test_peek_chunk_media_reports_the_opening_and_steady_chunk_lengths(relative, chunk_index, fps, expected) -> None:
+    pipeline = _bare_pipeline(
+        _num_frame_per_block=3,
+        vae_scale_factor_temporal=4,
+        transformer=SimpleNamespace(config=SimpleNamespace(use_relative_rope=relative)),
+    )
     state = StepRequestState(request_id="r", sampling=OmniDiffusionSamplingParams(fps=fps), chunk_index=chunk_index)
 
     media = pipeline.peek_chunk_media(state)
@@ -426,3 +445,390 @@ def test_text_cache_projection_activates_the_offloaded_transformer(monkeypatch, 
         assert moves[2:] == [("transformer", "cpu")]
     else:
         assert moves == []
+
+
+class _WordTokenizer:
+    """One id per word plus EOS, padded with zeros like the UMT5 tokenizer."""
+
+    def __call__(self, texts, *, max_length, **kwargs):
+        words = texts[0].split()[: max_length - 1]
+        ids = torch.zeros(1, max_length, dtype=torch.long)
+        ids[0, : len(words) + 1] = torch.tensor([len(word) + 1 for word in words] + [1])
+        return SimpleNamespace(input_ids=ids, attention_mask=(ids > 0).long())
+
+
+def _text_encoder(input_ids, attention_mask):
+    return SimpleNamespace(last_hidden_state=input_ids.float().unsqueeze(-1).expand(-1, -1, 2))
+
+
+@pytest.mark.parametrize(("relative", "eos_at"), [(False, [3]), (True, [3, 384])])
+def test_iris_prompt_is_a_global_row_and_an_empty_local_row(relative: bool, eos_at: list[int]) -> None:
+    pipeline = _bare_pipeline(
+        transformer=SimpleNamespace(config=SimpleNamespace(use_relative_rope=relative)),
+        tokenizer=_WordTokenizer(),
+        text_encoder=_text_encoder,
+        device=torch.device("cpu"),
+    )
+
+    embeds = pipeline.encode_prompt("a red  car", max_sequence_length=512, dtype=torch.float32)
+
+    assert embeds.shape == (1, 512, 2)
+    assert embeds[0, :3, 0].tolist() == [2.0, 4.0, 4.0]
+    assert torch.nonzero(embeds[0, :, 0] == 1.0).flatten().tolist() == eos_at
+    assert int(torch.count_nonzero(embeds[0, :, 0])) == 3 + len(eos_at)
+
+
+def test_text_cache_rebuild_keeps_the_reference_kv() -> None:
+    model = _relative_transformer()
+    state = _relative_kv_state(model)
+    pipeline = _bare_pipeline(transformer=model, _ar_diffusion_kv_state=state, _module_offload=False)
+    generator = torch.Generator().manual_seed(0)
+    reference = torch.randn(1, _REF_TOKENS, 1, 8, generator=generator)
+    state.populate_cross_attention("main", "ref", [(reference, -reference)])
+
+    with torch.no_grad():
+        before = pipeline._ar_text_caches(torch.randn(1, 5, 16, generator=generator), invalidate=False)[0].key.clone()
+        after = pipeline._ar_text_caches(torch.randn(1, 5, 16, generator=generator), invalidate=True)[0].key
+
+    assert not torch.equal(after, before)
+    kept = pipeline._ar_reference_caches()[0]
+    assert torch.equal(kept.key, reference) and torch.equal(kept.value, -reference)
+
+
+@pytest.mark.parametrize("model_type", ["ti2v", "ci2v"])
+def test_native_abot_checkpoint_resolves_without_a_pipeline_index(tmp_path, model_type: str) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"_class_name": "CausalWanModel", "model_type": model_type}))
+    config = OmniDiffusionConfig(model=str(tmp_path), model_class_name="ABotWorldCausalPipeline")
+
+    config.enrich_config()
+
+    assert config.model_class_name == "ABotWorldCausalPipeline"
+
+
+def _relative_transformer() -> ABotWorldCausalTransformer3DModel:
+    model = ABotWorldCausalTransformer3DModel(
+        patch_size=(1, 2, 2),
+        num_attention_heads=1,
+        attention_head_dim=8,
+        in_channels=4,
+        out_channels=4,
+        text_dim=16,
+        freq_dim=8,
+        ffn_dim=16,
+        num_layers=1,
+        downscale_factor_control_adapter=2,
+        use_relative_rope=True,
+        local_attn_size=7,
+    )
+    # vLLM parallel linear layers allocate uninitialized weights.
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.1)
+    # ROCm hosts dispatch rotary to a Triton kernel that cannot read CPU tensors.
+    for block in model.blocks:
+        rope = block.self_attn.rotary_embedding
+        rope._forward_method = rope.forward_native
+    return model.eval()
+
+
+def test_relative_rope_rollout_stays_finite_past_the_window_and_keeps_reference_sink() -> None:
+    model = _relative_transformer()
+    refs = torch.randn(1, 2, 4, 1, 4, 4)
+    mask = torch.tensor([[1.0, 0.0]])
+    ref_tokens = 2 * 4
+    cache = model.allocate_cache(
+        batch_size=1,
+        latent_height=4,
+        latent_width=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ref_tokens=ref_tokens,
+    )
+    text = torch.randn(1, 5, 16)
+
+    def call(frames: int, start: int, t: float, commit: bool) -> torch.Tensor:
+        return model(
+            torch.randn(1, 4, frames, 4, 4),
+            torch.full((1, frames), t),
+            text,
+            cache=cache,
+            start_frame=start,
+            update_cache=commit,
+            ref_latents=refs,
+            ref_mask=mask,
+        )
+
+    with torch.no_grad():
+        assert call(1, 0, 0.0, True).shape == (1, 4, 1, 4, 4)
+        sink = cache.self_attention[0].key[:, :ref_tokens].clone()
+        for block in range(6):  # 1 + 18 frames: the 7-frame window wraps twice
+            start = 1 + 3 * block
+            assert torch.isfinite(call(3, start, 500.0, False)).all()
+            assert torch.isfinite(call(3, start, 0.0, True)).all()
+
+    assert torch.equal(cache.self_attention[0].key[:, :ref_tokens], sink)
+
+
+def test_masked_reference_slot_contributes_no_tokens() -> None:
+    model = _relative_transformer()
+    refs = torch.randn(1, 2, 4, 1, 4, 4)
+
+    tokens = model._ref_tokens(refs, torch.tensor([[1.0, 0.0]]))
+
+    assert tokens.shape[1] == 2 * 4
+    assert tokens[:, :4].abs().sum() > 0
+    assert torch.count_nonzero(tokens[:, 4:]) == 0
+
+
+def _parse(
+    pipeline: ABotWorldCausalPipeline, *, num_frames: int | None, refs: tuple | None, output_type: str = "np"
+) -> _ABotRequestInputs:
+    mm_data = {"image": torch.zeros(3, 64, 64), "reference_images": refs}
+    sampling = OmniDiffusionSamplingParams(
+        height=704,
+        width=1280,
+        num_frames=num_frames,
+        output_type=output_type,
+        generator=torch.Generator(),
+        extra_args={},
+    )
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "p", "multi_modal_data": mm_data}, sampling_params=sampling, request_id="r"
+    )
+    return pipeline._parse_request(DiffusionRequestBatch(requests=[request]))
+
+
+def _parsing_pipeline(*, relative: bool) -> ABotWorldCausalPipeline:
+    config = SimpleNamespace(patch_size=(1, 2, 2), use_relative_rope=relative)
+    return _bare_pipeline(
+        transformer=SimpleNamespace(config=config),
+        od_config=SimpleNamespace(),
+        vae_scale_factor_spatial=16,
+        vae_scale_factor_temporal=4,
+        _num_frame_per_block=3,
+    )
+
+
+def test_reference_images_need_a_relative_rope_checkpoint() -> None:
+    refs = (torch.zeros(3, 8, 8),)
+
+    with pytest.raises(NotImplementedError, match="Iris"):
+        _parse(_parsing_pipeline(relative=False), num_frames=9, refs=refs)
+
+    assert _parse(_parsing_pipeline(relative=True), num_frames=13, refs=refs).reference_images == refs
+
+
+@pytest.mark.parametrize(("num_frames", "ok"), [(13, True), (25, True), (9, False), (1, False)])
+def test_relative_rope_prefills_one_frame_then_whole_blocks(num_frames: int, ok: bool) -> None:
+    pipeline = _parsing_pipeline(relative=True)
+
+    if ok:
+        assert _parse(pipeline, num_frames=num_frames, refs=None).num_latent_frames == (num_frames - 1) // 4 + 1
+    else:
+        with pytest.raises(ValueError, match="generated latent frames"):
+            _parse(pipeline, num_frames=num_frames, refs=None)
+
+
+@pytest.mark.parametrize(("relative", "expected"), [(False, 9), (True, 13)])
+def test_default_frame_count_is_one_block(relative: bool, expected: int) -> None:
+    assert _parse(_parsing_pipeline(relative=relative), num_frames=None, refs=None).num_frames == expected
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_offline_frame_cap_applies_only_to_pixel_decode(relative: bool) -> None:
+    pipeline = _parsing_pipeline(relative=relative)
+    num_frames = 121 if relative else 129
+
+    assert _parse(pipeline, num_frames=num_frames, refs=None, output_type="latent").num_frames == num_frames
+    with pytest.raises(ValueError, match="when decoding to pixels"):
+        _parse(pipeline, num_frames=num_frames, refs=None)
+
+
+def test_unfilled_reference_slots_are_zero_and_masked() -> None:
+    pipeline = _bare_pipeline(
+        transformer=SimpleNamespace(config=SimpleNamespace(in_channels=4)),
+        vae_scale_factor_spatial=16,
+        device=torch.device("cpu"),
+    )
+    pipeline._encode_first_frame = lambda image, height, width, dtype: torch.ones(1, 4, 1, 32, 32, dtype=dtype)
+
+    encoded = pipeline._encode_references((torch.zeros(3, 8, 8), torch.zeros(3, 8, 8)), torch.float32)
+
+    assert encoded["ref_mask"].tolist() == [[1.0, 1.0, 0.0, 0.0, 0.0]]
+    assert encoded["ref_latents"].shape[:3] == (1, 5, 4)
+    assert encoded["ref_latents"][:, 2:].abs().sum() == 0
+
+
+_REF_TOKENS = 2 * 4  # two 4x4-latent reference slots, 2x2 patches
+
+
+def _relative_kv_state(model: ABotWorldCausalTransformer3DModel) -> ARDiffusionKVState:
+    kv = ARDiffusionKVCache(
+        ARDiffusionKVConfig(enable=True, chunk_size=4, window_chunks=7, sink_chunks=0),
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        block_size=4,
+        max_model_len=4096,
+        available_bytes=1 << 24,
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=1,
+        frames_per_block=3,
+        max_scratch_tokens_per_branch=3 * 4,
+        cross_attention_lengths={"text": 5, "ref": _REF_TOKENS},
+        device=torch.device("cpu"),
+    )
+    return ARDiffusionKVState(kv, "s", {"main": kv.begin_request("s")}, num_layers=1)
+
+
+def test_paged_relative_rope_matches_the_dense_cache_past_the_window() -> None:
+    model = _relative_transformer()
+    generator = torch.Generator().manual_seed(0)
+    refs = torch.randn(1, 2, 4, 1, 4, 4, generator=generator)
+    text = torch.randn(1, 5, 16, generator=generator)
+    # Source-frame prefill, then 1 + 18 frames: the 7-frame window slides twice.
+    calls = [(1, 0, 0.0, True)] + [(3, 1 + 3 * block, t, t == 0.0) for block in range(6) for t in (750.0, 500.0, 0.0)]
+    inputs = [torch.randn(1, 4, frames, 4, 4, generator=generator) for frames, *_ in calls]
+
+    dense = model.allocate_cache(
+        batch_size=1,
+        latent_height=4,
+        latent_width=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ref_tokens=_REF_TOKENS,
+    )
+    state = _relative_kv_state(model)
+    holder = ABotAttentionCache(key=torch.empty(0), value=torch.empty(0))
+    paged = ABotTransformerCache(self_attention=[], cross_attention=[None], reference=[holder])
+
+    with torch.no_grad():
+        for (frames, start, t, commit), latent in zip(calls, inputs):
+            paged.self_attention = state.get_kv_caches("main", seq_len=frames * 4, commit_current=commit)
+            outputs = [
+                model(
+                    latent,
+                    torch.full((1, frames), t),
+                    text,
+                    cache=cache,
+                    start_frame=start,
+                    update_cache=commit,
+                    ref_latents=refs,
+                    ref_mask=torch.ones(1, 2),
+                )
+                for cache in (dense, paged)
+            ]
+            if commit:
+                state.commit_paged_context("main")
+            torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=1e-6)
+            sink = dense.self_attention[0].key[:, :_REF_TOKENS]
+            assert torch.equal(holder.key, sink)
+
+
+def test_paged_relative_rope_refuses_a_call_without_cached_reference_tokens() -> None:
+    model = _relative_transformer()
+    state = _relative_kv_state(model)
+    holder = ABotAttentionCache(key=torch.empty(0), value=torch.empty(0))
+    cache = ABotTransformerCache(
+        self_attention=state.get_kv_caches("main", seq_len=12, commit_current=False),
+        cross_attention=[None],
+        reference=[holder],
+    )
+
+    with torch.no_grad(), pytest.raises(RuntimeError, match="cached reference tokens"):
+        model(
+            torch.randn(1, 4, 3, 4, 4),
+            torch.full((1, 3), 500.0),
+            torch.randn(1, 5, 16),
+            cache=cache,
+            start_frame=1,
+            update_cache=False,
+            ref_latents=torch.randn(1, 2, 4, 1, 4, 4),
+        )
+
+
+def test_stepwise_publishes_reference_kv_beside_text_and_runs_the_first_chunk() -> None:
+    model = _relative_transformer()
+    state = _relative_kv_state(model)
+    pipeline = _bare_pipeline(
+        transformer=model,
+        device=torch.device("cpu"),
+        vae_scale_factor_spatial=16,
+        _ar_diffusion_kv_state=state,
+        _module_offload=False,
+    )
+    pipeline._build_action_tensor = lambda *args: None
+    generator = torch.Generator().manual_seed(0)
+    inputs = _ABotRequestInputs(
+        prompt="p",
+        image=torch.zeros(3, 64, 64),
+        reference_images=None,
+        camera_action_script=None,
+        height=64,
+        width=64,
+        num_frames=13,
+        num_latent_frames=4,
+        num_frame_per_block=3,
+        output_type="latent",
+        max_sequence_length=5,
+        flow_shift=5.0,
+        generator=generator,
+    )
+    ref_kwargs = {"ref_latents": torch.randn(1, 2, 4, 1, 4, 4, generator=generator), "ref_mask": torch.ones(1, 2)}
+    step = StepRequestState(
+        request_id="s",
+        sampling=OmniDiffusionSamplingParams(),
+        prompt_embeds=torch.randn(1, 5, 16, generator=generator),
+        chunk_index=0,
+        total_chunks=1,
+        chunk_num_steps=4,
+        extra={
+            "inputs": inputs,
+            "dtype": torch.float32,
+            "schedule": _build_shifted_flow_schedule(flow_shift=5.0),
+            "first_frame_latent": torch.randn(1, 4, 1, 4, 4, generator=generator),
+            "ref_kwargs": ref_kwargs,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="before it was populated"):
+        pipeline._ar_reference_caches()
+    with torch.no_grad():
+        pipeline._prefill_source_frame(step, pipeline._ar_text_caches(step.prompt_embeds, invalidate=False))
+        assert state.is_cross_attention_populated("main", "text")
+        published = pipeline._ar_reference_caches()[0]
+
+        dense = model.allocate_cache(
+            batch_size=1,
+            latent_height=4,
+            latent_width=4,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            ref_tokens=_REF_TOKENS,
+        )
+        model(
+            step.extra["first_frame_latent"],
+            torch.zeros(1, 1),
+            step.prompt_embeds,
+            cache=dense,
+            start_frame=0,
+            update_cache=True,
+            **ref_kwargs,
+        )
+        assert torch.equal(published.key, dense.self_attention[0].key[:, :_REF_TOKENS])
+        assert torch.equal(published.value, dense.self_attention[0].value[:, :_REF_TOKENS])
+
+        pipeline.prepare_next_chunk(step)
+        assert step.extra["start_frame"] == 1
+        for _ in range(step.chunk_num_steps):
+            pipeline.step_scheduler(step, pipeline.denoise_step(None, states=[step]))
+        output = pipeline.post_decode(step)
+
+    latents = output.output["payload"]["latents"]
+    assert latents.shape == (1, 4, 4, 4, 4)
+    assert torch.equal(latents[:, :, :1], step.extra["first_frame_latent"])
+    assert torch.equal(pipeline._ar_reference_caches()[0].key, published.key)
+    state.close()
+    assert not state.kv_cache.is_cross_attention_populated("s", "ref", "main")
