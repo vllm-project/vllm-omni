@@ -1946,7 +1946,7 @@ class WorkerProc:
 
         # Sync path (original, or async fallback).
         try:
-            pack_diffusion_output_shm(output)
+            output = pack_diffusion_output_shm(output, record_rpc_allocations=True)
         except (TypeError, ValueError):
             raise
         except Exception as e:
