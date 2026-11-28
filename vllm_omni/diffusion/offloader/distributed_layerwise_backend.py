@@ -1399,6 +1399,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Cache open file handles
         file_cache: dict[str, Any] = {}
         loaded_names: set[str] = set()
+        realized_transforms: set[str] = set()
 
         # Realize the loader's exact runtime-name bindings.  In particular,
         # do not reconstruct names from DLO block discovery: storage planning
@@ -1424,6 +1425,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     device="cpu",
                 )
             tensor = file_cache[binding.file_path].get_tensor(binding.checkpoint_key)
+            if tensor.dtype != target.dtype and binding.transform is not None:
+                # Post-load hooks and rank-local staging require the runtime
+                # dtype. Materialize dtype-changing conversions here; defer
+                # layout-only transformations to bounded block staging.
+                tensor = binding.transform(tensor)
+                if tensor.dtype != target.dtype:
+                    raise RuntimeError(f"Invalid dtype transform for mmap tensor {runtime_name!r}")
+                realized_transforms.add(runtime_name)
             if is_parameter:
                 replacement = torch.nn.Parameter(tensor, requires_grad=target.requires_grad)
                 parent._parameters[leaf_name] = replacement
@@ -1432,7 +1441,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 parent._buffers[leaf_name] = replacement
             loaded_names.add(runtime_name)
 
-        logger.info("Realized %d loader-planned tensors as mmap views", len(loaded_names))
+        logger.info("Realized %d loader-planned tensors from mmap", len(loaded_names))
 
         # Keep file handles open — _shard_and_pin will read from the mmap views.
         # They will be released after _shard_and_pin completes (when params are
@@ -1473,7 +1482,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # runtime tensor objects rather than the initial mmap replacements.
         self._mmap_transforms_by_tensor_id.clear()
         for runtime_name, binding in plan.bindings.items():
-            if binding.transform is None:
+            if binding.transform is None or runtime_name in realized_transforms:
                 continue
             parent_path, _, leaf_name = runtime_name.rpartition(".")
             parent = pipeline.get_submodule(parent_path)
