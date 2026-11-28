@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 from vllm.multimodal.processing import ProcessorInputs
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.ming_flash_omni import condition_encoder
 from vllm_omni.diffusion.models.ming_image.pipeline import (
     MingImageDiffusionPipeline,
     _validate_variant_config,
@@ -33,10 +35,59 @@ from vllm_omni.model_extras import (
     get_extra_body_params,
     should_init_extra_args_for_non_diffusion_stages,
 )
-from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
+from vllm_omni.transformers_utils.configs.ming_flash_omni import (
+    BailingMM2Config,
+    MingImageGenConfig,
+)
 from vllm_omni.transformers_utils.processors.ming import MingImageProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _ConnectorOutput:
+    hidden_states: list[torch.Tensor]
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+@pytest.mark.parametrize("use_2d_mask", [False, True], ids=["default", "2d-ones"])
+def test_query_connector_mask_keeps_all_tokens_visible(monkeypatch, is_npu, use_2d_mask):
+    monkeypatch.setattr(condition_encoder.current_omni_platform, "is_npu", lambda: is_npu)
+
+    class Connector(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mask: torch.Tensor | None = None
+
+        def forward(
+            self,
+            inputs_embeds: torch.Tensor,
+            attention_mask: torch.Tensor,
+            use_cache: bool,
+            output_hidden_states: bool,
+            return_dict: bool,
+        ) -> _ConnectorOutput:
+            assert not use_cache and output_hidden_states and return_dict
+            self.mask = attention_mask
+            return _ConnectorOutput(hidden_states=[inputs_embeds])
+
+    encoder = condition_encoder.MingConditionEncoder(
+        MingImageGenConfig(text_encoder_norm=False), normalize_output=False
+    )
+    encoder.connector = Connector()
+    hidden = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    attention_mask = torch.ones(hidden.shape[:2]) if use_2d_mask else None
+    assert torch.equal(encoder(hidden, attention_mask=attention_mask), hidden)
+    mask = encoder.connector.mask
+    assert mask is not None
+    assert mask.shape == (1, 1, 3, 3)
+    assert mask.dtype == (torch.bool if is_npu else hidden.dtype)
+    assert mask.all()
+    if is_npu:
+        # Match the Transformers NPU SDPA adapter: float ones would become
+        # all False here, while a boolean allow-mask passes through unchanged.
+        effective_mask = mask if mask.dtype == torch.bool else torch.logical_not(mask.bool())
+        assert effective_mask.all()
 
 
 def test_config_selects_qwen25_vision_tower():
@@ -318,7 +369,11 @@ def test_stage1_compile_uses_configured_dynamic_regional_cuda_graph(monkeypatch)
     assert pipeline._uses_cudagraph_trees
 
 
-def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatch):
+@pytest.mark.parametrize(
+    "root_config",
+    [None, {"architectures": ["BailingMM2NativeForConditionalGeneration"], "model_type": "bailingmm_moe_v2_lite"}],
+)
+def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatch, root_config):
     transformer_config = {
         "_class_name": "DiffusionTransformer",
         "alignment_padding_mode": "zero_masked",
@@ -327,7 +382,9 @@ def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatc
 
     def _get_hf_file_to_dict(filename, model, revision=None):
         del model, revision
-        return transformer_config if filename == "transformer/config.json" else None
+        if filename == "transformer/config.json":
+            return transformer_config
+        return root_config if filename == "config.json" else None
 
     monkeypatch.setattr(
         "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",

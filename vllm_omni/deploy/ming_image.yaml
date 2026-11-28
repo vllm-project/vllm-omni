@@ -45,4 +45,14 @@ edges:
     window_size: -1
     max_inflight: 1
 
-platforms: {}
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        enforce_eager: true
+        gpu_memory_utilization: 0.80
+      - stage_id: 1
+        enforce_eager: true
+        diffusion_attention_config:
+          default:
+            backend: TORCH_SDPA
