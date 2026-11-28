@@ -48,10 +48,17 @@ def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch():
 
 
 @pytest.mark.parametrize(
-    "transcript,valid",
-    [("Robin.", True), ("The secret word is robin.", True), ("Five. Robin.", False), ("5, robin", False)],
+    "transcript,late_audio,error",
+    [
+        ("Robin.", None, None),
+        ("The secret word is robin.", None, None),
+        ("Five. Robin.", None, "Five. Robin."),
+        ("5, robin", None, "5, robin"),
+        ("Robin.", "response.output_audio.delta", "cancelled response"),
+        ("Robin.", "response.audio.delta", "cancelled response"),
+    ],
 )
-def test_interrupt_recall_rejects_counting_under_the_new_response_id(tmp_path, transcript, valid):
+def test_interrupt_recall_rejects_stale_output(tmp_path, transcript, late_audio, error):
     from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _run_interrupted_recall
 
     async def exercise():
@@ -71,6 +78,8 @@ def test_interrupt_recall_rejects_counting_under_the_new_response_id(tmp_path, t
             await send({"type": "response.output_audio.delta", "response_id": "new", "delta": "AA=="})
             await send({"type": "response.done", "response": {"id": "new", "status": "completed"}})
             assert json.loads(await ws.recv())["type"] == "session.close"
+            if late_audio:
+                await send({"type": late_audio, "response_id": "old", "delta": "AA=="})
             await send({"type": "session.closed"})
 
         async with websockets.serve(serve, "127.0.0.1", 0) as server:
@@ -82,10 +91,10 @@ def test_interrupt_recall_rejects_counting_under_the_new_response_id(tmp_path, t
                 secret="robin",
                 event_path=tmp_path / "events.json",
             )
-            if valid:
+            if error is None:
                 assert await result == transcript
             else:
-                with pytest.raises(AssertionError, match=transcript):
+                with pytest.raises(AssertionError, match=error):
                     await result
 
     asyncio.run(exercise())

@@ -614,7 +614,10 @@ class DemoState:
                 response = event.get("response")
                 if isinstance(response, dict) and response.get("status") == "cancelled" and response_id is not None:
                     cancelled_responses.add(response_id)
-            elif event.get("type") == "response.output_audio.delta" and response_id in cancelled_responses:
+            elif (
+                event.get("type") in {"response.output_audio.delta", "response.audio.delta"}
+                and response_id in cancelled_responses
+            ):
                 stale += 1
         return stale
 

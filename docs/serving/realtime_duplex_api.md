@@ -1263,9 +1263,11 @@ cursor for `session.resume`. Client events may carry an `event_id`, echoed in
 Session identity is the server-allocated `session_id` (`duplex-<uuid>`,
 announced in `session.created`; a `session_id` the client puts in the session
 object is ignored, and ids are never reused); `attachment_generation`
-names the current socket; `epoch` is the interruption fence that advances on
-every cancel, clear, or barge-in; `turn_id` counts committed model turns;
-`response_id` (item id `item_<response_id>`) names one assistant utterance.
+names the current socket. The `epoch` advances on destructive cancellation,
+including `input.cancel`. Automatic MiniCPM sessions retain the epoch across
+`response.cancel`, `output_audio_buffer.clear`, and barge-in when the resident
+interruption succeeds. The `turn_id` counts committed model turns.
+The `response_id` (item id `item_<response_id>`) names one assistant utterance.
 
 **Tier** in the tables below: **1** means identical to OpenAI Realtime in
 name and semantics; **2** means an OpenAI event name carrying vLLM-Omni

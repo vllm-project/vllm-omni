@@ -16,6 +16,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     resolve_ref_audio,
     validated_input_wav,
 )
+from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import DemoState
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import run_multi_session
 from tests.e2e.online_serving.test_minicpmo_4_5_duplex import _run_seeded_text_to_audio
 from tests.helpers.mark import hardware_test
@@ -122,6 +123,7 @@ async def _run_interrupted_recall(
             packets = [e for e in tail if e.get("type") in audio_types and e.get("delta")]
             await send({"type": "session.close"})
             await receive_until(lambda e: e.get("type") == "session.closed")
+            assert DemoState(events=events).stale_audio_delta_count() == 0, "Received audio for a cancelled response"
             assert done["response"]["status"] == "completed", done
             assert packets, tail
             assert all(e["response_id"] == done["response"]["id"] for e in packets), tail
@@ -154,7 +156,7 @@ async def _run_interrupted_recall(
     ],
 )
 def test_mrv2_duplex_immediate_recall_after_interrupt(
-    omni_server, tmp_path: Path, cancel: str, sessions: int, interruptions: int = 1
+    omni_server, tmp_path: Path, cancel: str, sessions: int, interruptions: int
 ):
     async def recall():
         return await asyncio.gather(
