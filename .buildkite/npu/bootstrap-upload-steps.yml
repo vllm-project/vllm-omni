@@ -81,12 +81,8 @@ steps:
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
     command: bash .buildkite/npu/scripts/build-npu-image.sh Dockerfile.npu.ci "$${VLLM_IMAGE_TAG}" -310p
 
+  # Upload tests while images build. Each test declares its own image dependency.
   - label: "Upload Ready Pipeline"
-    depends_on:
-      - image-build-a2
-      - image-build-a3
-      - image-build-a5
-      - image-build-310p
     key: upload-ready-pipeline
     agents:
       queue: "medium_cpu_queue_premerge"
@@ -95,11 +91,6 @@ steps:
 
   # L4 Test — release-line+NIGHTLY=1 (scheduled), or PR nightly-test label
   - label: "Upload Nightly Pipeline"
-    depends_on:
-      - image-build-a2
-      - image-build-a3
-      - image-build-a5
-      - image-build-310p
     key: upload-nightly-pipeline
     commands:
       - |

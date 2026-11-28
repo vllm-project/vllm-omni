@@ -1,7 +1,6 @@
 steps:
   - group: ":card_index_dividers: Omni Model Test"
     key: nightly-omni-test-group
-    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
@@ -10,6 +9,7 @@ steps:
         source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -29,6 +29,7 @@ steps:
         source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -48,6 +49,7 @@ steps:
         key: nightly-omni-performance-qwen3-omni-duplex-omni-duplex-eval
         source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_npu, omni_v2_runtime]
         timeout_in_minutes: 120
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -65,6 +67,7 @@ steps:
             -m "full_model and npu and A3 and omni and cards_4" --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Test"
         source_file_dependencies: omni_minicpmo_4_5_function
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -75,6 +78,7 @@ steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -95,6 +99,7 @@ steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
         source_file_dependencies: omni_minicpmo_4_5_accuracy
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -122,6 +127,7 @@ steps:
       - label: ":full_moon: Omni · Qwen3-Omni · Accuracy Test"
         source_file_dependencies: [omni_qwen3_omni_accuracy, ci_npu]
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
@@ -145,6 +151,7 @@ steps:
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-minicpmo-4-5-npu-default-seed-tts
         timeout_in_minutes: 240
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -172,6 +179,7 @@ steps:
         source_file_dependencies: omni_duplex_eval_ci
         key: nightly-omni-minicpmo-4-5-npu-async-duplex-eval
         timeout_in_minutes: 240
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -195,6 +203,7 @@ steps:
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-minicpmo-4-5-npu-async-prefix
         timeout_in_minutes: 360
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -222,6 +231,7 @@ steps:
         source_file_dependencies: [omni_minicpmo_4_5_a3_2card_perf, ci_npu]
         key: nightly-omni-performance-minicpmo-4-5-npu-a3-2card
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -242,12 +252,12 @@ steps:
             '
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
-    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":sound: TTS · MOSS-TTS Local MRV2 Test (A3)"
         key: nightly-tts-moss-local-mrv2-npu
         source_file_dependencies: tts_moss_tts_local_npu_mrv2_function
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         timeout_in_minutes: 60
         env:
@@ -258,6 +268,7 @@ steps:
       - label: ":full_moon: TTS · Perf Test"
         source_file_dependencies: tts_qwen3_tts_perf
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -274,7 +285,6 @@ steps:
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
     key: nightly-diffusion-x2iat-group
-    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
@@ -282,6 +292,7 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
         source_file_dependencies: diffusion_qwen_image_21_accuracy
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -300,6 +311,7 @@ steps:
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 CFGP=2"
         source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -317,6 +329,7 @@ steps:
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 SP=2"
         source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -334,6 +347,7 @@ steps:
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=4"
         source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -352,6 +366,7 @@ steps:
         key: nightly-hunyuan-image3-accuracy-npu
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -369,6 +384,7 @@ steps:
         source_file_dependencies: diffusion_qwen_image_21_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-21-single-npu
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -386,6 +402,7 @@ steps:
         source_file_dependencies: diffusion_qwen_image_21_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-21-4npu
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -421,6 +438,7 @@ steps:
         source_file_dependencies: [diffusion_minimax_h3_image_perf, ci_npu]
         key: nightly-diffusion-x2iat-performance-minimax-h3-image-a3-1card
         timeout_in_minutes: 60
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -438,6 +456,7 @@ steps:
         source_file_dependencies: [diffusion_minimax_h3_image_perf, ci_npu]
         key: nightly-diffusion-x2iat-performance-minimax-h3-image-a3-2card
         timeout_in_minutes: 60
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -455,6 +474,7 @@ steps:
         source_file_dependencies: [diffusion_minimax_h3_image_perf, ci_npu]
         key: nightly-diffusion-x2iat-performance-minimax-h3-image-a3-4card
         timeout_in_minutes: 60
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_8
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -470,7 +490,6 @@ steps:
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
-    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
@@ -479,6 +498,7 @@ steps:
         key: nightly-diffusion-x2v-performance-minimax-h3
         source_file_dependencies: diffusion_minimax_h3_perf
         timeout_in_minutes: 90
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -501,6 +521,7 @@ steps:
           - diffusion_minimax_h3_perf
           - diffusion_minimax_h3_rainfusion
         timeout_in_minutes: 300
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -523,6 +544,7 @@ steps:
         key: nightly-diffusion-x2v-timeline-minimax-h3
         source_file_dependencies: diffusion_minimax_h3_accuracy
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -536,6 +558,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         timeout_in_minutes: 180
+        depends_on: image-build-a2
         mirror_hardwares: a2b3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -547,6 +570,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_video_accuracy
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -561,6 +585,7 @@ steps:
         source_file_dependencies: diffusion_hunyuan_video_perf
         key: nightly-diffusion-x2v-performance-hunyuanvideo15
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -579,6 +604,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · Wan 2.2 Function Test"
         source_file_dependencies: diffusion_wan22_function
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -590,6 +616,7 @@ steps:
         source_file_dependencies: diffusion_wan22_perf
         key: nightly-diffusion-x2v-performance
         timeout_in_minutes: 180
+        depends_on: image-build-a3
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -609,6 +636,7 @@ steps:
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_perf
         timeout_in_minutes: 60
+        depends_on: image-build-a2
         mirror_hardwares: a2b3_npu_4
         artifact_paths:
           - "tests/dfx/perf/results/*.json"
@@ -631,6 +659,7 @@ steps:
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_accuracy
         timeout_in_minutes: 90
+        depends_on: image-build-a2
         mirror_hardwares: a2b3_npu_4
         artifact_paths:
           - "tests/e2e/accuracy/results/lingbot_world/npu-capture/**/*"

@@ -8,10 +8,12 @@ device_suffix=${3:-}
 image_name=${IMAGE_NAME:-vllm-omni-ci-npu}
 image_registry=${IMAGE_REGISTRY:-swr.cn-southwest-2.myhuaweicloud.com/modelfoundry}
 buildkitd_addr=${BUILDKITD_ADDR:-tcp://buildkitd-service.buildkitd:1234}
+cache_ref="${image_registry}/${image_name}:build-cache${device_suffix:--a2}"
 
 echo "--- Building and pushing NPU Test Image"
 echo "Image: ${image_registry}/${image_name}:${image_tag}"
 echo "Dockerfile: ${dockerfile}"
+echo "Registry cache: ${cache_ref}"
 
 if ! command -v buildctl &> /dev/null; then
   mkdir -p /tmp/buildkit
@@ -41,6 +43,8 @@ buildctl \
   --opt "filename=${dockerfile}" \
   "${build_args[@]}" \
   --secret id=dockerconfig,src=/home/user/.docker/config.json \
+  --import-cache "type=registry,ref=${cache_ref}" \
+  --export-cache "type=registry,ref=${cache_ref},mode=max,ignore-error=true" \
   --output "type=image,name=${image_registry}/${image_name}:${image_tag},push=true" \
   --progress=plain
 
