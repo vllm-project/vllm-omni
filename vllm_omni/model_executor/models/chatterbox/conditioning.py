@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncCon
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.indextts2.preprocess_utils import compute_fbank
 from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ChatterboxConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.audio import mel_filter_bank
@@ -366,7 +367,11 @@ class VoiceConditioner:
 
     @torch.inference_mode()
     @torch.backends.cudnn.flags(
-        enabled=None, benchmark=None, benchmark_limit=None, deterministic=None, allow_tf32=False
+        enabled=False if current_omni_platform.is_rocm() else None,
+        benchmark=None,
+        benchmark_limit=None,
+        deterministic=None,
+        allow_tf32=False,
     )
     def from_resampled_batch(self, clips: list[tuple[np.ndarray, np.ndarray]]) -> list[VoiceConditioning]:
         """Encode clips with FP32 speaker kernels and unpadded CAMPPlus statistics.
@@ -378,6 +383,8 @@ class VoiceConditioner:
 
         cuDNN's TF32 RNN/convolution kernels change speaker embeddings with
         batch shape. The native flags context restores the caller's precision.
+        On ROCm it also turns MIOpen off: every new clip length would cost an
+        algorithm search and an allocator flush (see ``ChatterboxS3Gen.forward``).
         """
         if not clips:
             return []

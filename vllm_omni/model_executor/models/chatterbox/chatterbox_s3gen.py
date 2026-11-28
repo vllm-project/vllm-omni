@@ -44,6 +44,7 @@ predictor.
 
 import math
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -58,6 +59,7 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.upsample_encoder impo
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.glm_tts.vocoder import ConvRNNF0Predictor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.chatterbox import FLOW_DTYPES, ChatterboxConfig
 
 # CosyVoice 2's caches: eight mel frames, and HiFT's 480 samples per frame
@@ -684,7 +686,19 @@ class ChatterboxS3Gen(S3GenDecoder):
             ``multimodal_outputs`` with, per request, ``audio`` (1-D float32,
             the samples new in this step) and ``sr`` (int32 scalar).
         """
-        audios = self.decode_step(input_ids, seq_token_counts, model_intermediate_buffer, request_ids)
+        # MIOpen searches for an algorithm, then empties the caching allocator,
+        # for every convolution shape it has not run yet: about 0.3 s each on
+        # MI300. Streamed chunks give the flow and HiFT new lengths nearly
+        # every step, so on ROCm they use PyTorch's native convolutions.
+        native_convolutions = (
+            torch.backends.cudnn.flags(
+                enabled=False, benchmark=None, benchmark_limit=None, deterministic=None, allow_tf32=None
+            )
+            if current_omni_platform.is_rocm()
+            else nullcontext()
+        )
+        with native_convolutions:
+            audios = self.decode_step(input_ids, seq_token_counts, model_intermediate_buffer, request_ids)
         rate = torch.tensor(self.config.sample_rate, dtype=torch.int32)
         return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": [rate] * len(audios)})
 
