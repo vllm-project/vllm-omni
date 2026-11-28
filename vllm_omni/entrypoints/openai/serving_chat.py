@@ -1562,6 +1562,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if "max_completion_tokens" in explicit_fields and request.max_completion_tokens is not None:
             overrides["max_tokens"] = request.max_completion_tokens
 
+        # The response reads logprobs from the comprehension stage output, so
+        # request them with vLLM's ChatCompletionRequest.to_sampling_params mapping.
+        if request.logprobs:
+            if request.logprob_token_ids:
+                overrides["logprob_token_ids"] = request.logprob_token_ids
+            else:
+                overrides["logprobs"] = request.top_logprobs
+        prompt_logprobs = request.prompt_logprobs
+        if prompt_logprobs is None and request.echo:
+            prompt_logprobs = request.top_logprobs
+        if prompt_logprobs is not None:
+            overrides["prompt_logprobs"] = prompt_logprobs
+
         return overrides
 
     @staticmethod
