@@ -1,7 +1,7 @@
 ARG VLLM_ASCEND_IMAGE=quay.nju.edu.cn/atlas-ci/vllm-ascend
 ARG VLLM_ASCEND_VERSION=v0.34.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
-FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
+FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX} AS deps
 
 ENV VLLM_OMNI_TARGET_DEVICE=npu
 ARG APP_DIR=/vllm-workspace/vllm-omni
@@ -72,16 +72,22 @@ RUN python3 -m pip install -v --no-deps \
       "silero-vad==6.2.3" \
       --default-timeout=60
 
-COPY . .
-
-# Keep the editable install and its Git-derived version without resolving
-# the dependencies again for each source revision.
+# Register the editable source path with a stub so the install can be cached.
+# The final stage overlays the real package at the same path.
+COPY pyproject.toml setup.py README.md LICENSE ./
+RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    python3 -m pip install -v -e . --no-deps --no-build-isolation
+    VLLM_OMNI_VERSION_OVERRIDE=0.0.0+npu \
+      python3 -m pip install -v -e . --no-deps --no-build-isolation
 
 ENV VLLM_TARGET_DEVICE=npu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+FROM deps
+ARG APP_DIR=/vllm-workspace/vllm-omni
+WORKDIR ${APP_DIR}
+COPY --link . .
 
 ENTRYPOINT []
