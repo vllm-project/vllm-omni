@@ -65,7 +65,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.registry import DiffusionModelRegistry, initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -227,6 +227,32 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self._hwr_state: dict[str, object] | None = None
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
+
+    def _uses_pipeline_owned_quantization(self, load_format: str) -> bool:
+        """Keep host initialization when the native pipeline owns the sole quantized component.
+
+        The resolved class must opt in directly with a static
+        ``owns_eager_quantization(component, config)`` predicate. Derived
+        pipelines do not inherit the host initialization exception implicitly.
+        """
+        if load_format != "default":
+            return False
+
+        from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+        config = self.quant_config
+        if not isinstance(config, ComponentQuantizationConfig) or config.default_config is not None:
+            return False
+        active = [(name, method) for name, method in config.component_configs.items() if method is not None]
+        if len(active) != 1:
+            return False
+
+        model_class = DiffusionModelRegistry._try_load_model_cls(getattr(self.od_config, "model_class_name", None))
+        if model_class is None:
+            return False
+        owns_quantization = vars(model_class).get("owns_eager_quantization")
+        component, method = active[0]
+        return callable(owns_quantization) and owns_quantization(component, method)
 
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
@@ -748,7 +774,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # For online quantization, load on device so quantization can run on accelerator,
         # then move back to CPU afterward.
         offload_after_quant = False
-        if load_device == "cpu" and self.quant_config is not None and device is not None:
+        if (
+            load_device == "cpu"
+            and self.quant_config is not None
+            and device is not None
+            and not self._uses_pipeline_owned_quantization(load_format)
+        ):
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False

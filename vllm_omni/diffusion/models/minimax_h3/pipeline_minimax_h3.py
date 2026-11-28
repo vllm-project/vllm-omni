@@ -228,6 +228,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
+from .vae_int8 import owns_h3_eager_quantization, resolve_h3_video_vae_quant_config
 from .variant import BASE_H3, FASTH3_PREVIEW, H3Variant, control_task
 from .vdnh3 import VDNCheckpoint
 
@@ -748,6 +749,7 @@ class MiniMaxH3Pipeline(
 ):
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
+    owns_eager_quantization = staticmethod(owns_h3_eager_quantization)
     supports_step_execution: ClassVar[bool] = True
     denoise_step_updates_state: ClassVar[bool] = True
     # DiT implementation constructed for the primary ``transformer``.
@@ -1143,6 +1145,9 @@ class MiniMaxH3Pipeline(
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        video_vae_quant_config = resolve_h3_video_vae_quant_config(od_config.quantization_config)
+        if video_vae_quant_config is not None and not self.load_vae_decoder:
+            raise ValueError("MiniMax H3 video_vae quantization requires a loaded VAE decoder")
         if not self.load_vae_decoder and self.load_vae_encoder:
             raise ValueError(
                 "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
@@ -1515,6 +1520,7 @@ class MiniMaxH3Pipeline(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
                 ),
+                quant_config=video_vae_quant_config,
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
