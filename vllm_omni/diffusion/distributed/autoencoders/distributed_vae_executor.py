@@ -46,6 +46,14 @@ class DistributedVaeExecutor:
     Abstract util class for distributed patch/tile parallel VAE decoding.
     """
 
+    #: dtype of the int control tensors (tile counts, padding shape, tile
+    #: metadata, output shape) that cross the group's collectives. int64 is what
+    #: every backend here was validated with; a backend whose collectives cannot
+    #: carry it (Ascend 310P HCCL accepts INT8/INT16/INT32/FP16/FP32 only)
+    #: overrides this from its platform patch, so the shared path keeps the
+    #: dtype the other backends run with.
+    _control_dtype: torch.dtype = torch.int64
+
     def __init__(self):
         # Use a dedicated process group spanning the complete worker WORLD.
         world_group = get_world_group()
@@ -103,8 +111,12 @@ class DistributedVaeExecutor:
             dist.gather(tensor, gather_list=gather_list, dst=0, group=self.group)
         return gather_list if self.rank == 0 else None
 
-    def broadcast_tensor(self, tensor: torch.Tensor):
+    def _publish_tensor(self, tensor: torch.Tensor) -> None:
+        """Replicate rank 0's ``tensor`` to every rank of the group."""
         dist.broadcast(tensor, src=0, group=self.group)
+
+    def broadcast_tensor(self, tensor: torch.Tensor):
+        self._publish_tensor(tensor)
         return tensor
 
     def _compute_global_padding_shape(self, local_results, output_ndim: int, device):
@@ -113,7 +125,9 @@ class DistributedVaeExecutor:
             for _, tile_tensor in local_results:
                 for dim_idx, dim_size in enumerate(tile_tensor.shape):
                     local_tile_max_dims[dim_idx] = max(local_tile_max_dims[dim_idx], dim_size)
-            local_shape_stat = torch.tensor([len(local_results), *local_tile_max_dims], device=device)
+            local_shape_stat = torch.tensor(
+                [len(local_results), *local_tile_max_dims], device=device, dtype=self._control_dtype
+            )
         dist.all_reduce(
             local_shape_stat,
             op=dist.ReduceOp.MAX,
@@ -124,7 +138,7 @@ class DistributedVaeExecutor:
     def _pack_local_tiles(self, local_results, global_padding_shape, grid_spec, device, dtype):
         tile_tensor = torch.zeros(global_padding_shape, device=device, dtype=dtype)
         meta_tensor = torch.full(
-            (global_padding_shape[0], len(grid_spec.split_dims) + 1), -1, device=device, dtype=torch.int64
+            (global_padding_shape[0], len(grid_spec.split_dims) + 1), -1, device=device, dtype=self._control_dtype
         )
         for idx, (tid, t_tensor) in enumerate(local_results):
             meta_tensor[idx, 0] = tid
@@ -203,17 +217,19 @@ class DistributedVaeExecutor:
 
     def _sync_final_result(self, rank0_result, output_ndim, output_device, output_dtype):
         with self._sync_errors("output shape preparation"):
-            shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=torch.int64)
+            shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=self._control_dtype)
             if self.rank == 0:
-                shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=torch.int64))
-        dist.broadcast(shape_tensor, src=0, group=self.group)
+                shape_tensor.copy_(
+                    torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=self._control_dtype)
+                )
+        self._publish_tensor(shape_tensor)
 
         with self._sync_errors("output allocation"):
             if self.rank != 0:
                 sync_result = torch.empty(tuple(shape_tensor.tolist()), device=output_device, dtype=output_dtype)
             else:
                 sync_result = rank0_result
-        dist.broadcast(sync_result, src=0, group=self.group)
+        self._publish_tensor(sync_result)
         return sync_result
 
 
