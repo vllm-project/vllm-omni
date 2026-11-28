@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 
 import pytest
@@ -178,6 +179,47 @@ def test_request_event(monkeypatch, completed, reason, status, failure_reason):
 
 class _Pipeline(ProgressBarMixin):
     pass
+
+
+@pytest.mark.parametrize("disable", [True, False])
+def test_counts_each_iterated_step_once(disable):
+    # An enabled bar refreshes on every item (mininterval=0, miniters=1), so
+    # tqdm calls update() for items the iteration already counted.
+    pipeline = _Pipeline()
+    pipeline.set_progress_bar_config(disable=disable, mininterval=0, miniters=1, file=io.StringIO())
+
+    with denoise_progress_scope() as progress:
+        for _ in pipeline.progress_bar(range(5)):
+            pass
+
+    assert progress.result() == (5, 5)
+
+
+@pytest.mark.parametrize("disable", [True, False])
+def test_counts_a_partially_iterated_loop(disable):
+    pipeline = _Pipeline()
+    pipeline.set_progress_bar_config(disable=disable, mininterval=0, miniters=1, file=io.StringIO())
+
+    with denoise_progress_scope() as progress:
+        for index, _ in enumerate(pipeline.progress_bar(range(5))):
+            if index == 2:
+                break
+
+    # The break leaves the third step's body unfinished.
+    assert progress.result() == (2, 5)
+
+
+@pytest.mark.parametrize("disable", [True, False])
+def test_counts_explicit_updates(disable):
+    pipeline = _Pipeline()
+    pipeline.set_progress_bar_config(disable=disable, mininterval=0, miniters=1, file=io.StringIO())
+
+    with denoise_progress_scope() as progress:
+        with pipeline.progress_bar(total=4) as bar:
+            bar.update(2)
+            bar.update()
+
+    assert progress.result() == (3, 4)
 
 
 def test_counts_progress_bar_steps():
