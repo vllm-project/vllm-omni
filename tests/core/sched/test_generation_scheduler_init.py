@@ -32,7 +32,6 @@ def construct_scheduler(monkeypatch, mocker):
 def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128):
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            use_v2_model_runner=True,
             supports_native_mrv2_data_plane=native,
             retains_state_across_chunks=stateful,
             async_chunk=True,
@@ -53,6 +52,7 @@ def test_legacy_custom_readiness_enables_batch_waiting(construct_scheduler):
     config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
     config.model_config.async_chunk = False
     scheduler = OrchestratorScheduler(config)
+    assert scheduler.use_v2_model_runner
     assert scheduler.chunk_transfer_adapter is None
     assert scheduler._generation_min_batch_size == 4
     assert scheduler._generation_max_wait_s == 0.012

@@ -68,9 +68,6 @@ class FakeKV:
     def allocate_slots(self, request, num_tokens, num_lookahead_tokens=0):
         return None if self.fail_allocation else FakeBlocks()
 
-    def get_num_common_prefix_blocks(self, request_id):
-        return [0]
-
     def take_events(self):
         return []
 

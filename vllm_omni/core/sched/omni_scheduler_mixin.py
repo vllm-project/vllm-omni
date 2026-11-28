@@ -387,7 +387,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Initialize scheduler state shared by AR and generation stages."""
         # Use the same SchedulerOutput layout as the stage worker.
         model_config = self.vllm_config.model_config
-        self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
+        self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", True))
         # Native-AR stages whose decode step feeds more than the sampled token
         # into the model declare "fail": a recompute preemption replays the
         # prompt from the token stream, which cannot rebuild that state.

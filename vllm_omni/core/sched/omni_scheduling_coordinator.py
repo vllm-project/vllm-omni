@@ -33,7 +33,7 @@ def uses_native_mrv2_data_plane(
 def uses_native_qwen3_omni_resumable(model_config: Any) -> bool:
     return (
         uses_native_mrv2_data_plane(
-            model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False)
+            model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", True)
         )
         and getattr(model_config, "async_chunk", False)
         and getattr(model_config, "session_mode", "turn") == "turn"
