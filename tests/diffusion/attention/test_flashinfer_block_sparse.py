@@ -39,6 +39,15 @@ def test_shared_video_tiling_round_trips_ragged_grid(tile):
     torch.testing.assert_close(tiled[untile], source)
     assert sizes.sum().item() == rows
 
+    partition2, sizes2, non_pad2, untile2 = get_tile_metadata(grid, tile, elements, torch.device("cpu"))
+    assert partition2 is partition
+    assert sizes2 is sizes
+    assert non_pad2 is non_pad
+    assert untile2 is untile
+    reused_tiled = torch.full((sizes2.numel() * elements,), -1)
+    reused_tiled[non_pad2] = source[partition2]
+    torch.testing.assert_close(reused_tiled[untile2], source)
+
 
 @pytest.mark.parametrize(
     "precision,capability,supported",
