@@ -548,6 +548,7 @@ _OMNI_BENCH_DATASET_CHOICES = (
     "ttsd",
     "sound-effect",
     "videomme",
+    "sovbench-o",
 )
 
 
@@ -729,10 +730,72 @@ def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
             raise ValueError("Semantic evaluation requires evaluator root, Python and requirements lock")
 
 
+def add_sovbench_o_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add CLI arguments specific to the SOVBench-O dataset."""
+    group = parser.add_argument_group("SOVBench-O Dataset Options")
+    group.add_argument(
+        "--sovbench-jsonl",
+        type=str,
+        default=None,
+        help="Path to the SOVBench-O annotations file streamov_bench.jsonl "
+        "(172 sessions / 1739 turns), downloadable from the pinned file in the StreamOV "
+        "repository (see the SOVBench-O benchmark docs for the exact URL). "
+        "Alternatively set VLLM_SOVBENCH_O_JSONL, or point --dataset-path at the file or its directory.",
+    )
+    group.add_argument(
+        "--sovbench-video-dir",
+        type=str,
+        default=None,
+        help="Directory containing the SOVBench-O clips: benchvideos/<session_id>/<start>_<end>.mp4 "
+        "from the Hugging Face dataset PatrickyMing/StreamOV (benchvideos.tar, ~3 GB). Accepts either "
+        "the benchvideos directory itself or its parent. If omitted, the JSONL sibling directory is "
+        "tried, then benchvideos.tar is downloaded and extracted from the Hub on first use.",
+    )
+    group.add_argument(
+        "--sovbench-reference-mode",
+        type=str,
+        choices=["sample_level_multi_turn", "group_level_multi_turn"],
+        default="sample_level_multi_turn",
+        help="Dialogue accumulation mode: 'sample_level_multi_turn' (default) keeps the whole "
+        "session's prior dialogue as history; 'group_level_multi_turn' resets dialogue history at "
+        "each new group while earlier media stays available. Visual context always accumulates "
+        "from the session start through the current turn.",
+    )
+    group.add_argument(
+        "--sovbench-use-audio",
+        action="store_true",
+        default=False,
+        help="Also attach each accumulated clip's audio as a 16 kHz mono WAV audio part. "
+        "Default (off) matches the reference 1-FPS visual entries.",
+    )
+    group.add_argument(
+        "--sovbench-fps",
+        type=float,
+        default=1.0,
+        help="Frames per second sampled per clip (default 1.0, the documented reference setting).",
+    )
+    group.add_argument(
+        "--sovbench-max-frames",
+        type=int,
+        default=None,
+        help="Cap the accumulated image parts per turn, uniformly subsampling beyond the cap. "
+        "Keeps very long sessions servable at the cost of replay fidelity; leave unset for the "
+        "faithful full-context protocol.",
+    )
+    group.add_argument(
+        "--sovbench-save-eval-items",
+        action="store_true",
+        default=False,
+        help="Include per-turn SOVBench-O prediction rows in the saved JSON under key "
+        "sovbench_o_eval_items. Or set SOVBENCH_O_SAVE_EVAL_ITEMS=1.",
+    )
+
+
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
     add_videomme_cli_args(parser)
+    add_sovbench_o_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
     add_duplex_cli_args(parser)
@@ -767,6 +830,18 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             args.max_concurrency = 1
         elif args.max_concurrency <= 0:
             raise ValueError("Omni-DuplexEval requires positive --max-concurrency")
+    if getattr(args, "dataset_name", None) == "sovbench-o":
+        if getattr(args, "backend", None) not in ("openai-chat-omni", "sovbench-o"):
+            raise ValueError("SOVBench-O requires --backend openai-chat-omni")
+        # Route to the turn-chained request function; each turn is still an
+        # openai-chat-omni chat-completions request under the hood.
+        args.backend = "sovbench-o"
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = 3
+        if args.num_prompts < 0:
+            raise ValueError("SOVBench-O --num-prompts must be non-negative (0 selects all sessions)")
+        if getattr(args, "max_concurrency", None) is None:
+            args.max_concurrency = 1
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
