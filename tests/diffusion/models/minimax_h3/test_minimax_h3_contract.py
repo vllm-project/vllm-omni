@@ -2762,6 +2762,7 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
     from PIL import Image
 
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae import npu_image_conv
 
     events = []
     input_image = Image.new("RGB", (32, 32))
@@ -2783,6 +2784,7 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
 
         def encode_images(self, image, *, use_fp16_latent):
             assert events == ["enter"]
+            assert npu_image_conv._IMAGE_ENCODE.get() is not None
             assert image is input_image
             assert use_fp16_latent
             events.append("encode")
@@ -2808,6 +2810,7 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
         torch.testing.assert_close(rows, torch.ones(1, 4))
 
     assert events == ["enter", "encode", "exit"]
+    assert npu_image_conv._IMAGE_ENCODE.get() is None
     assert video_vae.model.parallel_tiling
 
 
