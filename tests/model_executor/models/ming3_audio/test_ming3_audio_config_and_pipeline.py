@@ -389,7 +389,11 @@ def test_asr_generation_prompt_uses_checkpoint_chat_template(
         enable_thinking=False,
     )
 
-    assert prompt["prompt_token_ids"] == expected_ids
+    # Newer transformers return a BatchEncoding from ``tokenize=True``; the
+    # engine needs the plain id list, so both sides normalize the same way.
+    if not isinstance(expected_ids, (list, tuple)):
+        expected_ids = expected_ids["input_ids"]
+    assert prompt["prompt_token_ids"] == list(expected_ids)
     assert prompt["multi_modal_data"]["audio"] is audio
 
 

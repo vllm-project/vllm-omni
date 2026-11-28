@@ -660,3 +660,131 @@ def test_absorb_passes_other_frames_through() -> None:
         assert connection._absorb_transcription_session(text) == text
     assert connection._pending_transcription_session is None
     assert connection._transcription_mode is False
+
+
+class _FakeRawFramingCleaner:
+    """Strips Qwen3-ASR-style ``language X<asr_text>`` framing, incrementally."""
+
+    def __init__(self) -> None:
+        self.raw_text = ""
+        self.emitted_text = ""
+
+    def process_delta(self, text_delta: str, finished: bool) -> str:
+        self.raw_text += text_delta
+        processed = self.raw_text.split("<asr_text>", 1)[1] if "<asr_text>" in self.raw_text else ""
+        new_text = processed[len(self.emitted_text) :]
+        self.emitted_text = processed
+        return new_text
+
+
+class _FakeInterfaceASR:
+    """A stage-0 model implementing the vLLM speech-to-text interface."""
+
+    last_stt_params = None
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config, task_type):
+        assert task_type == "transcribe"
+        return SimpleNamespace(sample_rate=16000.0)
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params):
+        cls.last_stt_params = stt_params
+        return {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"audio": stt_params.audio}}
+
+    @classmethod
+    def get_streaming_post_processor_cls(cls):
+        return _FakeRawFramingCleaner
+
+
+class _PartialInterfaceASR:
+    """Only the prompt builder — not enough to leave the fallback path."""
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params):
+        raise AssertionError("must not be called")
+
+
+class _RecordingEngine(SimpleNamespace):
+    """``engine.generate`` returns a scripted stream and records the prompt."""
+
+    def __init__(self, text_chunks: list[str]) -> None:
+        super().__init__(
+            model_config=SimpleNamespace(max_model_len=100),
+            default_sampling_params_list=[SamplingParams()],
+        )
+        self.text_chunks = list(text_chunks)
+        self.prompts = []
+
+    def generate(self, *, prompt, request_id, sampling_params_list, output_modalities):
+        self.prompts.append(prompt)
+        chunks = self.text_chunks
+
+        async def _stream():
+            for chunk in chunks:
+                yield SimpleNamespace(outputs=[SimpleNamespace(text=chunk)])
+
+        return _stream()
+
+
+@pytest.mark.asyncio
+async def test_model_transcription_interface_drives_the_turn() -> None:
+    """#11074 follow-up: a stage-0 model with the vLLM speech-to-text
+    interface drives the turn like ``/v1/audio/transcriptions`` — the knobs
+    ride the model's prompt protocol, the audio is resampled to the model's
+    rate, and the raw framing never reaches the client deltas."""
+    hold = asyncio.Event()
+    websocket = _InboundFakeWebSocket(
+        [
+            _transcription_update(),
+            _audio_append(b"\x01\x02" * 12000),
+            json.dumps({"type": "input_audio_buffer.commit"}),
+        ],
+        disconnect_event=hold,
+    )
+    engine = _RecordingEngine(["language English<asr_text>He", "llo ", "world"])
+    connection = _make_connection(websocket, engine)
+    connection._transcription_model_cls = _FakeInterfaceASR
+    conn_task = asyncio.create_task(connection.handle_connection())
+
+    assert await _wait_for(
+        lambda: bool(_events_of_type(websocket, "conversation.item.input_audio_transcription.completed"))
+    ), f"transcription never completed; got: {[e.get('type') for e in _sent_events(websocket)]}"
+    hold.set()
+    await asyncio.wait_for(conn_task, timeout=5.0)
+
+    # The streamed deltas and the final transcript are cleaned: the raw
+    # ``language English<asr_text>`` framing never reaches the client.
+    deltas = _events_of_type(websocket, "conversation.item.input_audio_transcription.delta")
+    assert [d["delta"] for d in deltas] == ["He", "llo ", "world"]
+    completed = _events_of_type(websocket, "conversation.item.input_audio_transcription.completed")
+    assert completed[0]["transcript"] == "Hello world"
+    # The instructions fallback was not used.
+    assert connection.transcription_instructions == []
+    # The model's interface received the snapshotted knobs and the
+    # resampled audio, and its prompt reached the engine unchanged.
+    stt = _FakeInterfaceASR.last_stt_params
+    assert stt.language == "en"
+    assert stt.request_prompt == "board meeting"
+    assert stt.task_type == "transcribe"
+    assert engine.prompts == [{"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"audio": stt.audio}}]
+    # 0.5 s of 24 kHz session audio was resampled to the model's 16 kHz rate.
+    assert abs(len(stt.audio) - 8000) <= 4
+
+
+def test_resolve_transcription_model_requires_the_full_interface(mocker) -> None:
+    """Only a complete speech-to-text interface leaves the fallback path."""
+    get_model_cls = mocker.patch("vllm.model_executor.model_loader.get_model_cls")
+
+    get_model_cls.return_value = _PartialInterfaceASR
+    partial = _make_connection(_FakeWebSocket(), _TranscribingEngine(["x"]))
+    assert partial._resolve_transcription_model() is None
+    get_model_cls.assert_called_once_with(partial.engine.model_config)
+
+    get_model_cls.return_value = _FakeInterfaceASR
+    complete = _make_connection(_FakeWebSocket(), _TranscribingEngine(["x"]))
+    assert complete._resolve_transcription_model() is _FakeInterfaceASR
+    # The resolution is cached — the registry is consulted once per
+    # connection, not once per committed turn.
+    assert complete._resolve_transcription_model() is _FakeInterfaceASR
+    assert get_model_cls.call_count == 2
