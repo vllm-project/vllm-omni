@@ -437,14 +437,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def record_device_event(cls) -> torch.Event | None:
         """Record a NPU event on the default stream to mark tensor readiness.
 
-        On NPU/Ascend with HCCL, distributed communication may use internal
-        streams not visible to the default stream. Synchronize the default
-        stream first so that HCCL results are written back before we record
-        the event, ensuring d2h_stream.wait_event() captures the complete
-        output data.
+        Ordering comes from this event: the async output consumer waits on it
+        via ``torch.Stream.wait_event`` before its D2H copies. Do not
+        host-synchronize first -- that only blocks the worker's event loop for
+        the whole device tail without ordering any other stream (#7894).
         """
         try:
-            torch.npu.current_stream().synchronize()
             # The async output worker uses the public ``torch.Stream`` API.
             # With torch_npu 2.10, a native ``torch.npu.Event`` cannot be
             # consumed by that wrapper stream (the reverse direction is

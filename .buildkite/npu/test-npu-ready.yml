@@ -70,6 +70,7 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/platforms/test_record_device_event.py
             -m 'core_model and npu and A2'
             --run-level 'core_model'
 
