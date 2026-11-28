@@ -75,6 +75,27 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
+def combine_cfg_zero_star(
+    positive_noise_pred: torch.Tensor,
+    negative_noise_pred: torch.Tensor,
+    guidance_scale: float,
+    zero_init: bool,
+) -> torch.Tensor:
+    """CFG-Zero* combination: optimized_scale projection with optional zero-init steps.
+
+    Factored out of the denoise steps so ``combine_cfg_noise`` can reuse it
+    under CFG parallel (every rank combines after the branch all-gather).
+    """
+    batch_size = positive_noise_pred.shape[0]
+    positive_flat = positive_noise_pred.view(batch_size, -1)
+    negative_flat = negative_noise_pred.view(batch_size, -1)
+    alpha_cfg = optimized_scale(positive_flat, negative_flat)
+    alpha_cfg = alpha_cfg.view(batch_size, *([1] * (positive_noise_pred.ndim - 1))).to(positive_noise_pred.dtype)
+    if zero_init:
+        return positive_noise_pred * 0.0
+    return negative_noise_pred * alpha_cfg + guidance_scale * (positive_noise_pred - negative_noise_pred * alpha_cfg)
+
+
 def _block_noise_cholesky_factor(
     block_size: int,
     gamma: float,
@@ -771,24 +792,6 @@ class HeliosPipeline(
             "attention_kwargs": extra["attention_kwargs"],
             "return_dict": False,
         }
-        if extra["use_cfg_zero_star"] and state.do_true_cfg:
-            noise_pred = self.transformer(
-                encoder_hidden_states=state.prompt_embeds,
-                **transformer_kwargs,
-            )[0]
-            noise_uncond = self.transformer(
-                encoder_hidden_states=state.negative_prompt_embeds,
-                conditioning_branch="negative",
-                **transformer_kwargs,
-            )[0]
-            positive_flat = noise_pred.view(batch_size, -1)
-            negative_flat = noise_uncond.view(batch_size, -1)
-            alpha_cfg = optimized_scale(positive_flat, negative_flat)
-            alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1))).to(noise_pred.dtype)
-            if (state.step_in_chunk <= extra["zero_steps"]) and extra["use_zero_init"]:
-                return noise_pred * 0.0
-            return noise_uncond * alpha_cfg + extra["guidance_scale"] * (noise_pred - noise_uncond * alpha_cfg)
-
         positive_kwargs = {
             "encoder_hidden_states": state.prompt_embeds,
             **transformer_kwargs,
@@ -802,12 +805,23 @@ class HeliosPipeline(
             if state.do_true_cfg
             else None
         )
+        # Route CFG-Zero* through the shared CFG path so cfg-parallel
+        # deployments keep their per-rank branch split; the zero-star math
+        # runs in combine_cfg_noise() on every rank after the all-gather.
+        zero_star_ctx = None
+        if extra["use_cfg_zero_star"] and state.do_true_cfg:
+            zero_star_ctx = {
+                "helios_cfg_zero_star": {
+                    "zero_init": bool(extra["use_zero_init"]) and state.step_in_chunk <= extra["zero_steps"],
+                }
+            }
         return self.predict_noise_maybe_with_cfg(
             do_true_cfg=state.do_true_cfg,
             true_cfg_scale=extra["guidance_scale"],
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
+            kwargs=zero_star_ctx,
         )
 
     def _denoise_stage2_step(self, state: StepRequestState) -> torch.Tensor:
@@ -832,29 +846,35 @@ class HeliosPipeline(
             "attention_kwargs": extra["attention_kwargs"],
             "return_dict": False,
         }
-        noise_pred = self.transformer(encoder_hidden_states=state.prompt_embeds, **transformer_kwargs)[0]
-        if state.do_true_cfg:
-            noise_uncond = self.transformer(
-                encoder_hidden_states=state.negative_prompt_embeds, conditioning_branch="negative", **transformer_kwargs
-            )[0]
-            if extra["use_cfg_zero_star"]:
-                positive_flat = noise_pred.view(batch_size, -1)
-                negative_flat = noise_uncond.view(batch_size, -1)
-                alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1))).to(noise_pred.dtype)
-                if (
-                    extra["stage_index"] == 0
-                    and extra["stage_step_index"] <= extra["zero_steps"]
-                    and extra["use_zero_init"]
-                ):
-                    noise_pred = noise_pred * 0.0
-                else:
-                    noise_pred = noise_uncond * alpha_cfg + extra["guidance_scale"] * (
-                        noise_pred - noise_uncond * alpha_cfg
-                    )
-            else:
-                noise_pred = noise_uncond + extra["guidance_scale"] * (noise_pred - noise_uncond)
-        return noise_pred
+        # Same as stage1: keep CFG (including CFG-Zero*) on the shared
+        # cfg-parallel path instead of running both branches on every rank.
+        zero_star_ctx = None
+        if extra["use_cfg_zero_star"] and state.do_true_cfg:
+            zero_star_ctx = {
+                "helios_cfg_zero_star": {
+                    "zero_init": bool(extra["use_zero_init"])
+                    and extra["stage_index"] == 0
+                    and extra["stage_step_index"] <= extra["zero_steps"],
+                }
+            }
+        positive_kwargs = {"encoder_hidden_states": state.prompt_embeds, **transformer_kwargs}
+        negative_kwargs = (
+            {
+                "encoder_hidden_states": state.negative_prompt_embeds,
+                "conditioning_branch": "negative",
+                **transformer_kwargs,
+            }
+            if state.do_true_cfg
+            else None
+        )
+        return self.predict_noise_maybe_with_cfg(
+            do_true_cfg=state.do_true_cfg,
+            true_cfg_scale=extra["guidance_scale"],
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+            kwargs=zero_star_ctx,
+        )
 
     def step_scheduler(
         self,
@@ -1676,6 +1696,31 @@ class HeliosPipeline(
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
         return self.transformer(**kwargs)[0]
+
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        true_cfg_scale: float,
+        cfg_normalize: bool = False,
+        kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]:
+        helios_ctx = (kwargs or {}).get("helios_cfg_zero_star")
+        if helios_ctx is None:
+            return super().combine_cfg_noise(
+                positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize, kwargs
+            )
+        # The shared CFG path wraps the single Helios output in a tuple.
+        if not isinstance(positive_noise_pred, torch.Tensor):
+            (positive_noise_pred,) = positive_noise_pred
+        if not isinstance(negative_noise_pred, torch.Tensor):
+            (negative_noise_pred,) = negative_noise_pred
+        return combine_cfg_zero_star(
+            positive_noise_pred,
+            negative_noise_pred,
+            true_cfg_scale,
+            zero_init=bool(helios_ctx["zero_init"]),
+        )
 
     def encode_prompt(
         self,
