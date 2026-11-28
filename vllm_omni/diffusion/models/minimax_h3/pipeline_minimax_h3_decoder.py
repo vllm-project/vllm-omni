@@ -87,6 +87,7 @@ class MiniMaxH3DecoderPipeline(
             trust_remote_code=od_config.trust_remote_code,
             lightvae_decoder_path=resolve_h3_lightvae_decoder_path(od_config.additional_config),
             stack_decode_tiles=od_config.vae_stack_tiles,
+            decode_tiling=(od_config.additional_config or {}).get("video_vae_decode"),
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             str(model_path / "audio_vae"),

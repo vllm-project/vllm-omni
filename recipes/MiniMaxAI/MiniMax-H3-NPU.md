@@ -702,13 +702,23 @@ attention to_out and the final decoder proj_out retain their native groups.
 With native stacking disabled, QKV and FFN w2 also retain the original sample
 batch. A tile limit of four is a tile packing limit, independent of latent
 sample batch. Unsupported modes and plans that reduce neither wave count nor
-maximum rank tile load retain native execution. Set controls before VAE construction:
+maximum rank tile load retain native execution. To enable the scheduler, set
+`H3_VIDEO_DECODER_CROSS_CHUNK=1` before starting the server. Merge the decoder
+settings into the existing `--additional-config` JSON; for example:
 
 ```bash
-export H3_VIDEO_DECODER_CROSS_CHUNK=1
-export H3_VIDEO_DECODER_TILE_BATCHING=1
-export H3_VIDEO_DECODER_TILE_BATCH_SIZE=4
+--additional-config '{"video_vae_decode":{"tile_batch_size":4,"tile_size":288,"tile_min_overlap":16}}'
 ```
+
+`tile_batch_size` is a positive integer and caps the scheduler's packed tiles
+per forward, subject to the native stacking limit. `1` disables packing. When
+omitted, the existing batch-size and batching environment controls still apply.
+The two geometry settings are in output pixels and apply to native Video VAE
+decode independently of cross-chunk scheduling. Omitted geometry uses the
+checkpoint values. The resolved pair must be divisible by the spatial VAE ratio
+and satisfy `0 < tile_min_overlap < tile_size`. Geometry can change decoded
+pixels and does not affect encoder tiling. A grid unsupported by cross-chunk
+scheduling stays on the native decode path.
 
 On eight 910B4-1 NPUs with main b7bbfbd and nightly/CANN 9.2.1, a 30-configuration
 matrix covers sample B=1/2/3/4, multiple chunk/tile grids and tile limits. Two

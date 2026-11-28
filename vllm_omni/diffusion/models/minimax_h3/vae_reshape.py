@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import wraps
 
@@ -21,14 +22,53 @@ logger = init_logger(__name__)
 _MISSING = object()
 
 
-def _reference_projection_modules(model):
+def configure_video_decode_tiles(model: torch.nn.Module, config: Mapping[str, object] | None) -> int | None:
+    """Apply optional decoder grid overrides and return the explicit packing limit.
+
+    Omitted values retain the checkpoint geometry or legacy packing policy.
+    Malformed values or an invalid resolved grid raise before mutating the model.
+    """
+    if config is None:
+        return None
+    if not isinstance(config, Mapping):
+        raise ValueError("video_vae_decode must be a JSON object")
+
+    values: dict[str, int] = {}
+    for key, value in config.items():
+        if key not in ("tile_batch_size", "tile_size", "tile_min_overlap"):
+            raise ValueError(f"Unknown video_vae_decode option: {key}")
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"video_vae_decode.{key} must be a positive integer")
+        values[key] = value
+
+    if "tile_size" in values or "tile_min_overlap" in values:
+        tile_size = values.get("tile_size", model.decoder_tile_size)
+        min_overlap = values.get("tile_min_overlap", model.decoder_tile_overlap_min)
+        ratio = model.vae_ratio
+        if not 0 < min_overlap < tile_size or tile_size % ratio or min_overlap % ratio:
+            raise ValueError(
+                "video_vae_decode requires 0 < tile_min_overlap < tile_size "
+                f"and both values divisible by the VAE spatial ratio ({ratio})"
+            )
+        model.decoder_tile_size = tile_size
+        model.decoder_tile_overlap_min = min_overlap
+    return values.get("tile_batch_size")
+
+
+def _native_stacking_enabled(adapter) -> bool:
+    """Match the checkpoint flag and mainline adapter's request-scoped stacking."""
+    model = adapter.model
+    return hasattr(model, "stack_tiling") and (model.stack_tiling or getattr(adapter, "stack_decode_tiles", False))
+
+
+def _reference_projection_modules(model, *, stack_tiling: bool):
     """Preserve shape-sensitive FFN and attention output Linear calls."""
     for block in getattr(model.decoder, "transformer_blocks", ()):
         projections = [
             getattr(getattr(block, "ff", None), "w1", None),
             getattr(getattr(block, "attn", None), "to_out", None),
         ]
-        if not getattr(model, "stack_tiling", False):
+        if not stack_tiling:
             # With no native tile stacking the reference calls are smaller;
             # QKV and FFN contraction also vary for narrower tile sequences.
             projections.extend(
@@ -81,7 +121,7 @@ def _reference_ffn_projection_batches(model, reference_batch_size):
         return forward
 
     try:
-        for projection in _reference_projection_modules(model):
+        for projection in _reference_projection_modules(model, stack_tiling=False):
             saved = projection.__dict__.get("forward", _MISSING)
             previous.append((projection, saved))
             projection.forward = wrap(projection.forward)
@@ -159,7 +199,7 @@ def _reference_ffn_projection_outputs(model, reference_groups):
         return forward
 
     try:
-        for projection in _reference_projection_modules(model):
+        for projection in _reference_projection_modules(model, stack_tiling=True):
             saved = projection.__dict__.get("forward", _MISSING)
             previous.append((projection, saved))
             standard = type(projection) is torch.nn.Linear and saved is _MISSING
@@ -196,10 +236,19 @@ class _TilePool:
         self.x = model.split_tiles(int(latent.shape[-1]) * model.vae_ratio, True)
         self.tiles = len(self.y[0]) * len(self.x[0])
         self.total = self.chunks * self.tiles
-        self.batching = os.environ.get("H3_VIDEO_DECODER_TILE_BATCHING", "1") == "1"
-        self.batch = int(os.environ.get("H3_VIDEO_DECODER_TILE_BATCH_SIZE", "4")) if self.batching else 1
-        if self.batch <= 0:
-            raise ValueError("H3_VIDEO_DECODER_TILE_BATCH_SIZE must be a positive integer")
+        configured_batch = getattr(adapter, "_h3_decode_tile_batch_size", None)
+        if configured_batch is not None:
+            self.batch = configured_batch
+            self.batching = configured_batch > 1
+        else:
+            self.batching = os.environ.get("H3_VIDEO_DECODER_TILE_BATCHING", "1") == "1"
+            self.batch = int(os.environ.get("H3_VIDEO_DECODER_TILE_BATCH_SIZE", "4")) if self.batching else 1
+            if self.batch <= 0:
+                raise ValueError("H3_VIDEO_DECODER_TILE_BATCH_SIZE must be a positive integer")
+        if _native_stacking_enabled(adapter) and getattr(adapter, "stack_decode_tiles", False):
+            cap = adapter.max_stacked_decode_tiles
+            if cap is not None:
+                self.batch = min(self.batch, cap)
         self.next_item = self.next_chunk = 0
         self.pending = {}
         self.state = None
@@ -495,14 +544,16 @@ class _BalancedNativeStackTilePool(_NativeStackTilePool):
         self.stats["native_groups_per_wave"].append(len(groups_by_rank[self.rank]))
 
 
-def _supported(model, latent):
+def _supported(model, latent, *, stack_tiling: bool | None = None):
+    if stack_tiling is None:
+        stack_tiling = getattr(model, "stack_tiling", False)
     return (
         latent.ndim == 5
         and not getattr(model, "training", True)
         and getattr(model, "use_3d_conv", False)
         and getattr(model, "use_vit_decoder", False)
         and getattr(model, "decoder_tiling", False)
-        and (not getattr(model, "stack_tiling", False) or callable(getattr(model, "_local_tile_indices", None)))
+        and (not stack_tiling or callable(getattr(model, "_local_tile_indices", None)))
         and not getattr(getattr(model, "decoder", None), "spatial_parallel", False)
         and not getattr(model, "isolated_first_frame", False)
         and not getattr(model, "isolated_last_frame", False)
@@ -534,12 +585,13 @@ def _cross_chunk_tiling(adapter, latent, *, all_outputs):
         pad_tokens = -(int(latent.shape[2]) + int(model.token_drop)) % int(model.tokens_chunk_size)
         if pad_tokens:
             latent = torch.cat([latent, latent[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
-    if not _supported(model, latent):
+    stack_tiling = _native_stacking_enabled(adapter)
+    if not _supported(model, latent, stack_tiling=stack_tiling):
         model._h3_vae_reshape_last_stats = {"active": False, "reason": "unsupported native boundary/parallel mode"}
         logger.info("H3_VAE_RESHAPE inactive: %s", model._h3_vae_reshape_last_stats["reason"])
         yield
         return
-    pool_class = _BalancedNativeStackTilePool if getattr(model, "stack_tiling", False) else _TilePool
+    pool_class = _BalancedNativeStackTilePool if stack_tiling else _TilePool
     pool = pool_class(adapter, latent, all_outputs=all_outputs)
     pool.stats.update(original_latent_tokens=original_tokens, native_pad_tokens=pad_tokens)
     previous = model.__dict__.get("tiled_decode", _MISSING)
@@ -569,7 +621,7 @@ def _cross_chunk_tiling(adapter, latent, *, all_outputs):
                     isinstance(getattr(getattr(block, "attn", None), "to_qkv", None), torch.nn.Linear)
                     for block in getattr(model.decoder, "transformer_blocks", ())
                 )
-                if not getattr(model, "stack_tiling", False)
+                if not stack_tiling
                 else 0
             )
             pool.stats["reference_ffn_contraction_projections"] = (
@@ -577,7 +629,7 @@ def _cross_chunk_tiling(adapter, latent, *, all_outputs):
                     isinstance(getattr(getattr(block, "ff", None), "w2", None), torch.nn.Linear)
                     for block in getattr(model.decoder, "transformer_blocks", ())
                 )
-                if not getattr(model, "stack_tiling", False)
+                if not stack_tiling
                 else 0
             )
             if isinstance(pool, _NativeStackTilePool):
@@ -601,12 +653,17 @@ def _cross_chunk_tiling(adapter, latent, *, all_outputs):
         logger.info("H3_VAE_RESHAPE %s", json.dumps(pool.stats, sort_keys=True))
 
 
-def install_cross_chunk_tiling(adapter):
-    """Install after the native model is ready; flags must precede construction."""
+def install_cross_chunk_tiling(adapter, *, tile_batch_size: int | None = None) -> None:
+    """Enable cross-chunk decode with an optional instance-local packing limit.
+
+    An explicit limit takes precedence over legacy batch environment variables.
+    """
     if os.environ.get("H3_VIDEO_DECODER_CROSS_CHUNK", "0") != "1":
         return
     if getattr(adapter, "_h3_vae_reshape_installed", False):
         return
+    adapter._h3_decode_tile_batch_size = tile_batch_size
+    grid_is_uniform = getattr(adapter, "_decoder_tile_grid_uniform", None)
     for name in ("decode_latent", "decode_with_chunks"):
         original = getattr(adapter, name, None)
         if original is None:
@@ -616,6 +673,10 @@ def install_cross_chunk_tiling(adapter):
             @wraps(function)
             @torch.inference_mode()
             def decode(latent, *args, **kwargs):
+                if latent.ndim == 5 and grid_is_uniform is not None and not grid_is_uniform(latent):
+                    adapter.model._h3_vae_reshape_last_stats = {"active": False, "reason": "nonuniform tile grid"}
+                    logger.info("H3_VAE_RESHAPE inactive: nonuniform tile grid")
+                    return function(latent, *args, **kwargs)
                 # Keep the adapter's existing latent denormalization contract;
                 # the scheduler slices the same tensor the native path decodes.
                 denormalized = adapter._denormalize_latent(latent)
@@ -628,4 +689,4 @@ def install_cross_chunk_tiling(adapter):
     adapter._h3_vae_reshape_installed = True
 
 
-__all__ = ["install_cross_chunk_tiling"]
+__all__ = ["configure_video_decode_tiles", "install_cross_chunk_tiling"]

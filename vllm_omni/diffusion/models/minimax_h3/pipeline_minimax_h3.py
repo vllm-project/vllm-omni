@@ -1511,6 +1511,7 @@ class MiniMaxH3Pipeline(
                 ),
                 lightvae_decoder_path=lightvae_decoder_path,
                 stack_decode_tiles=od_config.vae_stack_tiles,
+                decode_tiling=additional_config.get("video_vae_decode"),
                 allow_decoder_compile=vae_compile_allowed(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
