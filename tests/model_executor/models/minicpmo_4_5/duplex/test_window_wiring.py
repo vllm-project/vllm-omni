@@ -721,7 +721,8 @@ def test_assert_uniform_position_shift():
         assert_uniform_position_shift(pos_1d.unsqueeze(0).unsqueeze(0), moved_from=32)
 
 
-def test_reanchor_ordinary_append_fallback_rebuild_sequence():
+@pytest.mark.parametrize("interruption", [False, True])
+def test_reanchor_ordinary_append_fallback_rebuild_sequence(interruption):
     """Reviewer @amy-why-3459 Issue 1: Sequence test: reanchor -> ordinary append -> fallback rebuild.
 
     Verifies that:
@@ -787,6 +788,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
             "duplex": {
                 "data_plane": True,
                 "seq": 2,
+                "payload": {"duplex_interruption": interruption},
                 "runtime_config": {
                     "duplex_first_append_context_tokens": prefix_tokens,
                     "duplex_window_prefix_tokens": prefix_tokens,
@@ -815,7 +817,8 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
     # Verify atomic update of scheduler history and rebasing of coordinates
     assert session.num_computed_tokens == initial_computed - delta
     assert session.num_prompt_tokens == initial_computed - delta
-    assert session._minicpmo45_window_open_start == (initial_computed + len([42]) + 2) - delta
+    closure = ([997] if interruption else []) + [999, 998]
+    assert session._minicpmo45_window_open_start == (initial_computed + len([42]) + len(closure)) - delta
 
     # Worker evicts corresponding window units
     stage0_reanchor = update_reanchor.model_intermediate_buffer["duplex"]["stage0_reanchor"]
@@ -831,7 +834,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
         token_ids=list(range(unclosed_prompt_len)),
     )
     worker_state.pending_window_generated_tokens = stage0_window["completed_token_ids"]
-    worker_helper._finalize_window_unit(worker_state, closure_token_ids=[999, 998])
+    worker_helper._finalize_window_unit(worker_state, closure_token_ids=closure)
 
     # Simulate scheduler extending prompt with the update's tokens
     session.prompt_token_ids.extend(update_reanchor.prompt_token_ids)
@@ -880,8 +883,8 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
 
     # Worker finalizes turn from Step 1 on ordinary append
     worker_state.pending_window_unit = _MiniCPMO45WindowUnit(
-        embeds=[torch.zeros(1, 10)] * (64 - 3),
-        token_ids=[1000] * (64 - 3),
+        embeds=[torch.zeros(1, 10)] * (64 - 3 - int(interruption)),
+        token_ids=[1000] * (64 - 3 - int(interruption)),
     )
     worker_state.pending_window_generated_tokens = [43]
     worker_helper._finalize_window_unit(worker_state, closure_token_ids=[999, 998])

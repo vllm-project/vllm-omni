@@ -64,6 +64,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    INTERRUPTION_KEY,
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
 )
@@ -324,11 +325,15 @@ def build_duplex_data_plane_prompt(
     vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
     token_budget = _duplex_audio_token_budget(payload) + vision_tokens
     if isinstance(payload, dict) and payload.get("type") == "text":
-        text_ids = payload["text_token_ids"]
-        if not isinstance(text_ids, list) or not text_ids:
-            raise ValueError("Text append requires encoded text tokens")
+        if payload.get(INTERRUPTION_KEY) is True:
+            text_tokens = 1  # Reserve a turn EOS until the scheduler knows the previous unit's accepted tail.
+        else:
+            text_ids = payload.get("text_token_ids")
+            if not isinstance(text_ids, list) or not text_ids:
+                raise ValueError("Text append requires encoded text tokens")
+            text_tokens = len(text_ids)
         lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
-        token_budget = lead_tokens + 1 + len(text_ids)
+        token_budget = lead_tokens + 1 + text_tokens
     elif _duplex_payload_is_vision_only(payload):
         # Surplus slots are filled with </unit> pad embeddings that stay in the KV.
         # A VISION unit is <unit> + frame blocks; later units first close the
@@ -732,6 +737,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     input_clock_input_modalities = frozenset({"audio"})
     silence_continuation_samples = 16000
 
+    def interruption_payload(self) -> dict[str, object] | None:
+        # Stage0 places EOS before the previous unit's deferred closure, then
+        # opens a LISTEN control unit without advancing the audio encoder or
+        # replaying history. The worker owns the EOS token ID.
+        return {"type": "text", "force_listen": True, INTERRUPTION_KEY: True}
+
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = MiniCPMO45DataPlaneSession(encode_audio)
@@ -792,7 +803,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        if isinstance(payload, dict) and payload.get("type") == "text":
+        if isinstance(payload, dict) and payload.get("type") == "text" and payload.get(INTERRUPTION_KEY) is not True:
             key = runtime_config.get(TOKENIZER_KEY, "")
             tokenizer = self._tokenizers.get(key) if isinstance(key, str) else None
             if tokenizer is None:
@@ -800,6 +811,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             text = payload.get("text")
             if not isinstance(text, str) or not text:
                 raise ValueError("Text append requires non-empty text")
+            if payload.get("opens_after_interruption") is True:
+                # After multiple speech units BOS alone can continue the cancelled answer.
+                # Use the same user/assistant boundary as a seeded text turn in resident KV.
+                text = MiniCPMO45DuplexPolicy.user_turn_text(text)
+                payload = {**payload, "text_before_unit": True}
             text_ids = await asyncio.to_thread(tokenizer.encode, text, add_special_tokens=False)
             payload = {**payload, "text_token_ids": text_ids}
         return self.plan_append(
@@ -898,11 +914,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         output: object,
         streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
-        if stage_id >= final_stage_id or not segment_finished:
+        if not segment_finished:
             return None
 
         completion = _first_completion(output)
         output_metadata = _multimodal_output(output, completion)
+        interruption = stage_id == 0 and _coerce_int(output_metadata.get(INTERRUPTION_KEY)) == 1
+        if stage_id >= final_stage_id and not interruption:
+            return None
         special_token_ids = _special_token_ids(segment_output_metadata)
         special_token_ids.update(_special_token_ids(output_metadata))
         listen_id = special_token_ids.get("listen_token_id")
@@ -924,19 +943,30 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         chunk_eos_id = special_token_ids.get("chunk_eos_token_id")
         unit_terminators = {listen_id, chunk_eos_id, special_token_ids.get("chunk_tts_eos_token_id")}
         empty_unit = (
-            _coerce_int(output_metadata.get("duplex_text_input")) == 1
+            not interruption
+            and _coerce_int(output_metadata.get("duplex_text_input")) == 1
             and bool(unit_ids)
             and unit_ids[-1] == chunk_eos_id
             and (len(unit_ids) == 1 or unit_ids[-2] in unit_terminators)
         )
         if not empty_unit and _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
             return None
-        if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
+        # A marked control is its own append. A length-capped predecessor can
+        # leave TURN_EOS immediately before this LISTEN in cumulative output.
+        if not interruption and MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
             # The unit's final speech and <|turn_eos|> must reach the Talker,
             # or the response never ends.
             return None
 
         metadata = dict(output_metadata)
+        if interruption:
+            # Advance at the control unit's output, never when its append is
+            # queued: older units can still be running then. Downstream chunks
+            # already carry the old turn and the next Talker handoff resets it.
+            bridges = getattr(streaming_context, "bridge_states", None)
+            bridge = bridges.get("duplex") if isinstance(bridges, dict) else None
+            if isinstance(bridge, dict) and isinstance(bridge.get("model_turn_id"), int):
+                bridge["model_turn_id"] += 1
         for key, value in special_token_ids.items():
             metadata.setdefault(f"meta.{key}", value)
         metadata.update(

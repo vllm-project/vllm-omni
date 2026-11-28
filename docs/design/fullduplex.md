@@ -821,10 +821,12 @@ vllm_omni/
   `duplex-s.<b64 session id>.e.<epoch>.r.<role>`, model-side per-session state
   is keyed by `session_id` alone, and a command, close, touch or resume for an
   id the manager no longer holds is answered with `unknown_session`.
-- **Staleness inside a live session is epoch-based.** `DuplexFence
+- **Request staleness inside a live session is epoch-based.** `DuplexFence
   (session_id, epoch, turn_id)` is an engine-internal identity: every stage
-  request is bound to the fence it was submitted under, cancels advance the
-  epoch, and tracked tasks re-check the epoch after each `await`.
+  request is bound to the fence it was submitted under, destructive cancels
+  advance the epoch, and tracked tasks re-check the epoch after each `await`.
+  Native MiniCPM interruption retains the request and epoch; an ordered
+  control unit and model-turn filtering isolate cancelled output instead.
 - **Resume identity** is `(session_id, resume_token, expected_lease_generation)`:
   the token belongs to the attachment registry, the lease generation is the
   engine-side compare-and-swap.
@@ -1022,12 +1024,73 @@ for queue updates and the final validity check before delivery.
   memory. Retained frames continue to consume the pending-input byte budget
   until submission or cleanup. Before commit, the model's frame buffer applies
   its sampling policy, such as retaining only the latest camera frame.
-- **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
+- **Destructive cancel is atomic at the session.** By default, `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before
   yielding. An append task already past its last check is harmless: its stage
   request is bound to the old epoch's request id, which the abort covers, and
   the base never emits session-owned outputs to a client.
+- **Native MiniCPM interruption retains the Thinker.** For automatic resumable
+  sessions, `response.cancel`, `output_audio_buffer.clear`, explicit barge-in
+  and overlap-policy barge-in stop the response and invalidate its queued
+  audio immediately. Through the existing append tail, the plugin inserts
+  `<|turn_eos|><|listen|></unit>` to close the preceding unit, replacing its
+  uncomputed speech terminator, then opens an empty `<unit>` with forced LISTEN.
+  Stage 0 uses its own EOS token ID, so audio-only sessions can interrupt
+  without an orchestrator tokenizer. EOS must close the interrupted speech
+  unit. Placing it in the new control unit can make the model continue the
+  cancelled answer after a follow-up. Window accounting includes EOS in the
+  closed unit rather than the new control unit. No request is aborted,
+  no epoch is advanced, and no system/reference prefix or retained history is
+  replayed. Buffered and already submitted input remains owned by that stream.
+  Stage 0 confirms the marked control when its segment stops on LISTEN, even
+  if the previous segment reached its length limit immediately after turn EOS.
+  This routing decision advances the bridge and releases output suppression
+  for the next model turn. Late output from cancelled turns stays suppressed,
+  including a Thinker length error from a cancelled unit. Audio waiting for
+  its transcript can be delivered with terminal text on the same turn. The
+  projector releases any remaining buffered audio when that turn closes.
+  Late cumulative PCM advances the cursor only while it still belongs to the
+  same waveform. When a restarted waveform grows past its first real prefix,
+  delivery resumes at the end of that prefix even if the new snapshot has
+  reached the old waveform's length. Older turns can no longer advance its
+  cursor. The next Talker handoff starts its normal new-turn state. The
+  session advances its output turn without invalidating input reservations
+  already inside `submit`.
+  Repeated interruptions retain their order relative to intervening inputs;
+  output stays suppressed until all queued controls finish. An unforced text
+  append or explicit audio commit can reserve a cancellable response during
+  suppression. It keeps its ID and response options; the last control
+  completion binds it to the confirmed next model turn before output resumes.
+  It must not complete empty merely because admission captured the cancelled
+  turn. Input-clocked
+  sessions keep accounting for submitted units; the control carries zero input
+  duration. Pending audio awaiting transcript belongs to its model turn;
+  control completion discards cancelled turns' pending audio so it cannot
+  consume the next turn's text. The Talker-to-Code2Wav bridge also discards
+  buffered codec frames, transcript and left context when the model turn
+  advances without a normal turn end. It starts a fresh vocoder cache epoch
+  if the previous turn sent payloads, and rejects late older-turn callbacks.
+  If no payload was sent, the next turn still owns the initial reference-audio
+  payload. Normal turn ends advance the cache epoch only once.
+  The first unforced text append that opens a response
+  after interruption uses the seeded user/assistant role delimiters. Its
+  user text follows the closed control unit and precedes the new assistant
+  `<unit>`. This boundary distinguishes the question from speech already in KV
+  if the cancelled reply spanned multiple units.
+  The first unforced text reply after interruption starts with `<|tts_bos|>`:
+  the text API requests an answer, rather than a continuation of the old speech
+  or an empty turn. Forced-listen inputs retain this restart until a reply;
+  generated speech consumes it, so later text does not restart an active turn.
+  Audio input retains the native listen/speak decision.
+  If control submission fails, including behind
+  a rejected append, the runner uses destructive input cancellation with
+  reason `interruption_control_failed`. This retires the epoch and queued
+  input before allowing new replies; it does not wait indefinitely for LISTEN.
+  `input.cancel`, manual response sessions, context invalidation and
+  teardown retain destructive cancellation. Other plugins must explicitly opt
+  in via `interruption_payload`; MiniCPM-derived tool plugins retain their
+  epoch cancellation contract.
 - **Tool calls settle once, and the epoch settles them.** A function call the
   runtime exposes to the client (`response.function_call_arguments.done`) is
   recorded in a session-owned ledger before it is emitted, and its

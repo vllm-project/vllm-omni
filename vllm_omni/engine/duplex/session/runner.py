@@ -64,6 +64,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
+    DuplexTurnState,
     ResponseCreateOptions,
     effective_function_call_retry_policy,
     input_clocked,
@@ -78,6 +79,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     InputCleared,
+    OutputAudioCleared,
     PlaybackAcknowledged,
     ResponseDone,
     SessionExpired,
@@ -364,6 +366,8 @@ class DuplexSessionRunner:
             self.model,
             wait_for_append_tail=self._wait_for_append_tail,
         )
+        self._resident_stage0_segments = 0
+        self._resident_tts_drained_at_turn: int | None = 0
         #: Unit tracking of an input-clocked session (``extra_body.clock == "input"``,
         #: fixed at session creation); ``None`` for every other session.
         self._input_clock: InputClock | None = None
@@ -480,7 +484,7 @@ class DuplexSessionRunner:
             return True
         decision: DuplexOutputDecision | None = None
         project = False
-        if stage_id < context.final_stage_id:
+        if stage_id < context.final_stage_id or (stage_id == 0 and self.run.interruption_pending):
             decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
@@ -494,6 +498,8 @@ class DuplexSessionRunner:
             self.run.concurrent_turn_requests_released = True
         progress = self._input_clock_progress(stage_id, output, decision, context)
         consume = decision is not None or stage_id >= context.final_stage_id
+        if stage_id == 0 and not consume:
+            self._note_resident_stage0_end(request_id, context, forwarded=True)
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         project_output = consume or project or project_intermediate
         if not project_output:
@@ -536,6 +542,19 @@ class DuplexSessionRunner:
             self._mailbox.put_nowait(progress)
         # Projection-only must still forward to the next stage (return False).
         return consume
+
+    def _note_resident_stage0_end(self, request_id: str, context: DuplexOutputContext, *, forwarded: bool) -> None:
+        if (
+            context.segment_finished
+            and context.identity.fence.epoch == self.session.epoch
+            and request_id == self.manager.stage_request_id(context.identity.fence, stage_id=0)
+        ):
+            self._resident_stage0_segments += 1
+            if forwarded:
+                # Direct LISTENs leave any preceding Talker handoff outstanding.
+                self._resident_tts_drained_at_turn = (
+                    None if context.model_turn_id is None else context.model_turn_id + 1
+                )
 
     # ------------------------------------------------------------------ #
     # Input clock (``extra_body.clock == "input"``)                       #
@@ -1010,6 +1029,9 @@ class DuplexSessionRunner:
     async def _handle_item(self, item: DuplexCommand | StageOutput | StageProgress | _RefusedInput | _Internal) -> None:
         session = self.session
         if isinstance(item, StageOutput):
+            if item.stage_id == 0 and (item.context.final_stage_id == 0 or item.decision is not None):
+                # The clear ahead of a direct/final result still sees pending input.
+                self._note_resident_stage0_end(item.request_id, item.context, forwarded=False)
             if self.model.is_input_transcription(item.request_id) and not await self._wait_for_append_tail():
                 await self.model.finish_input_transcription(item, abandon=True)
                 return
@@ -1063,6 +1085,18 @@ class DuplexSessionRunner:
             self._on_get_session_stats(command)
 
     async def _on_internal(self, item: _Internal) -> None:
+        if item.kind == "interruption_submit_failed":
+            # A rejected predecessor can prevent the control from reaching
+            # Stage 0. Its LISTEN will never arrive; retire the stream before
+            # another reply can escape suppression. A later epoch owns itself.
+            if (
+                not self.run.closing
+                and self.session.state == DuplexSessionState.OPEN
+                and self.session.epoch == item.payload["epoch"]
+                and self.run.interruption_pending
+            ):
+                await self._on_cancel({"type": "input.cancel"}, reason="interruption_control_failed")
+            return
         if item.kind == "input_clock_settle":
             task = item.payload.get("task")
             if isinstance(task, asyncio.Task):
@@ -1195,8 +1229,22 @@ class DuplexSessionRunner:
                 if not await self._submit_buffered_media():
                     return
                 session.mark_user_input_activity()
+                payload: dict[str, object] = {
+                    "type": "text",
+                    "text": command.text,
+                    "force_listen": command.force_listen is True,
+                }
+                if (
+                    command.force_listen is not True
+                    and session.active_response_id is None
+                    and (
+                        self.run.interruption_pending
+                        or self.run.interrupted_through_turn == (session.epoch, session.turn_id - 1)
+                    )
+                ):
+                    payload["opens_after_interruption"] = True
                 task = await self._start_append(
-                    {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
+                    payload,
                     final=False,
                     precreate_response=command.force_listen is not True,
                 )
@@ -1477,6 +1525,10 @@ class DuplexSessionRunner:
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
         retired = True
         if new_epoch != old_epoch:
+            self.run.pending_interruptions = 0
+            self.run.interrupted_through_turn = None
+            self._resident_stage0_segments = 0
+            self._resident_tts_drained_at_turn = 0
             self.tool_calls.invalidate_epoch(new_epoch)
             if not closing_before:
                 retired = self._retire_pending_function_output()
@@ -1685,11 +1737,13 @@ class DuplexSessionRunner:
         playback_was_active = helpers.assistant_playback_active(self.session)
         model_state.audio_buffer.clear_force_listen()
         session.reset_overlap_speech()
+        cancel_reason = str(decision.get("cancel_reason") or "barge_in")
+        if await self._interrupt_resident_response(reason=cancel_reason):
+            return not self.run.closing
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         had_append = await self.tasks.cancel_append_tasks()
         had_stream = self.run.stream_request_id is not None
-        cancel_reason = str(decision.get("cancel_reason") or "barge_in")
         cancelled = await self._cancel_active_response(
             self.tasks.active_response_task,
             reason=cancel_reason,
@@ -2184,10 +2238,10 @@ class DuplexSessionRunner:
         # reached the stage; before_append skips silence that has not started.
         self.model_state.pending_silence_owner_id = None
 
-    def _real_input_waiting(self) -> bool:
+    def _real_input_waiting(self, *, include_queued: bool = True) -> bool:
         self._clear_completed_pending_silence()
         buffer = self.model_state.audio_buffer
-        if self._pending_input_appends > 0 or buffer.has_reserved():
+        if (include_queued and self._pending_input_appends > 0) or buffer.has_reserved():
             return True
         if self.run.partial_input_continuation_turn == (self.session.epoch, self.session.active_response_turn_id):
             # Text can release a reply without an audio commit. Keep partial PCM
@@ -2727,14 +2781,14 @@ class DuplexSessionRunner:
             and not model_state.committed_audio_consume_started
         )
 
-    async def _on_cancel(self, event: dict[str, object]) -> None:
+    async def _on_cancel(self, event: dict[str, object], *, reason: str | None = None) -> None:
         session = self.session
         model_state = self.model_state
         event_type = str(event.get("type"))
         if event_type == "barge_in" and not session.capabilities.supports_barge_in:
             self._emit_events([helpers.barge_in_unsupported_error()])
             return
-        cancel_reason = (
+        cancel_reason = reason or (
             "output_audio_buffer_clear"
             if event_type == "output_audio_buffer.clear"
             else "client_cancelled"
@@ -2765,6 +2819,8 @@ class DuplexSessionRunner:
                     event_id=event.get("realtime_event_id"),
                 )
                 return
+        if event_type != "input.cancel" and await self._interrupt_resident_response(reason=cancel_reason):
+            return
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
         self.memory.cancel_interaction()
         playback_was_active = helpers.assistant_playback_active(self.session)
@@ -2900,12 +2956,82 @@ class DuplexSessionRunner:
         if self.ctx.history_calibration is not None:
             self.ctx.history_calibration.request_ready()
 
+    def _resident_output_drained(self) -> bool:
+        session = self.session
+        playback = session.playback
+        audio_ms = max(playback.sent_ms, playback.generated_ms)
+        if (
+            session.turn_state not in (DuplexTurnState.IDLE, DuplexTurnState.USER_SPEAKING)
+            or playback.committed_ms < audio_ms
+            or helpers.response_in_progress(session, self.tasks)
+            or self.run.interruption_pending
+            or self.tasks.append_tasks
+            # A clear only observes inputs preceding it in the session mailbox.
+            or self._real_input_waiting(include_queued=False)
+            or self.model_state.committed_audio_payload is not None
+            or self._deferred_silence is not None
+            or any(t.get_name() == "duplex-continue" and not t.done() for t in self._background_tasks)
+        ):
+            return False
+        if self._resident_stage0_segments == session.input_seq and session.input_seq > 0:
+            return (
+                self._resident_tts_drained_at_turn is not None and session.turn_id >= self._resident_tts_drained_at_turn
+            )
+        # A terminal from the only accepted input also proves that input drained
+        # when it reached the session before its Stage 0 notification.
+        return (
+            self._resident_stage0_segments == 0
+            and session.input_seq == 1
+            and session.turn_state == DuplexTurnState.IDLE
+            and session.last_response_id is not None
+            and session.turn_id > 0
+        )
+
+    async def _interrupt_resident_response(self, *, reason: str) -> bool:
+        """Stop playback and enqueue the model's ordered resident control, if supported."""
+        session = self.session
+        if not (
+            self.out.auto_responds()
+            and session.capabilities.supports_core_resumable_request
+            and (self.run.stream_request_id is not None or session.active_request_id is not None)
+            and (payload := self.plugin.interruption_payload()) is not None
+        ):
+            return False
+        if reason == "output_audio_buffer_clear" and self._resident_output_drained():
+            # The resident request outlives playback. Clearing a drained
+            # reply only owes the client its acknowledgement.
+            self._emit_events([OutputAudioCleared(response_id=session.last_response_id)])
+            return True
+        self.run.pending_interruptions += 1
+        self.model_state.clear_continuation()
+        self._deferred_silence = None
+        self.memory.cancel_interaction()
+        cancelled = await self._cancel_active_response(
+            self.tasks.active_response_task, reason=reason, preserve_request=True
+        )
+        if not cancelled and reason == "output_audio_buffer_clear":
+            # Input can still be in flight after the failed response released its binding.
+            self._emit_events([OutputAudioCleared(response_id=session.last_response_id)])
+        # Already accepted units finish before this control, and subsequent
+        # client input follows it. Cancelling their submit tasks would
+        # compensate by aborting the resident KV.
+        epoch = session.epoch
+        task = await self._start_append(payload, final=False)
+
+        def settle_control(done: asyncio.Task[bool]) -> None:
+            if done.cancelled() or done.exception() is not None or not done.result():
+                self._mailbox.put_nowait(_Internal("interruption_submit_failed", {"epoch": epoch}))
+
+        task.add_done_callback(settle_control)
+        return True
+
     async def _cancel_active_response(
         self,
         active_task: asyncio.Task[None] | None,
         *,
         reason: str,
         notify: bool = True,
+        preserve_request: bool = False,
     ) -> bool:
         session = self.session
         has_running_task = active_task is not None and not active_task.done()
@@ -2923,7 +3049,7 @@ class DuplexSessionRunner:
             old_response_id = session.last_response_id
         committed_ms = session.playback.committed_ms
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
-        # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
+        # Cancelling the reply clears the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
         # The model is no longer filling the call this cancel tears down, so
         # client frames are appended again instead of dropped.
@@ -2933,6 +3059,7 @@ class DuplexSessionRunner:
         committed_message = session.end_response(
             commit_text=should_commit,
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+            preserve_request=preserve_request,
         )
         committed = committed_message is not None
         if old_response_id is not None:
@@ -2959,6 +3086,22 @@ class DuplexSessionRunner:
             response_id=old_response_id,
             release_owner=not committed and committed_ms == 0 and not audio_started,
         )
+        if preserve_request:
+            old_playback = session.playback.as_dict()
+            session.clear_playback_cursor()
+            self.emit(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": old_response_id,
+                    "reason": reason,
+                    "cancelled_epoch": old_epoch,
+                    "epoch": old_epoch,
+                    "committed_ms": committed_ms,
+                    "playback": old_playback,
+                }
+            )
+            return True
         draining_cancels: list[tuple[str, int, dict[str, int]]] = []
         seen_responses: set[str] = set()
         if isinstance(old_response_id, str) and old_response_id:

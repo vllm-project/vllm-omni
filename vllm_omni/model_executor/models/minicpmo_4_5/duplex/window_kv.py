@@ -119,6 +119,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.model_executor.common.duplex.payload import payload_audio
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    INTERRUPTION_KEY,
     MiniCPMO45TurnState,
     record_turn_sample,
 )
@@ -131,6 +132,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     cdiv,
     plan_position_reanchor,
     prepare_stage0_window,
+    stage0_unit_closure_tokens,
 )
 
 if TYPE_CHECKING:
@@ -642,7 +644,7 @@ class MiniCPMO45DuplexWindowPolicy:
                 if seq > 1 and segment_output_ids is not None:
                     preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
                     old_prompt_tokens = int(getattr(session, "num_prompt_tokens", 0) or 0)
-                    boundary_cur = old_prompt_tokens + len(segment_output_ids) + 2
+                    boundary_cur = old_prompt_tokens + len(segment_output_ids) + stage0_unit_closure_tokens(duplex)
                     recorded_open = getattr(session, "_minicpmo45_window_open_start", None)
                     open_start = preserve_len if recorded_open is None else int(recorded_open)
                     closing_len = boundary_cur - open_start
@@ -781,7 +783,7 @@ class MiniCPMO45SchedulerWindowPolicy:
             stage0_window["completed_terminator_token_id"] = int(completed_terminator)
 
         # Synchronize scheduler window units and coordinates atomically with compaction
-        boundary_before = old_prompt_tokens + len(generated_ids) + 2
+        boundary_before = old_prompt_tokens + len(generated_ids) + stage0_unit_closure_tokens(duplex)
         recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
         open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
         unit_len = boundary_before - open_start
@@ -886,8 +888,11 @@ class MiniCPMO45SchedulerWindowPolicy:
         active_ids = generated[:-1] if parked else generated[:consumed]
         accepted = generated if parked else active_ids
         backend_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY))
-        if (payload.get("text_token_ids") or backend_text) and settled >= request.num_prompt_tokens:
-            turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
+        if settled >= request.num_prompt_tokens:
+            if payload.get(INTERRUPTION_KEY) is True:
+                turn.interrupt()
+            elif payload.get("text_token_ids") or backend_text:
+                turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
         if accepted and payload.get("open_assistant_turn") is True and payload.get("is_speech") is not True:
             if turn.current_turn_ended:
                 turn.current_turn_ended = False
@@ -1040,6 +1045,21 @@ class MiniCPMO45SchedulerWindowPolicy:
         completed_terminator: int | None,
     ) -> int | None:
         info = getattr(update, "model_intermediate_buffer", None)
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        payload = duplex.get("payload") if isinstance(duplex, dict) else None
+        if isinstance(payload, dict) and payload.get(INTERRUPTION_KEY) is True:
+            # The prompt reserves an EOS before the previous unit's deferred LISTEN.
+            # Release that row if the accepted KV already ends in EOS or the
+            # previous unit only listened. A sampled but uncomputed EOS still needs a row.
+            ids = (duplex.get("runtime_config") or {}).get("duplex_boundary_token_ids") or {}
+            # Audio-only sessions may omit the tokenizer. Use the released 4.5 vocabulary there.
+            turn_eos = ids.get("turn_eos_token_id", 151717)
+            listen = ids.get("listen_token_id", 151705)
+            if (segment_output_ids and segment_output_ids[-1] == turn_eos) or (
+                not segment_output_ids and completed_terminator == listen
+            ):
+                duplex["interruption_turn_closed"] = True
+                update.prompt_token_ids = update.prompt_token_ids[:-1]
         replay_enabled = duplex_window_replay_enabled(info)
         if replay_enabled:
             self.snapshot_window(request)
@@ -1056,7 +1076,6 @@ class MiniCPMO45SchedulerWindowPolicy:
                 segment_output_ids=segment_output_ids,
                 completed_terminator=completed_terminator,
             )
-        duplex = info.get("duplex") if isinstance(info, dict) else None
         if isinstance(duplex, dict) and isinstance(duplex.get("stage0_window"), dict):
             request._minicpmo45_window_planned = True
         replaced = reanchored is None and prepare_stage0_window(

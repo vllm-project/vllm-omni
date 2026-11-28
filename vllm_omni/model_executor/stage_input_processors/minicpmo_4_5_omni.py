@@ -349,6 +349,7 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         record["last_terminal_turn"] = None
+        record.pop("duplex_turn_key", None)
         record.pop("last_closed_condition", None)
         _drop_codec_state(transfer_manager, request_id)
 
@@ -356,6 +357,20 @@ def tts2code2wav_async_chunk(
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
         return None
+
+    if native_duplex and all(isinstance(value, int) and value >= 0 for value in duplex_turn_key):
+        previous_turn = record.get("duplex_turn_key")
+        if previous_turn is not None and duplex_turn_key < previous_turn:
+            return None
+        if previous_turn is not None and duplex_turn_key != previous_turn and _MINICPMO45_ASYNC_STATE in container:
+            # Interruption keeps the request without sending a Talker turn end.
+            # Drop its queued codes/text and left context before the next turn.
+            # A normal turn end already retired this state and advanced the epoch.
+            if record["chunk_seq"]:
+                record["cache_epoch"] = int(record["cache_epoch"]) + 1
+            record["chunk_seq"] = 0
+            _drop_codec_state(transfer_manager, request_id)
+        record["duplex_turn_key"] = duplex_turn_key
 
     # Async scheduling can publish lookahead outputs after this condition's
     # EOS, including after the next condition starts. Fence by the identity

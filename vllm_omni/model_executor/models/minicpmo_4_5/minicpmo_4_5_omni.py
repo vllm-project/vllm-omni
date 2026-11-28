@@ -40,6 +40,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    INTERRUPTION_KEY,
     MiniCPMO45DuplexPolicy,
     record_turn_sample,
 )
@@ -71,6 +72,7 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
     # audio follows text on the same resumable scheduler request.
     outputs["duplex_text_input"] = [info.get("text_input") is True for info in duplex_rows]
     outputs["duplex_explicit_reply"] = [info.get("duplex_explicit_reply") is True for info in duplex_rows]
+    outputs[INTERRUPTION_KEY] = [info.get(INTERRUPTION_KEY) is True for info in duplex_rows]
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
@@ -397,6 +399,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 pending_speech_context = (
                     bool(getattr(state, "pending_speech_context", False)) if state is not None else False
                 )
+                if payload.get("type") == "text" and not force_listen and getattr(state, "interrupted_turn", False):
+                    # An unforced text append explicitly requests a new answer.
+                    # After interruption, sampling a continuation marker or EOS
+                    # here can resume the old answer or finish without content.
+                    # Frame this reply with BOS; recording that sample consumes
+                    # the latch. Audio keeps its native listen/speak decision.
+                    bos_id = token_ids.get("tts_bos_token_id", -1)
+                    if 0 <= bos_id < logits.shape[-1]:
+                        logits[row_idx].fill_(float("-inf"))
+                        logits[row_idx].narrow(0, bos_id, 1).fill_(0.0)
+                        continue
                 if is_speech is True:
                     if state is not None:
                         with suppress(Exception):
@@ -841,7 +854,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
             "input_text_token_ids": payload.get("text_token_ids"),
+            "text_before_unit": payload.get("text_before_unit") is True,
             "force_listen": payload.get("force_listen") is True,
+            "interruption": payload.get(INTERRUPTION_KEY) is True,
+            "interruption_turn_closed": duplex.get("interruption_turn_closed") is True,
             "stage0_window": window if isinstance(window, dict) else None,
             "text_token_ids": text_token_ids if isinstance(text_token_ids, list) else None,
             "prepend_text_token_ids": prepend_ids,

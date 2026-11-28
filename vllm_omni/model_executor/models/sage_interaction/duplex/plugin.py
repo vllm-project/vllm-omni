@@ -227,6 +227,9 @@ def _current_unit_tokens(token_ids: list[int], special_token_ids: Mapping[str, i
 class SageInteractionDuplexPlugin(MiniCPMO45DuplexPlugin):
     """Engine and session duplex policy for InternLM Sage-Interaction."""
 
+    def interruption_payload(self) -> None:
+        return None
+
     plugin_id = "sage_interaction"
     private_runtime_config_keys = SAGE_PRIVATE_RUNTIME_CONFIG_KEYS
     abandoned_tool_call_reasons = frozenset(

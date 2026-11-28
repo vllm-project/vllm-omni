@@ -73,6 +73,17 @@ LISTEN_TOKEN_ID = 7
 # --------------------------------------------------------------------------- #
 
 
+class AbortOnCancelPlugin(MiniCPMO45DuplexPlugin):
+    """Exercise the shared epoch-cancellation contract with MiniCPM projection.
+
+    Resident MiniCPM interruption has its own real-plugin scenarios in
+    ``test_resident_interruption.py``.
+    """
+
+    def interruption_payload(self) -> None:
+        return None
+
+
 class RecordingStagePort(DuplexStagePort):
     """Records what the runner asks of the orchestrator; never talks to a stage."""
 
@@ -263,7 +274,7 @@ async def open_harness(
     model: str = "openbmb/MiniCPM-o-4_5",
 ) -> Harness:
     if plugin is None:
-        plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
+        plugin = AbortOnCancelPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()

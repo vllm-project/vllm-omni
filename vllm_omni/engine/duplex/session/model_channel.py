@@ -1025,6 +1025,41 @@ class ModelChannel:
         if isinstance(context, DuplexDataPlaneContext) and model_turn_id is not None:
             context = replace(context, model_turn_id=model_turn_id)
         for model_result in self._ctx.plugin.data_plane.project(result, context=context):
+            # Consume the projector even when discarding output: cumulative
+            # token/audio cursors must not replay the cancelled reply later.
+            run = self._ctx.run
+            result_turn = coerce_int(model_result.get("model_turn_id"))
+            if model_result.get("interruption_completed") is True and run.interruption_pending:
+                run.pending_interruptions -= 1
+                self._deferred_text_listen = None
+                if result_turn is not None:
+                    run.interrupted_through_turn = (session.epoch, result_turn)
+                    # A later input can already be inside submit(). The model
+                    # turn changes now; the accepted input fence changes when
+                    # the ordered append commits, so it cannot invalidate an
+                    # in-flight reservation and abort the resident request.
+                    session.complete_model_turn(result_turn, advance_input_fence=False)
+                    if not run.interruption_pending and session.active_response_id is not None:
+                        # Text or an explicit commit/create can reserve the next reply
+                        # while controls are pending. Keep that response and
+                        # its options, but replace the cancelled turn captured
+                        # at admission with the model-confirmed next turn.
+                        session.bind_response_turn(session.turn_id)
+                continue
+            interrupted = run.interrupted_through_turn
+            stale_turn = (
+                interrupted is not None
+                and interrupted[0] == session.epoch
+                and (
+                    (result_turn is not None and result_turn <= interrupted[1])
+                    or (model_turn_id is not None and model_turn_id <= interrupted[1])
+                )
+            )
+            # A cancelled unit can hit its length cap after the next response
+            # has been reserved. Request-wide errors still need reporting.
+            request_error = "error_code" in model_result and result_turn is None
+            if (run.interruption_pending or stale_turn) and not request_error:
+                continue
             close_reason_for_result, did_emit = await self._send_one_model_output_event(
                 model_result,
                 expected_epoch=expected_epoch,
@@ -1034,7 +1069,7 @@ class ModelChannel:
             if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
         pending = self._deferred_text_listen
-        if pending is not None and session.active_response_id is None:
+        if pending is not None and session.active_response_id is None and not self._ctx.run.interruption_pending:
             self._deferred_text_listen = None
             pending_epoch, pending_result = pending
             pending_turn = coerce_int(pending_result.get("model_turn_id"))
@@ -2294,6 +2329,8 @@ class ModelChannel:
         finished_segment: bool = False,
         finished_request_id: str | None = None,
     ) -> None:
+        if self._ctx.run.interruption_pending:
+            return
         session = self._ctx.session
         model_state = self._ctx.model_state
         response_id = session.active_response_id

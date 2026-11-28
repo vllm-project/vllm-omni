@@ -17,7 +17,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.model_executor.common.request_outputs import coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import INTERRUPTION_KEY, MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
@@ -28,6 +28,7 @@ EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 @dataclass(slots=True)
 class _TurnState:
+    pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     sent_segment_text: str = ""
     last_text_chunk: tuple[int, int] | None = None
     has_text: bool = False
@@ -53,11 +54,12 @@ class _EOSCursor:
 @dataclass(slots=True)
 class _RequestState:
     audio_offset: int = 0
-    #: A snapshot below ``audio_offset`` that has not been accepted as a restart
-    #: yet. See :meth:`MiniCPMO45DataPlaneSession.slice_cumulative_audio`.
-    audio_restart_candidate: int | None = None
+    audio_buffer_id: tuple[int, int] = (0, 0)
+    #: Earliest producer turn that can still advance the cursor after a confirmed restart.
+    audio_buffer_start_turn: int | None = None
+    #: Producer turn and emitted prefix length of a possible restarted waveform.
+    audio_restart_candidate: tuple[int | None, int] | None = None
     uses_segment_text_metadata: bool = False
-    pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
     stage0_consumed_tokens: int = 0
@@ -72,6 +74,46 @@ class _RequestState:
 
     def turn(self, turn_id: int | None) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
+
+    def accept_audio_buffer(self, buffer_id: tuple[int, int], audio: object) -> bool:
+        if buffer_id < self.audio_buffer_id:
+            return False
+        if buffer_id == self.audio_buffer_id:
+            # A delta list was drained when published. Within a cumulative
+            # buffer, a shorter nonempty snapshot can only be an older one.
+            return not isinstance(audio, list) and not (0 < (_audio_num_samples(audio) or 0) < self.audio_offset)
+        self.audio_buffer_id = buffer_id
+        self.audio_offset = 0
+        self.audio_restart_candidate = None
+        self.audio_buffer_start_turn = None
+        return True
+
+    def discard_stale_audio(self, num_samples: int, turn_id: int | None) -> None:
+        if self.audio_buffer_start_turn is None or (turn_id is not None and turn_id >= self.audio_buffer_start_turn):
+            self.audio_offset = max(self.audio_offset, num_samples)
+
+    def advance_audio_cursor(self, num_samples: int, turn_id: int | None) -> int:
+        """Consume a cumulative snapshot and return the start of its new samples."""
+        previous = self.audio_offset
+        candidate = self.audio_restart_candidate
+        if candidate is not None:
+            prefix_turn, emitted = candidate
+            # Growth from a real prefix confirms a restart even if this
+            # snapshot has already caught up with the old waveform. A lone
+            # continuation placeholder can also precede the old waveform.
+            if num_samples > emitted and (emitted > 1 or (prefix_turn == turn_id and num_samples < previous)):
+                previous = emitted
+                self.audio_buffer_start_turn = prefix_turn if prefix_turn is not None else turn_id
+            elif num_samples == emitted and emitted > 1:
+                return emitted
+        if num_samples < previous:
+            # A continuation placeholder does not replace an emitted prefix.
+            if num_samples > 1 or candidate is None:
+                self.audio_restart_candidate = (turn_id, num_samples)
+            return 0
+        self.audio_restart_candidate = None
+        self.audio_offset = num_samples
+        return previous
 
 
 class MiniCPMO45DataPlaneSession(DuplexDataPlane):
@@ -112,6 +154,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         if state is None:
             return
         state.audio_offset = 0
+        state.audio_buffer_id = (0, 0)
+        state.audio_restart_candidate = None
+        state.audio_buffer_start_turn = None
         state.turns.pop(None, None)
         for cursor in state.eos_cursors.values():
             cursor.pending_turn = None
@@ -198,7 +243,8 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
         text_input = coerce_int(mm_output.get("duplex_text_input")) == 1
-        if text_input and context.model_turn_id is not None:
+        interruption = coerce_int(mm_output.get(INTERRUPTION_KEY)) == 1
+        if (text_input or interruption) and context.model_turn_id is not None:
             output_turn_id = context.model_turn_id
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
@@ -209,8 +255,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         # Advance the cumulative EOS cursor before skipping stale output, so a later
         # empty step does not rescan the skipped tokens.
         eos_cursor = None
+        stage_id = coerce_int(getattr(output, "stage_id", None))
         if request_state is not None and not self.thinker_only:
-            eos_cursor = request_state.eos_cursor(coerce_int(getattr(output, "stage_id", None)))
+            eos_cursor = request_state.eos_cursor(stage_id)
         eos_scan_ids = [] if self.thinker_only else self._unscanned_token_ids(eos_cursor, completion)
         stale = context.auto_responds and (stale_turn or stale_epoch)
         if self.thinker_only:
@@ -226,9 +273,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     context=context,
                     runtime_result=runtime_result,
                 )
-                if not stale:
-                    yield from projected
-                else:
+                if stale:
                     # Consume skipped tokens so their text and boundaries do not reach the next reply.
                     for _ in projected:
                         pass
@@ -236,8 +281,33 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     if snapshot_len > request_state.stage0_consumed_tokens:
                         request_state.stage0_consumed_tokens = snapshot_len
                         request_state.stage0_skip_open_unit = True
+                elif interruption:
+                    # Advance the decoder, but only the Stage 0 routing decision
+                    # can confirm the control and advance the producer turn.
+                    for result in projected:
+                        if result.get("error_code"):
+                            yield result
+                else:
+                    yield from projected
+            if not interruption or stale:
+                return
+        if interruption and direct_decision is None:
+            return
+        raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
+        identity = _coerce_int_list(mm_output.get("duplex_audio_buffer_id"))
+        if (
+            not stale_epoch
+            and request_state is not None
+            and len(identity) == 2
+            and not request_state.accept_audio_buffer((identity[0], identity[1]), raw_audio)
+        ):
             return
         if stale:
+            # A late TTS snapshot still contributes PCM to this request's
+            # next cumulative waveform. Stage 0 latents and delta lists do not.
+            if not stale_epoch and stage_id != 0 and request_state is not None and raw_audio is not None:
+                if not isinstance(raw_audio, list) and (num_samples := _audio_num_samples(raw_audio)):
+                    request_state.discard_stale_audio(num_samples, output_turn_id)
             return
 
         mm_text = _llm_output_text(mm_output)
@@ -253,6 +323,10 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
+            if interruption and request_state is not None:
+                for turn_id, turn_state in request_state.turns.items():
+                    if turn_id is None or (output_turn_id is not None and turn_id <= output_turn_id):
+                        turn_state.pending_audio_without_text.clear()
             explicit_reply = coerce_int(mm_output.get("duplex_explicit_reply")) == 1
             listen_result = runtime_result(
                 stage_role="llm",
@@ -262,6 +336,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 data_plane_request_id=request_id,
                 end_of_turn=explicit_reply,
                 continue_with_partial_input=text_input and not explicit_reply,
+                interruption_completed=interruption,
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id
@@ -279,13 +354,15 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             )
             return
 
-        raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
         raw_audio_samples = _audio_num_samples(raw_audio)
         offset_before = self.audio_offset(request_id)
+        sample_rate_hz = _sample_rate_hz(mm_output)
         audio_chunks = list(
             self._encode_audio_chunks_with_duration(
-                mm_output,
+                raw_audio,
+                sample_rate_hz=sample_rate_hz,
                 request_id=request_id,
+                turn_id=output_turn_id if output_turn_id is not None else context.turn_id,
                 response_format=context.response_format,
                 speed=context.speed,
             )
@@ -343,7 +420,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         if audio_chunks:
             delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
             last_idx = len(audio_chunks) - 1
-            sample_rate_hz = _sample_rate_hz(mm_output)
             audio_text_marks = _audio_text_marks(mm_output)
             fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
             audio_results: list[dict[str, object]] = []
@@ -386,12 +462,12 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 )
                 turn_has_text = text_turn_state is not None and text_turn_state.has_text
                 if not future_model_turn and not response_turn_bound and not turn_has_text:
-                    if request_state is not None:
-                        if tts_segment_end:
-                            request_state.pending_audio_without_text.clear()
+                    if text_turn_state is not None:
+                        if tts_segment_end or unit_end_of_turn:
+                            text_turn_state.pending_audio_without_text.clear()
                         else:
-                            request_state.pending_audio_without_text.extend(audio_results)
-                    if tts_segment_end:
+                            text_turn_state.pending_audio_without_text.extend(audio_results)
+                    if tts_segment_end or unit_end_of_turn:
                         terminal_result = dict(audio_results[-1])
                         terminal_result.update(
                             audio_data="",
@@ -401,16 +477,16 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                         )
                         yield terminal_result
                     return
-                if request_state is not None and request_state.pending_audio_without_text:
-                    pending = request_state.pending_audio_without_text
-                    request_state.pending_audio_without_text = []
+                if text_turn_state is not None and text_turn_state.pending_audio_without_text:
+                    pending = text_turn_state.pending_audio_without_text
+                    text_turn_state.pending_audio_without_text = []
                     yield from pending
             yield from audio_results
             return
 
-        if context.auto_responds and request_state is not None and isinstance(text, str) and text:
-            pending_audio = request_state.pending_audio_without_text
-            request_state.pending_audio_without_text = []
+        if context.auto_responds and text_turn_state is not None and isinstance(text, str) and text:
+            pending_audio = text_turn_state.pending_audio_without_text
+            text_turn_state.pending_audio_without_text = []
             if pending_audio:
                 delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
                 if delta_text:
@@ -431,7 +507,11 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                         pending_audio[-1]["abort_data_plane_request"] = True
                     yield from pending_audio
                     return
-                request_state.pending_audio_without_text = pending_audio
+                text_turn_state.pending_audio_without_text = pending_audio
+
+        # Terminal text gets the last chance to claim this turn's buffered PCM.
+        if unit_end_of_turn and text_turn_state is not None:
+            text_turn_state.pending_audio_without_text.clear()
 
         if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
             # Venus text also carries delegation control. Deliver it even
@@ -457,9 +537,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             return
 
         if tts_segment_end:
-            if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
-                request_state.pending_audio_without_text[-1]["end_of_turn"] = True
-                request_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
@@ -493,10 +570,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             return
 
         if request_id is not None and context.auto_responds and unit_end_of_turn and context.active_response_id is None:
-            # The legacy projector only removed the request-scoped pending
-            # buffer here when no explicit model-turn key was present.
-            if request_state is not None and output_turn_id is None:
-                request_state.pending_audio_without_text.clear()
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
@@ -680,6 +753,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             unit_start = len(new_token_ids)
             yield make_result(
                 error_code="runtime_data_plane_unterminated_unit",
+                model_turn_id=turn_id,
                 error=(
                     "MiniCPM-o Stage0 stopped without a unit terminator "
                     f"(finish_reason={getattr(completion, 'finish_reason', None)!r})."
@@ -749,43 +823,20 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         turn_state.sent_segment_text = text
         return delta_text
 
-    def slice_cumulative_audio(self, request_id: str | None, audio_data: object) -> object:
+    def slice_cumulative_audio(
+        self, request_id: str | None, audio_data: object, *, turn_id: int | None = None
+    ) -> object:
         if request_id is None:
             return audio_data
         num_samples = _audio_num_samples(audio_data)
         if num_samples is None or num_samples <= 0:
             return audio_data
         state = self._requests.setdefault(request_id, _RequestState())
-        prev_samples = state.audio_offset
-        if prev_samples <= 0:
-            state.audio_offset = num_samples
-            state.audio_restart_candidate = None
+        prev_samples = state.advance_audio_cursor(num_samples, turn_id)
+        if prev_samples == 0:
             return audio_data
         if num_samples == prev_samples:
             return None
-        if num_samples < prev_samples:
-            # Below the cursor means one of two things, and they are not
-            # distinguishable from this snapshot alone: the producer restarted
-            # its buffer, or this is a unit that carries no cumulative audio at
-            # all (a continuation placeholder arrives as a single sample).
-            # Rewinding the cursor for the second case is expensive and silent:
-            # the next real snapshot is then sliced from ~0 and the whole
-            # session's audio goes out again as one delta. So defer the
-            # decision — hold the candidate and leave the cursor where it is.
-            candidate = state.audio_restart_candidate
-            if candidate is None or num_samples <= candidate:
-                state.audio_restart_candidate = num_samples
-                return audio_data
-            # A second below-cursor snapshot that grew from the first: the
-            # producer really did restart, and this is its delta.
-            state.audio_offset = num_samples
-            state.audio_restart_candidate = num_samples
-            prev_samples = candidate
-        else:
-            # Above the cursor: whatever the dip was, this stream never
-            # restarted, so it is sliced from the cursor as usual.
-            state.audio_restart_candidate = None
-            state.audio_offset = num_samples
         try:
             import torch
 
@@ -798,14 +849,14 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
 
     def _encode_audio_chunks_with_duration(
         self,
-        mm_output: dict[str, object],
+        audio_data: object,
         *,
+        sample_rate_hz: int,
         request_id: str | None,
+        turn_id: int | None,
         response_format: str,
         speed: float | None,
     ) -> Iterator[tuple[str, int]]:
-        sample_rate_hz = _sample_rate_hz(mm_output)
-        audio_data = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
         if isinstance(audio_data, list):
             for value in audio_data:
                 encoded = self._encode_audio(value, sample_rate_hz, response_format, speed)
@@ -813,7 +864,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     duration_ms = int((_audio_num_samples(value) or 0) * 1000 / max(1, sample_rate_hz))
                     yield encoded, duration_ms
             return
-        sliced = self.slice_cumulative_audio(request_id, audio_data)
+        sliced = self.slice_cumulative_audio(request_id, audio_data, turn_id=turn_id)
         encoded = self._encode_audio(sliced, sample_rate_hz, response_format, speed)
         if encoded:
             duration_ms = int((_audio_num_samples(sliced) or 0) * 1000 / max(1, sample_rate_hz))

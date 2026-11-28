@@ -555,6 +555,48 @@ def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
     )
 
 
+@pytest.mark.parametrize("emitted_audio", [False, True])
+@pytest.mark.parametrize("old_segment_finished", [False, True])
+def test_interrupted_turn_cannot_supply_next_turn_codes_or_text(emitted_audio, old_segment_finished) -> None:
+    from vllm.sampling_params import SamplingParams
+
+    manager = _manager()
+    request = _request("resident")
+    request.sampling_params = SamplingParams(stop_token_ids=[6561])
+    request.additional_information = {"codes": {"ref": [0.1, 0.2]}, "meta": {"ref_audio_sr": 16000}}
+
+    def output(codes, turn_id, text, *, eos=False):
+        request.sampled_token_ids = [6561] if eos else []
+        return tts2code2wav_async_chunk(manager, _duplex_delta(*codes, turn_id=turn_id, text=text), request)
+
+    if emitted_audio:
+        first = output(range(25), 7, "One.", eos=True)
+        assert first is not None and first.meta.codec_chunk_frames == 25
+    # The ordered interruption control never enters the Talker. Its old turn
+    # can therefore leave a partial codec window without a turn-end payload.
+    held = output([10, 11, 12], 7, "Five.", eos=old_segment_finished)
+    assert held is None or held.meta.code_flat_numel == 0
+    resumed = output(range(100, 125), 8, "Robin.")
+    assert resumed is not None
+    assert bytes(resumed.meta.llm_output_text_utf8.tolist()) == b"Robin."
+    assert _codes(resumed) == [4218] * 3 + list(range(100, 125))
+    assert resumed.meta.chunk_seq == 0
+    assert resumed.meta.cache_epoch == int(emitted_audio or held is not None)
+    if not emitted_audio and held is None:
+        # Nothing reached Code2Wav before this interruption; keep the first
+        # payload's custom reference audio instead of advancing its epoch.
+        torch.testing.assert_close(resumed.codes.ref, torch.tensor([0.1, 0.2]))
+
+    # A late old-turn callback cannot reopen the buffer or poison the new tail.
+    assert output([999], 7, "stale", eos=True) is None
+    tail = output(range(125, 130), 8, "Robin.", eos=True)
+    assert tail is not None
+    assert _codes(tail) == [122, 123, 124, *range(125, 130)]
+    assert tail.meta.llm_output_text_utf8.numel() == 0
+    assert tail.meta.cache_epoch == resumed.meta.cache_epoch
+    assert tail.meta.chunk_seq == 1
+
+
 @pytest.mark.parametrize("unit_frames", [1, 4, 5, 24, 25, 26, 29, 30, 50, 54])
 def test_duplex_unit_flag_leaves_at_most_a_short_tail_and_the_turn_end_flushes_it(unit_frames: int) -> None:
     """The bound input-clocked sessions document for MiniCPM-o (realtime_duplex_api.md, model note).
@@ -699,17 +741,16 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     manager = _manager()
     stale = _request("req", "internal-0")
 
-    assert tts2code2wav_async_chunk(manager, _delta(*range(10)), stale, False) is None
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(10), turn_id=7), stale, False) is None
     stale.status = RequestStatus.FINISHED_ABORTED
     assert tts2code2wav_async_chunk(manager, None, stale, True) is None
-    assert tts2code2wav_async_chunk(manager, _delta(*range(25)), stale, False) is None
-
     replacement = _request("req", "internal-1")
-    payload = tts2code2wav_async_chunk(manager, _delta(*range(25)), replacement, False)
+    payload = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=0), replacement, False)
 
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=7), stale, False) is None
 
 
 @pytest.mark.parametrize("aborted", [False, True])

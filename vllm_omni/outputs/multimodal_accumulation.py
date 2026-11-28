@@ -15,6 +15,7 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "duplex_audio_chunk_seq",
         "duplex_epoch",
         "duplex_explicit_reply",
+        "duplex_interruption",
         "duplex_text_input",
         "duplex_turn_id",
         "finished",

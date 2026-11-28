@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 # Server-owned token IDs appended after the media in one native input unit.
 APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
+# Server-owned control carried on one append, echoed as row-local output metadata.
+INTERRUPTION_KEY = "duplex_interruption"
 
 
 @dataclass(kw_only=True)
@@ -23,6 +25,15 @@ class MiniCPMO45TurnState:
     pending_speech_context: bool = False
     pending_speech_response_open: bool = False
     explicit_response_awaiting_content: bool = False
+    interrupted_turn: bool = False
+
+    def interrupt(self) -> None:
+        """Close the answer, retaining input, generated history and decoder KV."""
+        self.current_turn_ended = True
+        self.pending_speech_context = False
+        self.pending_speech_response_open = False
+        self.explicit_response_awaiting_content = False
+        self.interrupted_turn = True
 
     def observe_text_prefill(self, *, force_listen: bool, backend_result: bool) -> None:
         """Apply the newly accepted client text or delegated result before sampling."""
@@ -48,6 +59,7 @@ def record_turn_sample(
         state.explicit_response_awaiting_content = False
         state.pending_speech_response_open = False
     else:
+        state.interrupted_turn = False
         # A seeded prefix can open a response before tts_bos. Its pending
         # input stays available until the first content token is accepted.
         opening = getattr(state, "pending_speech_response_open", False)
@@ -210,6 +222,10 @@ class MiniCPMO45DuplexPolicy:
         return cnn_frames // 5
 
     @staticmethod
+    def user_turn_text(text: str) -> str:
+        return f"\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+    @staticmethod
     def session_context_texts(
         instructions: object,
         has_ref_audio: bool,
@@ -225,7 +241,7 @@ class MiniCPMO45DuplexPolicy:
             prefix += "\n<|audio_start|>"
             suffix = "<|audio_end|>" + suffix
         if isinstance(initial_user_text, str) and initial_user_text:
-            suffix += f"\n<|im_start|>user\n{initial_user_text}<|im_end|>\n<|im_start|>assistant\n"
+            suffix += MiniCPMO45DuplexPolicy.user_turn_text(initial_user_text)
         return prefix, suffix
 
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {

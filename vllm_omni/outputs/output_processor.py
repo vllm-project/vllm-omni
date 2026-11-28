@@ -3,6 +3,7 @@
 
 from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
+from itertools import count
 from typing import Any, cast
 
 import numpy as np
@@ -143,6 +144,8 @@ class OmniRequestState(RequestState):
     are produced incrementally during generation.
     """
 
+    # The orchestrator owns one output processor per logical stage, shared by its replicas.
+    _duplex_audio_buffers = count(1)
     sent_tokens_offset: int
 
     def __init__(
@@ -174,6 +177,8 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        self._duplex_audio_generation = next(self._duplex_audio_buffers)
+        self._duplex_audio_drain = 0
 
     def apply_streaming_update(self, update) -> None:
         # Streaming updates are built from EngineCoreRequest.prompt_token_ids
@@ -383,6 +388,13 @@ class OmniRequestState(RequestState):
                 # can access with .get("hidden_states", {}).get("layers", {}).
                 merged = {**self.mm_accumulated.tensors, **self.mm_accumulated.metadata}
                 nested = unflatten_payload(merged)
+                meta = nested.get("meta")
+                if isinstance(nested.get("audio"), (torch.Tensor, list)) and (
+                    "duplex_audio_chunk_seq" in nested or isinstance(meta, dict) and "duplex_audio_chunk_seq" in meta
+                ):
+                    # A resident request may receive snapshots from successive accumulators.
+                    # Cache epochs describe the vocoder, not the lifetime of this waveform.
+                    nested["duplex_audio_buffer_id"] = (self._duplex_audio_generation, self._duplex_audio_drain)
                 snapshot = MultimodalPayload.from_dict(nested) or MultimodalPayload()
                 kwargs = {f.name: getattr(base_output, f.name) for f in dataclass_fields(CompletionOutput)}
                 output = MultimodalCompletionOutput(
@@ -398,6 +410,7 @@ class OmniRequestState(RequestState):
                 # their client-facing per-chunk metadata.
                 if self.output_kind == RequestOutputKind.DELTA:
                     drain_delta_payload(self.mm_accumulated)
+                    self._duplex_audio_drain += 1
 
                 return output
         except (RuntimeError, TypeError, AttributeError):

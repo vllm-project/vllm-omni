@@ -440,6 +440,57 @@ def _policy_row(payload):
     )
 
 
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_text_followup_after_interrupt_opens_with_tts_bos_once(interrupted):
+    state = _MiniCPMO45Stage0SessionState(session_id="s0")
+    if interrupted:
+        state.interrupt()
+    state.observe_text_prefill(force_listen=False, backend_result=False)
+    model = _policy_model_with_state(state)
+    row = _policy_row({"type": "text", "force_listen": False})
+    logits = torch.zeros(1, VOCAB)
+    logits[0, TOKEN_IDS["turn_eos_token_id"]] = 100
+    model.prepare_duplex_sampling(logits, None, rows=(row,))
+    expected = TOKEN_IDS["tts_bos_token_id" if interrupted else "turn_eos_token_id"]
+    assert int(logits.argmax()) == expected
+    model._record_minicpmo45_duplex_terminator(0, TOKEN_IDS["tts_bos_token_id"], TOKEN_IDS)
+    continuation = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(continuation, None, rows=(row,))
+    assert torch.isfinite(continuation).all()
+
+
+def test_interrupted_audio_keeps_native_sampling_and_consumes_text_restart_on_speech():
+    state = _MiniCPMO45Stage0SessionState(session_id="s0")
+    state.interrupt()
+    state.pending_speech_context = True
+    model = _policy_model_with_state(state)
+    audio = _policy_row({"type": "audio", "is_speech": True})
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(audio,))
+    assert torch.isfinite(logits).all()
+    model._record_minicpmo45_duplex_terminator(0, TOKEN_IDS["tts_bos_token_id"], TOKEN_IDS)
+    state.observe_text_prefill(force_listen=False, backend_result=False)
+    model.prepare_duplex_sampling(logits, None, rows=(_policy_row({"type": "text"}),))
+    assert torch.isfinite(logits).all()
+
+
+def test_forced_listen_after_interrupt_preserves_the_next_text_restart():
+    state = _MiniCPMO45Stage0SessionState(session_id="s0")
+    state.interrupt()
+    model = _policy_model_with_state(state)
+    row = _policy_row({"type": "text", "force_listen": True})
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(row,))
+    assert int(logits.argmax()) == LISTEN
+    model._record_minicpmo45_duplex_terminator(0, LISTEN, TOKEN_IDS)
+    state.observe_text_prefill(force_listen=False, backend_result=False)
+    row = _policy_row({"type": "text", "force_listen": False})
+    row.seq = 1
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(row,))
+    assert int(logits.argmax()) == TOKEN_IDS["tts_bos_token_id"]
+
+
 @pytest.mark.parametrize("post_idle", [True, False], ids=["post-idle", "explicit-commit"])
 def test_reopening_a_closed_turn_preserves_the_raw_sample_for_replay(post_idle):
     state = _MiniCPMO45Stage0SessionState(
@@ -576,7 +627,11 @@ def test_neutral_listen_knobs_leave_the_draw_bit_identical(seed):
     params = base_model._minicpmo45_duplex_row_params(base_md, 6)
     kwargs = dict(row_idxs=list(range(6)), token_ids=TOKEN_IDS, row_params=params)
     expected = base_model._sample_minicpmo45_native_duplex_rows(steps[0], base_md, **kwargs)
-    for neutral in ({row: {} for row in range(6)}, {row: {"listen_prob_scale": 1.0} for row in range(6)}):
+    neutral_payloads: list[dict[int, dict[str, object]]] = [
+        {row: {} for row in range(6)},
+        {row: {"listen_prob_scale": 1.0} for row in range(6)},
+    ]
+    for neutral in neutral_payloads:
         model, _, md, _ = _setup(seed, max_chars=10**6, turns_open=False, payloads=neutral)
         fresh_params = model._minicpmo45_duplex_row_params(md, 6)
         assert model._sample_minicpmo45_native_duplex_rows(steps[0], md, **kwargs) == expected
@@ -587,7 +642,7 @@ def test_neutral_listen_knobs_leave_the_draw_bit_identical(seed):
 
 
 def test_listen_top_k_early_return_stays_out_of_the_repetition_history():
-    payloads = {0: {"listen_top_k": 2}, 1: {"listen_top_k": 2}}
+    payloads: dict[int, dict[str, object]] = {0: {"listen_top_k": 2}, 1: {"listen_top_k": 2}}
     model, states, md, _ = _setup(3, all_greedy=True, max_chars=10**6, turns_open=False, payloads=payloads)
     logits = torch.full((6, VOCAB), -10.0)
     logits[0, LISTEN], logits[0, 17] = 5.0, 4.0  # listen leads: rank 0, within 2 -> early
@@ -607,7 +662,7 @@ def test_listen_top_k_early_return_stays_out_of_the_repetition_history():
 @pytest.mark.parametrize("all_greedy", [False, True])
 @pytest.mark.parametrize("seed", range(3))
 def test_deferred_listen_knobs_match_the_synchronous_rows(seed, all_greedy, monkeypatch):
-    payloads = {
+    payloads: dict[int, dict[str, object]] = {
         0: {"listen_prob_scale": 0.5},
         1: {"listen_top_k": 2},
         3: {"listen_prob_scale": 3.0, "listen_top_k": 4},
@@ -630,7 +685,7 @@ def test_listen_top_k_beyond_the_sampler_range_is_clamped_not_raised():
     because a rank counts strictly greater logits over the whole vocabulary.
     """
     huge = 2**70
-    payloads = {0: {"listen_top_k": huge}, 1: {"listen_top_k": VOCAB + 1}}
+    payloads: dict[int, dict[str, object]] = {0: {"listen_top_k": huge}, 1: {"listen_top_k": VOCAB + 1}}
     model, _, md, steps = _setup(7, all_greedy=True, max_chars=10**6, turns_open=False, payloads=payloads)
     params = model._minicpmo45_duplex_row_params(md, 6)
     kwargs = dict(row_idxs=[0, 1], token_ids=TOKEN_IDS, row_params=params)
@@ -652,7 +707,7 @@ def test_early_listen_leaves_the_reference_rng_for_the_next_stochastic_step(seed
     deferred-vs-sync generator-state equality with the same ``listen_top_k``
     payloads on a two-step run.
     """
-    payloads = {row: {"listen_top_k": 3} for row in range(6)}
+    payloads: dict[int, dict[str, object]] = {row: {"listen_top_k": 3} for row in range(6)}
     model, model_states, md, steps = _setup(seed, max_chars=10**6, turns_open=False, payloads=payloads)
     _, ref_states, ref_md, _ = _setup(seed)
     params = model._minicpmo45_duplex_row_params(md, 6)

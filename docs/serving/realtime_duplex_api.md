@@ -665,8 +665,44 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
-On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
-old output. Its replacement re-prefills the accepted Thinker context before
+In automatic MiniCPM duplex sessions (`extra_body.auto_response=true`),
+`response.cancel`, `output_audio_buffer.clear`, and explicit or speech-overlap
+barge-in end the current response while keeping the original Thinker request,
+epoch and KV. The server queues a text-only turn-end control followed by
+forced listening. Already submitted inputs finish in order; subsequent inputs
+continue on the same stream. Late text/audio from the cancelled answer is
+discarded. A later answer receives a new response ID, so clients should discard
+cancelled output by response ID rather than treating the whole epoch as dead.
+An unforced text append or an explicit audio commit with `create_response: true`
+creates the next response even while the model is confirming the interruption.
+Clients can cancel it immediately, and its ID stays the same when its answer
+arrives. Once input and playback have drained, each clear receives one
+`output_audio_buffer.cleared` acknowledgement. This also applies after a
+text-only reply fails, a cancellation finishes, or the model only listens
+without opening a reply. If input or speech handed to TTS is still pending,
+the server acknowledges the clear and queues the interruption.
+No history prefill is needed for this interruption, on either local or hosted
+Stage-0 replicas. Normal sliding-window eviction still applies. As in the
+official native implementation, KV can contain generated speech the client has
+not played; playback acknowledgements govern conversation history and do not
+roll back the Thinker KV.
+
+These interruption commands also retain partial PCM buffered before the
+interruption, including explicit `barge_in`. For example, 250 ms buffered
+before `barge_in` can combine with 750 ms sent afterward into the next
+1000 ms input unit. Send `input_audio_buffer.clear` separately to discard
+that unsubmitted audio while retaining the resident Thinker request.
+
+If the ordered interruption control cannot be submitted (including when a
+preceding append is rejected), the server falls back to destructive
+cancellation. It advances the epoch and sends `input_audio_buffer.cleared`,
+rather than suppressing all subsequent replies
+while waiting for a control that never reached the model. Input queued behind
+the failed control is cancelled too; clients may submit it again afterward.
+
+`input.cancel`, manual response sessions, context invalidation and session
+teardown retain the destructive cancellation path. On a locally managed
+Stage-0 replica, its replacement re-prefills the accepted Thinker context before
 processing its first input, including the processed rows of an unfinished
 unit. If the first new input is unforced text or carries a delegated tool
 result, it can open a reply on that same unit. In `"off"` mode, if the
@@ -778,7 +814,7 @@ up with the chunks sent before cancellation.
 ### Interrupt
 
 ```python
-await client.cancel_response()        # cancel the active response (epoch advances)
+await client.cancel_response()        # cancel the active response; native MiniCPM retains its epoch
 await client.clear_input()            # drop un-committed input audio
 ```
 
@@ -1237,9 +1273,11 @@ cursor for `session.resume`. Client events may carry an `event_id`, echoed in
 Session identity is the server-allocated `session_id` (`duplex-<uuid>`,
 announced in `session.created`; a `session_id` the client puts in the session
 object is ignored, and ids are never reused); `attachment_generation`
-names the current socket; `epoch` is the interruption fence that advances on
-every cancel, clear, or barge-in; `turn_id` counts committed model turns;
-`response_id` (item id `item_<response_id>`) names one assistant utterance.
+names the current socket. The `epoch` advances on destructive cancellation,
+including `input.cancel`. Automatic MiniCPM sessions retain the epoch across
+`response.cancel`, `output_audio_buffer.clear`, and barge-in when the resident
+interruption succeeds. The `turn_id` counts committed model turns.
+The `response_id` (item id `item_<response_id>`) names one assistant utterance.
 
 **Tier** in the tables below: **1** means identical to OpenAI Realtime in
 name and semantics; **2** means an OpenAI event name carrying vLLM-Omni
@@ -1606,7 +1644,11 @@ requests, and the session's advertised
   response (the cancelled epoch). The units still open from it, and the
   appends the cancel called off, are settled as `cancelled` right after the
   cancellation's own events, and the acknowledgements they held back are
-  sent. The cancel command itself is not acknowledged.
+  sent. Native MiniCPM automatic sessions retain submitted units and acknowledge
+  them as their work finishes; cancellation filters their old response output
+  without advancing the epoch. The turn-end control can appear as a listen
+  boundary with the next acknowledgement, at the same input time as the
+  preceding unit. The cancel command itself is not acknowledged.
 - **Failure after acceptance.** An append that fails after the model
   accepted it does not leave its acknowledgement to the timeouts: the failure
   closes the session, so its unit is settled with the teardown below
@@ -1863,8 +1905,8 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `conversation.item.delete` | 1 | Delete a stored item by id. |
 | `conversation.item.truncate` | 1 | Truncate an assistant item's audio/transcript at `audio_end_ms`. |
 | `response.create` | 1 | Explicitly request a response with per-response overrides. Requires committed audio input; otherwise `response_create_without_input`. |
-| `response.cancel` | 1 | Cancel the active (or named) response; advances `epoch`. |
-| `output_audio_buffer.clear` | 1 | Discard queued output audio; advances `epoch` (OpenAI: WebRTC-only, here also WebSocket). |
+| `response.cancel` | 1 | Cancel the active (or named) response; native automatic MiniCPM retains the request and `epoch`, other paths advance `epoch`. |
+| `output_audio_buffer.clear` | 1 | Discard queued output audio; native automatic MiniCPM retains the request and `epoch`, other paths advance `epoch` (OpenAI: WebRTC-only, here also WebSocket). |
 | `barge_in` | 3 | Explicit hard interrupt; requires `capabilities.supports_barge_in`. |
 | `turn.signal` | 3 | External turn-taking signal (e.g. `event:"barge_in"`); same capability gate. |
 | `playback.ack` | 3 | Report cumulative playback progress (`played_ms`, `committed_ms`, optional `truncate`). |
@@ -2293,7 +2335,8 @@ MiniCPM-o 4.5 accepts non-empty text fragments in a native session with
 prefilled immediately as its own model unit, using the checkpoint's native
 `streaming_prefill(text_list=...)` format. It does not wait for the complete
 text, reset the session, or insert synthetic input audio. Tokenization occurs
-per fragment, so send complete words when possible.
+per fragment, so send complete words when possible. The first unforced fragment that opens a response after an interruption starts a
+new user turn in the retained conversation context.
 
 Text can be interleaved with microphone appends on the same connection:
 

@@ -666,6 +666,15 @@ class DuplexModelPlugin(ABC):
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
 
+    def interruption_payload(self) -> dict[str, object] | None:
+        """An ordered model control unit that stops a reply while retaining its request.
+
+        Opting in requires a projected ``interruption_completed`` result after
+        this unit, with the model turn it closed. Other models keep epoch-based
+        cancellation. This hook is used only for automatic resumable sessions.
+        """
+        return None
+
     def fast_path_active(self, request_id: str, output_metadata: Mapping[str, object]) -> bool:
         """Whether this decoded Stage-0 frame opens a back-to-back stretch.
 

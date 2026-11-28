@@ -33,6 +33,38 @@ def _load_demo_module():
     return module
 
 
+@pytest.mark.parametrize("audio_type", ["response.output_audio.delta", "response.audio.delta"])
+def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch(audio_type):
+    state = _load_demo_module().DemoState()
+    state.events = [
+        {"type": "response.output_audio.delta", "response_id": "old", "metadata": {"epoch": 0}},
+        {"type": "response.done", "response": {"id": "old", "status": "cancelled", "metadata": {"cancelled_epoch": 0}}},
+        {"type": "response.output_audio.delta", "response_id": "new", "metadata": {"epoch": 0}},
+    ]
+    assert state.stale_audio_delta_count() == 0
+    state.events.extend(
+        [{"type": "session.closed"}, {"type": audio_type, "response_id": "old", "metadata": {"epoch": 0}}]
+    )
+    assert state.stale_audio_delta_count() == 1
+
+
+@pytest.mark.parametrize(
+    "transcript,valid",
+    [
+        ("Robin.", True),
+        ("The secret word is robin.", True),
+        ("Five. Robin.", False),
+        ("5, robin", False),
+        ("Robin or squirrel.", False),
+        ("Squirrel.", False),
+    ],
+)
+def test_interrupted_recall_transcript(transcript, valid):
+    from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _recalls_own_secret
+
+    assert _recalls_own_secret(transcript, "robin", ("robin", "squirrel")) is valid
+
+
 def _load_multi_demo_module():
     spec = importlib.util.spec_from_file_location("minicpmo_realtime_duplex_multi_session_test", MULTI_DEMO_PATH)
     assert spec is not None and spec.loader is not None

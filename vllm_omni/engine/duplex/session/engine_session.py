@@ -1058,7 +1058,7 @@ class DuplexEngineSession:
         self._track_history_message(message, changed=True)
         return True
 
-    def complete_model_turn(self, turn_id: int) -> None:
+    def complete_model_turn(self, turn_id: int, *, advance_input_fence: bool = True) -> None:
         """Advance the model-owned output identity after its terminal signal."""
         completed_turn_id = int(turn_id)
         self._response.request_started_at_s_by_turn = {
@@ -1068,7 +1068,8 @@ class DuplexEngineSession:
         }
         if completed_turn_id >= self.turn_id:
             self.turn_id = completed_turn_id + 1
-            self.sync_fence()
+            if advance_input_fence:
+                self.sync_fence()
         if self.perf is not None:
             self.perf.close_turns(epoch=self.epoch, up_to_turn_id=completed_turn_id)
 

@@ -778,7 +778,7 @@ def test_fast_tool_result_does_not_end_a_live_non_resumable_request() -> None:
             history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
-            run=SimpleNamespace(closing=False, stream_request_id="req-live"),
+            run=DuplexRunState(stream_request_id="req-live"),
         ),
         out,
         close_from_runtime=_noop,

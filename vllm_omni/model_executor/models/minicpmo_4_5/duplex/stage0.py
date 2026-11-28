@@ -21,7 +21,11 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.core.sched.window_policy import WindowOperation
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy, MiniCPMO45TurnState
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    INTERRUPTION_KEY,
+    MiniCPMO45DuplexPolicy,
+    MiniCPMO45TurnState,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -636,10 +640,13 @@ class MiniCPMO45Stage0DuplexRuntime:
         video_frames: list[Image.Image] | None = None,
         encoded_frames: list[list[torch.Tensor]] | None = None,
         input_text_token_ids: list[int] | None = None,
+        text_before_unit: bool = False,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
         force_listen: bool = False,
+        interruption: bool = False,
+        interruption_turn_closed: bool = False,
         stage0_window: dict[str, object] | None = None,
         text_token_ids: list[int] | None = None,
         prepend_text_token_ids: list[int] | None = None,
@@ -687,7 +694,13 @@ class MiniCPMO45Stage0DuplexRuntime:
         num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
         # Client TEXT units are separate from server-owned result tokens
         # appended after the unit's media embeddings below.
+        if interruption:
+            input_text_token_ids = [self.turn_eos_token_id]
         has_text = bool(input_text_token_ids)
+        if text_before_unit and input_text_token_ids:
+            # The explicit user turn precedes its assistant unit. Embed the unit
+            # opener with the text so it occupies exactly one scheduler row.
+            input_text_token_ids = [*input_text_token_ids, self.unit_token_id]
         vision_only = audio_waveform is None or len(audio_waveform) == 0
         if vision_only and not num_frames and not has_text:
             return self._stage_prefill_result(False, start_time, "empty audio")
@@ -741,6 +754,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         # pad again here: the first processor chunk is hop-aligned below 1035ms
         # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
+        close_interrupted_unit = interruption and state.audio_chunk_idx > 0
         while True:
             if vision_only and units_built:
                 break
@@ -780,6 +794,17 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # seeing its own past decisions in context.
                 pending_terminator = state.pending_terminator_token
                 closure_token_ids: list[int] = []
+                if close_interrupted_unit and units_built == 0:
+                    # End the speech inside the unit that produced it, before
+                    # </unit>, matching the official forced-listen tail:
+                    # turn_eos + listen + </unit>. Its deferred speech
+                    # terminator has not reached KV and must yield to LISTEN.
+                    # EOS in the next unit leaves old speech as a continuation.
+                    if not interruption_turn_closed:
+                        embed_parts.append(self._embed_token(self.turn_eos_token_id))
+                        token_ids.append(self.turn_eos_token_id)
+                        closure_token_ids.append(self.turn_eos_token_id)
+                    pending_terminator = self.listen_token_id
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None
                     embed_parts.append(self._embed_token(pending_terminator))
@@ -802,8 +827,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 for prepend_token_id in prepend_text_token_ids:
                     embed_parts.append(self._embed_token(prepend_token_id))
                     token_ids.append(int(prepend_token_id))
-            embed_parts.append(self._embed_token(self.unit_token_id))
-            token_ids.append(self.unit_token_id)
+            if not text_before_unit:
+                embed_parts.append(self._embed_token(self.unit_token_id))
+                token_ids.append(self.unit_token_id)
             if frame_blocks:
                 # Official order inside a unit: every frame_list entry as
                 # <image> + 64 embeds + </image>, then any HD patches as
@@ -838,9 +864,8 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.extend(
                         [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
                     )
-            if input_text_token_ids and units_built == 0:
-                # Match native streaming_prefill(text_list=...): raw text after
-                # this unit's media, without a new chat template or audio clock.
+            if input_text_token_ids and units_built == 0 and not close_interrupted_unit:
+                # Ordinary text appends follow the unit's media in native streaming_prefill order.
                 text_ids = torch.tensor(input_text_token_ids, dtype=torch.long, device=self._model_device())
                 embed_parts.append(self._token_embedder()(text_ids))
                 token_ids.extend(input_text_token_ids)
@@ -893,6 +918,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runtime_impl": "scheduler_data_plane",
                 "stage0_window_replaced": window_result is not None,
                 "text_input": has_text and not force_listen,
+                INTERRUPTION_KEY: interruption,
             }
         )
         # Standalone VISION input can open a response without speech. Camera
@@ -906,6 +932,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             elif is_speech or (vision_only and num_frames) or prepend_text_token_ids:
                 state.pending_speech_context = True
                 state.pending_speech_append_identity = append_identity
+        if interruption:
+            state.interrupt()
         if is_speech:
             # The audio front end bounds its streaming history at 30 seconds.
             # Allow one reply at the end of the first voiced turn after that gap.
@@ -1697,7 +1725,9 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
-        if not audio and (payload.get("video_frames") or payload.get("text_token_ids")):
+        if not audio and (
+            payload.get("video_frames") or payload.get("text_token_ids") or payload.get(INTERRUPTION_KEY) is True
+        ):
             return np.empty(0, dtype=np.float32)
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")

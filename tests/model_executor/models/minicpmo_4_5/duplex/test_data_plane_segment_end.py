@@ -37,6 +37,78 @@ def _project(plane, output):
     return list(plane.project_output(output, context=context))
 
 
+def test_cancelled_turn_audio_is_consumed_before_the_next_turn_is_encoded():
+    encoded = []
+
+    def encode(audio, *_args):
+        encoded.append(np.asarray(audio).tolist())
+        return "pcm"
+
+    plane = MiniCPMO45DataPlaneSession(encode)
+    waveform = np.array([1, 1, 2, 2, 3, 3, 4, 4], dtype=np.float32)
+    first = _boundary(0, samples=2)
+    first.multimodal_output["audio"] = waveform[:2]
+    assert _project(plane, first)
+
+    # The control has advanced the session to turn 1. Code2Wav still has a
+    # final snapshot from turn 0 on the same request and output stream.
+    context = DuplexDataPlaneContext(auto_responds=True, turn_id=1)
+    late = _boundary(1, samples=4)
+    late.multimodal_output["audio"] = waveform[:4]
+    assert list(plane.project_output(late, context=context)) == []
+    current = _boundary(0, samples=6, cache_epoch=1)
+    current.multimodal_output.update({"audio": waveform[:6], "meta.duplex_turn_id": 1})
+    assert list(plane.project_output(current, context=context))[0]["audio_data"] == "pcm"
+    # Replayed smaller snapshots from the old turn cannot rewind live PCM.
+    for end in (2, 4):
+        late.multimodal_output["audio"] = waveform[:end]
+        assert list(plane.project_output(late, context=context)) == []
+    current.multimodal_output["audio"] = waveform
+    assert list(plane.project_output(current, context=context))[0]["audio_data"] == "pcm"
+    assert encoded == [[1, 1], [3, 3], [4, 4]]
+
+
+@pytest.mark.parametrize("second_end", [6, 8, 10], ids=["below_old_cursor", "at_old_cursor", "past_old_cursor"])
+def test_late_audio_cannot_establish_or_replace_a_new_turns_restart_candidate(second_end):
+    encoded = []
+
+    def encode(audio, *_args):
+        if audio is None:
+            return None
+        encoded.append(audio.tolist())
+        return "pcm"
+
+    plane = MiniCPMO45DataPlaneSession(encode)
+    old = _boundary(0, samples=8)
+    assert _project(plane, old)
+    context = DuplexDataPlaneContext(auto_responds=True, turn_id=1, active_response_id="new", active_response_turn_id=1)
+    current = _boundary(0, cache_epoch=1)
+    current.multimodal_output["meta.duplex_turn_id"] = 1
+    waveform = np.arange(1, 13, dtype=np.float32)
+    for stale_len, new_len in ((2, 4), (1, second_end), (16, 12)):
+        old.multimodal_output["audio"] = np.zeros(stale_len)
+        assert list(plane.project_output(old, context=context)) == []
+        current.multimodal_output["audio"] = waveform[:new_len]
+        assert list(plane.project_output(current, context=context))
+    assert encoded[1:] == [waveform[:4].tolist(), waveform[4:second_end].tolist(), waveform[second_end:].tolist()]
+
+
+@pytest.mark.parametrize(
+    "stage_id,epoch,media",
+    [(2, 0, {"audio": np.zeros(4)}), (0, 1, {"latent": np.zeros(4)}), (2, 1, {"audio": [np.zeros(4)]})],
+    ids=["old_epoch", "thinker_latent", "delta_list"],
+)
+def test_stale_output_outside_the_cumulative_waveform_keeps_its_cursor(stage_id, epoch, media):
+    plane = MiniCPMO45DataPlaneSession(lambda *_: "pcm")
+    plane.slice_cumulative_audio("request", np.zeros(2))
+    late = _boundary(1)
+    late.stage_id = stage_id
+    late.multimodal_output = {**media, "meta.duplex_epoch": epoch, "meta.duplex_turn_id": 0}
+    context = DuplexDataPlaneContext(auto_responds=True, turn_id=1, epoch=1)
+    assert list(plane.project_output(late, context=context)) == []
+    assert plane.audio_offset("request") == 2
+
+
 @pytest.mark.parametrize("samples", [0, 24000])
 def test_queued_inputs_do_not_suppress_later_segment_boundaries(samples):
     plane = MiniCPMO45DataPlaneSession(
