@@ -15,6 +15,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.sampler import ModelEvaluation, SamplingState
 
 from .latent_mask import MiniMaxH3LatentEdit
+from .reference_kv_cache import ReferenceKVRefreshRequiredError
 from .scheduling_minimax_h3_euler_ancestral import minimax_h3_rf_v_to_x0
 
 if TYPE_CHECKING:
@@ -249,7 +250,19 @@ class MiniMaxH3ModelBatch:
             reference_kv_state = kwargs.get("reference_kv_state")
             if reference_kv_state is not None:
                 reference_kv_state.begin_step(evaluations[0].state.step_index, sigma=float(evaluations[0].sigmas[0]))
-            video, audio = models[0].transformer(**kwargs)
+            if reference_kv_state is None:
+                video, audio = models[0].transformer(**kwargs)
+            else:
+                replay_refresh = False
+                try:
+                    video, audio = models[0].transformer(**kwargs)
+                except ReferenceKVRefreshRequiredError:
+                    replay_refresh = True
+                if replay_refresh:
+                    # Release the probe traceback before replaying the same
+                    # evaluation, without advancing the sampler or its clock.
+                    reference_kv_state.promote_step_to_refresh()
+                    video, audio = models[0].transformer(**kwargs)
             if reference_kv_state is not None:
                 reference_kv_state.end_step()
             check_request_cancellation()
