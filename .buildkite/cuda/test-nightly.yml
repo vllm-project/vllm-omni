@@ -182,6 +182,7 @@ steps:
           - tts_qwen3_tts_function
           - tts_chatterbox_function
           - tts_cosyvoice3_voice_isolation
+          - tts_qwen3_tts_voice_isolation
           - tts_yue2_function
         timeout_in_minutes: 120
         env:

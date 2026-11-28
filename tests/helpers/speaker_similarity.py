@@ -21,7 +21,7 @@ An output is labelled:
   output, so a leak needs agreement.
 * ``disagree``: anything else. Logged, not failing.
 * ``unscorable``: the clip is shorter than ``MIN_SCORABLE_S`` or silent. It is not
-  embedded and not a leak; it is a content problem.
+  embedded. An opening without detected speech is also unscorable.
 
 ``score(..., window=2.0)`` repeats the check on the first two seconds only, which
 is where a leak that affects only the start of an utterance shows up.
@@ -33,7 +33,7 @@ import io
 import json
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -193,6 +193,29 @@ def is_scorable(clip: np.ndarray) -> bool:
     return float(np.sqrt(np.mean(np.square(clip, dtype=np.float64)))) >= MIN_SCORABLE_RMS
 
 
+def load_opening_speech_check() -> Callable[[np.ndarray], bool]:
+    """Share one pinned CPU Silero model, with fresh stream state for each opening."""
+    from huggingface_hub import hf_hub_download
+
+    from vllm_omni.engine.duplex.vad import (
+        SILERO_VAD_FILENAME,
+        SILERO_VAD_REPO_ID,
+        SILERO_VAD_REVISION,
+        SileroStreamingVAD,
+        SileroVADBackendProvider,
+        SileroVADConfig,
+    )
+
+    path = hf_hub_download(repo_id=SILERO_VAD_REPO_ID, filename=SILERO_VAD_FILENAME, revision=SILERO_VAD_REVISION)
+    provider = SileroVADBackendProvider(model_path=path)
+
+    def has_speech(opening: np.ndarray) -> bool:
+        detector = SileroStreamingVAD(SileroVADConfig(), backend_provider=provider)
+        return detector.process(opening).is_speech
+
+    return has_speech
+
+
 def crop_window(wav16: np.ndarray, window: float | None) -> tuple[np.ndarray, bool]:
     """Return the first ``window`` seconds, and whether the clip was too short for it."""
     if window is None:
@@ -210,13 +233,15 @@ def score(
     window: float | None = None,
     *,
     reference_embeddings: Mapping[str, Mapping[str, np.ndarray]] | None = None,
+    window_has_speech: Callable[[np.ndarray], bool] | None = None,
 ) -> list[OutputScore]:
     """Score each output against all references.
 
     ``outputs`` is a list of ``(requested_voice, audio)`` and ``references`` maps
     voice name to audio. Audio may be wav bytes, a path, or a mono 16 kHz float32
     array. ``window`` crops each output to its first ``window`` seconds (references
-    are always used whole). ``reference_embeddings`` (embedder name -> voice ->
+    are always used whole). With ``window_has_speech``, an opening without speech
+    is labelled unscorable. The full-clip check is unchanged. ``reference_embeddings`` (embedder name -> voice ->
     vector) skips re-embedding the references on repeated calls.
     """
     voices = list(references)
@@ -234,7 +259,9 @@ def score(
         sims: dict[str, list[float]] = {}
         argmax: dict[str, str] = {}
         margin: dict[str, float] = {}
-        if not is_scorable(clip):
+        if not is_scorable(clip) or (
+            window is not None and window_has_speech is not None and not window_has_speech(clip)
+        ):
             results.append(
                 OutputScore(
                     idx=idx,
