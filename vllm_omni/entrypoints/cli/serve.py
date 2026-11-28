@@ -819,15 +819,18 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
-            "--ulysses-a2a-permute",
-            action=argparse.BooleanOptionalAction,
+            "--ulysses-a2a-backend",
+            type=str,
             default=None,
+            # Kept in sync with vllm_omni.diffusion.data.ULYSSES_A2A_BACKENDS (asserted in tests); importing it here
+            # would pull in vllm when the docs build renders the parser.
+            choices=["auto", "nccl", "copy_engine"],
             help=(
-                "Enable Ulysses all-to-all over platform symmetric memory "
-                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
-                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
-                "TorchNPU NPUSHMEM and Triton-Ascend, "
-                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
+                "Transport for the strict Ulysses all-to-all. 'auto' (default) uses the copy engine when the "
+                "Ulysses group is on one node with CUDA peer access between all GPUs, otherwise 'nccl'. "
+                "'copy_engine' uses CUDA copy engines on CUDA and TorchNPU on NPU. Only strict Ulysses layouts are "
+                "eligible. NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, with libshmem.so on LD_LIBRARY_PATH."
             ),
         )
         omni_config_group.add_argument(
@@ -835,9 +838,9 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help=(
-                "With --ulysses-a2a-permute on CUDA, split each rank's attention heads into this many chunks and "
-                "move them on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; "
-                "0 disables). Requires strict pure Ulysses. Defaults to disabled."
+                "On the copy-engine transport, split each rank's attention heads into this many chunks and move them "
+                "on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; 0 disables; "
+                "ignored when auto resolves to nccl). Requires strict pure Ulysses. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(
@@ -1160,6 +1163,16 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Compatibility alias for distributed layerwise CPU offload. "
             "New integrations should use mode=layer and configure weight transfer per component.",
+        )
+        omni_config_group.add_argument(
+            "--enable-submodule-offload",
+            action="store_true",
+            help="Enable sub-module level weight offload for DiT blocks. "
+            "Streams attn/mlp/adaln weights independently within each block, "
+            "overlapping H2D transfer with sub-module compute. "
+            "Uses finer-grained weight staging than block-level DLO. "
+            "Reuses DLO infrastructure (AllGather, mmap, pin_memory, copy/comm streams). "
+            "Token Refiner blocks keep DLO block-level hooks.",
         )
         omni_config_group.add_argument(
             "--dlo-use-allgather",
@@ -1699,7 +1712,17 @@ def run_headless(args: TrackingNamespace) -> None:
         )
         return
 
-    omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+    from vllm_omni.engine.stage_engine_startup import fetch_deployment_id
+
+    expected_deployment_id = fetch_deployment_id(
+        omni_master_address=omni_master_address,
+        omni_master_port=omni_master_port,
+    )
+    omni_transfer_config = load_omni_transfer_config_for_model(
+        model,
+        config_path,
+        deployment_scope=expected_deployment_id,
+    )
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
@@ -1774,6 +1797,7 @@ def run_headless(args: TrackingNamespace) -> None:
         omni_dp_size_local=omni_dp_size_local,
         per_replica_devices=per_replica_devices,
         replica_bind_address=omni_replica_address,
+        expected_deployment_id=expected_deployment_id,
     )
 
 

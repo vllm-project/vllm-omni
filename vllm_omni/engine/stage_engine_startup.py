@@ -10,6 +10,7 @@ import dataclasses
 import os
 import socket
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import connection
@@ -177,9 +178,13 @@ class OmniMasterServer:
         coordinator_router_address: str | None = None,
         on_register: OnRegisterCallback | None = None,
         head_local_replicas: dict[int, list[int]] | None = None,
+        deployment_id: str | None = None,
     ) -> None:
         self._address = master_address
         self._port = master_port
+        # One id per head. Headless processes learn it from registration
+        # instead of hashing their own spelling of this address.
+        self.deployment_id = deployment_id or uuid.uuid4().hex
         self._stage_routes: dict[StageRoute, StageAllocation] = {}
         self._stage_configs: dict[StageRoute, Any] = {}
         self._stage_coordinator_addresses: dict[StageRoute, StageCoordinatorAddresses] = {}
@@ -566,6 +571,10 @@ class OmniMasterServer:
             logger.warning("[OmniMasterServer] Failed to decode registration message: %s", exc)
             return None
 
+        if msg.get("query") == "deployment_id":
+            reg_socket.send_multipart([identity, msgspec.msgpack.encode({"deployment_id": self.deployment_id})])
+            return None
+
         stage_id_raw = msg.get("stage_id")
         if not isinstance(stage_id_raw, int) or stage_id_raw < 0:
             logger.warning(
@@ -660,6 +669,7 @@ class OmniMasterServer:
                 "output_address": alloc.output_bind_address,
                 "replica_id": replica_id,
                 "coordinator_router_address": self._coordinator_router_address,
+                "deployment_id": self.deployment_id,
             }
         )
         # ROUTER-DEALER: reply is [identity, payload] (no empty delimiter).
@@ -683,6 +693,7 @@ class StageRegistrationResponse:
     output_address: str
     replica_id: int
     coordinator_router_address: str | None
+    deployment_id: str = ""
 
 
 def _detect_local_bind_address(master_address: str, master_port: int) -> str:
@@ -777,6 +788,7 @@ def register_stage_with_omni_master(
             output_address: str = response_msg["output_address"]
             assigned_replica_id: int = int(response_msg.get("replica_id", wire_replica_id))
             coord_router_addr: str | None = response_msg.get("coordinator_router_address")
+            deployment_id: str = str(response_msg.get("deployment_id") or "")
             logger.info(
                 "Stage %d replica %d registered; handshake_address=%s",
                 omni_stage_id,
@@ -794,6 +806,53 @@ def register_stage_with_omni_master(
         output_address=output_address,
         replica_id=assigned_replica_id,
         coordinator_router_address=coord_router_addr,
+        deployment_id=deployment_id,
+    )
+
+
+def fetch_deployment_id(*, omni_master_address: str, omni_master_port: int) -> str:
+    """Read the head's deployment id before this process builds connectors.
+
+    Head and ``--headless`` can name the same master differently (``127.0.0.1``
+    versus a hostname). Hashing those strings would put their shared-memory
+    markers in different directories. The head generates one id and serves it
+    on the registration socket.
+    """
+    reg_ctx = zmq.Context()
+    try:
+        reg_sock: zmq.Socket = reg_ctx.socket(zmq.DEALER)  # type: ignore[attr-defined]
+        try:
+            reg_sock.connect(f"tcp://{omni_master_address}:{omni_master_port}")
+            reg_sock.send(msgspec.msgpack.encode({"query": "deployment_id"}))
+            if not reg_sock.poll(timeout=_DEFAULT_STARTUP_TIMEOUT_S * 1_000):
+                raise RuntimeError(
+                    f"Timed out waiting for deployment id from OmniMasterServer "
+                    f"({omni_master_address}:{omni_master_port})."
+                )
+            response = msgspec.msgpack.decode(reg_sock.recv())
+            deployment_id = response.get("deployment_id") if isinstance(response, dict) else None
+            if not isinstance(deployment_id, str) or not deployment_id:
+                raise RuntimeError("OmniMasterServer registration reply did not include a deployment id")
+            return deployment_id
+        finally:
+            reg_sock.close(linger=0)
+    finally:
+        reg_ctx.term()
+
+
+def ensure_matching_deployment_id(*, expected: str, actual: str) -> None:
+    """Fail before spawning if registration saw a different master generation.
+
+    Headless builds connector config from a prefetched id, then registers.
+    A master restart on the same endpoint can accept the later registration
+    with a new id while this process still holds the old scope.
+    """
+    if actual == expected:
+        return
+    raise RuntimeError(
+        "OmniMasterServer deployment id changed between connector setup and "
+        f"registration (expected {expected!r}, got {actual!r}). Restart this "
+        "headless worker so it loads the current deployment id."
     )
 
 
@@ -1276,6 +1335,7 @@ def launch_headless_llm_replica(
     stage_config: Any,
     coordinator: DPCoordinator | None = None,
     replica_bind_address: str | None = None,
+    expected_deployment_id: str | None = None,
 ) -> CoreEngineProcManager:
     """Register and launch one headless LLM replica.
 
@@ -1301,6 +1361,8 @@ def launch_headless_llm_replica(
         replica_id=None,
         replica_bind_address=replica_bind_address,
     )
+    if expected_deployment_id is not None:
+        ensure_matching_deployment_id(expected=expected_deployment_id, actual=response.deployment_id)
 
     manager = StageEngineCoreProcManager(
         local_engine_count=local_engine_count,
@@ -1336,6 +1398,7 @@ def launch_headless_llm_replicas(
     omni_dp_size_local: int,
     per_replica_devices: list[str | None],
     replica_bind_address: str | None = None,
+    expected_deployment_id: str | None = None,
 ) -> None:
     """Launch, monitor, and clean up all local headless LLM replicas."""
     parallel_config = vllm_config.parallel_config
@@ -1379,6 +1442,7 @@ def launch_headless_llm_replicas(
                 stage_config=stage_config,
                 coordinator=coordinator,
                 replica_bind_address=replica_bind_address,
+                expected_deployment_id=expected_deployment_id,
             )
 
         launch_headless_replica_group(
@@ -1401,6 +1465,7 @@ def launch_headless_diffusion_replica(
     omni_master_address: str,
     omni_master_port: int,
     replica_bind_address: str | None = None,
+    expected_deployment_id: str | None = None,
 ) -> Any:
     """Register and launch one headless diffusion replica.
 
@@ -1415,6 +1480,8 @@ def launch_headless_diffusion_replica(
         replica_id=None,
         replica_bind_address=replica_bind_address,
     )
+    if expected_deployment_id is not None:
+        ensure_matching_deployment_id(expected=expected_deployment_id, actual=response.deployment_id)
     from vllm_omni.diffusion import stage_diffusion_proc
 
     manager = stage_diffusion_proc.StageDiffusionProcManager.launch_headless(
@@ -1560,7 +1627,15 @@ def launch_headless_diffusion_replicas(
     replica_bind_address: str | None = None,
 ) -> None:
     """Prepare diffusion config, launch replicas, monitor, and clean up."""
-    omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(model, config_path)
+    expected_deployment_id = fetch_deployment_id(
+        omni_master_address=omni_master_address,
+        omni_master_port=omni_master_port,
+    )
+    omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(
+        model,
+        config_path,
+        deployment_scope=expected_deployment_id,
+    )
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,
         stage_id,
@@ -1572,6 +1647,8 @@ def launch_headless_diffusion_replicas(
         else stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
     )
     if omni_conn_cfg:
+        if omni_from is None or omni_to is None:
+            raise RuntimeError("Omni KV connector requires source and destination stages")
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the
@@ -1603,6 +1680,7 @@ def launch_headless_diffusion_replicas(
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
             replica_bind_address=replica_bind_address,
+            expected_deployment_id=expected_deployment_id,
         )
 
     launch_headless_replica_group(
