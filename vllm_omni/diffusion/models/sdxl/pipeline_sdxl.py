@@ -163,8 +163,7 @@ class StableDiffusionXLPipeline(
         pooled_prompt_embeds = None
         if return_pooled:
             pooled_prompt_embeds = outputs[0].to(dtype=self.od_config.dtype, device=self.device)
-            pooled_prompt_embeds = pooled_prompt_embeds.repeat(num_images_per_prompt, 1)
-            pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+            pooled_prompt_embeds = pooled_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
         return prompt_embeds, pooled_prompt_embeds
 

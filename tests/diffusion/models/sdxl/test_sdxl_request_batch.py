@@ -4,6 +4,7 @@
 """Request-level batching contract for the SDXL text2image pipeline."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -21,6 +22,28 @@ HEIGHT = 64
 WIDTH = 64
 LATENT_CHANNELS = 4
 VAE_SCALE = 8
+
+
+def test_clip_embeddings_keep_prompt_order() -> None:
+    """Token and pooled conditioning must identify the same prompt for every image."""
+    pipeline = object.__new__(StableDiffusionXLPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(dtype=torch.float32)
+    pipeline.tokenizer_max_length = 2
+
+    ids = torch.tensor([[1, 1], [2, 2]])
+    tokenizer = Mock(return_value=SimpleNamespace(input_ids=ids))
+    encoder_output = MagicMock()
+    encoder_output.hidden_states = [ids.unsqueeze(-1).float()] * 2
+    encoder_output.__getitem__.return_value = ids[:, :1].float()
+    encoder = Mock(return_value=encoder_output)
+    token, pooled = pipeline._get_clip_prompt_embeds(["A", "B"], tokenizer, encoder, 2, return_pooled=True)
+
+    expected = [1, 1, 2, 2]
+    assert token[:, 0, 0].tolist() == expected
+    assert pooled is not None
+    assert pooled[:, 0].tolist() == expected
 
 
 class _StubScheduler:
