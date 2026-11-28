@@ -1040,7 +1040,13 @@ for queue updates and the final validity check before delivery.
   sessions keep accounting for submitted units; the control carries zero input
   duration. Pending audio awaiting transcript belongs to its model turn;
   control completion discards cancelled turns' pending audio so it cannot
-  consume the next turn's text. If control submission fails, including behind
+  consume the next turn's text. The Talker-to-Code2Wav bridge also discards
+  buffered codec frames, transcript and left context when the model turn
+  advances without a normal turn end. It starts a fresh vocoder cache epoch
+  if the previous turn sent payloads, and rejects late older-turn callbacks.
+  If no payload was sent, the next turn still owns the initial reference-audio
+  payload. Normal turn ends advance the cache epoch only once.
+  If control submission fails, including behind
   a rejected append, the runner uses destructive input cancellation with
   reason `interruption_control_failed`. This retires the epoch and queued
   input before allowing new replies; it does not wait indefinitely for LISTEN.
