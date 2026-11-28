@@ -67,11 +67,12 @@ On one H100, the pinned Modular Diffusers pipeline generates reference images in
 with component-level CPU offload. The vLLM-Omni server uses single-GPU
 layerwise offload. The test resolves the model's `main` once and passes the
 same local snapshot to both implementations. It records the resolved commit in
-the accuracy results. Both implementations use the same text encoder and fixed
-requests from the NPU recipe. Text-to-image uses seed 42 and generates
-directly on a 1024² canvas. Single-reference editing uses seed 1234 and
-generates on a 2048² canvas. Both cases use a CPU generator and the
-checkpoint's six-step schedule.
+the accuracy results. Both implementations use the same text encoder and run
+the same two requests. Text-to-image uses seed 42 and sets `min_generation_area`
+to 1024², so it generates directly on a 1024² canvas. The NPU recipe's 1024²
+text-to-image benchmark generates on a 2048² canvas and downsamples the result.
+Single-reference editing uses seed 1234 and generates on a 2048² canvas. Both
+cases use a CPU generator and the checkpoint's six-step schedule.
 
 For editing, the reference script draws the target and reference noise in
 Omni's order and passes both tensors to Diffusers. Diffusers samples the
