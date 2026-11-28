@@ -32,6 +32,11 @@ logger = init_logger(__name__)
 # official streaming demo uses; small enough for a fast first audible chunk.
 _DEFAULT_EMIT_CHUNK_FRAMES = 5
 
+# CUDA-graph the steady-state chunk decode (~2.6-2.9x per chunk, bit-exact,
+# eager fallback for flush tails and utterances past the frame cap).
+_DEFAULT_CUDAGRAPH = True
+_DEFAULT_CUDAGRAPH_MAX_FRAMES = 1024
+
 
 def _meta_int(value: Any, default: int = 0) -> int:
     if isinstance(value, torch.Tensor):
@@ -103,11 +108,23 @@ class AudexCode2Wav(nn.Module):
         self._emit_chunk_frames = _meta_int(extra_cfg.get("decoder_emit_chunk_frames"), _DEFAULT_EMIT_CHUNK_FRAMES)
         if self._emit_chunk_frames <= 0:
             raise ValueError(f"decoder_emit_chunk_frames must be positive, got {self._emit_chunk_frames}")
+        cudagraph_cfg = extra_cfg.get("decoder_cudagraph")
+        self._cudagraph = _meta_bool(cudagraph_cfg) if cudagraph_cfg is not None else _DEFAULT_CUDAGRAPH
+        self._cudagraph_max_frames = _meta_int(
+            extra_cfg.get("decoder_cudagraph_max_frames"), _DEFAULT_CUDAGRAPH_MAX_FRAMES
+        )
+        if self._cudagraph_max_frames < self._emit_chunk_frames:
+            raise ValueError(
+                f"decoder_cudagraph_max_frames must be >= decoder_emit_chunk_frames "
+                f"({self._emit_chunk_frames}), got {self._cudagraph_max_frames}"
+            )
 
         # One streaming session per in-flight request, keyed by the request id
         # carried in each chunk payload's meta (equal to the stage-1 engine
         # request id, so on_requests_finished can free aborted requests too).
         self._sessions: dict[str, AudexCausalSpeechDecoderSession] = {}
+        # Built in load_weights once the decoder sits on its final device.
+        self._graph_runner = None
 
     def _connector_extra_config(self) -> dict[str, Any]:
         connector_cfg = getattr(self.vllm_config.model_config, "stage_connector_config", None)
@@ -133,6 +150,25 @@ class AudexCode2Wav(nn.Module):
         self.decoder.load_state_dict(state_dict, strict=True)
         device = self.vllm_config.device_config.device
         self.decoder.to(device=device, dtype=torch.float32)
+        self._graph_runner = None
+        if self._cudagraph and device.type == "cuda":
+            try:
+                from vllm_omni.model_executor.models.audex.speech_decoder.graph_runner import (
+                    AudexCausalSpeechDecoderGraphRunner,
+                )
+
+                self._graph_runner = AudexCausalSpeechDecoderGraphRunner(
+                    self.decoder,
+                    emit_frames=self._emit_chunk_frames,
+                    max_frames=self._cudagraph_max_frames,
+                )
+            except Exception:
+                logger.warning(
+                    "Audex code2wav: CUDA graph runner unavailable (%s); using eager decode",
+                    device,
+                    exc_info=True,
+                )
+                self._graph_runner = None
         return {f"decoder.{name}" for name in state_dict}
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
@@ -156,6 +192,7 @@ class AudexCode2Wav(nn.Module):
             session = self.decoder.create_session(
                 chunk_frames=self._emit_chunk_frames,
                 return_numpy=False,
+                graph_runner=self._graph_runner,
             )
             self._sessions[req_id] = session
         return session
