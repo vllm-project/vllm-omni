@@ -1,0 +1,16 @@
+# Astribot S1 uses the same encoders and worker topology as RoboTwin.
+base_config: motubrain2.yaml
+stages:
+  - stage_id: 0
+    engine_extras:
+      model_config:
+        motubrain2_metadata:
+          image_resolution: [720, 1280]
+          # Torso pose, two head joints, left pose/gripper, right pose/gripper.
+          # Each pose is XYZ + XYZW.
+          action_space: cartesian_pose_xyzw_joint_position_gripper
+          action_dim: 25
+          camera_sources:
+            - head_camera
+            - left_camera
+            - right_camera
