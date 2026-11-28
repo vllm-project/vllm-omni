@@ -15,7 +15,13 @@ upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
 local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
 # The job id in the tag keeps the 1-card and 2-card jobs of one commit from
 # deleting each other's image when they land on the same host.
-image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}-${BUILDKITE_JOB_ID:-local}"
+commit="${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
+test_suite="${1:-all}"
+image_name="${VLLM_OMNI_IMAGE:-xpu/vllm-omni-ci:${commit}-${BUILDKITE_JOB_ID:-local}}"
+case "${test_suite}" in
+    all|core_model|advanced_model|omni|quantization) ;;
+    *) echo "Unknown XPU_TEST_SUITE: ${test_suite}" >&2; exit 2 ;;
+esac
 container_name="xpu_${BUILDKITE_COMMIT}_$(
     tr -dc A-Za-z0-9 </dev/urandom | head -c 10
     echo
@@ -87,10 +93,14 @@ resolve_vllm_base() {
     fi
 }
 
-resolve_vllm_base
+if [ -n "${VLLM_OMNI_IMAGE:-}" ]; then
+    docker pull "${image_name}"
+else
+    resolve_vllm_base
 
-# Try building the docker image
-docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+    # Try building the docker image
+    docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+fi
 
 # Setup cleanup
 remove_docker_container() {
@@ -108,7 +118,8 @@ HF_MOUNT="/root/.cache/huggingface"
 # Each stage also has its own cap, per job:
 #   pr · 1 card   6+13+28+2 = 49m
 #   pr · 2 cards  10m
-#   broad (both card groups in one step)  49+20+10+15 = 94m
+#   broad · 1 card  49+20 = 69m
+#   broad · 2 cards 10+15 = 25m
 # so one runaway stage cannot eat the whole budget, and the stages that run
 # last still get their full cap. Measured end to end in the pr scope:
 # 3m40s dispatch + 10m05s omni + 23m01s core 1-card + 23s mxfp8 on the 1-card
@@ -147,12 +158,13 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     -e XPU_REQUIRE_CARDS \
     -e XPU_CPU_WORKERS \
     -e ZE_AFFINITY_MASK \
+    -e XPU_TEST_SUITE="${test_suite}" \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
     set -uo pipefail
     pip install tblib==3.1.0 || exit 1
-    cd /workspace/vllm-omni || exit 1
+    cd /vllm-omni || exit 1
 
     # Card budget. The agent sets ZE_AFFINITY_MASK; take its first entry for the
     # cards_1 stages and its first two for the cards_2 ones, so a test can never
@@ -203,7 +215,7 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # job here with the repo named, not six minutes into the omni stage.
     # huggingface_hub locks per file, so two agents sharing one cache can
     # fetch the same repo at once.
-    if [ "${run_1card}" = 1 ]; then
+    if [ "${run_1card}" = 1 ] && { [ "${XPU_TEST_SUITE}" = all ] || [ "${XPU_TEST_SUITE}" = core_model ] || [ "${XPU_TEST_SUITE}" = omni ]; }; then
         python - <<PY || exit 1
 import time
 from huggingface_hub import snapshot_download
@@ -291,7 +303,7 @@ PY
     # independent and the CUDA and ROCm lanes already run it. Note --ignore does
     # not apply to files named explicitly, which is why the exclusions live in
     # the list itself. See the header of both files for the measurements.
-    if [ "${run_1card}" = 1 ]; then
+    if [ "${run_1card}" = 1 ] && { [ "${XPU_TEST_SUITE}" = all ] || [ "${XPU_TEST_SUITE}" = core_model ]; }; then
         # Upstream deletes test files; one stale path aborts the whole
         # collection, so drop missing ones loudly instead of failing on them.
         xpu_path=()
@@ -305,25 +317,33 @@ PY
         stage "xpu dispatch (no card)" 6m "${one_card}" -n "${XPU_CPU_WORKERS:-8}" \
             "${xpu_path[@]}" \
             -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+    fi
 
+    if [ "${run_1card}" = 1 ]; then
         # The omni models go first and in their own process. They want the most
         # device memory of anything here - Qwen2.5-Omni colocates three stages
         # on one card at utils 0.45/0.25/0.15 - so they run on a clean card.
-        stage "omni · 1 card" 13m "${one_card}" "${paths[@]}" "${ignore[@]}" \
-            -m "omni and xpu and B60 and cards_1" --run-level core_model
+        if [ "${XPU_TEST_SUITE}" = all ] || [ "${XPU_TEST_SUITE}" = omni ]; then
+            stage "omni · 1 card" 13m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+                -m "omni and xpu and B60 and cards_1" --run-level core_model
+        fi
 
         # core_model excludes omni: the async-omni tests carry both markers and
         # would otherwise run twice.
-        stage "core_model · 1 card" 28m "${one_card}" "${paths[@]}" "${ignore[@]}" \
-            -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
-        stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
+        if [ "${XPU_TEST_SUITE}" = all ] || [ "${XPU_TEST_SUITE}" = core_model ]; then
+            stage "core_model · 1 card" 28m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+                -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
+        fi
+        if [ "${XPU_TEST_SUITE}" = all ] || [ "${XPU_TEST_SUITE}" = quantization ]; then
+            stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
+        fi
 
         # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image,
         # Wan2.1, Voxtral) with real weights - --run-level advanced_model, not
         # core_model, which swaps in tiny checkpoints and dummy weights - so it
         # waits for the nightly or a manual build. full_model stays out of both
         # until the cache is seeded.
-        if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+        if [ "${XPU_TEST_SUITE}" = advanced_model ] || { [ "${XPU_TEST_SUITE}" = all ] && [ "${XPU_TEST_SCOPE:-pr}" = broad ]; }; then
             stage "advanced_model · 1 card" 20m "${one_card}" "${paths[@]}" "${ignore[@]}" \
                 -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level advanced_model
         fi
@@ -337,11 +357,19 @@ PY
         # "or omni" picks up the Qwen2.5-Omni expansion, which carries the omni
         # marker and no level; "not advanced_model" keeps the sleep/wake cases
         # (omni + advanced_model, and BAGEL-7B-MoT) in the broad stage below.
-        stage "core_model · 2 cards" 10m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
-            -m "(core_model or omni) and not advanced_model and not full_model and xpu and (B60 or B70) and cards_2" \
-            --run-level core_model
+        case "${XPU_TEST_SUITE}" in
+            all) two_card_marker="(core_model or omni)" ;;
+            core_model) two_card_marker="core_model and not omni" ;;
+            omni) two_card_marker="omni" ;;
+            *) two_card_marker="" ;;
+        esac
+        if [ -n "${two_card_marker}" ]; then
+            stage "core_model · 2 cards" 10m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+                -m "${two_card_marker} and not advanced_model and not full_model and xpu and (B60 or B70) and cards_2" \
+                --run-level core_model
+        fi
 
-        if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+        if [ "${XPU_TEST_SUITE}" = advanced_model ] || { [ "${XPU_TEST_SUITE}" = all ] && [ "${XPU_TEST_SCOPE:-pr}" = broad ]; }; then
             # Z-Image-Turbo on two cards and tensor parallel TP=2.
             stage "advanced_model · 2 cards" 15m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
                 --ignore tests/entrypoints/test_omni_sleep_mode_xpu.py \

@@ -1,0 +1,153 @@
+# Optional, diff-aware Intel XPU Ready suites. Uploaded only when
+# INTEL_XPU_READY=1.
+
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+
+steps:
+  - group: "Intel XPU Ready tests"
+    depends_on: upload-intel-xpu-ready-pipeline
+    steps:
+      - label: "Intel XPU: Core model · 1 card"
+        source_file_dependencies:
+          - intel_xpu_diffusion_function
+          - diffusion_distributed_attention
+          - intel_xpu_omni_tts_function
+          - diffusion_quantization
+          - intel_xpu_platform_function
+        timeout_in_minutes: 60
+        commands:
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model 1
+        agents:
+          queue: intel-gpu-k8s
+        plugins: &intel-xpu-k8s-plugins
+          - kubernetes:
+              checkout:
+                skip: true
+              podSpec: &intel-xpu-pod
+                resourceClaims:
+                  - name: gpu
+                    resourceClaimTemplateName: b70-1
+                containers:
+                  - &intel-xpu-container
+                    image: "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-intel-xpu-ready"
+                    imagePullPolicy: Always
+                    env:
+                      - name: VLLM_USAGE_SOURCE
+                        value: ci-test
+                      - name: VLLM_TEST_DEVICE
+                        value: xpu
+                      - name: VLLM_DISABLE_COMPILE_CACHE
+                        value: "1"
+                      - name: VLLM_WORKER_MULTIPROC_METHOD
+                        value: spawn
+                      - name: HF_HUB_DOWNLOAD_TIMEOUT
+                        value: "300"
+                      - name: HF_HUB_ETAG_TIMEOUT
+                        value: "60"
+                      - name: HF_HOME
+                        value: /data/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                    resources:
+                      claims:
+                        - name: gpu
+                      requests:
+                        cpu: "8"
+                        memory: 32Gi
+                      limits:
+                        cpu: "32"
+                        memory: 64Gi
+                    volumeMounts:
+                      - name: dshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /data/huggingface
+                volumes:
+                  - name: dshm
+                    emptyDir:
+                      medium: Memory
+                      sizeLimit: 8Gi
+                  - name: hf-cache
+                    hostPath:
+                      path: /data/huggingface
+                      type: DirectoryOrCreate
+
+      - label: "Intel XPU: MXFP8 quantization · 1 card"
+        source_file_dependencies: diffusion_quantization
+        timeout_in_minutes: 30
+        commands:
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh quantization 1
+        agents:
+          queue: intel-gpu-k8s
+        plugins: *intel-xpu-k8s-plugins
+
+      - label: "Intel XPU: Advanced model · 1 card"
+        source_file_dependencies:
+          - intel_xpu_diffusion_function
+          - diffusion_distributed_attention
+          - intel_xpu_omni_tts_function
+          - diffusion_quantization
+          - intel_xpu_platform_function
+        timeout_in_minutes: 60
+        commands:
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh advanced_model 1
+        agents:
+          queue: intel-gpu-k8s
+        plugins: *intel-xpu-k8s-plugins
+
+      - label: "Intel XPU: Omni · 1 card"
+        source_file_dependencies: intel_xpu_omni_tts_function
+        timeout_in_minutes: 60
+        commands:
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh omni 1
+        agents:
+          queue: intel-gpu-k8s
+        plugins: *intel-xpu-k8s-plugins
+
+      - label: "Intel XPU: Core model · 2 cards"
+        source_file_dependencies:
+          - intel_xpu_diffusion_function
+          - diffusion_distributed_attention
+          - intel_xpu_omni_tts_function
+          - diffusion_quantization
+          - intel_xpu_platform_function
+        timeout_in_minutes: 35
+        commands:
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model 2
+        agents:
+          queue: intel-gpu-k8s
+        plugins:
+          - kubernetes:
+              checkout:
+                skip: true
+              podSpec:
+                <<: *intel-xpu-pod
+                resourceClaims:
+                  - name: gpu
+                    resourceClaimTemplateName: b70-2
+                containers:
+                  - <<: *intel-xpu-container
+                    resources:
+                      claims:
+                        - name: gpu
+                      requests:
+                        cpu: "16"
+                        memory: 64Gi
+                      limits:
+                        cpu: "64"
+                        memory: 128Gi
+                volumes:
+                  - name: dshm
+                    emptyDir:
+                      medium: Memory
+                      sizeLimit: 16Gi
+                  - name: hf-cache
+                    hostPath:
+                      path: /data/huggingface
+                      type: DirectoryOrCreate
