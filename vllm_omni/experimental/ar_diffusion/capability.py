@@ -4,15 +4,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVState
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+
+AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE = "ARDiffusionRequestRejectedError"
+
+
+class ARDiffusionRequestRejectedError(OmniClientError):
+    """A request failed admission validation before any state was touched.
+
+    Pipelines raise this for fail-closed rejections (session-fingerprint
+    mismatch, out-of-order chunk index, over-long prompt, wrong resolution,
+    malformed inputs). The contract: no session state, KV pool content, or
+    accounting was modified, so the runner must surface the error WITHOUT
+    releasing the session — the client keeps its paid-for KV history and can
+    retry a corrected request or explicitly reset.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, error_type=AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE)
 
 
 @dataclass(frozen=True)
@@ -107,6 +126,8 @@ class ARDiffusionKVCacheSpec:
     retained segment handles; legacy frame fields are not retention policy
     for this path.
 
+    ``max_scratch_frames_per_branch`` is the maximum current-video span that a
+    non-committing forward writes to scratch; it defaults to ``frames_per_block``.
     ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
     action/state registers) that must coexist with an uncommitted video block.
     ``model_owned_state_bytes_per_session`` is a conservative upper bound for
@@ -135,6 +156,7 @@ class ARDiffusionKVCacheSpec:
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
+    max_scratch_frames_per_branch: int | None = None
     segmented: ARDiffusionSegmentedKVSpec | None = None
 
     def __post_init__(self) -> None:
@@ -153,6 +175,11 @@ class ARDiffusionKVCacheSpec:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
         if self.sink_frames < 0:
             raise ValueError(f"AR-Diffusion sink_frames must be non-negative, got {self.sink_frames}")
+        if self.max_scratch_frames_per_branch is not None and self.max_scratch_frames_per_branch < 0:
+            raise ValueError(
+                "AR-Diffusion max_scratch_frames_per_branch must be non-negative, "
+                f"got {self.max_scratch_frames_per_branch}"
+            )
         if self.max_scratch_tokens_per_branch < 0:
             raise ValueError(
                 "AR-Diffusion max_scratch_tokens_per_branch must be non-negative, "
@@ -224,6 +251,30 @@ class SupportsARDiffusionPipeline(Protocol):
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         """Drop model-owned state after close, eviction, or failed forward."""
+        ...
+
+
+@dataclass(frozen=True)
+class ARDiffusionRequestAdmission:
+    """Read-only runner metadata and the one-time entry point to execution.
+
+    After all checks that can raise ARDiffusionRequestRejectedError, call
+    ``admit`` to apply lifecycle changes and bind KV before mutating model state.
+    """
+
+    session_id: str
+    tokens_per_frame: int
+    admit: Callable[[], None]
+
+
+@runtime_checkable
+class SupportsARDiffusionRequestAdmission(Protocol):
+    """Optional request-mode capability for admission before KV binding."""
+
+    def bind_ar_diffusion_request_admission(
+        self, admission: ARDiffusionRequestAdmission
+    ) -> AbstractContextManager[None]:
+        """Expose request admission for one forward without binding KV yet."""
         ...
 
 

@@ -274,6 +274,7 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
         cross_attention_kv_heads: dict[str, int] | None = None,
         device: torch.device | None = None,
         frames_per_block: int = 1,
+        max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
         segmented: ARDiffusionSegmentedKVSpec | None = None,
@@ -309,6 +310,8 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
         self.num_local_kv_branches = max(local_indices) + 1
         if frames_per_block <= 0:
             raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
+        if max_scratch_frames_per_branch is not None and max_scratch_frames_per_branch < 0:
+            raise ValueError(f"max_scratch_frames_per_branch must be non-negative, got {max_scratch_frames_per_branch}")
         if max_scratch_tokens_per_branch < 0:
             raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
         if model_owned_state_bytes_per_session < 0:
@@ -316,6 +319,9 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
                 f"model_owned_state_bytes_per_session must be non-negative, got {model_owned_state_bytes_per_session}"
             )
         self.frames_per_block = int(frames_per_block)
+        self.max_scratch_frames_per_branch = int(
+            frames_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
+        )
         self.block_size = block_size
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -388,7 +394,7 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
         # block_size) blocks once the two sizes are allowed to differ.
         blocks_per_frame = -(-config.chunk_size // block_size)
         self.blocks_per_frame = blocks_per_frame
-        minimum_scratch_blocks = self.frames_per_block * blocks_per_frame + declared_scratch_blocks
+        minimum_scratch_blocks = self.max_scratch_frames_per_branch * blocks_per_frame + declared_scratch_blocks
         override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
         override_blocks = int(override) if override is not None else 0
         if override_blocks < 0:

@@ -1358,7 +1358,6 @@ class Cosmos3VFMTransformer(nn.Module):
     _language_model_cls = Cosmos3LanguageModel
     _gen_layer_cls = Cosmos3GenDecoderLayer
     _gen_mlp_cls = Cosmos3GatedMLP
-    _gen_layer_cls = Cosmos3GenDecoderLayer
     _cross_attention_cls = Cosmos3CrossAttention
 
     @staticmethod

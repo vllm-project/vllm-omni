@@ -71,7 +71,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     prompt_token_hash,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.errors import OmniClientError
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
@@ -80,13 +80,6 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
-
-
-class ARDiffusionRequestRejectedError(OmniClientError):
-    """A Sim request failed validation before its dense session was modified."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, error_type="ARDiffusionRequestRejectedError")
 
 
 def _first_not_none(*values: Any) -> Any:

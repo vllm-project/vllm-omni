@@ -68,10 +68,32 @@ that capacity evict the least-recently-used session through the same lifecycle
 hook used by explicit close and failure cleanup.
 
 Scratch storage is also capability-driven. `frames_per_block` reserves space for
-an uncommitted current video block, while `max_scratch_tokens_per_branch`
+an uncommitted current video block unless `max_scratch_frames_per_branch` sets
+that span explicitly (`0` for a pipeline that never runs a non-committing paged
+forward), while `max_scratch_tokens_per_branch`
 declares the maximum model-specific tokens, such as action/state registers, that
 must coexist with it. `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` may increase
 that derived minimum for deployment experiments but cannot reduce it.
+
+## Admission rejection vs. forward failure
+
+A pipeline that rejects a request during validation — before touching session
+state or the KV pool — should raise `ARDiffusionRequestRejectedError`. The runner
+surfaces the error without releasing the session, so the client keeps its
+accumulated KV history and can retry a corrected request (or reset
+explicitly). Any other exception from a forward is treated as a failure of
+unknown extent: the runner releases the session's KV and notifies the pipeline
+to drop its model-owned state, because partially committed pages cannot be
+trusted. Pipelines must therefore complete every fail-closed check (session
+fingerprint, chunk-index ordering, prompt-length, resolution, action coverage)
+before their first side effect.
+
+Paged request-mode pipelines that raise this error during forward implement
+`SupportsARDiffusionRequestAdmission`. The runner exposes the session ID and
+pool frame size for validation. Once all admission checks pass, the pipeline
+calls `admit()` before changing model state. The runner then applies any
+requested reset, obtains and binds KV, and updates LRU order. Validation that
+rejects before `admit()` leaves all resident sessions and their LRU order intact.
 
 ## DreamZero adapter
 

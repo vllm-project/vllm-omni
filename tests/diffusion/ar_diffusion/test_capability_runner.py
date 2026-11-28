@@ -12,13 +12,16 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
@@ -281,6 +284,7 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert kv is not None
     assert kv.num_local_kv_branches == 1
     assert kv.frames_per_block == 3
+    assert kv.max_scratch_frames_per_branch == 3
     assert kv.spec.window_chunks == 5
     assert kv.spec.sink_chunks == 1
     assert kv.cross_attention_lengths == {"text": 8}
@@ -515,6 +519,104 @@ def test_error_output_releases_only_failed_session(monkeypatch, status_code):
     runner.close_session("healthy")
     assert not kv._adapters and not kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_serialized_admission_rejection_retains_session(monkeypatch):
+    pipeline = CapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    session = commit_one_frame(runner, "retained", "main")
+    output = DiffusionOutput.from_exception(ARDiffusionRequestRejectedError("out of order"))
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", lambda *args, **kwargs: output)
+    request = OmniDiffusionRequest(
+        prompt="test",
+        request_id="rejected-request",
+        sampling_params=OmniDiffusionSamplingParams(
+            seed=0, extra_args={"session_id": "retained", "close_session": True}
+        ),
+    )
+
+    assert runner.execute_model(request) is output
+    assert runner._sessions["retained"] is session
+    assert pipeline.closes == []
+
+
+@pytest.mark.parametrize(
+    ("capacity", "rejected_session", "reset"),
+    [(1, "fresh", False), (1, "original", True), (2, "original", False)],
+    ids=["fresh-at-capacity", "reset", "lru"],
+)
+def test_rejected_request_preserves_resident_kv(monkeypatch, capacity, rejected_session, reset):
+    class AdmittingPipeline(CapablePipeline):
+        admission = None
+
+        @contextmanager
+        def bind_ar_diffusion_request_admission(self, admission):
+            self.admission = admission
+            try:
+                yield
+            finally:
+                self.admission = None
+
+    pipeline = AdmittingPipeline(lingbot_like_spec(capacity=capacity))
+    runner = make_runner(pipeline)
+    runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.DENSE_LEGACY
+    kv = runner.kv_cache
+    assert kv is not None
+    text_key = torch.ones(1, 8, 4, 64)
+
+    def execute_request_list(self, reqs, **kwargs):
+        (req,) = reqs
+        if req.prompt == "invalid":
+            raise ARDiffusionRequestRejectedError("invalid model input")
+        if pipeline.admission is not None:
+            pipeline.admission.admit()
+        state = pipeline.bound_state
+        assert state is not None
+        adapter = state.adapter("main")
+        if req.request_id == "start":
+            state.populate_cross_attention("main", "text", [(text_key, -text_key)] * state.num_layers)
+        if req.request_id == "resume":
+            assert state is original
+            assert adapter.completed_chunks == 1
+            assert kv.block_table(adapter) == original_blocks
+            torch.testing.assert_close(state.get_cross_attention_kv("main", "text")[0]["k"], text_key)
+        ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(torch.device("cpu"))
+        state.commit_paged_context("main")
+        return BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id=req.request_id, step_index=None, finished=True, result=DiffusionOutput())]
+        )
+
+    monkeypatch.setattr(DiffusionModelRunner, "_execute_request_list", execute_request_list)
+
+    def execute(session_id, request_id, *, prompt="valid", reset=False):
+        return runner.execute_model(
+            OmniDiffusionRequest(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params=OmniDiffusionSamplingParams(
+                    seed=0, extra_args={"session_id": session_id, "reset": reset}
+                ),
+            )
+        )
+
+    assert not execute("original", "start").error
+    original = runner._sessions["original"]
+    original_blocks = list(kv.block_table(original.adapter("main")))
+    assert original_blocks
+    if capacity == 2:
+        assert not execute("other", "start-other").error
+    original_order = tuple(runner._sessions)
+    free_blocks = kv.manager.block_pool.get_num_free_blocks()
+
+    output = execute(rejected_session, "reject", prompt="invalid", reset=reset)
+
+    assert output.error_type == ARDiffusionRequestRejectedError.__name__
+    assert tuple(runner._sessions) == original_order
+    assert kv.manager.block_pool.get_num_free_blocks() == free_blocks
+    assert pipeline.closes == pipeline.resets == []
+    assert not execute("original", "resume").error
+    assert original.adapter("main").completed_chunks == 2
 
 
 def test_decode_failure_after_kv_commit_releases_session(monkeypatch):
