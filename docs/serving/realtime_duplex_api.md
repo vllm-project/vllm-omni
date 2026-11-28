@@ -670,8 +670,9 @@ cancelled output by response ID rather than treating the whole epoch as dead.
 An unforced text append or an explicit audio commit with `create_response: true`
 creates the next response even while the model is confirming the interruption.
 Clients can cancel it immediately, and its ID stays the same when its answer
-arrives. Clearing an idle, fully played response acknowledges the clear without
-submitting a model control.
+arrives. Once input and playback have drained, clearing output only acknowledges
+the clear. This also applies to text-only replies and to repeated clears after
+a cancellation has finished.
 No history prefill is needed for this interruption, on either local or hosted
 Stage-0 replicas. Normal sliding-window eviction still applies. As in the
 official native implementation, KV can contain generated speech the client has

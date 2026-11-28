@@ -186,12 +186,18 @@ async def test_cancelled_audio_cannot_consume_next_turn_text(h):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("h", [{"stages": 3}], indirect=True)
 @pytest.mark.parametrize("clear_input", [False, True])
 async def test_barge_in_retains_partial_input_until_explicit_clear(h, clear_input):
+    h.runner.plugin._tokenizers.clear()  # Audio-only serving can run without an orchestrator tokenizer.
     await h.run(append_audio())
+    request_id = h.port.submissions[0].context.request_id
     await h.run(append_audio(samples=4000))  # 250 ms, below the native unit size.
     await h.run(commands.BargeIn())
+    assert h.session.epoch == 0
     assert len(h.port.submissions) == 2  # First unit, then interruption control.
+    await h.deliver_and_settle(_control(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+    assert h.session.turn_id == 1 and not h.runner.run.interruption_pending
     if clear_input:
         await h.run(commands.ClearInput())
     await h.run(append_audio(samples=12000))  # Another 750 ms.
@@ -199,6 +205,7 @@ async def test_barge_in_retains_partial_input_until_explicit_clear(h, clear_inpu
         assert len(h.port.submissions) == 2
         await h.run(append_audio(samples=4000))
     assert len(h.port.submissions) == 3
+    assert all(submission.context.request_id == request_id for submission in h.port.submissions)
     payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
     assert len(base64.b64decode(payload["audio"])) == 16000 * 4
     assert not h.port.aborts and not h.port.cleanups
@@ -339,6 +346,39 @@ async def test_cancel_keeps_request_and_filters_output_through_orchestrator(thin
         assert clients[0].abort_calls == [[request_id]]
     finally:
         await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "h", [{"thinker_only": True, "stages": 1}, {"stages": 3}], indirect=True, ids=["text", "cancelled"]
+)
+async def test_repeated_clear_after_a_drained_reply_without_pcm(h):
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    if h.runner.plugin.data_plane.thinker_only:
+        events = await h.deliver_and_settle(
+            _stage0(request_id, [SPEAK, A, TURN_EOS, LISTEN], "嗯，", stop=True),
+            stage_id=0,
+            segment_finished=True,
+            model_turn_id=0,
+        )
+        assert find(events, "response.done").status == "completed"
+    else:
+        await h.deliver_and_settle(_speak_segment_end(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+        await h.deliver_and_settle(tts_output(request_id), stage_id=2)
+        events = await h.run(commands.CancelResponse())
+        assert find(events, "response.done").status == "cancelled"
+        await h.deliver_and_settle(_control(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+
+    response_id = find(events, "response.done").response_id
+    assert h.session.playback.sent_ms == h.session.playback.generated_ms == 0
+    submissions = len(h.port.submissions)
+    turn_id = h.session.turn_id
+    for _ in range(2):
+        cleared = await h.run(commands.ClearOutputAudio())
+        assert types(cleared) == ["output_audio_buffer.cleared"] and cleared[0].response_id == response_id
+        assert not h.runner.run.interruption_pending
+        assert h.session.turn_id == turn_id
+        assert len(h.port.submissions) == submissions
 
 
 @pytest.mark.parametrize("pending", ["none", "queued", "completed", "awaiting-tts"])

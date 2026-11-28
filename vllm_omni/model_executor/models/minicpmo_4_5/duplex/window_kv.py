@@ -888,10 +888,11 @@ class MiniCPMO45SchedulerWindowPolicy:
         active_ids = generated[:-1] if parked else generated[:consumed]
         accepted = generated if parked else active_ids
         backend_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY))
-        if (payload.get("text_token_ids") or backend_text) and settled >= request.num_prompt_tokens:
-            turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
+        if settled >= request.num_prompt_tokens:
             if payload.get(INTERRUPTION_KEY) is True:
                 turn.interrupt()
+            elif payload.get("text_token_ids") or backend_text:
+                turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
         if accepted and payload.get("open_assistant_turn") is True and payload.get("is_speech") is not True:
             if turn.current_turn_ended:
                 turn.current_turn_ended = False

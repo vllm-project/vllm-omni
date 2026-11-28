@@ -54,6 +54,8 @@ class _EOSCursor:
 @dataclass(slots=True)
 class _RequestState:
     audio_offset: int = 0
+    #: Earliest producer turn that can still advance the cursor after a confirmed restart.
+    audio_buffer_start_turn: int | None = None
     #: A snapshot below ``audio_offset`` that has not been accepted as a restart
     #: yet. See :meth:`advance_audio_cursor`.
     audio_restart_candidate: int | None = None
@@ -73,20 +75,23 @@ class _RequestState:
     def turn(self, turn_id: int | None) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
 
-    def advance_audio_cursor(self, num_samples: int, *, allow_restart: bool = True) -> int:
+    def discard_stale_audio(self, num_samples: int, turn_id: int | None) -> None:
+        if self.audio_buffer_start_turn is None or (turn_id is not None and turn_id >= self.audio_buffer_start_turn):
+            self.audio_offset = max(self.audio_offset, num_samples)
+
+    def advance_audio_cursor(self, num_samples: int, turn_id: int | None) -> int:
         """Consume a cumulative snapshot and return the start of its new samples."""
         previous = self.audio_offset
         if num_samples < previous:
             # A short snapshot may be a continuation placeholder. Only rewind
             # the cursor once a live below-cursor snapshot grows from it.
             # Delayed old snapshots alone cannot rewind already delivered PCM.
-            if not allow_restart:
-                return 0
             candidate = self.audio_restart_candidate
             self.audio_restart_candidate = num_samples
             if candidate is None or num_samples <= candidate:
                 return 0
             previous = candidate
+            self.audio_buffer_start_turn = turn_id
         elif num_samples > previous:
             self.audio_restart_candidate = None
         self.audio_offset = num_samples
@@ -131,6 +136,8 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         if state is None:
             return
         state.audio_offset = 0
+        state.audio_restart_candidate = None
+        state.audio_buffer_start_turn = None
         state.turns.pop(None, None)
         for cursor in state.eos_cursors.values():
             cursor.pending_turn = None
@@ -276,7 +283,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             # next cumulative waveform. Stage 0 latents and delta lists do not.
             if not stale_epoch and stage_id != 0 and request_state is not None and raw_audio is not None:
                 if not isinstance(raw_audio, list) and (num_samples := _audio_num_samples(raw_audio)):
-                    request_state.advance_audio_cursor(num_samples, allow_restart=False)
+                    request_state.discard_stale_audio(num_samples, output_turn_id)
             return
 
         mm_text = _llm_output_text(mm_output)
@@ -331,6 +338,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 raw_audio,
                 sample_rate_hz=sample_rate_hz,
                 request_id=request_id,
+                turn_id=output_turn_id if output_turn_id is not None else context.turn_id,
                 response_format=context.response_format,
                 speed=context.speed,
             )
@@ -791,14 +799,16 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         turn_state.sent_segment_text = text
         return delta_text
 
-    def slice_cumulative_audio(self, request_id: str | None, audio_data: object) -> object:
+    def slice_cumulative_audio(
+        self, request_id: str | None, audio_data: object, *, turn_id: int | None = None
+    ) -> object:
         if request_id is None:
             return audio_data
         num_samples = _audio_num_samples(audio_data)
         if num_samples is None or num_samples <= 0:
             return audio_data
         state = self._requests.setdefault(request_id, _RequestState())
-        prev_samples = state.advance_audio_cursor(num_samples)
+        prev_samples = state.advance_audio_cursor(num_samples, turn_id)
         if prev_samples == 0:
             return audio_data
         if num_samples == prev_samples:
@@ -819,6 +829,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         *,
         sample_rate_hz: int,
         request_id: str | None,
+        turn_id: int | None,
         response_format: str,
         speed: float | None,
     ) -> Iterator[tuple[str, int]]:
@@ -829,7 +840,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     duration_ms = int((_audio_num_samples(value) or 0) * 1000 / max(1, sample_rate_hz))
                     yield encoded, duration_ms
             return
-        sliced = self.slice_cumulative_audio(request_id, audio_data)
+        sliced = self.slice_cumulative_audio(request_id, audio_data, turn_id=turn_id)
         encoded = self._encode_audio(sliced, sample_rate_hz, response_format, speed)
         if encoded:
             duration_ms = int((_audio_num_samples(sliced) or 0) * 1000 / max(1, sample_rate_hz))

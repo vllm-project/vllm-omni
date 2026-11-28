@@ -692,6 +692,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
         # Client TEXT units are separate from server-owned result tokens
         # appended after the unit's media embeddings below.
+        if interruption:
+            input_text_token_ids = [self.turn_eos_token_id]
         has_text = bool(input_text_token_ids)
         vision_only = audio_waveform is None or len(audio_waveform) == 0
         if vision_only and not num_frames and not has_text:
@@ -1716,7 +1718,9 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
-        if not audio and (payload.get("video_frames") or payload.get("text_token_ids")):
+        if not audio and (
+            payload.get("video_frames") or payload.get("text_token_ids") or payload.get(INTERRUPTION_KEY) is True
+        ):
             return np.empty(0, dtype=np.float32)
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")

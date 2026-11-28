@@ -52,15 +52,16 @@ def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_
         },
     }
     for seq, interrupted, text_ids, generated, terminator in (
-        (2, True, [runtime.turn_eos_token_id], [51, 52], runtime.chunk_eos_token_id),
+        (2, True, None, [51, 52], runtime.chunk_eos_token_id),
         (3, False, [23], [], runtime.listen_token_id),
     ):
         payload = {
             "type": "text",
-            "text_token_ids": text_ids,
             "force_listen": interrupted,
             INTERRUPTION_KEY: interrupted,
         }
+        if not interrupted:
+            payload["text_token_ids"] = text_ids
         update = StreamingUpdate(
             mm_features=None,
             prompt_token_ids=[0] * 4,
@@ -120,17 +121,17 @@ def test_text_units_match_exact_scheduler_budget_and_preserve_audio_state(window
     for seq, text_ids in enumerate(([21, 22, 23], [24, 25]), start=1):
         interruption = terminator != "normal" and seq == 2
         if interruption:
-            text_ids = [runtime.turn_eos_token_id]
             state.pending_terminator_token = getattr(runtime, terminator) if terminator else None
             state.generated_tokens = [51, 52]
             state.current_turn_ended = False
             state.pending_speech_context = state.pending_speech_response_open = True
         payload = {
             "type": "text",
-            "text_token_ids": text_ids,
             "force_listen": interruption,
             INTERRUPTION_KEY: interruption,
         }
+        if not interruption:
+            payload["text_token_ids"] = text_ids
         audio = runtime._decode_audio_payload(payload)
         assert audio.size == 0
         kwargs = MiniCPMO45OmniForConditionalGeneration._minicpmo45_duplex_prefill_kwargs(

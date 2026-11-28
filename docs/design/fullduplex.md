@@ -1028,15 +1028,18 @@ for queue updates and the final validity check before delivery.
   audio immediately. Through the existing append tail, the plugin inserts
   `<|turn_eos|><|listen|></unit>` to close the preceding unit, replacing its
   uncomputed speech terminator, then opens an empty `<unit>` with forced LISTEN.
-  EOS must close the old speech
-  unit; placing it in the new control unit can leave the model continuing the
+  Stage 0 uses its own EOS token ID, so audio-only sessions can interrupt
+  without an orchestrator tokenizer. EOS must close the interrupted speech
+  unit. Placing it in the new control unit can make the model continue the
   cancelled answer after a follow-up. Window accounting includes EOS in the
   closed unit rather than the new control unit. No request is aborted,
   no epoch is advanced, and no system/reference prefix or retained history is
   replayed. Buffered and already submitted input remains owned by that stream.
   Output is suppressed until Stage 0 confirms the control; that boundary
   advances the bridge's model turn, and later output from the cancelled turns
-  stays suppressed while projection cursors keep consuming it. The next Talker
+  stays suppressed. Late cumulative PCM advances the cursor only while it still
+  belongs to the same waveform. Once a new turn confirms a restarted waveform,
+  older turns can no longer advance its cursor. The next Talker
   handoff starts its normal new-turn state. The session advances its output
   turn without invalidating input reservations already inside `submit`.
   Repeated interruptions retain their order relative to intervening inputs;

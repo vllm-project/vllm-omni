@@ -325,11 +325,15 @@ def build_duplex_data_plane_prompt(
     vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
     token_budget = _duplex_audio_token_budget(payload) + vision_tokens
     if isinstance(payload, dict) and payload.get("type") == "text":
-        text_ids = payload["text_token_ids"]
-        if not isinstance(text_ids, list) or not text_ids:
-            raise ValueError("Text append requires encoded text tokens")
+        if payload.get(INTERRUPTION_KEY) is True:
+            text_tokens = 1  # Stage 0 embeds its native turn EOS.
+        else:
+            text_ids = payload.get("text_token_ids")
+            if not isinstance(text_ids, list) or not text_ids:
+                raise ValueError("Text append requires encoded text tokens")
+            text_tokens = len(text_ids)
         lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
-        token_budget = lead_tokens + 1 + len(text_ids)
+        token_budget = lead_tokens + 1 + text_tokens
     elif _duplex_payload_is_vision_only(payload):
         # Surplus slots are filled with </unit> pad embeddings that stay in the KV.
         # A VISION unit is <unit> + frame blocks; later units first close the
@@ -736,8 +740,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def interruption_payload(self) -> dict[str, object] | None:
         # Stage0 places EOS before the previous unit's deferred closure, then
         # opens a LISTEN control unit without advancing the audio encoder or
-        # replaying history. Tokenization reserves its exact KV span.
-        return {"type": "text", "text": "<|turn_eos|>", "force_listen": True, INTERRUPTION_KEY: True}
+        # replaying history. The worker owns the EOS token ID.
+        return {"type": "text", "force_listen": True, INTERRUPTION_KEY: True}
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
@@ -799,7 +803,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        if isinstance(payload, dict) and payload.get("type") == "text":
+        if isinstance(payload, dict) and payload.get("type") == "text" and payload.get(INTERRUPTION_KEY) is not True:
             key = runtime_config.get(TOKENIZER_KEY, "")
             tokenizer = self._tokenizers.get(key) if isinstance(key, str) else None
             if tokenizer is None:

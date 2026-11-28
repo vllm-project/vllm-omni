@@ -2940,7 +2940,6 @@ class DuplexSessionRunner:
         if (
             session.turn_state != DuplexTurnState.IDLE
             or session.last_response_id is None
-            or audio_ms == 0
             or playback.committed_ms < audio_ms
             or helpers.response_in_progress(session, self.tasks)
             or self.run.interruption_pending
