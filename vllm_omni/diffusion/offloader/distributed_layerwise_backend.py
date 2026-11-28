@@ -1761,7 +1761,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.comm_stream,
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
-                    rank_local_mmap=use_dit_mmap and self._component_transport(component)[1] <= 1,
+                    rank_local_mmap=use_dit_mmap,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
                     fused_sources=self._mmap_fused_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
@@ -2074,7 +2074,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         unified_shard_buffers = self._allocate_shared_shard_buffers(allgather_hooks) if allgather_hooks else None
         unified_cpu_staging = None
         cpu_staging_events = None
-        if mmap_hooks and not self._using_registered_mmap:
+        # A resident group that owns rank-local mmap states needs the shared
+        # staging slots even when no streamed hook is rank-local: a fully
+        # resident DiT beside an AllGather encoder has no rank-local hook at
+        # all, yet its resident group still loads through those slots.
+        needs_staging = bool(mmap_hooks) or (
+            self._resident_layer_group is not None and self._resident_layer_group.rank_local_mmap
+        )
+        if needs_staging and not self._using_registered_mmap:
             unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
                 mmap_hooks,
                 self._resident_layer_group,
@@ -2131,9 +2138,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         if self._using_mmap and not self._using_rank_local_mmap:
             # AllGather packing copied each rank's persistent shard, and a
-            # rank-local encoder's hooks keep their own host copies, so the
-            # checkpoint mappings are no longer needed. Fully rank-local mode
-            # retains them as the node-shared host master until disable().
+            # rank-local encoder's hooks hold their own tensors from the
+            # safetensors mapping (the mapping stays alive while those tensors
+            # do), so the backend's own checkpoint handles are no longer needed.
+            # Fully rank-local mode retains them as the node-shared host master
+            # until disable().
             self._release_mmap_handles()
 
         self._cleanup_after_loading()
