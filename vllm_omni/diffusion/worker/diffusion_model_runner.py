@@ -69,6 +69,8 @@ from vllm_omni.diffusion.models.interface import (
     SupportsSamplingStep,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
+    step_resume_hook,
+    step_wait_hook,
     supports_interaction_apply,
     supports_step_execution,
 )
@@ -1579,16 +1581,85 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if new_req.diffusion_kv_metadata is not None:
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
-            return self._execute_stepwise_core(
+            # Resume before batching: the pipeline installs the prompt (or other
+            # input) the scheduler woke it for, and the batch must be built from
+            # it. Deliberately here and not in ``_execute_stepwise_core``: a
+            # runner that groups chunk steps re-enters that core with a
+            # continuation that still carries ``step_resumes``, so dispatching
+            # there would resume the same wake twice and a pipeline that already
+            # cleared its held flag would reject the second one.
+            self._dispatch_step_resumes(scheduler_output)
+            output = self._execute_stepwise_core(
                 scheduler_output,
                 record_output_peak_memory=record_output_peak_memory,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
+            self._apply_step_wait(output, scheduler_output)
+            return output
         except Exception:
             self.release_step_requests(scheduler_output.scheduled_request_ids)
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
+
+    def _dispatch_step_resumes(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Hand each scheduled request's wake reason to the pipeline before batching.
+
+        The scheduler decides when a suspended request may continue and records why
+        in ``step_resumes``; the pipeline owns what continuing means. A request the
+        scheduler woke after it was cancelled or released has no cached state, so
+        the wake is dropped rather than re-admitting it: a late callback must not
+        recreate a cancelled request.
+        """
+        resumes = getattr(scheduler_output, "step_resumes", None)
+        if not resumes:
+            return
+        pipeline = self.pipeline
+        assert pipeline is not None, "Model not loaded. Call load_model() first."
+        for request_id in scheduler_output.scheduled_request_ids:
+            reason = resumes.get(request_id)
+            if reason is None:
+                continue
+            state = self.state_cache.get(request_id)
+            if state is None:
+                logger.debug(
+                    "Dropping step wake %r for %s: the request no longer has state",
+                    reason,
+                    request_id,
+                )
+                continue
+            resume = step_resume_hook(pipeline)
+            if resume is None:
+                raise RuntimeError(f"Scheduler resumed {request_id} but the pipeline implements no step resume hook")
+            # A failure here propagates through the caller's ``except``, which
+            # releases the wave's step requests through the runner-owned boundary.
+            resume(state, reason)
+
+    def _apply_step_wait(self, output: BatchRunnerOutput, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Let the pipeline suspend a request that just finished a chunk cleanly.
+
+        Only a successful, non-terminal chunk may wait again: a finished request has
+        nothing left to resume, a chunk that returned no result has not reached a
+        boundary, and a failed chunk is already being cleaned up.
+        """
+        pipeline = self.pipeline
+        if pipeline is None:
+            return
+        wait_hook = step_wait_hook(pipeline)
+        if wait_hook is None:
+            return
+        for request_id in scheduler_output.scheduled_request_ids:
+            state = self.state_cache.get(request_id)
+            if state is None:
+                continue
+            request_output = output.get_request_output(request_id)
+            if (
+                request_output is not None
+                and not request_output.finished
+                and request_output.result is not None
+                and not request_output.result.error
+            ):
+                request_output.wait_for_interaction = wait_hook(state)
 
     def _step_execution_batch(self, states: Sequence[StepRequestState]) -> ExecutionBatch:
         """Describe independent step members before packing model-specific tensors."""

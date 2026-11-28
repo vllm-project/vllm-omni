@@ -782,7 +782,7 @@ def test_hold_idles_at_a_request_boundary_until_a_prompt_update(monkeypatch) -> 
     assert state.extra["taomate_held"] is True
     assert state.step_in_chunk == 3  # no fake step or timestep reset while waiting
     assert pipe.supports_chunk_step_grouping is True
-    assert pipe.ar_diffusion_step_wait(state).timeout_seconds is None
+    assert pipe.step_wait(state).timeout_seconds is None
     with pytest.raises(RuntimeError, match="waiting requests"):
         pipe.denoise_step(None, states=[state])
 
@@ -791,10 +791,25 @@ def test_hold_idles_at_a_request_boundary_until_a_prompt_update(monkeypatch) -> 
 
     monkeypatch.setattr(pipe, "apply_interaction_at_chunk_boundary", apply_prompt, raising=False)
     with pytest.raises(_RequestStartedError):
-        pipe.ar_diffusion_resume_step(state, "interaction")
+        pipe.resume_step(state, "interaction")
     assert state.extra["taomate_held"] is False
     assert state.extra["taomate_prompt_version"] == 2
-    assert pipe.ar_diffusion_step_wait(state) is None
+    assert pipe.step_wait(state) is None
+
+
+def test_deprecated_hook_names_still_reach_the_same_implementation() -> None:
+    """The worker prefers the neutral names; the old ones keep working.
+
+    Compared at class level: each attribute access creates a fresh bound method,
+    so identity holds for the functions, not for the bound views.
+    """
+    from vllm_omni.diffusion.models.taomate_h3.pipeline import TaoMateH3Pipeline
+
+    assert TaoMateH3Pipeline.ar_diffusion_resume_step is TaoMateH3Pipeline.resume_step
+    assert TaoMateH3Pipeline.ar_diffusion_step_wait is TaoMateH3Pipeline.step_wait
+    # The aliases reach the real implementations, not placeholders.
+    assert TaoMateH3Pipeline.ar_diffusion_resume_step.__name__ == "resume_step"
+    assert TaoMateH3Pipeline.ar_diffusion_step_wait.__name__ == "step_wait"
 
 
 def test_hold_never_blocks_the_first_request_or_request_mode(monkeypatch) -> None:
@@ -1458,11 +1473,11 @@ def test_hold_is_released_after_its_time_bound(monkeypatch) -> None:
     pipe._tm_hold_max_seconds = 0.05
     state = _hold_state(chunk_index=_NUM_PHASES, applied_version=1)  # request 1, no new prompt
     pipe.prepare_next_chunk(state)
-    assert pipe.ar_diffusion_step_wait(state).timeout_seconds == 0.05
+    assert pipe.step_wait(state).timeout_seconds == 0.05
     pipe.prepare_next_chunk(state)
     assert state.extra["taomate_held"] is True
     with pytest.raises(_RequestStartedError):
-        pipe.ar_diffusion_resume_step(state, "timeout")
+        pipe.resume_step(state, "timeout")
     assert state.extra["taomate_held"] is False
     assert state.extra["taomate_prompt_version"] == 1
 
@@ -1484,7 +1499,7 @@ def test_hold_bound_can_fall_back_to_a_neutral_prompt(monkeypatch) -> None:
     state = _hold_state(chunk_index=_NUM_PHASES, applied_version=1)
     pipe.prepare_next_chunk(state)
     with pytest.raises(_RequestStartedError):
-        pipe.ar_diffusion_resume_step(state, "timeout")
+        pipe.resume_step(state, "timeout")
     assert calls == ["She listens quietly."]
     assert tuple(state.prompt_embeds.shape) == (6, 8) and state.txt_seq_lens == [6]
     assert int(state.extra["text_tags"][0]) == 0
@@ -1492,7 +1507,7 @@ def test_hold_bound_can_fall_back_to_a_neutral_prompt(monkeypatch) -> None:
     state2 = _hold_state(chunk_index=2 * _NUM_PHASES, applied_version=1)
     pipe.prepare_next_chunk(state2)
     with pytest.raises(_RequestStartedError):
-        pipe.ar_diffusion_resume_step(state2, "timeout")
+        pipe.resume_step(state2, "timeout")
     assert calls == ["She listens quietly."]
 
 

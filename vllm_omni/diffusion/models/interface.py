@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState, StepWait
 
 
 @runtime_checkable
@@ -196,6 +196,67 @@ def supports_step_execution(pipeline: object) -> bool:
     return isinstance(pipeline, SupportsStepExecution) or (
         isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state
     )
+
+
+@runtime_checkable
+class SupportsStepWait(Protocol):
+    """Optional capability: a step pipeline that can suspend and resume itself.
+
+    A pipeline that returns a step boundary it does not want to cross yet -- H3
+    holding at a request boundary until the client chooses the next prompt --
+    declares it here instead of polling inside a step. The scheduler owns the
+    deadline: ``step_wait`` only states whether to suspend and for how long, and
+    the worker re-enters the pipeline through ``resume_step`` once the scheduler
+    decided why (a control arrived, or the deadline expired).
+
+    Optional on purpose: it is read through ``supports_step_wait``, so it does
+    not become part of the required ``SupportsStepExecution`` contract.
+    """
+
+    def step_wait(self, state: StepRequestState) -> StepWait | None:
+        """Return the wait this chunk boundary asks for, or ``None`` to continue."""
+        ...
+
+    def resume_step(self, state: StepRequestState, reason: Literal["interaction", "timeout"]) -> None:
+        """Continue a suspended request with the scheduler's reason for waking it."""
+        ...
+
+
+# One-release compatibility: the AR-Diffusion runner originally spelled these
+# hooks after its own package. Models use the neutral names above; the worker
+# still accepts the old spelling so existing pipelines keep working.
+_STEP_WAIT_ALIASES = {"step_wait": "ar_diffusion_step_wait", "resume_step": "ar_diffusion_resume_step"}
+
+
+def step_wait_hook(pipeline: object) -> Callable[[StepRequestState], StepWait | None] | None:
+    """Return the pipeline's wait hook, preferring the neutral name."""
+
+    hook = getattr(pipeline, "step_wait", None)
+    if callable(hook):
+        return hook
+    legacy = getattr(pipeline, _STEP_WAIT_ALIASES["step_wait"], None)
+    return legacy if callable(legacy) else None
+
+
+def step_resume_hook(pipeline: object) -> Callable[..., None] | None:
+    """Return the pipeline's resume hook, preferring the neutral name.
+
+    The hook takes ``(state, reason)``, where ``reason`` is either
+    ``"interaction"`` or ``"timeout"``, as declared by
+    :class:`SupportsStepWait`.
+    """
+
+    hook = getattr(pipeline, "resume_step", None)
+    if callable(hook):
+        return hook
+    legacy = getattr(pipeline, _STEP_WAIT_ALIASES["resume_step"], None)
+    return legacy if callable(legacy) else None
+
+
+def supports_step_wait(pipeline: object) -> bool:
+    """Return whether the pipeline declares both wait/resume hooks."""
+
+    return step_wait_hook(pipeline) is not None and step_resume_hook(pipeline) is not None
 
 
 # --- Generic role-based component loading for diffusion disaggregation ---------

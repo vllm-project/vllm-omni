@@ -802,25 +802,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             # boundary below is the meaningful one, and syncing per step would
             # cost one synchronize per denoise step instead of per AR block.
             with self._bound_ar_session(session_id, description="stepwise", synchronize=False):
-                resume_reason = scheduler_output.step_resumes.get(request_id)
-                if resume_reason is not None:
-                    resume = getattr(pipeline, "ar_diffusion_resume_step", None)
-                    if not callable(resume):
-                        raise RuntimeError("Pipeline requested a step wait without an AR-Diffusion resume hook")
-                    resume(self.state_cache[request_id], resume_reason)
+                # Wait/resume dispatch belongs to the main worker, which runs it
+                # inside this binding and before batching: the pipeline resumes
+                # with the session already bound, and a resumed request is
+                # batched from the input the resume installed.
                 output = super().execute_stepwise(scheduler_output)
-                wait_hook = getattr(pipeline, "ar_diffusion_step_wait", None)
-                req_output = output.get_request_output(request_id)
-                state = self.state_cache.get(request_id) if callable(wait_hook) else None
-                if (
-                    callable(wait_hook)
-                    and state is not None
-                    and req_output is not None
-                    and not req_output.finished
-                    and req_output.result is not None
-                    and not req_output.result.error
-                ):
-                    req_output.wait_for_interaction = wait_hook(state)
             runner_output = output.get_request_output(request_id)
             finished = bool(runner_output is not None and runner_output.finished)
             result = None if runner_output is None else runner_output.result

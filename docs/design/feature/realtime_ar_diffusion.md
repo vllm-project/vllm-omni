@@ -111,6 +111,34 @@ creation of the same `session_id`, and rejects reset. Only an idempotent close
 retry that succeeds removes the session. Transport disconnect uses the same
 path.
 
+## Suspending at a chunk boundary
+
+A stepwise pipeline may hold a request instead of crossing a chunk boundary. H3
+does this at a request boundary when a client has not yet chosen the next
+prompt; Invoker-Render does it while waiting for enough proxy frames. The
+decision is split so no model steps poll:
+
+- The scheduler owns the deadline. After a clean chunk it latches the
+  pipeline's `StepWait` (`None` waits indefinitely, a value is a bound), wakes
+  the request when a control arrives, and otherwise expires the deadline.
+  `DiffusionSchedulerOutput.step_resumes` carries the reason it chose.
+- The main worker owns the dispatch. `DiffusionModelRunner._dispatch_step_resumes`
+  calls the pipeline's `resume_step` before batching and inside whatever
+  binding the runner wraps around the call (for AR-Diffusion, the bound KV
+  session), so a resumed request is batched from the input the resume
+  installed. `_apply_step_wait` lets a chunk wait again only when it finished
+  cleanly and is not terminal.
+- The pipeline owns only the meaning of continuing. `SupportsStepWait` declares
+  `step_wait` and `resume_step`; the older `ar_diffusion_step_wait` /
+  `ar_diffusion_resume_step` spellings are still accepted for one release.
+
+The dispatch sits in the entry point rather than the stepwise core on purpose.
+A runner that groups chunk steps re-enters the core with a continuation that
+still carries `step_resumes`; dispatching inside the core would replay the wake
+and a pipeline that already cleared its held flag would reject the replay.
+A wake that arrives after its request was released has no cached state and is
+dropped, so a late callback cannot recreate a cancelled request.
+
 ## KV ownership and capacity
 
 The storage boundary `KVCacheLifecycle[OwnerT]` separates finishing a compute
