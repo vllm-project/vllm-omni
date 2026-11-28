@@ -3257,6 +3257,82 @@ class TestDistributedComponentSelection:
             name = f"text_encoder.encoder.block.{index}.weight"
             assert torch.equal(pipeline.text_encoder.encoder.block[index].weight, expected[name]), name
 
+    def test_resident_dit_allocates_staging_beside_an_allgather_encoder(
+        self, tmp_path, patched_offload_runtime, monkeypatch
+    ):
+        """A fully resident DiT still needs the shared staging slots.
+
+        When every DiT block is resident no rank-local hook is installed, but
+        the resident group still loads its host states through the shared
+        staging buffers. Sizing those buffers from the hooks alone left the
+        group indexing an empty list.
+        """
+
+        class Pipeline(_GenericDistributedEncoderPipeline):
+            _offload_plan = dataclasses.replace(
+                _GenericDistributedEncoderPipeline._offload_plan,
+                resident_dit_paths=frozenset({"transformer"}),
+                component_backing={"text_encoder": BackingKind.CHECKPOINT_MMAP},
+            )
+
+        pipeline = Pipeline()
+        pipeline.transformer = _SingleBlockModel(num_blocks=2)
+        expected = {}
+        for name, parameter in pipeline.named_parameters():
+            parameter.data.copy_(torch.arange(parameter.numel(), dtype=torch.float32).view_as(parameter) + 1)
+            expected[name] = parameter.detach().clone()
+        checkpoint_file = tmp_path / "model.safetensors"
+        save_file(expected, str(checkpoint_file))
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+                dlo_resident_layers=2,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=HostWeightPlan(
+                backing_kind="checkpoint_mmap",
+                bindings={
+                    name: TensorBinding(checkpoint_key=name, file_path=str(checkpoint_file)) for name in expected
+                },
+                planned_source_prefixes=frozenset({"transformer.", "text_encoder."}),
+            ),
+        )
+        backend.dp_group = object()
+        full_weights_by_rank_zero_shard = {
+            tuple(parameter.flatten()[: (parameter.numel() + 1) // 2].tolist()): parameter.flatten()
+            for parameter in expected.values()
+            if parameter.numel() > 4
+        }
+
+        def fake_allgather(output, local, group):
+            del group
+            output.copy_(full_weights_by_rank_zero_shard[tuple(local.tolist())])
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        backend.enable(pipeline)
+
+        resident_group = backend._resident_layer_group
+        assert resident_group is not None
+        assert resident_group.rank_local_mmap
+        assert all(buffers for buffers in resident_group._cpu_staging_buffers)
+        # No rank-local streamed hook exists: the resident group is the only
+        # consumer of those slots.
+        assert not [hook for group in backend._all_hook_groups for hook in group if hook.rank_local_mmap]
+
+        # The denoise stage loads the resident blocks through those slots.
+        backend.load_resident_layers()
+        for index in range(2):
+            name = f"transformer.blocks.{index}.weight"
+            torch.testing.assert_close(pipeline.transformer.blocks[index].weight, expected[name])
+
+        backend.disable()
+        for name, parameter in pipeline.named_parameters():
+            torch.testing.assert_close(parameter, expected[name])
+
     def test_explicit_single_block_dit_is_rejected(self, patched_offload_runtime):
         pipeline = nn.Module()
         pipeline.transformer = _SingleBlockModel(num_blocks=1)
