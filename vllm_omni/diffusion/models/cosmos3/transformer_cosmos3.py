@@ -2072,6 +2072,7 @@ class Cosmos3VFMTransformer(nn.Module):
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
         multiview_layout: Any | None = None,
+        final_multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """Run the shared GEN stack, including sequence parallelism and cache-dit wrappers.
 
@@ -2103,10 +2104,14 @@ class Cosmos3VFMTransformer(nn.Module):
             if _pp_parallel_active():
                 own_layers = self.gen_layers[self.start_layer : self.end_layer]
                 own_kv = und_kv[self.start_layer : self.end_layer]
+                first_index = self.start_layer
             else:
                 own_layers = self.gen_layers
                 own_kv = und_kv
-            for layer, (k_und, v_und) in zip(own_layers, own_kv, strict=True):
+                first_index = 0
+            for index, (layer, (k_und, v_und)) in enumerate(zip(own_layers, own_kv, strict=True), start=first_index):
+                if final_multiview_layout is not None and index == len(self.gen_layers) - 1:
+                    layer_kwargs["multiview_layout"] = final_multiview_layout
                 hidden_gen = layer(
                     hidden_gen,
                     k_und=k_und,

@@ -430,6 +430,7 @@ def vllm_flash_attn_varlen_with_lse(
     causal: bool = False,
     deterministic: bool = False,
     fa_version: int | None = None,
+    num_splits: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed vLLM FlashAttention and retain LSE for post-processing."""
 
@@ -452,6 +453,7 @@ def vllm_flash_attn_varlen_with_lse(
         deterministic=deterministic,
         return_softmax_lse=True,
         fa_version=version,
+        num_splits=num_splits,
     )
     return out, lse
 

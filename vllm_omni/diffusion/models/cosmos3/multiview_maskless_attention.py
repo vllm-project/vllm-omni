@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .multiview_flex_attention import MultiviewAttentionContext
+from .multiview_flex_attention import MultiviewAttentionContext, MultiviewLayout
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
@@ -77,7 +77,7 @@ def normalize_varlen_lse(lse: torch.Tensor, tokens: int, query_heads: int) -> to
     return lse.transpose(0, 1).float().contiguous()
 
 
-def _make_vllm_flash_attn_kernel(fa_version: int) -> PassKernel:
+def _make_vllm_flash_attn_kernel(fa_version: int, num_splits: int = 0) -> PassKernel:
     def kernel(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -102,6 +102,7 @@ def _make_vllm_flash_attn_kernel(fa_version: int) -> PassKernel:
             softmax_scale=softmax_scale,
             causal=False,
             fa_version=fa_version,
+            num_splits=num_splits,
         )
         return out, normalize_varlen_lse(lse, q.shape[0], q.shape[1])
 
@@ -140,6 +141,7 @@ def torch_reference_pass_kernel(
 for _version in (2, 3, 4):
     register_pass_kernel(f"fa{_version}", lambda version=_version: _make_vllm_flash_attn_kernel(version))
 register_pass_kernel("torch", lambda: torch_reference_pass_kernel)
+register_pass_kernel("fa3_single_split", lambda: _make_vllm_flash_attn_kernel(3, num_splits=1))
 
 
 @cache
@@ -198,6 +200,37 @@ def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, t
     return _compiled_merge_step
 
 
+def _merge_pass(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q_index: torch.Tensor,
+    identity_q: bool,
+    first_pass: bool,
+    result: torch.Tensor | None = None,
+) -> None:
+    """Fuse one pass's FP32 recurrence and indexed writes, in plan order."""
+    if first_pass:
+        merged, merged_lse = out.float(), lse.float()
+    elif identity_q:
+        merged, merged_lse = merge_step(acc, acc_lse, out, lse)
+    else:
+        merged, merged_lse = merge_step(acc.index_select(0, q_index), acc_lse.index_select(0, q_index), out, lse)
+    if identity_q:
+        acc.copy_(merged)
+        acc_lse.copy_(merged_lse)
+    else:
+        acc.index_copy_(0, q_index, merged)
+        acc_lse.index_copy_(0, q_index, merged_lse)
+    if result is not None:
+        # Partial final passes must preserve rows last touched by earlier passes.
+        result.copy_(acc)
+
+
+_compiled_merge_pass = torch.compile(_merge_pass, fullgraph=True, dynamic=True)
+
+
 def _maskless_attention_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -214,7 +247,7 @@ def _maskless_attention_impl(
         raise ValueError(f"Maskless plan carries {len(plan)} tensors for {num_passes} passes.")
     first_meta = plan[TENSORS_PER_PASS - 1]
     planned_tokens = int(first_meta[META_GEN_TOKENS])
-    if q.shape[1] != planned_tokens or plan[0].numel() != planned_tokens:
+    if q.shape[1] != planned_tokens or plan[0].numel() > planned_tokens:
         raise ValueError(
             "Cosmos3 maskless packed GEN length does not match the request plan: "
             f"attention={q.shape[1]}, plan={planned_tokens}."
@@ -227,6 +260,16 @@ def _maskless_attention_impl(
         raise ValueError("Maskless attention requires an integral GQA ratio.")
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
+    same_view_kernel = get_pass_kernel("fa3_single_split") if kernel_name == "fa3" else kernel
+    fused_merge = kernel_name == "fa3" and q.device.type == "cuda"
+    direct_merge = None
+    if fused_merge:
+        from .multiview_lse_store import direct_store
+
+        direct_merge = direct_store
+    trimmed_queries = plan[0].numel() < planned_tokens
+    if trimmed_queries and not (fused_merge and head_dim == 128 and q.dtype == torch.bfloat16):
+        raise ValueError("Trimmed same-view queries require BF16 FA3 with head_dim=128 on CUDA.")
     merge = _merge_step_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
@@ -250,7 +293,8 @@ def _maskless_attention_impl(
             queries = q[0] if identity_q else q[0].index_select(0, q_index)
             if not identity_k:
                 keys, values = keys.index_select(0, k_index), values.index_select(0, k_index)
-            out, lse = kernel(
+            pass_kernel = same_view_kernel if index == 0 else kernel
+            out, lse = pass_kernel(
                 queries,
                 keys,
                 values,
@@ -267,9 +311,40 @@ def _maskless_attention_impl(
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
             if acc is None:
-                # The same-view pass covers every row and seeds the accumulators.
+                # The same-view pass seeds all live rows.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+                if trimmed_queries:
+                    # Dead terminal control rows need finite seeds for later passes.
+                    acc.zero_()
+                    acc_lse.zero_()
+            assert acc_lse is not None
+            if direct_merge is not None and direct_merge(
+                acc,
+                acc_lse,
+                out,
+                lse,
+                q_index,
+                start=0 if identity_q else -1,
+                seed=index == 0,
+                result=result[0] if index == num_passes - 1 else None,
+            ):
+                del out, lse
+                continue
+            if fused_merge:
+                _compiled_merge_pass(
+                    acc,
+                    acc_lse,
+                    out,
+                    lse,
+                    q_index,
+                    identity_q,
+                    index == 0,
+                    result[0] if index == num_passes - 1 else None,
+                )
+                del out, lse
+                continue
+            if index == 0:
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
                     if identity_q:
@@ -294,9 +369,10 @@ def _maskless_attention_impl(
                         acc_lse.index_copy_(0, gather, merged_lse)
             del out, lse
         assert acc is not None
-        for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
-            chunk = slice(start, start + MERGE_CHUNK_SIZE)
-            result[0, chunk].copy_(acc[chunk])
+        if not fused_merge:
+            for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
+                chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                result[0, chunk].copy_(acc[chunk])
     return result
 
 
@@ -358,6 +434,102 @@ def prepare_maskless_context(
     plan = get_maskless_plan(context, num_und_tokens=num_und_tokens, device=device)
     runtime = MasklessRuntime(plan.flatten(), len(plan.passes), kernel or resolve_maskless_kernel())
     return replace(context, maskless=runtime)
+
+
+def prepare_long_first_same_view_context(
+    context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
+) -> MultiviewAttentionContext:
+    """Schedule longer independent same-view sequences first, preserving KV order."""
+    runtime = context.maskless
+    if runtime is None or runtime.kernel != "fa3" or head_dim != 128 or dtype != torch.bfloat16:
+        return context
+    if runtime.plan[0].device.type != "cuda":
+        return context
+    key = ("same_view_long_first", context.layout, runtime.plan[0].data_ptr())
+    cached = context.mask_cache.get(key)
+    if cached is None:
+        cached = _sort_same_view_sequences(runtime)
+        context.mask_cache[key] = cached
+    return replace(context, maskless=cached)
+
+
+def _sort_same_view_sequences(runtime: MasklessRuntime) -> MasklessRuntime:
+    """Reorder complete descriptors; never reorder a sequence's key/value rows."""
+    q_index, k_index = (tensor.cpu() for tensor in runtime.plan[:2])
+    cu_q, cu_k = (tensor.cpu().tolist() for tensor in runtime.plan[2:4])
+    order = sorted(range(len(cu_k) - 1), key=lambda i: cu_k[i + 1] - cu_k[i], reverse=True)
+    if order == list(range(len(order))):
+        return runtime
+    device = runtime.plan[0].device
+    plan = list(runtime.plan)
+    for slot, indices, offsets, identity_meta in (
+        (0, q_index, cu_q, META_IDENTITY_Q),
+        (1, k_index, cu_k, META_IDENTITY_K),
+    ):
+        selected = torch.cat([indices[offsets[i] : offsets[i + 1]] for i in order])
+        lengths = [offsets[i + 1] - offsets[i] for i in order]
+        plan[slot] = selected.to(device)
+        plan[slot + 2] = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+        if slot == 0:
+            plan[4] = plan[4].clone()
+        plan[4][identity_meta] = int(torch.equal(selected, torch.arange(selected.numel())))
+    return MasklessRuntime(plan, runtime.num_passes, runtime.kernel)
+
+
+def prepare_last_layer_same_view_context(
+    context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
+) -> MultiviewAttentionContext | None:
+    """Omit whole control query tiles only in the terminal GEN layer.
+
+    The 128-row alignment preserves FA3 d128 query MMA positions, including
+    mixed boundary tiles. K/V and subsequent pass ordering stay unchanged.
+    """
+    runtime = context.maskless
+    if runtime is None or runtime.kernel != "fa3" or head_dim != 128 or dtype != torch.bfloat16:
+        return None
+    if runtime.plan[0].device.type != "cuda":
+        return None
+    key = ("last_layer_same_view_trim", context.layout, runtime.plan[0].data_ptr())
+    cached = context.mask_cache.get(key)
+    if cached is None:
+        cached = _trim_same_view_queries(runtime, context.layout)
+        context.mask_cache[key] = cached
+    return replace(context, maskless=cached)
+
+
+def _trim_same_view_queries(runtime: MasklessRuntime, layout: MultiviewLayout) -> MasklessRuntime:
+    """Host planner; its CPU form also validates arbitrary layout geometry."""
+    device = runtime.plan[0].device
+    target = torch.empty(layout.gen_tokens, dtype=torch.bool)
+    start = 0
+    for item in layout.items:
+        target[start : start + item.num_tokens] = not item.is_control
+        start += item.num_tokens
+    q_index = runtime.plan[0].cpu()
+    offsets = runtime.plan[2].cpu().tolist()
+    selected, lengths = [], []
+    for lo, hi in zip(offsets, offsets[1:]):
+        segment = q_index[lo:hi]
+        keep = []
+        for begin in range(0, hi - lo, 128):
+            tile = segment[begin : begin + 128]
+            if target[tile].any():
+                keep.append(tile)
+        # Control-only view: preserve it to keep the varlen KV pairing valid.
+        retained = torch.cat(keep) if keep else segment
+        selected.append(retained)
+        lengths.append(retained.numel())
+    if sum(lengths) == q_index.numel() or max(lengths) <= 64:
+        return runtime
+    plan = list(runtime.plan)
+    selected_index = torch.cat(selected)
+    plan[0] = selected_index.to(device)
+    plan[2] = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    plan[4] = plan[4].clone()
+    plan[4][META_MAX_SEQLEN_Q] = max(lengths)
+    plan[4][META_IDENTITY_Q] = 0
+    cached = MasklessRuntime(plan, runtime.num_passes, runtime.kernel)
+    return cached
 
 
 def maskless_multiview_attention(
