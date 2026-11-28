@@ -39,6 +39,11 @@ from tests.helpers.mark import hardware_test
 if TYPE_CHECKING:
     from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
+skip_pending_natten_build = pytest.mark.skipif(
+    os.getenv("BUILDKITE") == "true" and torch.version.cuda == "13.0" and torch.__version__.startswith("2.14."),
+    reason="NATTEN Hub build for PyTorch 2.14 with CUDA 13.0 is pending at https://github.com/SHI-Labs/NATTEN/issues/356",
+)
+
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 LTX25_OFFICIAL_REVISION = "7954dcb0d986bdc36ef272564a9789ade07fcc65"
 LTX25_OMNI_MODEL_ID = "Lightricks/LTX-2.5-Diffusers"
@@ -938,6 +943,7 @@ def _assert_strict_similarity(
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
+@skip_pending_natten_build
 def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path, task: str) -> None:
     """Compare Omni with official canonical DiffVAE and matching connector weights."""
     artifact_parent = accuracy_artifact_root / "ltx_official"
@@ -1064,6 +1070,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
+@skip_pending_natten_build
 def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
     """Compare raw official Full/SFT and DiffVAE weights with Omni."""
     artifact_parent = accuracy_artifact_root / "ltx_official"
