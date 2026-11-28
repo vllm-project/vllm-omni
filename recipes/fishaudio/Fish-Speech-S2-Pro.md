@@ -46,10 +46,11 @@ model runs out of the box, including in the official Docker image.
 
 #### Kvcache attention fast path
 
-Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
-default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
-`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
-installed.
+CUDA uses the Fish Triton attention kernel for eligible decode batches.
+The standard attention backend handles other layouts. Set
+`VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable the kernel, or set it to
+`required` to raise an error if the kernel cannot load or a decode batch
+cannot use it.
 
 ```bash
 # Verify fast path availability.
@@ -75,7 +76,10 @@ Notes:
 - `--omni` is required.
 - The default deploy config `vllm_omni/deploy/fish_qwen3_omni.yaml` is loaded
   automatically by model registry (HF `model_type=fish_qwen3_omni`).
-
+- Both stages use Model Runner V2. On CUDA the Slow AR stage enables graph capture. Its
+  model state prepares the attention metadata and workspaces for decode. It
+  sends frame windows to the DAC through the native data plane. Prefix caching is disabled because
+  the Slow AR builds its prompt embeddings from the first prompt token.
 
 #### Verification
 
@@ -90,6 +94,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "response_format": "wav"
     }' --output output.wav
 ```
+
 [output.wav](https://github.com/user-attachments/files/27134970/output.wav)
 
 Voice cloning:
@@ -104,10 +109,9 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_text": "Transcript of the reference audio."
     }' --output cloned.wav
 ```
+
 [reference.wav](https://github.com/user-attachments/files/27134971/reference.wav) <br>
 [cloned.wav](https://github.com/user-attachments/files/27134969/cloned.wav)
-
-
 
 #### Notes
 

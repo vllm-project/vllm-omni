@@ -182,6 +182,28 @@ def maybe_attach_fish_kvcache_seq_lens_upper_bound(
     )
 
 
+def attach_fish_kvcache_seq_lens_upper_bound_mrv2(
+    *,
+    model_config: Any,
+    attn_metadata: Any,
+    seq_lens_cpu_upper_bound: torch.Tensor,
+    for_cudagraph_capture: bool = False,
+) -> None:
+    """Model Runner V2 counterpart of :func:`maybe_attach_fish_kvcache_seq_lens_upper_bound`.
+
+    The V2 input batch already carries the CPU upper bound (padded rows are
+    zero); its attention metadata just does not expose it. Non-decode metadata
+    may carry it too: dispatch reads it only when ``max_query_len == 1``.
+    """
+    if not is_fish_kvcache_attn_active_for_model(model_config):
+        return
+    if for_cudagraph_capture:
+        # A captured decode graph replays at any length; take the long path.
+        capture_upper_bound = max(int(model_config.max_model_len), FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN)
+        seq_lens_cpu_upper_bound = torch.full_like(seq_lens_cpu_upper_bound, capture_upper_bound)
+    _attach_seq_lens_cpu_upper_bound(attn_metadata, seq_lens_cpu_upper_bound)
+
+
 def _dispatch_max_seq_len(attn_metadata: Any, active_batch: int, seq_lens: Any) -> int | None:
     max_seq_len = int(attn_metadata.max_seq_len)
     if int(attn_metadata.max_query_len) != 1:
