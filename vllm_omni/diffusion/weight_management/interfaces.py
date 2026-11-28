@@ -43,6 +43,13 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.weight_management.startup import FaultPlan  # type: ignore[attr-defined]
 
 
+class WeightStack(str, enum.Enum):
+    """Weight-management implementation selector (RFC 01 section 1)."""
+
+    LEGACY = "legacy"
+    UNIFIED = "unified"
+
+
 class LoadState(enum.Enum):
     """State of one unified startup transaction (RFC 01 section 4)."""
 
