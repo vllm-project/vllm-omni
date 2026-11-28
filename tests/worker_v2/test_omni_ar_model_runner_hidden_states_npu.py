@@ -4,7 +4,9 @@
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
+
+pytest.importorskip("torch_npu")
+
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 import vllm_omni.worker_v2.omni_ar_model_runner as omni_ar_model_runner
