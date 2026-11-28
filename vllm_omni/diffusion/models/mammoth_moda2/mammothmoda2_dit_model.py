@@ -403,6 +403,7 @@ class AttnProcessor:
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: RotaryEmbedding | None = None,
+        attention_mask_mode: str | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -436,7 +437,14 @@ class AttnProcessor:
         if attention_mask is not None:
             attention_mask = attention_mask.to(torch.bool)
 
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = (
+            AttentionMetadata(
+                attn_mask=attention_mask,
+                extra={"attention_mask_mode": attention_mask_mode} if attention_mask_mode is not None else {},
+            )
+            if attention_mask is not None
+            else None
+        )
         hidden_states = attn.omni_attn(query, key, value, attn_metadata)
 
         if attention_mask is not None:
@@ -568,9 +576,11 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         image_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor | None = None,
+        *,
+        attention_mask_mode: str | None = None,
     ) -> torch.Tensor:
         if self.modulation:
             if temb is None:
@@ -582,6 +592,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                attention_mask_mode=attention_mask_mode,
             )
             hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
@@ -593,6 +604,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                attention_mask_mode=attention_mask_mode,
             )
             hidden_states = hidden_states + self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states))
@@ -843,7 +855,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         img_tokens = self.x_embedder(img_tokens)
 
         img_len = (height // p) * (width // p)
-        img_mask = torch.ones((batch_size, img_len), dtype=torch.bool, device=device)
         l_effective_img_len = [img_len for _ in range(batch_size)]
         img_sizes = [(height, width) for _ in range(batch_size)]
 
@@ -872,7 +883,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             text_hidden_states,
             text_attention_mask,
             img_tokens,
-            img_mask,
             img_len,
             context_rotary_emb,
             noise_rotary_emb,
@@ -881,29 +891,52 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             seq_lengths,
         )
 
+    @staticmethod
+    def _mask_mode_from_lengths(lengths: list[int], width: int) -> str:
+        # ``lengths`` must count the valid entries in each row of a mask ``width``
+        # wide. These host-side counts give the mode without reading the mask
+        # on the device.
+        return "none" if all(length == width for length in lengths) else "padding"
+
     def _apply_refiners(
         self,
         text_hidden_states: torch.Tensor,
         text_attention_mask: torch.Tensor,
         context_rotary_emb: RotaryEmbedding,
         img_tokens: torch.Tensor,
-        img_mask: torch.Tensor,
         noise_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor,
+        *,
+        context_attention_mask_mode: str,
     ):
         # Online-FP8 GEMM kernels do not accept M=0. The default CFG
         # unconditional branch has zero text tokens when no negative prompt
         # embeddings are available, so skip the entire context refiner.
         if text_hidden_states.shape[1] > 0:
             for layer in self.context_refiner:
-                text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+                text_hidden_states = layer(
+                    text_hidden_states,
+                    text_attention_mask,
+                    context_rotary_emb,
+                    attention_mask_mode=context_attention_mask_mode,
+                )
 
+        # Every image in the batch has the same latent size, so the noise
+        # refiner has no padding to mask.
         for layer in self.noise_refiner:
-            img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
+            img_tokens = layer(img_tokens, None, noise_rotary_emb, temb)
 
         return text_hidden_states, img_tokens
 
-    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+    def _apply_transformer_layers(
+        self,
+        hidden_states,
+        attention_mask,
+        rotary_emb,
+        temb,
+        *,
+        attention_mask_mode: str,
+    ):
         # Call blocks with keyword arguments: Cache-DiT's Pattern_3 wrapper
         # re-invokes blocks as block(hidden_states, **kwargs), so the cached
         # and uncached paths share this exact calling convention.
@@ -913,6 +946,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 attention_mask=attention_mask,
                 image_rotary_emb=rotary_emb,
                 temb=temb,
+                attention_mask_mode=attention_mask_mode,
             )
         return hidden_states
 
@@ -941,7 +975,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             text_hidden_states,
             text_attention_mask,
             img_tokens,
-            img_mask,
             img_len,
             context_rotary_emb,
             noise_rotary_emb,
@@ -975,14 +1008,15 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb, min_tokens)
         rotary_emb = _with_packed_rope_table(rotary_emb, min_tokens)
 
+        context_attention_mask_mode = self._mask_mode_from_lengths(encoder_seq_lengths, text_attention_mask.shape[1])
         text_hidden_states, img_tokens = self._apply_refiners(
             text_hidden_states,
             text_attention_mask,
             context_rotary_emb,
             img_tokens,
-            img_mask,
             noise_rotary_emb,
             temb,
+            context_attention_mask_mode=context_attention_mask_mode,
         )
 
         max_seq_len = max(seq_lengths)
@@ -993,7 +1027,14 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
 
-        hidden_states = self._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        attention_mask_mode = self._mask_mode_from_lengths(seq_lengths, max_seq_len)
+        hidden_states = self._apply_transformer_layers(
+            joint_hidden_states,
+            attention_mask,
+            rotary_emb,
+            temb,
+            attention_mask_mode=attention_mask_mode,
+        )
 
         hidden_states = self.norm_out(hidden_states, temb)
 
