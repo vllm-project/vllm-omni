@@ -121,6 +121,8 @@ configuration, defaults, or supported behavior changes. Treat draft invariants
 as review questions, not automatic blockers. In the PR description, summarize
 before/after behavior, the affected documentation (or why it is unchanged),
 and the supporting regression evidence. Report checks not run explicitly.
+See the [worked PR handoff](../../../docs/contributing/ci/pr_merge_loop.md#worked-pr-handoff)
+for an example using the existing Purpose, Test Plan, and Test Result fields.
 
 **Also run the Code-Quality sweep on every PR**, regardless of type or mode: the five diff-scoped checks in [references/code-quality.md](references/code-quality.md) — kwargs fragility, broad-except swallow, `Any`/wrong type hints, hot-path `.clone()`/`deepcopy`, and event-loop blocking — plus the advisory conventions (log level, structured logging, synchronization, cleanup, dependencies, naming) in [checklists.md](references/checklists.md). These count only lines the PR *adds* — the pre-existing backlog across the repo is out of scope.
 

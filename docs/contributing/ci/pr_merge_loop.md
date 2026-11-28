@@ -79,6 +79,27 @@ Keep one record per PR with the fields below. Use timestamps with a timezone; pr
 | --- | --- | --- | --- | --- | --- | --- |
 | PR link / SHA | Current category | Linked facts; clearly marked proposal | Specific gap or none verified | Concrete next step; verified owner or proposed recipient | Timestamp or unknown | Observable change |
 
+### Worked PR handoff
+
+This pilot follows one review finding in [PR #10783](https://github.com/vllm-project/vllm-omni/pull/10783), which changes how `AsyncOmni` restores request admission after sleep. It uses the existing PR description fields and the maintainer record above.
+
+**Author — Purpose.** Cancel a stage-0 AR `sleep()` while it is clearing the frontend multimodal cache, before the sleep RPC. At reviewed revision `d675bb0`, the cleanup decremented the in-flight sleep count and left admission paused. A subsequent `generate()` could stay parked even though the stage never slept. The repair in `06b265d` reopens admission before dispatch when no explicit hold, sleeping tag, or in-flight sleep remains. The owning contract is request admission in the [Entrypoints safe-change guide](https://github.com/vllm-project/vllm-omni/blob/dfd29f8d4e3da2504d15dd49d9120060994856af/docs/design/module/entrypoints.md#safe-change-guide). [Review finding](https://github.com/vllm-project/vllm-omni/pull/10783#pullrequestreview-5990988286) · [Author's repair note](https://github.com/vllm-project/vllm-omni/pull/10783#issuecomment-7054957729)
+
+**Author — Test Plan / Test Result.** The focused CPU regression parks the cache-clear call, cancels sleep, checks that the mocked RPC was never awaited, and calls real `generate()` with a stubbed engine submission. [Regression test](https://github.com/vllm-project/vllm-omni/blob/dfd29f8d4e3da2504d15dd49d9120060994856af/tests/entrypoints/test_async_omni_pause_sleep_routing.py#L580-L617)
+
+```bash
+python -m pytest -q --run-level=core_model -m 'core_model and cpu' \
+  tests/entrypoints/test_async_omni_pause_sleep_routing.py::test_sleep_cancelled_before_rpc_restores_admission_without_explicit_resume
+```
+
+The PR description reports 89 CPU passes on `00afa4c` with vLLM import stubs and mocked RPCs. That run predates the focused test. The repair note names the test without a run result, and the command above was unrun during the pilot. The PR description lists a full suite with native vLLM imports and GPU L2/E2E among the checks unrun locally. [PR test report](https://github.com/vllm-project/vllm-omni/pull/10783)
+
+**Reviewer — Call path at the pinned head.** At `dfd29f8d4e3d`, trace [`sleep()` from cache clear to the conditional reopen in its finalizer](https://github.com/vllm-project/vllm-omni/blob/dfd29f8d4e3da2504d15dd49d9120060994856af/vllm_omni/entrypoints/async_omni.py#L1457-L1527). Then follow the consumer of that state, [`generate()` waiting on the admission predicate](https://github.com/vllm-project/vllm-omni/blob/dfd29f8d4e3da2504d15dd49d9120060994856af/vllm_omni/entrypoints/async_omni.py#L227-L236), called in production by [chat serving](https://github.com/vllm-project/vllm-omni/blob/dfd29f8d4e3da2504d15dd49d9120060994856af/vllm_omni/entrypoints/openai/serving_chat.py#L1046). Check that the test reaches engine submission without a resume call. This establishes the source path and the test's assertion. A runtime pass still needs a result tied to the tested revision.
+
+**Merge maintainer — Evidence at the same head.** On 2026-11-22, GitHub showed successful DCO, pre-commit, and build checks for `dfd29f8d4e3d`. The pilot found neither a CUDA L2 result nor an approval for that head. Record the focused CPU result as unverified for this revision. The maintainer checks CI admission and merge eligibility under the existing [CI ladder](#ci-ladder-cuda-merge-gate). Recheck when the head, validation evidence, or review status changes. [Pinned commit status](https://github.com/vllm-project/vllm-omni/commit/dfd29f8d4e3da2504d15dd49d9120060994856af/checks)
+
+The pilot exposed a mismatch between the revision in the PR description and the revision containing the test requested in review. Keep the command, result, SHA, and backend together in **Test Result**, and link that entry from the review and maintainer record. A reply that adds a test can link to that entry once there is a run to report.
+
 ### Actionable review TODOs
 
 Present actionable findings in every PR review as a TODO checklist, including
