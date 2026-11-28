@@ -71,6 +71,19 @@ def test_a_genuinely_restarted_producer_is_still_picked_up() -> None:
     assert _sliced_len(session, 5000) == 2000
 
 
+def test_a_restarted_waveform_can_grow_across_turns() -> None:
+    session = _session()
+    session.slice_cumulative_audio(REQUEST_ID, _snapshot(8), turn_id=0)
+    session.slice_cumulative_audio(REQUEST_ID, _snapshot(1), turn_id=0)
+    waveform = _snapshot(12)
+    first = session.slice_cumulative_audio(REQUEST_ID, waveform[:4], turn_id=1)
+    assert session.slice_cumulative_audio(REQUEST_ID, waveform[:4], turn_id=1) is None
+    placeholder = session.slice_cumulative_audio(REQUEST_ID, _snapshot(1), turn_id=2)
+    np.testing.assert_array_equal(placeholder, _snapshot(1))
+    tail = session.slice_cumulative_audio(REQUEST_ID, waveform, turn_id=2)
+    np.testing.assert_array_equal(np.concatenate([first, tail]), waveform)
+
+
 def test_close_stream_releases_the_cursor_for_the_next_stream() -> None:
     session = _session()
     assert _sliced_len(session, 48000) == 48000

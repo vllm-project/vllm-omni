@@ -68,7 +68,8 @@ def test_cancelled_turn_audio_is_consumed_before_the_next_turn_is_encoded():
     assert encoded == [[1, 1], [3, 3], [4, 4]]
 
 
-def test_late_audio_cannot_establish_or_replace_a_new_turns_restart_candidate():
+@pytest.mark.parametrize("second_end", [6, 8, 10], ids=["below_old_cursor", "at_old_cursor", "past_old_cursor"])
+def test_late_audio_cannot_establish_or_replace_a_new_turns_restart_candidate(second_end):
     encoded = []
 
     def encode(audio, *_args):
@@ -83,13 +84,13 @@ def test_late_audio_cannot_establish_or_replace_a_new_turns_restart_candidate():
     context = DuplexDataPlaneContext(auto_responds=True, turn_id=1, active_response_id="new", active_response_turn_id=1)
     current = _boundary(0, cache_epoch=1)
     current.multimodal_output["meta.duplex_turn_id"] = 1
-    waveform = np.arange(2, 10, dtype=np.float32)
-    for stale_len, new_len in ((2, 4), (1, 6), (8, 8)):
+    waveform = np.arange(1, 13, dtype=np.float32)
+    for stale_len, new_len in ((2, 4), (1, second_end), (16, 12)):
         old.multimodal_output["audio"] = np.zeros(stale_len)
         assert list(plane.project_output(old, context=context)) == []
         current.multimodal_output["audio"] = waveform[:new_len]
         assert list(plane.project_output(current, context=context))
-    assert encoded[1:] == [[2, 3, 4, 5], [6, 7], [8, 9]]
+    assert encoded[1:] == [waveform[:4].tolist(), waveform[4:second_end].tolist(), waveform[second_end:].tolist()]
 
 
 @pytest.mark.parametrize(

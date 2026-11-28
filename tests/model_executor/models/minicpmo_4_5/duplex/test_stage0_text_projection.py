@@ -316,6 +316,7 @@ def test_thinker_only_without_a_tokenizer_fails_without_leaking_latent_or_text()
     session, encoded = _session(tokenizer=None)
     results = _project(session, _snapshot([SPEAK, A, CHUNK_EOS], "一", stop=True))
     assert [result.get("error_code") for result in results] == ["runtime_data_plane_missing_tokenizer"]
+    assert "model_turn_id" not in results[0]
     assert _texts(results) == ""
     assert encoded == []
 
@@ -402,6 +403,7 @@ def test_stop_string_without_a_unit_terminator_fails_instead_of_completing() -> 
     assert _texts(results) == "一二"
     assert not any(r.get("end_of_turn") or r.get("segment_complete") for r in results)
     assert results[-1]["error_code"] == "runtime_data_plane_unterminated_unit"
+    assert results[-1]["model_turn_id"] == 2
     assert _project(session, output, active_response_id="resp", turn_id=2) == []
 
 

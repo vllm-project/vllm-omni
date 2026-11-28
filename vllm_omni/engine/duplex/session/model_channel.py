@@ -1047,15 +1047,18 @@ class ModelChannel:
                         session.bind_response_turn(session.turn_id)
                 continue
             interrupted = run.interrupted_through_turn
-            if "error_code" not in model_result and (
-                run.interruption_pending
-                or (
-                    interrupted is not None
-                    and interrupted[0] == session.epoch
-                    and result_turn is not None
-                    and result_turn <= interrupted[1]
+            stale_turn = (
+                interrupted is not None
+                and interrupted[0] == session.epoch
+                and (
+                    (result_turn is not None and result_turn <= interrupted[1])
+                    or (model_turn_id is not None and model_turn_id <= interrupted[1])
                 )
-            ):
+            )
+            # A cancelled unit can hit its length cap after the next response
+            # has been reserved. Request-wide errors still need reporting.
+            request_error = "error_code" in model_result and result_turn is None
+            if (run.interruption_pending or stale_turn) and not request_error:
                 continue
             close_reason_for_result, did_emit = await self._send_one_model_output_event(
                 model_result,

@@ -484,15 +484,9 @@ class DuplexSessionRunner:
             return True
         decision: DuplexOutputDecision | None = None
         project = False
-        if (
-            stage_id == 0
-            and context.segment_finished
-            and context.model_turn_id is not None
-            and context.identity.fence.epoch == self.session.epoch
-            and request_id == self.manager.stage_request_id(context.identity.fence, stage_id=0)
-        ):
-            self._resident_stage0_segments += 1
-            self._last_stage0_turn = context.model_turn_id
+        if stage_id == 0 and context.final_stage_id > 0:
+            # An intermediate Thinker result can go straight to the Talker.
+            self._note_resident_stage0_end(request_id, context)
         if stage_id < context.final_stage_id or (stage_id == 0 and self.run.interruption_pending):
             decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
@@ -549,6 +543,15 @@ class DuplexSessionRunner:
             self._mailbox.put_nowait(progress)
         # Projection-only must still forward to the next stage (return False).
         return consume
+
+    def _note_resident_stage0_end(self, request_id: str, context: DuplexOutputContext) -> None:
+        if (
+            context.segment_finished
+            and context.identity.fence.epoch == self.session.epoch
+            and request_id == self.manager.stage_request_id(context.identity.fence, stage_id=0)
+        ):
+            self._resident_stage0_segments += 1
+            self._last_stage0_turn = context.model_turn_id
 
     # ------------------------------------------------------------------ #
     # Input clock (``extra_body.clock == "input"``)                       #
@@ -1023,6 +1026,9 @@ class DuplexSessionRunner:
     async def _handle_item(self, item: DuplexCommand | StageOutput | StageProgress | _RefusedInput | _Internal) -> None:
         session = self.session
         if isinstance(item, StageOutput):
+            if item.stage_id == item.context.final_stage_id == 0:
+                # A final Thinker result still awaits delivery behind any earlier clear.
+                self._note_resident_stage0_end(item.request_id, item.context)
             if self.model.is_input_transcription(item.request_id) and not await self._wait_for_append_tail():
                 await self.model.finish_input_transcription(item, abandon=True)
                 return
@@ -2948,13 +2954,18 @@ class DuplexSessionRunner:
             or self.model_state.committed_audio_payload is not None
         ):
             return False
+        # A failed text reply releases its request binding without advancing
+        # the model turn. Stage 0 is its final stage, so check for queued input.
+        all_inputs_finished_stage0 = self._resident_stage0_segments == session.input_seq
+        if not session.capabilities.emits_audio and session.active_request_id is None:
+            return all_inputs_finished_stage0
         # One completed turn can account for a single append. With pipelined
         # input, its TTS terminal can precede the next input's first PCM.
         # All accepted units must have left Stage 0 on already closed turns.
         return session.turn_id > 0 and (
             session.input_seq == 1
             or (
-                self._resident_stage0_segments == session.input_seq
+                all_inputs_finished_stage0
                 and self._last_stage0_turn is not None
                 and self._last_stage0_turn < session.turn_id
             )
@@ -2979,7 +2990,12 @@ class DuplexSessionRunner:
         self.model_state.clear_continuation()
         self._deferred_silence = None
         self.memory.cancel_interaction()
-        await self._cancel_active_response(self.tasks.active_response_task, reason=reason, preserve_request=True)
+        cancelled = await self._cancel_active_response(
+            self.tasks.active_response_task, reason=reason, preserve_request=True
+        )
+        if not cancelled and reason == "output_audio_buffer_clear":
+            # Input can still be in flight after the failed response released its binding.
+            self._emit_events([OutputAudioCleared(response_id=session.last_response_id)])
         # Already accepted units finish before this control, and subsequent
         # client input follows it. Cancelling their submit tasks would
         # compensate by aborting the resident KV.

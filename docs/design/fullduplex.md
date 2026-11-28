@@ -1037,11 +1037,14 @@ for queue updates and the final validity check before delivery.
   replayed. Buffered and already submitted input remains owned by that stream.
   Output is suppressed until Stage 0 confirms the control; that boundary
   advances the bridge's model turn, and later output from the cancelled turns
-  stays suppressed. Late cumulative PCM advances the cursor only while it still
-  belongs to the same waveform. Once a new turn confirms a restarted waveform,
-  older turns can no longer advance its cursor. The next Talker
-  handoff starts its normal new-turn state. The session advances its output
-  turn without invalidating input reservations already inside `submit`.
+  stays suppressed, including a Thinker length error from a cancelled unit.
+  Late cumulative PCM advances the cursor only while it still belongs to the
+  same waveform. When a restarted waveform grows past its first real prefix,
+  delivery resumes at the end of that prefix even if the new snapshot has
+  reached the old waveform's length. Older turns can no longer advance its
+  cursor. The next Talker handoff starts its normal new-turn state. The
+  session advances its output turn without invalidating input reservations
+  already inside `submit`.
   Repeated interruptions retain their order relative to intervening inputs;
   output stays suppressed until all queued controls finish. An unforced text
   append or explicit audio commit can reserve a cancellable response during

@@ -23,6 +23,7 @@ from tests.engine.duplex.test_session_runner_minicpmo_thinker_only import (
     SPEAK,
     TURN_EOS,
     A,
+    B,
     _stage0,
     _thinker_only_plugin,
 )
@@ -74,6 +75,13 @@ async def h(request):
 def _control(request_id, tokens=(LISTEN,)):
     output = _stage0(request_id, list(tokens), "", stop=True)
     output.multimodal_output[INTERRUPTION_KEY] = True
+    return output
+
+
+def _capped_reply(request_id):
+    output = _stage0(request_id, [SPEAK, A, B, TURN_EOS], "嗯，好的", stop=True)
+    output.outputs[0].finish_reason = "length"
+    output.outputs[0].stop_reason = None
     return output
 
 
@@ -228,6 +236,32 @@ async def test_control_uses_producer_turn_when_snapshot_includes_cancelled_units
     assert not h.runner.run.interruption_pending
 
 
+@pytest.mark.parametrize("h", [{"thinker_only": True, "stages": 1}], indirect=True)
+async def test_cancelled_thinker_length_stop_preserves_the_followup(h):
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    await h.deliver_and_settle(_stage0(request_id, [SPEAK, A], "嗯，", stop=False), stage_id=0, model_turn_id=0)
+    cancelled = find(await h.run(commands.CancelResponse()), "response.done")
+    assert cancelled.status == "cancelled"
+    new_id = find(await h.run(commands.AppendText(text="New question")), "response.created").response_id
+    assert new_id != cancelled.response_id
+
+    capped = _capped_reply(request_id)
+    late = await h.deliver_and_settle(capped, stage_id=0, segment_finished=True, model_turn_id=0)
+    assert not {"error", "response.done", "response.output_text.delta"}.intersection(types(late))
+    assert h.session.active_response_id == new_id
+
+    tokens = [*capped.outputs[0].token_ids, LISTEN]
+    await h.deliver_and_settle(_control(request_id, tokens), stage_id=0, segment_finished=True, model_turn_id=0)
+    assert not h.runner.run.interruption_pending
+    reply = _stage0(request_id, [*tokens, SPEAK, B, TURN_EOS, CHUNK_EOS], "好的", stop=True)
+    events = await h.deliver_and_settle(reply, stage_id=0, segment_finished=True, model_turn_id=1)
+    delta = find(events, "response.output_text.delta")
+    done = find(events, "response.done")
+    assert delta.response_id == done.response_id == new_id
+    assert delta.delta == "好的" and done.status == "completed"
+
+
 @pytest.mark.asyncio
 async def test_overlap_barge_in_queues_control_before_user_audio(h):
     await h.run(commands.UpdateSession(patch={"overlap_policy": "barge_in_on_speech", "overlap_short_ack_ms": 0}))
@@ -378,6 +412,34 @@ async def test_repeated_clear_after_a_drained_reply_without_pcm(h):
         assert types(cleared) == ["output_audio_buffer.cleared"] and cleared[0].response_id == response_id
         assert not h.runner.run.interruption_pending
         assert h.session.turn_id == turn_id
+        assert len(h.port.submissions) == submissions
+
+
+@pytest.mark.parametrize("h", [{"thinker_only": True, "stages": 1}], indirect=True)
+@pytest.mark.parametrize("next_input", ["none", "submitted", "output_queued"])
+async def test_clear_after_failed_thinker_reply(h, next_input):
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    await h.deliver_and_settle(_stage0(request_id, [SPEAK, A], "嗯，", stop=False), stage_id=0, model_turn_id=0)
+    if next_input != "none":
+        await h.run(append_audio())
+    events = await h.deliver_and_settle(_capped_reply(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+    failed = find(events, "response.done")
+    assert failed.status == "failed"
+    submissions = len(h.port.submissions)
+    h.submit(commands.ClearOutputAudio())
+    if next_input == "output_queued":
+        # Stage 0 has produced the next input's output, but the session
+        # mailbox must process the client's clear before delivering it.
+        tokens = [SPEAK, A, B, TURN_EOS, SPEAK, B, TURN_EOS, CHUNK_EOS]
+        h.deliver(_stage0(request_id, tokens, "好的", stop=True), stage_id=0, segment_finished=True, model_turn_id=0)
+    events = await h.settle()
+    assert types(events) == ["output_audio_buffer.cleared"] and events[0].response_id == failed.response_id
+    assert h.runner.run.interruption_pending is (next_input != "none")
+    assert len(h.port.submissions) == submissions + int(next_input != "none")
+    if next_input == "none":
+        events = await h.run(commands.ClearOutputAudio())
+        assert types(events) == ["output_audio_buffer.cleared"] and events[0].response_id == failed.response_id
         assert len(h.port.submissions) == submissions
 
 

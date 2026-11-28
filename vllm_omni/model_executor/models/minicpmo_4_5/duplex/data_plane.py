@@ -56,9 +56,8 @@ class _RequestState:
     audio_offset: int = 0
     #: Earliest producer turn that can still advance the cursor after a confirmed restart.
     audio_buffer_start_turn: int | None = None
-    #: A snapshot below ``audio_offset`` that has not been accepted as a restart
-    #: yet. See :meth:`advance_audio_cursor`.
-    audio_restart_candidate: int | None = None
+    #: Producer turn and emitted prefix length of a possible restarted waveform.
+    audio_restart_candidate: tuple[int | None, int] | None = None
     uses_segment_text_metadata: bool = False
     terminal: bool = False
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
@@ -82,18 +81,23 @@ class _RequestState:
     def advance_audio_cursor(self, num_samples: int, turn_id: int | None) -> int:
         """Consume a cumulative snapshot and return the start of its new samples."""
         previous = self.audio_offset
+        candidate = self.audio_restart_candidate
+        if candidate is not None:
+            prefix_turn, emitted = candidate
+            # Growth from a real prefix confirms a restart even if this
+            # snapshot has already caught up with the old waveform. A lone
+            # continuation placeholder can also precede the old waveform.
+            if num_samples > emitted and (emitted > 1 or (prefix_turn == turn_id and num_samples < previous)):
+                previous = emitted
+                self.audio_buffer_start_turn = prefix_turn if prefix_turn is not None else turn_id
+            elif num_samples == emitted and emitted > 1:
+                return emitted
         if num_samples < previous:
-            # A short snapshot may be a continuation placeholder. Only rewind
-            # the cursor once a live below-cursor snapshot grows from it.
-            # Delayed old snapshots alone cannot rewind already delivered PCM.
-            candidate = self.audio_restart_candidate
-            self.audio_restart_candidate = num_samples
-            if candidate is None or num_samples <= candidate:
-                return 0
-            previous = candidate
-            self.audio_buffer_start_turn = turn_id
-        elif num_samples > previous:
-            self.audio_restart_candidate = None
+            # A continuation placeholder does not replace an emitted prefix.
+            if num_samples > 1 or candidate is None:
+                self.audio_restart_candidate = (turn_id, num_samples)
+            return 0
+        self.audio_restart_candidate = None
         self.audio_offset = num_samples
         return previous
 
@@ -730,6 +734,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             unit_start = len(new_token_ids)
             yield make_result(
                 error_code="runtime_data_plane_unterminated_unit",
+                model_turn_id=turn_id,
                 error=(
                     "MiniCPM-o Stage0 stopped without a unit terminator "
                     f"(finish_reason={getattr(completion, 'finish_reason', None)!r})."
