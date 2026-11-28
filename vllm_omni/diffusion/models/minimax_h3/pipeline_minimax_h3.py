@@ -803,6 +803,12 @@ class MiniMaxH3Pipeline(
         lora_path: str | Path,
         dtype: torch.dtype,
     ) -> tuple[LoRAModel, PEFTHelper] | None:
+        if getattr(self, "_transformer_checkpoint", None) is not None:
+            raise OmniClientError("transformer_checkpoint contains merged adapters; remove runtime LoRA options")
+        if getattr(getattr(self, "transformer", None), "_serialized_mxfp4", False):
+            raise OmniClientError("MiniMax-H3 serialized MXFP4 requires LoRA to be merged before quantization export")
+        if getattr(getattr(self, "transformer", None), "_fake_mxfp4", False):
+            raise OmniClientError("MiniMax-H3 fake quantization requires LoRA to be merged before loading")
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
@@ -1255,6 +1261,21 @@ class MiniMaxH3Pipeline(
         if partition != expected_partition:
             raise ValueError(f"invalid MiniMax-H3 {expected_partition} partition at {model_path}")
 
+        from .qat import resolve_h3_transformer_checkpoint, resolve_h3_transformer_quant_config
+
+        tf_config = od_config.tf_model_config
+        self._transformer_checkpoint = resolve_h3_transformer_checkpoint(
+            additional_config.get("transformer_checkpoint"),
+            partition=self.partition,
+            modular=modular,
+            runtime_lora=bool(od_config.lora_path),
+            base_config=tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config),
+        )
+        if self._transformer_checkpoint is not None:
+            if control_path:
+                raise ValueError("transformer_checkpoint does not support H3 control adapters")
+            release = self._transformer_checkpoint.release
+
         supported_tasks = {str(task).lower() for task in release.get("tasks", [])}
         if not supported_tasks:
             supported_tasks = {"ref2va"} if partition == "ref2va" else {"t2va", "fl2va"}
@@ -1289,11 +1310,16 @@ class MiniMaxH3Pipeline(
             else model_path
         )
         transformer_component = self._fasth3_checkpoint.transformer_component if modular else "transformer"
+        transformer_path = (
+            self._transformer_checkpoint.path
+            if self._transformer_checkpoint is not None
+            else model_path / transformer_component
+        )
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(model_path),
-                subfolder=transformer_component,
-                revision=od_config.revision,
+                model_or_path=str(transformer_path if self._transformer_checkpoint is not None else model_path),
+                subfolder=None if self._transformer_checkpoint is not None else transformer_component,
+                revision=None if self._transformer_checkpoint is not None else od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=False,
             )
@@ -1324,6 +1350,16 @@ class MiniMaxH3Pipeline(
         transformer_quant_config = _resolve_component_quant_config(
             od_config.quantization_config,
             "transformer",
+        )
+        transformer_config_path = transformer_path / "config.json"
+        transformer_disk_config = (
+            json.loads(transformer_config_path.read_text()) if transformer_config_path.is_file() else {}
+        )
+        transformer_quant_config = resolve_h3_transformer_quant_config(
+            transformer_quant_config,
+            transformer_disk_config.get("quantization_config"),
+            diffusers_weights=modular,
+            runtime_lora=bool(od_config.lora_path),
         )
         from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
 
@@ -1358,6 +1394,9 @@ class MiniMaxH3Pipeline(
             od_config,
             quant_config=transformer_quant_config,
             diffusers_weights=modular,
+        )
+        self.transformer._fake_mxfp4 = (
+            transformer_quant_config is not None and transformer_quant_config.get_name() == "mxfp4_fake"
         )
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint

@@ -185,6 +185,28 @@ resolved through `quantization_config`; runtime attention/KV-cache quantization
 is configured by the diffusion attention configuration and must be validated
 independently.
 
+MiniMax-H3's initial serialized MXFP4 integration consumes native H3 tensor
+names with the shared single-scale or DualScale storage layouts. It resolves
+the transformer's disk metadata before construction, preserves fine/coarse
+scale alignment through QKV permutation and gate/up sharding, and rejects
+missing required tensors. Runtime LoRA and Diffusers-named serialized MX
+artifacts are rejected by this initial path. Floating SLA projections remain
+model-owned parameters; four-step schedule metadata remains release-owned.
+See the [H3 QAT/SLA design](minimax_h3_qat_sla.md) for composition and validation.
+
+The explicit NPU `mxfp4` recipe `mxfp4_c7` encodes floating weights and
+activations into native E2M1/E8M0 operands. It preserves C7 input-dtype
+arithmetic, requires local K divisible by 64, and currently requires DLO to
+be disabled. Default OCP/UOS behavior is unchanged.
+
+The opt-in `mxfp4_fake` method provides explicit E2M1-reference and supplied C7 QDQ recipes through
+ordinary floating weight storage and GEMM. It reuses vLLM linear weight loading,
+applies weight fake quantization after loading and activation fake quantization
+on each call. It requires no serialized scales and is not native W4A4 execution
+or full training/runtime C7 parity. H3 requires adapters to be merged first and keeps SLA
+projections outside this route. See the
+[reference configuration](../../user_guide/quantization/mxfp4.md#explicit-fake-quantization-reference).
+
 ## Platform and parallelism boundaries
 
 Platform checks belong in the method implementation rather than in the common

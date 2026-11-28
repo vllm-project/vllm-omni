@@ -160,6 +160,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
         require_smooth_scale: bool = False,
         w4a8_fallback_layers: list[str] | None = None,
         mxfp4_scale_alg: int = 0,
+        mxfp4_recipe: str = "default",
     ) -> None:
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
@@ -174,6 +175,16 @@ class DiffusionMXFP4Config(QuantizationConfig):
         if type(mxfp4_scale_alg) is not int or mxfp4_scale_alg not in (0, 2):
             raise ValueError("mxfp4_scale_alg must be 0 (OCP MX) or 2 (UOS with dst_type_max=7.25).")
         self.mxfp4_scale_alg = mxfp4_scale_alg
+        if mxfp4_recipe not in {"default", "mxfp4_c7"}:
+            raise ValueError("mxfp4_recipe must be default or mxfp4_c7")
+        if mxfp4_recipe == "mxfp4_c7" and (
+            is_checkpoint_mxfp4_serialized
+            or mxfp4_scale_alg != 0
+            or self.w4a8_fallback_steps
+            or self.w4a8_fallback_layers
+        ):
+            raise ValueError("native C7 requires floating weights, no scale-alg override and no W4A8 fallback")
+        self.mxfp4_recipe = mxfp4_recipe
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -208,6 +219,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
             w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
             require_smooth_scale=config.get("require_smooth_scale", False),
             mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
+            mxfp4_recipe=config.get("mxfp4_recipe", "default"),
         )
 
     _XPU_OFFLINE_UNSUPPORTED = (
@@ -228,6 +240,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            if self.mxfp4_recipe == "mxfp4_c7" and not current_omni_platform.is_npu():
+                raise NotImplementedError("native C7 execution requires Ascend NPU")
             if current_omni_platform.is_npu():
                 if self.is_checkpoint_mxfp4_serialized:
                     return NPUMxfp4LinearMethod(self, prefix=prefix)
@@ -267,9 +281,15 @@ class DiffusionMXFP4Config(QuantizationConfig):
 # ---------------------------------------------------------------------------
 
 
-def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int, recipe: str = "default") -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize weight or activation using the same explicit FP4 algorithm."""
     import torch_npu
+
+    if recipe == "mxfp4_c7":
+        from vllm_omni.quantization.mxfp4_c7 import pack_mxfp4_c7
+
+        packed, scales = pack_mxfp4_c7(x)
+        return packed, scales.reshape(*scales.shape[:-1], -1, 2).contiguous()
 
     # Universal Optimal Scaling (Qmax=7.25), MXAttention Section 4.1:
     # https://arxiv.org/abs/2607.24377
@@ -457,7 +477,7 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         return super()._apply_inner(layer, x, bias, ori_dtype)
 
     def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return _npu_quantize_mxfp4(x, self.quant_config.mxfp4_scale_alg)
+        return _npu_quantize_mxfp4(x, self.quant_config.mxfp4_scale_alg, self.quant_config.mxfp4_recipe)
 
     def _quant_matmul(
         self,
@@ -474,7 +494,7 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         # FP4 differences vs FP8:
         #   weight (N,K) transposed inline → (K,N); scale (N,S/2,2) transposed inline → (S/2,N,2).
         #   x1_dtype / x2_dtype required — FP4 dtype not inferred from tensor dtype.
-        return torch_npu.npu_quant_matmul(
+        output = torch_npu.npu_quant_matmul(
             x_q,
             layer.weight.transpose(0, 1),  # (K, N) inline
             layer.weight_scale.transpose(0, 1),  # (S/2, N, 2) inline
@@ -487,6 +507,10 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
             output_dtype=ori_dtype,
             group_sizes=[1, 1, 32],
         )
+
+        if self.quant_config.mxfp4_recipe == "mxfp4_c7":
+            logger.info_once("Executed native C7 MXFP4 W4A4 npu_quant_matmul; packed FP4 operands, E8M0 scales")
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +546,7 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
 
         # Prepare once; offline checkpoints keep their existing weight algorithm.
         weight_fp4, weight_scale_raw = _npu_quantize_mxfp4(
-            cast(torch.Tensor, layer.weight), self.quant_config.mxfp4_scale_alg
+            cast(torch.Tensor, layer.weight), self.quant_config.mxfp4_scale_alg, self.quant_config.mxfp4_recipe
         )
 
         # Weight stays (N, K) — no pre-transpose for FP4 packed format.
