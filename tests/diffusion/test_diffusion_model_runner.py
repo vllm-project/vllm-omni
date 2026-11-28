@@ -1361,6 +1361,33 @@ def test_execute_model_batch_uses_runner_output_helper(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("release_cache", [False, True])
+def test_execute_model_releases_requested_cache_before_stage_handoff(monkeypatch, release_cache):
+    calls = []
+    platform = _fake_platform_for_peak_memory()
+    platform.empty_cache = lambda: calls.append("release")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", platform)
+    output = DiffusionOutput(
+        output={"payload": torch.ones(1)},
+        to_cpu=True,
+        release_cache_before_transport=release_cache,
+    )
+    runner = _make_batch_runner(_BatchPipeline(outputs=[output]))
+
+    def send_stage_payload(_, outputs):
+        assert len(outputs) == 1 and outputs[0] is output
+        assert outputs[0].output["payload"].device.type == "cpu"
+        calls.append("send")
+
+    monkeypatch.setattr(runner, "_maybe_send_stage_payload", send_stage_payload)
+    DiffusionModelRunner.execute_model_batch(runner, _make_scheduler_output(num_reqs=1), runner.od_config)
+
+    assert calls == (["release", "send"] if release_cache else ["send"])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_execute_model_batch_prepares_typed_media_before_return(monkeypatch):
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())

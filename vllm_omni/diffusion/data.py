@@ -2191,6 +2191,9 @@ class DiffusionOutput:
     # Host-side playback diagnostics; carried through the existing output metadata.
     streaming_metrics: dict[str, float | int] = field(default_factory=dict)
 
+    # Release idle device allocations on the producer before handing off this output.
+    release_cache_before_transport: bool = False
+
     # In-process ownership only; never part of the pipeline constructor contract.
     _ready_event: torch.Event | None = field(default=None, init=False, repr=False, compare=False)
     _ready_tensors: tuple[torch.Tensor, ...] = field(default=(), init=False, repr=False, compare=False)
