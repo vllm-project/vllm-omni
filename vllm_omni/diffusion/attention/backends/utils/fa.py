@@ -729,6 +729,31 @@ def _upad_input(
     )
 
 
+def _unpad_qkv_input(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    is_cross_attn: bool = False,
+):
+    """Unpad masked K/V, retaining all queries for cross-attention or unequal Q/K lengths."""
+    batch_size, q_len = query.shape[:2]
+    if not is_cross_attn and q_len == key.size(1):
+        return _upad_input(query, key, value, attention_mask, q_len, _unpad_input)
+
+    # AllGather's local queries need not be a suffix of the global keys.
+    # The mask covers keys only; keep every query row.
+    # Static caches can contain unused slots beyond the key mask.
+    if key.size(1) > (mask_len := attention_mask.shape[-1]):
+        key, value = key[:, :mask_len], value[:, :mask_len]
+    k, indices_k, cu_k, max_k, _ = _unpad_input(key, attention_mask)
+    v = _index_first_axis(value, indices_k)
+    q = query.flatten(0, 1)
+    cu_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=query.device)
+    return q, k, v, None, (cu_q, cu_k), (q_len, max_k)
+
+
 def _is_packed_sequence(position_ids, batch_size):
     """
     Check the position ids whether packed sequences are indicated or not

@@ -543,10 +543,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
-            _index_first_axis,
             _pad_input,
-            _unpad_input,
-            _upad_input,
+            _unpad_qkv_input,
             flash_attn_varlen_func,
             vllm_varlen_version_kwargs,
         )
@@ -555,20 +553,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             raise ImportError("Masked variable-length attention requires flash_attn_varlen_func")
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         batch_size, query_length = query.shape[:2]
-        if not self.is_cross_attn and query_length == key.size(1):
-            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-                query, key, value, attention_mask, query_length, _unpad_input
-            )
-        else:
-            # Cross-attention: the mask covers keys only, so keep every query row.
-            k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
-            v = _index_first_axis(value, indices_k)
-            q = query.flatten(0, 1)
-            cu_seq_lens_q = torch.arange(
-                0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
-            )
-            max_length_q = query_length
-            indices_q = None
+        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _unpad_qkv_input(
+            query, key, value, attention_mask, is_cross_attn=self.is_cross_attn
+        )
 
         out_unpad = flash_attn_varlen_func(
             q,

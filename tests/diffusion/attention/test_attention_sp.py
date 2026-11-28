@@ -209,6 +209,66 @@ class _MockAllGatherSPGroup:
         return torch.cat(chunks, dim=dim)
 
 
+def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
+    from vllm_omni.diffusion.attention.backends import flash_attn_hub
+
+    init_distributed_environment(world_size=2, rank=rank, distributed_init_method=init_method)
+    try:
+        initialize_model_parallel(sequence_parallel_size=2, allgather_degree=2)
+        strategy = AllGatherKVParallelAttention(parallel_state.get_sp_group())
+        impl = getattr(flash_attn_hub, backend)(num_heads=1, head_size=64, softmax_scale=0.125)
+        query = torch.zeros(2, 2, 1, 64, device=current_omni_platform.get_torch_device(rank), dtype=torch.bfloat16)
+        device = query.device
+        joint = torch.zeros(2, 4, 1, 64, device=device, dtype=query.dtype)
+        joint_mask = torch.tensor([[True, True, True, False], [True, False, False, False]], device=device)
+        for joint_strategy in ("front", "rear"):
+            metadata = AttentionMetadata(
+                joint_attn_mask=joint_mask,
+                joint_query=joint,
+                joint_key=joint,
+                joint_value=joint_mask[:, :, None, None].expand_as(joint).to(query.dtype),
+                joint_strategy=joint_strategy,
+            )
+            q, k, v, metadata, _ = strategy.pre_attention(query, query, torch.ones_like(query), metadata)
+            output = impl.forward_cuda(q, k, v, metadata)
+            # Every valid value is one and every padding value zero.
+            torch.testing.assert_close(output, torch.ones_like(output))
+            # Equal Q/K lengths retain the existing query-padding behavior.
+            torch.testing.assert_close(impl.forward_cuda(k, k, v, metadata), v, atol=0, rtol=1e-2)
+    finally:
+        destroy_distributed_env()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            "FlashAttentionHubImpl",
+            marks=hardware_marks(res={"cuda": ["L4", "RTX5090"]}, num_cards=2),
+        ),
+        pytest.param("FlashAttention3HubImpl", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+    ],
+)
+def test_allgather_joint_key_mask_reaches_flash_hub(backend, tmp_path):
+    from vllm_omni.diffusion.attention.backends.utils.fa import _is_hopper
+
+    if not current_omni_platform.is_cuda():
+        pytest.skip("Requires CUDA GPUs")
+    if backend == "FlashAttention3HubImpl" and not _is_hopper():
+        pytest.skip("FA3 Hub requires Hopper GPUs")
+    torch.multiprocessing.spawn(_joint_mask_hub_worker, args=(backend, f"file://{tmp_path}/store"), nprocs=2)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("mask_shape", [(2, 4), (1, 6), (1, 2, 6)])
+def test_allgather_preserves_existing_full_mask(mask_shape):
+    key = torch.zeros(1, mask_shape[-1], 1, 1)
+    mask = torch.ones(mask_shape, dtype=torch.bool)
+    metadata = AttentionMetadata(attn_mask=mask, joint_key=key[:, :2] if mask_shape[-1] == 6 else None)
+    assert AllGatherKVParallelAttention._merge_joint_attn_mask(metadata, key) is metadata
+    assert metadata.attn_mask is mask
+
+
 @pytest.mark.cpu
 def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     rank = 1
@@ -756,70 +816,28 @@ def _composed_mask_mocks(
 
 
 @pytest.mark.cpu
-def test_composed_strategy_merges_joint_only_mask(monkeypatch):
-    """A joint-only 2D mask (text padding, ``attn_mask=None``) must not be dropped.
-
-    ``defer_joint=True`` skips the Ulysses mask merge and the AllGather path
-    only reads ``attn_mask``: without the post-gather merge, padded joint K/V
-    (e.g. Qwen-Image with unequal prompt lengths) would attend unmasked. The
-    padding column must survive at the joint key offset of the merged mask.
-    """
-    region, joint_len = 4, 1
-    make = _composed_mask_mocks(monkeypatch, region=region, joint_len=joint_len)
-    query = torch.zeros(1, 2, 4, 1)
-
-    # front: joint keys precede the gathered image keys.
-    joint_mask = torch.tensor([[False]], dtype=torch.bool)  # one padded text token
-    _, strategy = make()
-    _, k_out, _, merged, _ = strategy.pre_attention(
-        query, query, query, AttentionMetadata(attn_mask=None, joint_attn_mask=joint_mask, joint_strategy="front")
+@pytest.mark.parametrize("strategy_cls", [AllGatherKVParallelAttention, UlyssesAllGatherKVParallelAttention])
+@pytest.mark.parametrize(
+    ("joint_strategy", "joint_len", "image_mask", "expected"),
+    [
+        ("front", 0, None, None),
+        ("front", 1, None, [[False, True, True, True, True]]),
+        ("rear", 1, None, [[True, True, True, True, False]]),
+        ("front", 1, [[True, False, True, True]], [[False, True, False, True, True]]),
+        ("rear", 1, [[True, False, True, True]], [[True, False, True, True, False]]),
+    ],
+)
+def test_allgather_merges_joint_masks(strategy_cls, joint_strategy, joint_len, image_mask, expected):
+    """Both strategies merge against final keys, preserving empty and padded masks."""
+    metadata = AttentionMetadata(
+        attn_mask=None if image_mask is None else torch.tensor(image_mask),
+        joint_attn_mask=torch.zeros(1, joint_len, dtype=torch.bool),
+        joint_key=torch.zeros(1, joint_len, 1, 1),
+        joint_strategy=joint_strategy,
     )
-
-    full_len = joint_len + 2 * region
-    assert merged.attn_mask is not None, "joint-only mask was silently dropped"
-    assert merged.attn_mask.shape == (1, full_len)
-    assert merged.attn_mask.dtype == torch.bool
-    assert not merged.attn_mask[0, 0], "padding column must stay masked at the front joint offset"
-    assert bool(merged.attn_mask[0, 1:].all()), "gathered image keys must stay attendable"
-    assert k_out.shape[1] == full_len
-
-    # rear: joint keys follow the gathered image keys.
-    _, strategy = make()
-    _, _, _, merged_rear, _ = strategy.pre_attention(
-        query, query, query, AttentionMetadata(attn_mask=None, joint_attn_mask=joint_mask, joint_strategy="rear")
-    )
-    assert not merged_rear.attn_mask[0, -1], "padding column must stay masked at the rear joint offset"
-    assert bool(merged_rear.attn_mask[0, :-1].all())
-
-
-@pytest.mark.cpu
-def test_composed_strategy_merges_joint_and_image_masks(monkeypatch):
-    """Both 2D masks merge in ``joint_strategy`` order, preserving both contents."""
-    region, joint_len = 4, 1
-    make = _composed_mask_mocks(monkeypatch, region=region, joint_len=joint_len)
-    query = torch.zeros(1, 2, 4, 1)
-    joint_mask = torch.tensor([[False]])  # one padded text token
-    img_mask = torch.ones(1, 2 * region, dtype=torch.bool)
-    img_mask[0, 3] = False  # one masked image key
-
-    _, strategy = make()
-    _, _, _, merged_front, _ = strategy.pre_attention(
-        query,
-        query,
-        query,
-        AttentionMetadata(attn_mask=img_mask.clone(), joint_attn_mask=joint_mask.clone(), joint_strategy="front"),
-    )
-    assert merged_front.attn_mask.shape == (1, joint_len + 2 * region)
-    torch.testing.assert_close(merged_front.attn_mask, torch.cat([joint_mask, img_mask], dim=1))
-
-    _, strategy = make()
-    _, _, _, merged_rear, _ = strategy.pre_attention(
-        query,
-        query,
-        query,
-        AttentionMetadata(attn_mask=img_mask.clone(), joint_attn_mask=joint_mask.clone(), joint_strategy="rear"),
-    )
-    torch.testing.assert_close(merged_rear.attn_mask, torch.cat([img_mask, joint_mask], dim=1))
+    merged = strategy_cls._merge_joint_attn_mask(metadata, torch.zeros(1, joint_len + 4, 1, 1))
+    assert merged is not None
+    torch.testing.assert_close(merged.attn_mask, None if expected is None else torch.tensor(expected))
 
 
 @pytest.mark.cpu
@@ -848,36 +866,25 @@ def test_composed_strategy_sizes_joint_mask_from_joint_key(monkeypatch):
 
 
 @pytest.mark.cpu
-def test_composed_strategy_rejects_inconsistent_2d_masks(monkeypatch):
+@pytest.mark.parametrize("strategy_cls", [AllGatherKVParallelAttention, UlyssesAllGatherKVParallelAttention])
+@pytest.mark.parametrize(
+    ("image_shape", "joint_shape", "error"),
+    [
+        ((1, 4), (1, 1), "global image keys"),
+        ((1, 9), (1, 1), "global image keys"),
+        (None, (1, 2), "joint_attn_mask inconsistent"),
+        ((2, 8), (1, 1), "global image keys"),
+    ],
+)
+def test_allgather_rejects_inconsistent_2d_masks(strategy_cls, image_shape, joint_shape, error):
     """Shape mismatches fail closed with the expected layout in the message."""
-    region, joint_len = 4, 1
-    make = _composed_mask_mocks(monkeypatch, region=region, joint_len=joint_len)
-    query = torch.zeros(1, 2, 4, 1)
-
-    # Image mask shorter than the gathered global image keys (e.g. a stale
-    # shard-local mask covering only this rank's own region).
-    _, strategy = make()
-    with pytest.raises(ValueError, match="global image keys"):
-        strategy.pre_attention(
-            query, query, query, AttentionMetadata(attn_mask=torch.ones(1, region, dtype=torch.bool))
-        )
-
-    # Joint mask length must match the joint keys.
-    _, strategy = make()
-    with pytest.raises(ValueError, match="joint_attn_mask inconsistent"):
-        strategy.pre_attention(
-            query,
-            query,
-            query,
-            AttentionMetadata(attn_mask=None, joint_attn_mask=torch.ones(1, joint_len + 1, dtype=torch.bool)),
-        )
-
-    # Batch dimension must match the keys.
-    _, strategy = make()
-    with pytest.raises(ValueError, match="global image keys"):
-        strategy.pre_attention(
-            query, query, query, AttentionMetadata(attn_mask=torch.ones(2, 2 * region, dtype=torch.bool))
-        )
+    metadata = AttentionMetadata(
+        attn_mask=None if image_shape is None else torch.ones(image_shape, dtype=torch.bool),
+        joint_attn_mask=torch.ones(joint_shape, dtype=torch.bool),
+        joint_key=torch.zeros(1, 1, 1, 1),
+    )
+    with pytest.raises(ValueError, match=error):
+        strategy_cls._merge_joint_attn_mask(metadata, torch.zeros(1, 9, 1, 1))
 
 
 @pytest.mark.cpu
