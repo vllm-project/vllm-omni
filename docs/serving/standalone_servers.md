@@ -72,7 +72,7 @@ for memory, personas, delegation backends, and the browser UI.
 Start `python -m vllm_omni.entrypoints.mage_vl.serving.server` to serve
 `WS /v1/mage-vl/duplex`. Its session runtime and adapter live under
 `vllm_omni/entrypoints/mage_vl/`; native vLLM model execution remains follow-up
-work. See the [Mage-VL recipe](../../recipes/Microsoft/Mage-VL.md) for backend,
+work. See the [Mage-VL recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Microsoft/Mage-VL.md) for backend,
 authentication, and client options.
 
 ## Python Module Locations
