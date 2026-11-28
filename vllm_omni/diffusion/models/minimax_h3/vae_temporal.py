@@ -32,6 +32,8 @@ from types import MethodType
 import torch
 from vllm.logger import init_logger
 
+from .vae_encode_tiling import encode_clip_group, encode_tile_batch_size
+
 logger = init_logger(__name__)
 
 _LEGACY_TEMPORAL_ENV = "VLLM_OMNI_VAE_LEGACY_TEMPORAL"
@@ -45,20 +47,32 @@ def _legacy_temporal_enabled() -> bool:
 def _encode_temporal_tail_pad(self, x):
     """Drop-in fork of the checkpoint's ``encode_temporal``.
 
-    Frame handling is identical to the original; only the padding site
-    moves from a whole-video ``torch.cat`` into the tail chunk.
+    Frame handling matches the original. Padding happens on the tail clip,
+    and reference-video encoding may batch equal-length interior clips.
     """
     offset_frame = 1 if self.isolated_first_frame and self.frame_pre_padding == 0 else 0
 
     orig_frames = int(x.shape[2])
+    if not orig_frames or not x.shape[-2] or not x.shape[-1]:
+        raise ValueError("MiniMax H3 video VAE requires frames with non-zero spatial dimensions after alignment")
     pad_size = (offset_frame - orig_frames) % self.clip_length
     padded_frames = orig_frames + pad_size
     num_chunks = (padded_frames - offset_frame) // self.clip_length
 
+    sample_batch = x.shape[0]
+    batch_limit = encode_tile_batch_size.get()
+    clips_per_forward = 1
+    if batch_limit > 1 and self.encoder_tiling and not self.encoder_parallel and not self.isolated_key_frame:
+        clips_per_forward = max(1, batch_limit // sample_batch)
+
     z_list = []
-    for i in range(num_chunks):
-        start_idx = i * self.clip_length + offset_frame
-        end_idx = (i + 1) * self.clip_length + offset_frame
+    clip = 0
+    while clip < num_chunks:
+        full_clips = num_chunks - clip - bool(pad_size)
+        count = max(1, min(clips_per_forward, full_clips))
+        start_idx = clip * self.clip_length + offset_frame
+        clip += count
+        end_idx = clip * self.clip_length + offset_frame
         clip_x = x[:, :, start_idx : min(end_idx, orig_frames), :, :]
         if end_idx > orig_frames:
             # The original pads the whole video up front by repeating the
@@ -79,6 +93,13 @@ def _encode_temporal_tail_pad(self, x):
                 z = torch.cat([z_key, z_video], dim=2)
             else:
                 z = z_key
+        elif count > 1:
+            clips = clip_x.unflatten(2, (count, self.clip_length)).transpose(1, 2).flatten(0, 1)
+            encoded = encode_clip_group(self, clips, count)
+            z = encoded.unflatten(0, (sample_batch, count)).transpose(1, 2).flatten(2, 3)
+            loss_info = getattr(self.encoder, "loss_info", {})
+            if "cls_token" in loss_info:
+                loss_info["cls_token"] = loss_info["cls_token"].unflatten(0, (sample_batch, count))[:, -1].contiguous()
         else:
             z = self._adaptive_encode(clip_x)
 

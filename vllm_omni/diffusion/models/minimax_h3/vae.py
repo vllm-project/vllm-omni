@@ -36,6 +36,11 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_encode_tiling import (
+    configure_video_encode_tiling,
+    reference_video_tile_batching,
+    reference_video_tile_geometry,
+)
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -354,6 +359,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     stack_decode_tiles: bool = True
+    encode_tile_batch_size: int = 1
+    encode_tile_geometry: tuple[int, int] | None = None
     # Upper bound on the tiles one stacked decoder call takes, so a one-rank
     # decode (every tile of the grid on one rank) stays near the serial peak.
     max_stacked_decode_tiles: int | None = 7
@@ -371,6 +378,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
         stack_decode_tiles: bool = True,
+        additional_config: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -429,6 +437,17 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
+        if not self.decode_only:
+            encode_options = (additional_config or {}).get("video_vae_encode", {})
+            if not isinstance(encode_options, Mapping):
+                raise ValueError("video_vae_encode must be an object")
+            self.encode_tile_batch_size = encode_options.get("tile_batch_size", 1)
+            self.encode_tile_geometry = configure_video_encode_tiling(
+                self.remote.model,
+                batch_size=self.encode_tile_batch_size,
+                tile_size=encode_options.get("tile_size"),
+                tile_overlap=encode_options.get("tile_min_overlap"),
+            )
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
         # its own fused-operator path (install_h3_vae_optimizations above); on
@@ -857,9 +876,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             return nullcontext()
         logger.warning_once(
             "MiniMax-H3 VAE encode splits a %dx%d input into %d tile(s) but "
-            "the tile group has %d ranks; encoding rank-locally for this "
-            "shape instead, which avoids ranks without tiles hanging the "
-            "collective.",
+            "the tile group has %d ranks; the checkpoint's spatial-only "
+            "path will run rank-locally to avoid empty-rank collectives.",
             width,
             height,
             num_tiles,
@@ -1123,6 +1141,22 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             out[:, start:end].copy_(chunk)
         return out
 
+    @contextmanager
+    def _reference_video_tiling(self, frames: Any, device: torch.device) -> Iterator[None]:
+        with reference_video_tile_geometry(self.model, self.encode_tile_geometry):
+            tile_group = None
+            local_tiling = nullcontext()
+            if int(getattr(self, "parallel_size", 1)) > 1:
+                shape = getattr(frames, "shape", None)
+                if shape is None or len(shape) != 4:
+                    raise ValueError("parallel MiniMax H3 video encode requires a rank-4 frame array")
+                height, width = shape[-3:-1] if shape[-1] in {1, 3, 4} else shape[-2:]
+                local_tiling = self._encoder_tiling_context(int(height), int(width))
+                if device.type == "npu" and self.encode_tile_batch_size > 1 and self.model.parallel_tiling:
+                    tile_group = self._native_parallel_state()["sp_process_group"]
+            with local_tiling, reference_video_tile_batching(self.encode_tile_batch_size, tile_group):
+                yield
+
     @torch.inference_mode()
     def encode_video(
         self,
@@ -1132,22 +1166,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode videos")
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
+        devices = [parameter.device] if parameter.device.type != "cpu" else []
         if previous_dtype != torch.float32:
             self.to(torch.float32)
-        devices = [parameter.device] if parameter.device.type != "cpu" else []
-        shape = getattr(frames, "shape", None)
-        if int(getattr(self, "parallel_size", 1)) > 1:
-            if shape is None or len(shape) != 4:
-                raise ValueError("parallel MiniMax H3 video encode requires a rank-4 frame array")
-            if int(shape[-1]) in {1, 3, 4}:
-                frame_height, frame_width = int(shape[-3]), int(shape[-2])
-            else:
-                frame_height, frame_width = int(shape[-2]), int(shape[-1])
-            tiling_context = self._encoder_tiling_context(frame_height, frame_width)
-        else:
-            tiling_context = nullcontext()
         try:
-            with tiling_context, torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+            with (
+                self._reference_video_tiling(frames, parameter.device),
+                torch.random.fork_rng(devices=devices, device_type=parameter.device.type),
+            ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):

@@ -679,6 +679,30 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - The lossy configuration (RainFusion + INT8) is validated for T2VA and
   Ref2VA; use the lossless configuration for FL2VA or re-validate first.
 
+## Video VAE encoder tiles
+
+For reference video encoding, add a `video_vae_encode` object to the server's
+`--additional-config` JSON (tile size and minimum overlap are in pixels):
+
+```bash
+--additional-config '{"video_vae_encode":{"tile_batch_size":4,"tile_size":288,"tile_min_overlap":16}}'
+```
+
+The default `tile_batch_size` is `1`; omitted geometry uses the checkpoint values.
+A batch size above `1` lets equal-length reference-video clips share a tile
+forward as independent samples. With VAE tile parallelism enabled, Ascend
+workers distribute `(clip, spatial tile)` pairs across the VAE group. This can
+keep ranks busy even when one clip has fewer tiles than the group has ranks.
+When the combined window has fewer tasks than ranks, idle ranks still join the
+gather without running the encoder. The batch size caps tile samples per
+forward; short batches do not use dummy samples. Single clips, keyframe splits
+and a padded tail keep their existing path. Encoder tile size and overlap must
+be integers divisible by the checkpoint's spatial compression ratio and satisfy
+`0 < overlap < tile size`. Changing geometry may change reference-video latents;
+validate it separately. The override applies only during reference-video encode,
+not to image or control conditioning or the decoder. The same options apply on
+both the monolithic diffusion pipeline and the split MiniMax H3 encoder stage.
+
 ## Additional resources
 
 - [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide

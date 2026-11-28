@@ -1515,6 +1515,7 @@ class MiniMaxH3Pipeline(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
                 ),
+                additional_config=additional_config,
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
