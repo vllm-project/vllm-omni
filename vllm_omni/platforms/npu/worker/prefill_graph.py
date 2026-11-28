@@ -113,15 +113,11 @@ class PrefillGraph:
         finally:
             current.wait_stream(warmup)
         self.graph = torch.npu.NPUGraph()
-        if not thinker:
-            if not hasattr(runner, "_talker_prefill_capture_pool"):
-                runner._talker_prefill_capture_pool = torch.npu.graph_pool_handle()
-            # Replay is serialized on the model worker and returns a snapshot.
-            with torch.npu.graph(self.graph, pool=runner._talker_prefill_capture_pool, stream=warmup):
-                self.hidden = forward()
-        else:
-            with torch.npu.graph(self.graph):
-                self.hidden = forward()
+        if not hasattr(runner, "_prefill_capture_pool"):
+            runner._prefill_capture_pool = torch.npu.graph_pool_handle()
+        # Graphs replay serially on this worker. The caller snapshots live outputs.
+        with torch.npu.graph(self.graph, pool=runner._prefill_capture_pool, stream=warmup):
+            self.hidden = forward()
         self.replays = 0
         logger.info("[%s-prefill-graph] captured tokens=%d", "thinker" if thinker else "talker", size)
 
