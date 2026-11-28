@@ -21,7 +21,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
 # Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
-# platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
+# qwen2_5_omni overlay's platforms: section in tests/helpers/stage_config.py.
 
 # The default 16384-token profiling step leaves the Thinker and the Talker too little KV cache on
 # 22 GiB L4 cards; no request in this file exceeds 8192 tokens, so the smaller step does not chunk any.
