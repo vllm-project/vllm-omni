@@ -49,7 +49,7 @@ from vllm_omni.diffusion.io_support import (
     supports_multimodal_input,
 )
 from vllm_omni.diffusion.mixfusion.setup import validate_mixfusion_config
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import allows_streaming_step_execution
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
@@ -393,18 +393,17 @@ class DiffusionEngine:
             od_config.step_execution = True
             self.step_execution = True
         if od_config.streaming_output and not self.step_execution:
-            if supports_step_execution(resolve_pipeline_cls(od_config)):
+            if allows_streaming_step_execution(resolve_pipeline_cls(od_config)):
                 logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
                 od_config.step_execution = True
                 self.step_execution = True
             else:
-                # Request-only pipelines keep Request execution. Intermediate
-                # CHUNK_READY media requires the pipeline to bind the request
+                # Intermediate CHUNK_READY media requires the pipeline to bind the request
                 # chunk emitter (CausVid today); otherwise the client only sees
                 # a single final result.
                 logger.warning_once(
-                    "streaming_output=True on a request-only pipeline keeps Request "
-                    "execution. Intermediate CHUNK_READY media is emitted only when "
+                    "streaming_output=True keeps request execution for this pipeline. "
+                    "Intermediate CHUNK_READY media is emitted only when "
                     "the pipeline binds the request chunk emitter (currently CausVid); "
                     "other request pipelines still return a single final output."
                 )

@@ -94,6 +94,13 @@ Step continuous batching is experimental. Start with `max_num_seqs=1` when
 validating a model or debugging correctness, then increase it for
 multi-request throughput.
 
+Stable Diffusion 3 supports explicit step execution and continuous batching.
+Requests can share a wave when their conditioning tensors have compatible
+layouts. The effective text padding length and the shapes of supplied
+embeddings affect this grouping. HSDP data parallelism and diffusion cache
+backends remain available through request execution, subject to their
+existing compatibility rules.
+
 Step execution is capability-based, not a generic switch for every diffusion
 model. Qwen-Image supports step-wise continuous batching. BAGEL supports
 step-wise continuous batching for image generation with `bagel.yaml`,
@@ -140,10 +147,10 @@ vllm serve BestWishYsh/Helios-Distilled --omni \
   --diffusion-streaming-output
 ```
 
-Streaming output requires step execution. If
-`--diffusion-streaming-output` is set without `--step-execution`, the engine
-enables step execution automatically. Model initialization fails if the
-pipeline does not implement step execution.
+Some pipelines automatically enable step execution with
+`--diffusion-streaming-output`. Stable Diffusion 3 requires
+`--step-execution` explicitly and emits its final image when denoising and
+decoding finish.
 
 Chunk-capable pipelines emit intermediate and final outputs through the same
 request stream. Final-only step pipelines emit only the final result even when
@@ -256,7 +263,7 @@ For step execution, set `step_execution: true` and remove
 | `--step-execution` | disabled | Select step-wise scheduling |
 | `--max-num-seqs` | `1` for diffusion stages | Set request- or step-scheduler capacity |
 | `--request-batch-max-wait-ms` | `0` (`500` with `--hsdp-data-parallel`) | Wait for burst coalescing in request mode |
-| `--diffusion-streaming-output` | disabled | Expose supported intermediate diffusion outputs and require step execution |
+| `--diffusion-streaming-output` | disabled | Expose supported intermediate diffusion outputs |
 
 ## Limitations and Troubleshooting
 
