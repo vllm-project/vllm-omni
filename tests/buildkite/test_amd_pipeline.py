@@ -968,11 +968,11 @@ def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
 
 
 _R2_02_LABEL = "ROCm · Entrypoints GPU Coverage (R2-02)"
-_R2_02_JUNIT_MESSAGE = "Expected exactly 3 executed entrypoint GPU tests"
+_R2_02_JUNIT_MESSAGE = "Expected exactly 4 executed entrypoint GPU tests"
 
 
 def test_r2_02_entrypoint_execution_guard_is_blocking() -> None:
-    """The blocking job requires three executed tests and clean teardown."""
+    """The blocking job requires four executed tests and clean teardown."""
     step = _find_step(_R2_02_LABEL, AMD_READY_PIPELINE)
     commands = step["commands"]
     joined = "\n".join(commands)
@@ -981,7 +981,7 @@ def test_r2_02_entrypoint_execution_guard_is_blocking() -> None:
     assert step["agent_pool"] == "mi300_1"
     assert step["timeout_in_minutes"] == 30
     assert step["artifact_paths"] == ["artifacts/rocm-r2-02/**/*"]
-    assert "assert-pytest-collection.sh 3" in joined
+    assert "assert-pytest-collection.sh 4" in joined
     assert _R2_02_JUNIT_MESSAGE in joined
     assert "PIPESTATUS[0]" in joined
     assert '(exit "$$status")' in joined
@@ -995,13 +995,15 @@ def test_r2_02_entrypoint_execution_guard_is_blocking() -> None:
 @pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
-        (0, 3, 0, None, 0),
-        (0, 3, 1, None, 5),
+        (0, 4, 0, None, 0),
+        (0, 4, 1, None, 5),
         (0, 0, 0, None, 5),
-        (1, 3, 0, None, 1),
-        (0, 3, 0, 124, 124),
+        (0, 3, 0, None, 5),
+        (0, 5, 0, None, 5),
+        (1, 4, 0, None, 1),
+        (0, 4, 0, 124, 124),
     ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+    ids=("pass", "skipped", "zero-tests", "old-count", "extra-test", "pytest-failure", "timeout"),
 )
 def test_r2_02_entrypoint_junit_guard_before_exit(
     tmp_path: Path,
