@@ -151,7 +151,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
-| `seed` | integer | null | Random seed for repeatable generation. |
+| `seed` | integer | null | Random seed for reproducible generation. Controls this request's sampling randomness only; under concurrent batching the interleaving with other requests can still diverge the output. Set `seed` together with `seeded_isolation=true` to run the request in scheduler isolation, which preserves the previously guaranteed byte-reproducible behavior. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 | `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
@@ -672,6 +672,7 @@ the same sampling override validation, precedence, and normalization as REST.
 | `model_input_mode` | `"complete"` or `"incremental"` | `"complete"` | Select one complete request per text segment or one incrementally fed request per utterance. Incremental input requires commitment, PCM streaming, and an opted-in model adapter (currently Qwen3-TTS CustomVoice with MRv2). |
 | `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
 | `seed` | integer | null | Forwarded to the speech engine for this session |
+| `seeded_isolation` | bool | false | Explicit opt-in to scheduler isolation for a seeded session: the request waits for the engine to drain and runs alone, which makes its output byte-reproducible under concurrency but lowers throughput while it runs. Requires a seed. A seed alone keeps normal continuous batching. |
 
 ASCII punctuation only ends a unit when whitespace or `input.done` follows it,
 and decimals (`3.14`), thousands separators (`1,000`), abbreviations (`Dr.`,

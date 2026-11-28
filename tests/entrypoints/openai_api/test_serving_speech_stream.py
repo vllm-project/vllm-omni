@@ -2242,6 +2242,29 @@ class TestSessionConfigRestParameters:
             "stream_audio",
         }
 
+    def test_session_seeded_isolation_forwards_to_speech_request(self):
+        config = StreamingSpeechSessionConfig(seed=42, seeded_isolation=True)
+        request = OmniStreamingSpeechHandler._speech_request(config, "Hello.")
+        assert request.seed == 42
+        assert request.seeded_isolation is True
+
+    def test_session_seeded_isolation_forwards_to_incremental_request(self):
+        config = StreamingSpeechSessionConfig(
+            seed=7,
+            seeded_isolation=True,
+            text_input_mode="commitment",
+            model_input_mode="incremental",
+            stream_audio=True,
+            response_format="pcm",
+        )
+        request = OmniStreamingSpeechHandler._incremental_request(config, "Hello.")
+        assert request.seed == 7
+        assert request.seeded_isolation is True
+
+    def test_session_seeded_isolation_requires_a_seed(self):
+        with pytest.raises(ValidationError, match="seeded_isolation requires a seed"):
+            StreamingSpeechSessionConfig.model_validate({"seeded_isolation": True})
+
     def test_every_shared_field_is_forwarded(self):
         config = StreamingSpeechSessionConfig()
         request = OmniStreamingSpeechHandler._speech_request(config, "Hello.")

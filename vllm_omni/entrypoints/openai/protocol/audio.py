@@ -795,6 +795,15 @@ class StreamingSpeechSessionConfig(BaseModel):
         le=_INT64_MAX,
         description="Random seed forwarded to /v1/audio/speech for this session.",
     )
+    seeded_isolation: bool = Field(
+        default=False,
+        description=(
+            "Explicit opt-in to scheduler isolation for a seeded session: its requests "
+            "wait for the engine to drain and run alone, which makes their output "
+            "byte-reproducible under concurrency but lowers throughput while they run. "
+            "Requires a seed. A seed alone does not isolate."
+        ),
+    )
     watermarking: bool = Field(
         default=True,
         description="Whether the server's configured watermarking applies to this session's audio.",
@@ -814,6 +823,11 @@ class StreamingSpeechSessionConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.seeded_isolation and self.seed is None:
+            raise ValueError(
+                "seeded_isolation requires a seed: the flag opts a seeded session into "
+                "scheduler isolation, so there is nothing to isolate without one."
+            )
         if self.model_input_mode == "incremental":
             if self.text_input_mode != "commitment":
                 raise ValueError("Incremental model input requires text_input_mode='commitment'")
