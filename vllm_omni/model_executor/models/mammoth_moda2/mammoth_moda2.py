@@ -59,10 +59,12 @@ from vllm.transformers_utils.config import (
     patch_rope_parameters,
     set_default_rope_theta,
 )
+from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 
 from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
     MoERoutingKey,
     get_moe_routing_key,
+    install_moe_routing_graphs,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, is_interleaved
@@ -1170,6 +1172,9 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # refreshes decode metadata outside FULL capture. See AR wrappers.
             self.requires_raw_input_tokens = True
             self.supports_omni_decode_step_metadata = True
+            # AR emits no multimodal outputs, so forward hands MRv2 the hidden
+            # states tensor and FULL graphs stay enabled.
+            self.mrv2_forward_returns_tensor = True
         elif self.model_stage == "dit":
             self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -1252,12 +1257,21 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             )
         raise NotImplementedError("Underlying model does not implement get_input_embeddings")
 
-    def forward(self, *args, **kwargs) -> OmniOutput | torch.Tensor:
+    def specialize_cudagraph_manager(self, manager: ModelCudaGraphManager) -> None:
+        """MRv2 hook: add the single-expert MoE FULL graphs before capture."""
+        compilation_config = self.vllm_config.compilation_config
+        if self.ar is None or not getattr(compilation_config, "cudagraph_specialize_moe_routing", False):
+            return
+        install_moe_routing_graphs(manager, int(self.ar.language_model.gen_vocab_start_index))
+
+    def forward(self, *args, **kwargs) -> OmniOutput | IntermediateTensors | torch.Tensor:
         out = self.model(*args, **kwargs)
-        if isinstance(out, OmniOutput):
-            return out
         if isinstance(out, list):
             out = out[0]
+        if self.model_stage == "ar":
+            return out.text_hidden_states if isinstance(out, OmniOutput) else out
+        if isinstance(out, OmniOutput):
+            return out
         return OmniOutput(text_hidden_states=out, multimodal_outputs={}, intermediate_tensors=None)
 
     def update_decode_step_metadata(self, **kwargs: Any) -> None:

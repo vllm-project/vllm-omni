@@ -144,12 +144,14 @@ runs a single expert.
 
 If CUDA-graph capture runs through MoE (`cudagraph_mode: FULL`, or
 `PIECEWISE` when MoE sits in a captured piece), the graph-safe path must
-record **both** experts and select per token with `torch.where` (see #9764 /
-#9851) unless a specialized FULL graph is replayed. `_is_graph_capturing()`
-is mode-agnostic: PIECEWISE does **not** avoid that dual-expert cost.
-Measured FULL overhead is ~+25% AR decode on H200 t2i **when every decode
-replays the blend graph**. That number has not been remeasured after replay
-selection.
+record **both** experts and select per token with `torch.where` (see #9764
+and #9851) unless a specialized FULL graph is replayed.
+`_is_graph_capturing()` is mode-agnostic: PIECEWISE does **not** avoid that
+dual-expert cost.
+On 1x A40 (t2i 1024², greedy, one request), AR decode TPOT is 29.3 ms when
+FULL replay selects the specialty graphs, 31.3 ms with `enforce_eager: true`
+and 40.3 ms when every step replays the blend graph. The A40 attention
+backend (FlashAttention 2) limits `FULL` to `FULL_DECODE_ONLY`.
 
 FULL replay now classifies the unpadded scheduled token ids and selects
 all-und, all-gen, or blend (#9865). Mixed batches still pay the blend cost.
@@ -161,10 +163,10 @@ PIECEWISE capture does not grow those specialty keys.
 | Text-to-image (default) | [`mammoth_moda2.yaml`](../../vllm_omni/deploy/mammoth_moda2.yaml) (AR eager) |
 | Text-to-image with FULL AR graphs | [`mammoth_moda2_ar_graph_full.yaml`](../../vllm_omni/deploy/mammoth_moda2_ar_graph_full.yaml) (uniform steps select all-gen/all-und; mixed stays on blend) |
 
-Do not point und-only serving at graph-capture presets until FULL all-und
-replay is remeasured; keep the eager default. PIECEWISE still records both
-experts. Mask-keyed FULL graphs are selected on replay from the unpadded
-scheduled token ids (#9865).
+For und-only serving, FULL all-und replay on 1x A40 answers a 128-token chat
+in 3.8 s against 3.9 s eager, so the eager default stays. PIECEWISE still
+records both experts. Mask-keyed FULL graphs are selected on replay from the
+unpadded scheduled token ids (#9865).
 
 ### 1x L40S 48GB
 
