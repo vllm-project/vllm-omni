@@ -16,6 +16,7 @@ depends_on:
 validation_paths:
   - tests/benchmarks/**
   - tests/dfx/perf/**
+  - tests/entrypoints/test_bench_startup.py
 upstream_refs:
   - vllm.benchmarks
 last_reviewed: 2026-07-16

@@ -46,3 +46,11 @@ vllm bench serve --omni \
 
 See [vllm bench serve](./bench/serve.md) for serving benchmark arguments and
 dataset-specific examples, including OmniInteract native-duplex sessions.
+
+Measure cold and warm pipeline startup time:
+
+```bash
+vllm bench startup --omni --model Qwen/Qwen2.5-Omni-7B
+```
+
+See [vllm bench startup](./bench/startup.md) for details.
