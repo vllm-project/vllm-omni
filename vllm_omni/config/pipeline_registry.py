@@ -123,6 +123,7 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
     MINICPMO_4_5_PIPELINE,
     MINICPMO_4_5_THINKER_ONLY_PIPELINE,
+    MINICPMO_4_5_TURN_CHUNKED_PIPELINE,
 )
 from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_DECODE_PIPELINE, MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_music3.pipeline import MINIMAX_MUSIC3_PIPELINE
@@ -245,6 +246,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
     "minicpmo_4_5_thinker_only": MINICPMO_4_5_THINKER_ONLY_PIPELINE,
+    "minicpmo_4_5_turn_chunked": MINICPMO_4_5_TURN_CHUNKED_PIPELINE,
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,

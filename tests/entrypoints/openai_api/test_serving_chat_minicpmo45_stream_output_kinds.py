@@ -110,3 +110,20 @@ def test_ming3_sync_audio_waits_for_complete_thinker_text(serving_chat, async_ch
     expected = RequestOutputKind.DELTA if async_chunk else RequestOutputKind.FINAL_ONLY
     assert out[0].output_kind is expected
     assert out[1].output_kind is RequestOutputKind.DELTA
+
+
+def test_chunked_talker_bridge_streams_the_thinker(serving_chat):
+    """The turn-chunked profile's Talker bridge consumes the running Thinker stream."""
+    prefix = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
+    stages = _minicpmo45_stages()
+    stages[1].custom_process_input_func = f"{prefix}.llm2tts_chunked"
+    serving_chat.engine_client = SimpleNamespace(stage_configs=stages)
+
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
+
+    assert out[0].output_kind is RequestOutputKind.DELTA
+    assert out[1].output_kind is RequestOutputKind.DELTA
+
+    stages[1].custom_process_input_func = f"{prefix}.llm2tts"
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
+    assert out[0].output_kind is RequestOutputKind.FINAL_ONLY

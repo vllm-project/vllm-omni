@@ -13,6 +13,8 @@ streams request-routed codec chunks.
 through its ``pipeline`` key; checkpoint auto-detection keeps the full pipeline.
 """
 
+import dataclasses
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -150,5 +152,32 @@ MINICPMO_4_5_THINKER_ONLY_PIPELINE = PipelineConfig(
                 "stop_token_ids": [151705, 151718, 151721],
             },
         ),
+    ),
+)
+
+
+# Opt-in turn profile (minicpmo_4_5_turn_chunked.yaml): the Talker starts on
+# the first block of reply tokens, as HF ``streaming_generate`` does, instead
+# of the whole reply when the Thinker finishes.
+MINICPMO_4_5_TURN_CHUNKED_PIPELINE = dataclasses.replace(
+    MINICPMO_4_5_PIPELINE,
+    model_type="minicpmo_4_5_turn_chunked",
+    default_deploy_config_name="minicpmo_4_5_turn_chunked.yaml",
+    # Selected by the deploy profile only, for turn serving; architecture
+    # inference and native duplex keep the default pipeline.
+    duplex_plugin=None,
+    hf_architectures=(),
+    hf_config_predicate=None,
+    stages=(
+        MINICPMO_4_5_PIPELINE.stages[0],
+        dataclasses.replace(
+            MINICPMO_4_5_PIPELINE.stages[1],
+            custom_process_input_func=f"{_PROC}.llm2tts_chunked",
+            # After a block is appended the request carries only its newest
+            # condition, so a replay from zero would rebuild the earlier
+            # conditions and codes as placeholders.
+            recompute_preemption="fail",
+        ),
+        *MINICPMO_4_5_PIPELINE.stages[2:],
     ),
 )

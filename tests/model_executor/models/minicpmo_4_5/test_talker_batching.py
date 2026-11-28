@@ -422,6 +422,207 @@ def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
     assert condition.shape[0] == token_ids.shape[0] + 1
 
 
+def _condition_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(16, 2)
+    talker.projector_semantic = nn.Identity()
+    talker._normalize = False
+    talker._text_eos_id = 14
+    talker._tts_bos_id = 15
+    with torch.no_grad():
+        talker.emb_text.weight.copy_(torch.arange(32, dtype=torch.float32).reshape(16, 2))
+    return talker
+
+
+@pytest.mark.parametrize(("close", "suffix_ids"), [(False, [15]), (True, [14, 15])], ids=["open", "last"])
+def test_turn_chunk_condition_closes_text_only_on_the_last_block(close, suffix_ids) -> None:
+    """Blocks before the last end in <audio_bos>; the last adds <text_eos>, as generate_with_buffer."""
+    talker = _condition_talker()
+    token_ids = torch.tensor([2, 3])
+    hidden_states = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
+    length = token_ids.shape[0] + len(suffix_ids)
+
+    _, embeds, _ = talker.preprocess(
+        torch.zeros(length, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=length,
+        request_id="req-chunk",
+        meta={"turn_chunk": True, "turn_chunk_close": close, "streaming_condition_seq": 0},
+        tts_token_ids=token_ids,
+        tts_hidden_states=hidden_states,
+    )
+
+    expected = torch.cat(
+        [talker.emb_text(token_ids) + hidden_states, talker.emb_text(torch.tensor(suffix_ids))],
+        dim=0,
+    )
+    assert torch.equal(embeds, expected)
+
+
+def test_turn_chunk_next_block_resumes_with_the_confirmed_penalty_window() -> None:
+    """The next block's prefill builds only its own condition and restarts the codec segment.
+
+    K-step: the token stream holds control rows, so the window comes from the
+    frames the model confirmed.
+    """
+    talker = _condition_talker()
+    talker._k_step_frames = 16
+    confirmed = [1, 2, 3, 4, 5, 6] * 4
+    talker._request_codec_history = {"req-chunk": list(confirmed)}
+    talker._request_audio_states["req-chunk"] = {"finished": True, "step": 40}
+    talker._request_codec_device_states = {"req-chunk": object()}
+    talker._request_codec_device_inputs = {"req-chunk": object()}
+    talker._request_host_codec_states = {
+        "req-chunk": {"finished": True, "condition_seq": 0, "step": 40, "history": [5, 6], "bins": {5: 1, 6: 1}}
+    }
+    token_ids = torch.tensor([2, 3])
+    hidden_states = torch.ones(2, 2)
+    # The scheduler kept the previous prompt and confirmed codes (40 tokens)
+    # and appended this block's three condition slots.
+    _, embeds, updates = talker.preprocess(
+        torch.zeros(3, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=43,
+        _omni_num_computed_tokens=40,
+        request_id="req-chunk",
+        meta={"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": 1},
+        tts_token_ids=token_ids,
+        tts_hidden_states=hidden_states,
+    )
+
+    expected = torch.cat([talker.emb_text(token_ids) + hidden_states, talker.emb_text(torch.tensor([15]))], dim=0)
+    assert torch.equal(embeds, expected)
+    state = updates["audio_state"]
+    assert state["finished"] is False
+    assert state["step"] == 0
+    assert state["recent_codes"] == confirmed[-16:]
+    assert state["max_tokens"] == 500
+    assert state["host_condition_seq"] == 1
+    assert "req-chunk" not in talker._request_codec_device_states
+    assert "req-chunk" not in talker._request_codec_device_inputs
+    # A block inside the same reply is not a new turn: the host sampler keeps
+    # its penalty history and only restarts the segment.
+    assert talker._request_host_codec_states["req-chunk"] == {
+        "finished": False,
+        "condition_seq": 1,
+        "step": 0,
+        "history": [5, 6],
+        "bins": {5: 1, 6: 1},
+    }
+
+
+def _finished_block(prompt_len: int, codes: list[int]):
+    """A Talker session whose block has sampled its EOS, as the scheduler holds it."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request
+
+    session = Request("req-chunk", [0] * prompt_len, SamplingParams(max_tokens=600), None)
+    session.append_output_token_ids([*codes, 7])
+    # The sampled EOS is never forwarded.
+    session.num_computed_tokens = prompt_len + len(codes)
+    return session
+
+
+def test_turn_chunk_single_frame_blocks_carry_the_codes_the_scheduler_confirmed() -> None:
+    """Single-frame decoding keeps the sampled codes in the runner, not in the model.
+
+    Each new block's window is the one its predecessor started from plus the
+    codes the scheduler hands over (_update_native_talker_prompt).
+    """
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _update_native_talker_prompt
+
+    talker = _condition_talker()
+    assert talker._k_step_frames == 0
+
+    def block(seq: int, session, prompt_len: int):
+        payload = {
+            "meta": {"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": seq},
+            "tts_token_ids": torch.tensor([2, 3]),
+            "tts_hidden_states": torch.ones(2, 2),
+        }
+        if session is not None:
+            assert _update_native_talker_prompt(None, session, payload) is None
+        computed = 0 if session is None else session.num_computed_tokens
+        _, _, updates = talker.preprocess(
+            torch.zeros(prompt_len - computed, dtype=torch.long),
+            None,
+            _omni_is_prefill=True,
+            _omni_prompt_len=prompt_len,
+            _omni_num_computed_tokens=computed,
+            request_id="req-chunk",
+            **payload,
+        )
+        return updates["audio_state"]
+
+    assert "recent_codes" not in block(0, None, 3)
+    first = [1, 2, 3, 4, 5, 6] * 3 + [1, 2]
+    state = block(1, _finished_block(3, first), 3 + len(first) + 3)
+    assert state["recent_codes"] == first[-16:]
+    second = [6, 5, 4, 3, 2]
+    state = block(2, _finished_block(26, second), 26 + len(second) + 3)
+    assert state["recent_codes"] == (first + second)[-16:]
+    assert not getattr(talker, "_request_codec_history", {})
+
+
+def test_turn_chunk_replay_from_zero_cannot_rebuild_earlier_blocks() -> None:
+    """Why the turn-chunked Talker declares ``recompute_preemption="fail"``.
+
+    After a block is appended the prompt holds every earlier condition and
+    code, but the request's buffer carries only the newest condition. A
+    recompute replays the prompt from offset zero and the earlier positions
+    come back as placeholders.
+    """
+    talker = _condition_talker()
+    _, embeds, _ = talker.preprocess(
+        torch.zeros(43, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=43,
+        _omni_num_computed_tokens=0,
+        request_id="req-chunk",
+        meta={"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": 1},
+        tts_token_ids=torch.tensor([2, 3]),
+        tts_hidden_states=torch.ones(2, 2),
+    )
+    assert embeds.shape[0] == 43
+    assert torch.equal(embeds[:40], talker.emb_text(torch.zeros(40, dtype=torch.long)))
+
+
+def test_turn_chunk_open_block_stops_at_the_code_cap_the_bridge_counted() -> None:
+    talker = _condition_talker()
+    meta = {"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": 0, "turn_chunk_max_codes": 200}
+    _, _, updates = talker.preprocess(
+        torch.zeros(3, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=3,
+        request_id="req-cap",
+        meta=meta,
+        tts_token_ids=torch.tensor([2, 3]),
+        tts_hidden_states=torch.ones(2, 2),
+    )
+    assert updates["audio_state"]["max_tokens"] == 200
+
+
+def test_ordinary_turn_condition_keeps_the_whole_reply_ceiling() -> None:
+    talker = _condition_talker()
+    _, _, updates = talker.preprocess(
+        torch.zeros(4, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=4,
+        request_id="req-turn",
+        tts_token_ids=torch.tensor([2, 3]),
+        tts_hidden_states=torch.ones(2, 2),
+    )
+    state = updates["audio_state"]
+    assert state["max_tokens"] == 2048
+    assert "recent_codes" not in state
+    assert "host_condition_seq" not in state
+
+
 def test_native_duplex_rollover_matches_official_sliding_recompute(mocker) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)
