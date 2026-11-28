@@ -2329,8 +2329,7 @@ MiniCPM-o 4.5 accepts non-empty text fragments in a native session with
 prefilled immediately as its own model unit, using the checkpoint's native
 `streaming_prefill(text_list=...)` format. It does not wait for the complete
 text, reset the session, or insert synthetic input audio. Tokenization occurs
-per fragment, so send complete words when possible. In Thinker-only mode, the
-first unforced fragment that opens a response after an interruption starts a
+per fragment, so send complete words when possible. The first unforced fragment that opens a response after an interruption starts a
 new user turn in the retained conversation context.
 
 Text can be interleaved with microphone appends on the same connection:

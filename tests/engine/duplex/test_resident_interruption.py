@@ -238,7 +238,7 @@ async def test_control_uses_producer_turn_when_snapshot_includes_cancelled_units
 
 @pytest.mark.parametrize("h", [{"thinker_only": True, "stages": 1}, {"stages": 3}], indirect=True)
 @pytest.mark.parametrize("control_confirmed", [False, True])
-async def test_only_new_thinker_text_response_after_interrupt_gets_a_user_turn(h, control_confirmed):
+async def test_only_new_text_response_after_interrupt_gets_a_user_turn(h, control_confirmed):
     await h.run(append_audio())
     request_id = h.stage0_request_id()
     await h.run(commands.BargeIn())
@@ -248,7 +248,7 @@ async def test_only_new_thinker_text_response_after_interrupt_gets_a_user_turn(h
     for text, forced in (("context", True), ("new question", False), ("continuation", False)):
         await h.run(commands.AppendText(text=text, force_listen=forced))
         payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
-        framed = h.runner.plugin.data_plane.thinker_only and text == "new question"
+        framed = text == "new question"
         assert bool(payload.get("text_before_unit")) is framed
         expected = f"\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n" if framed else text
         tokenizer = next(iter(h.runner.plugin._tokenizers.values()))
