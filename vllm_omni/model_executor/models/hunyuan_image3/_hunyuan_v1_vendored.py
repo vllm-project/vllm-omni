@@ -605,7 +605,9 @@ class HunYuanModel(nn.Module, EagleModelMixin):
         prev_kv_states = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         shared_rope = getattr(self, "shared_rotary_emb", None)
-        layer_positions = positions if shared_rope is None else shared_rope.prepare_factors(positions, hidden_states.dtype)
+        layer_positions = (
+            positions if shared_rope is None else shared_rope.prepare_factors(positions, hidden_states.dtype)
+        )
         for i, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             hidden_states, residual, kv_states = layer(
                 layer_positions,
