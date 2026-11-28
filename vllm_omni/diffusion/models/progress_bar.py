@@ -28,10 +28,6 @@ class _CountingTqdm(tqdm):
         super().__init__(*args, **kwargs)
         self._denoise_progress = progress
         progress.num_loops += 1
-        if progress.num_scheduled_steps is not None:
-            progress.num_scheduled_steps = (
-                None if self.total is None else progress.num_scheduled_steps + int(self.total)
-            )
 
     def update(self, n=1):
         if not self._denoise_iterating:

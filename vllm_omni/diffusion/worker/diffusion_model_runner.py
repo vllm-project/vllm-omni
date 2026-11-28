@@ -1073,10 +1073,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         outputs = [DiffusionOutput(aborted=True, abort_message=str(exc)) for _ in reqs]
                 if denoise_progress is not None:
                     # One forward runs one denoising schedule for every request in the batch.
-                    completed, scheduled = denoise_progress.result()
+                    completed = denoise_progress.result()
                     for output in outputs:
                         output.num_completed_steps = completed
-                        output.num_scheduled_steps = scheduled
                         output.execution_runtime = getattr(self, "_execution_runtime", None)
                 with record_function("prepare_output_for_transport"):
                     outputs = [
@@ -1121,7 +1120,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         attach_stage_durations(state, output)
         if self._execution_summary_enabled():
             output.num_completed_steps = state.step_index
-            output.num_scheduled_steps = state.total_steps
             output.execution_runtime = getattr(self, "_execution_runtime", None)
 
         # In streaming output mode with interaction, acknowledge which events are handled in this chunk.

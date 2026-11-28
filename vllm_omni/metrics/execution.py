@@ -6,7 +6,7 @@
 what it ran, so a benchmark harness can check a run against its declared
 workload. Each line is one JSON object with ``schema_version`` and ``event``:
 
-- ``request``: once per finished request, next to ``[OmniTiming]``. Each
+- ``diffusion_request_completed``: once per finished request, next to ``[OmniTiming]``. Each
   diffusion stage reports what the request ran (``diffusion``) and how the
   stage ran it (``runtime``: versions, model revision, dtype, quantization,
   resolved attention backends, cache and parallel config), so a single line
@@ -136,8 +136,9 @@ def diffusion_facts(
     the pipeline reported, e.g. for video it encoded in the worker) or
     ``request``; ``frames_source`` does the same for ``num_frames`` (``tensor``,
     ``metadata`` for the encoder's frame counts, ``stream`` or ``request``).
-    ``num_scheduled_steps`` and ``num_completed_steps`` are the denoising
-    steps the model runner counted (``None`` without a progress signal).
+    ``num_inference_steps`` is the requested step count; ``completed_steps``
+    is the denoising steps the model runner counted (``None`` without a
+    progress signal).
     ``guidance_scale`` is ``None`` unless the request set it.
     """
     sp = request.sampling_params
@@ -173,8 +174,7 @@ def diffusion_facts(
         "fps": sp.fps if sp.fps is not None else _output_fps(output, formatted_outputs),
         "seed": sp.seed,
         "num_inference_steps": sp.num_inference_steps,
-        "num_scheduled_steps": output.num_scheduled_steps,
-        "num_completed_steps": output.num_completed_steps,
+        "completed_steps": output.num_completed_steps,
         "guidance_scale": sp.guidance_scale if sp.guidance_scale_provided else None,
         "flow_shift": flow_shift,
         "num_outputs_per_prompt": sp.num_outputs_per_prompt,
@@ -232,6 +232,7 @@ def _engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any]:
     if hasattr(quantization, "get_name"):
         quantization = quantization.get_name()
     parallel = getattr(od_config, "parallel_config", None)
+    cache_backend = getattr(od_config, "cache_backend", None)
     parallel_fields = (
         "tensor_parallel_size",
         "pipeline_parallel_size",
@@ -252,7 +253,10 @@ def _engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any]:
         "model_class_name": getattr(od_config, "model_class_name", None),
         "dtype": str(getattr(od_config, "dtype", None)).removeprefix("torch."),
         "quantization": _jsonable(quantization),
-        "cache_backend": getattr(od_config, "cache_backend", None),
+        "cache_backend": cache_backend,
+        "cache_config": _jsonable(getattr(od_config, "cache_config", None))
+        if cache_backend not in (None, "none")
+        else None,
         "parallel_config": (
             {name: getattr(parallel, name, None) for name in parallel_fields} if parallel is not None else None
         ),

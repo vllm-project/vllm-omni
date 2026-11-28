@@ -2194,11 +2194,10 @@ class DiffusionOutput:
     # Host-side playback diagnostics; carried through the existing output metadata.
     streaming_metrics: dict[str, float | int] = field(default_factory=dict)
 
-    # Denoising steps the runner counted for this output: completed loop
-    # iterations and the scheduled loop length. None when the pipeline did not
-    # report progress (no shared progress bar) or counting was disabled.
+    # Denoising steps the runner counted for this output (completed loop
+    # iterations). None when the pipeline did not report progress (no shared
+    # progress bar) or counting was disabled.
     num_completed_steps: int | None = None
-    num_scheduled_steps: int | None = None
     # Values the pipeline resolved itself (e.g. ``width``, ``height``,
     # ``flow_shift`` when the request left them to the model defaults), and the
     # worker's runtime facts (resolved attention backends, device), reported by

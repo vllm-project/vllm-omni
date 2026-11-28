@@ -1127,7 +1127,6 @@ async def test_step_streaming_execution_summary_reports_counted_steps_for_omitte
         request_id="omitted-steps",
     )
     output = DiffusionOutput(
-        num_scheduled_steps=8,
         num_completed_steps=8,
         execution_facts={"width": 832, "height": 480, "flow_shift": 5.0},
         execution_runtime={"device": "cpu"},
@@ -1156,7 +1155,7 @@ async def test_step_streaming_execution_summary_reports_counted_steps_for_omitte
     execution = formatted_output.metrics["execution"]
     facts = execution["diffusion"]
     assert facts["num_inference_steps"] is None
-    assert (facts["num_scheduled_steps"], facts["num_completed_steps"]) == (8, 8)
+    assert facts["completed_steps"] == 8
     assert (facts["width"], facts["height"], facts["flow_shift"]) == (832, 480, 5.0)
     assert execution["runtime"] == {"dtype": "bfloat16", "device": "cpu"}
 

@@ -408,8 +408,7 @@ def test_request_forward_attaches_counted_denoise_steps(enabled, requested_steps
     )
 
     output = result.get_request_output(request.request_id).result
-    expected = (3, 4) if enabled else (None, None)
-    assert (output.num_completed_steps, output.num_scheduled_steps) == expected
+    assert output.num_completed_steps == (3 if enabled else None)
 
 
 def _make_compile_runner(

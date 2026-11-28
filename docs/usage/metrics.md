@@ -170,13 +170,13 @@ Pass `--enable-execution-summary` to log what each request actually ran, for
 example to check a benchmark run against its declared workload. `[OmniTiming]`
 reports how long a request took; `[OmniExecution]` reports what it ran: one JSON
 line per finished request, logged next to its `[OmniTiming]` line, with
-`schema_version` (currently `1`) and `event: "request"`. Each line stands on its
+`schema_version` (currently `1`) and `event: "diffusion_request_completed"`. Each line stands on its
 own; there are no separate startup lines to correlate.
 
 | Field | Meaning |
 | --- | --- |
-| `request_id` | Internal id, as in `[OmniTiming] req=`. |
-| `external_request_id` | The id the client sees: the `POST /v1/videos` job `id` or the `X-Request-Id` header. |
+| `request_id` | The id the client sees, to match client-side records: the `POST /v1/videos` job `id` or the `X-Request-Id` header. |
+| `engine_request_id` | Internal id, as in `[OmniTiming] req=`. |
 | `status`, `failure_reason` | `completed` or `failed`; the reason as in `vllm_omni:requests_failed` (e.g. `client_disconnect`, `stage_error`). |
 | `stages` | One entry per stage: `stage_id`, `replica_id`, `output_type`, `batch_size`; `diffusion` and `runtime` for diffusion stages, `num_tokens_in` and `num_tokens_out` for the others, `audio` (`duration_s`, `sample_rate`) for stages that output audio samples. |
 
@@ -190,7 +190,7 @@ defaults report what the pipeline resolved where the pipeline reports it
 | `num_frames`, `frames_source` | Frame count before optional frame interpolation and its source: `tensor`, `metadata` (frame counts of video the worker encoded), `stream` (sum of streamed chunks) or `request`. |
 | `fps`, `seed` | Output rate; resolved seed, including a server-assigned random seed. |
 | `num_inference_steps` | Requested denoising steps (`null` when the model default applied). |
-| `num_scheduled_steps`, `num_completed_steps` | Denoising steps the pipeline scheduled and completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
+| `completed_steps` | Denoising steps the pipeline completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
 | `flow_shift` | Shift the pipeline reported, else the request's or server's value; `null` when unknown. |
 | `guidance_scale` | Value set by the request; `null` means the model default applied (e.g. none for CFG-distilled models). |
 | `num_outputs_per_prompt`, `attention_schedule`, `lora` | Request settings that change the work done. |
@@ -204,15 +204,15 @@ worker once after the model loads:
 | `vllm_omni_version`, `vllm_version`, `torch_version` | Software versions (`dev` when vLLM-Omni runs from a source tree without version metadata). |
 | `model`, `model_revision` | Model as served; a local directory that resolves into a Hugging Face hub snapshot reports the repo id and snapshot commit. |
 | `model_class_name`, `dtype`, `quantization` | Pipeline class, weight dtype, quantization method (`null` for none). |
-| `cache_backend` | Step cache backend (`none` when off). |
+| `cache_backend`, `cache_config` | Step cache backend (`none` when off) and its settings (`null` when off). |
 | `parallel_config`, `max_num_seqs` | Parallel degrees; maximum requests batched together. |
 | `device`, `world_size` | Accelerator name and number of ranks. |
 | `attention` | The backend each attention layer resolved, counted per role. |
 
-MiniMax-H3 on one B300, with only `prompt`, `aspect_ratio` and `seed` set in the request:
+MiniMax-H3 on one B300; the request set `prompt`, `aspect_ratio`, `seed` and `num_inference_steps=49`:
 
 ```text
-[OmniExecution] {"schema_version": 1, "event": "request", "request_id": "video_gen_<job id>-<8 hex>", "external_request_id": "video_gen_<job id>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "diffusion": {"width": 1344, "height": 768, "size_source": "pipeline", "num_frames": 209, "frames_source": "metadata", "fps": 24, "seed": 42, "num_inference_steps": null, "num_scheduled_steps": 50, "num_completed_steps": 50, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "attention_schedule": null, "lora": null, "audio_flow_shift": 3.0}, "runtime": {"vllm_omni_version": "dev", "vllm_version": "0.34.0", "torch_version": "2.14.0+cu130", "model": "MiniMaxAI/MiniMax-H3", "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe", "model_class_name": "MiniMaxH3ModularPipeline", "dtype": "bfloat16", "quantization": null, "cache_backend": "none", "parallel_config": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1, "data_parallel_size": 1, "sequence_parallel_size": 1, "ulysses_degree": 1, "ring_degree": 1, "cfg_parallel_size": 1, "vae_patch_parallel_size": 1, "use_hsdp": false}, "max_num_seqs": 1, "device": "NVIDIA B300 SXM6 AC", "world_size": 1, "attention": {"minimax_h3.token_refiner": {"FLASHINFER_ATTN": 2}, "self": {"FLASHINFER_ATTN": 50}}}}]}
+[OmniExecution] {"schema_version": 1, "event": "diffusion_request_completed", "request_id": "video_gen_<job id>", "engine_request_id": "video_gen_<job id>-<8 hex>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "diffusion": {"width": 1344, "height": 768, "size_source": "pipeline", "num_frames": 209, "frames_source": "metadata", "fps": 24, "seed": 42, "num_inference_steps": 49, "completed_steps": 49, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "attention_schedule": null, "lora": null, "audio_flow_shift": 3.0}, "runtime": {"vllm_omni_version": "dev", "vllm_version": "0.34.0", "torch_version": "2.14.0+cu130", "model": "MiniMaxAI/MiniMax-H3", "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe", "model_class_name": "MiniMaxH3ModularPipeline", "dtype": "bfloat16", "quantization": null, "cache_backend": "none", "cache_config": null, "parallel_config": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1, "data_parallel_size": 1, "sequence_parallel_size": 1, "ulysses_degree": 1, "ring_degree": 1, "cfg_parallel_size": 1, "vae_patch_parallel_size": 1, "use_hsdp": false}, "max_num_seqs": 1, "device": "NVIDIA B300 SXM6 AC", "world_size": 1, "attention": {"minimax_h3.token_refiner": {"FLASHINFER_ATTN": 2}, "self": {"FLASHINFER_ATTN": 50}}}}]}
 ```
 
 Failed requests whose diffusion stage did not return have no `diffusion` or

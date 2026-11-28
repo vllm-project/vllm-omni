@@ -20,15 +20,13 @@ class DenoiseProgress:
     """Steps counted during one pipeline forward."""
 
     num_completed_steps: int = 0
-    # Sum of the progress bars' totals; None once a bar without a known length opens.
-    num_scheduled_steps: int | None = 0
     num_loops: int = 0
 
-    def result(self) -> tuple[int | None, int | None]:
-        """(completed, scheduled) denoising steps, or (None, None) when no loop reported."""
+    def result(self) -> int | None:
+        """Completed denoising steps, or None when no loop reported."""
         if not self.num_loops:
-            return None, None
-        return self.num_completed_steps, self.num_scheduled_steps
+            return None
+        return self.num_completed_steps
 
 
 _active_denoise_progress: ContextVar[DenoiseProgress | None] = ContextVar("_active_denoise_progress", default=None)

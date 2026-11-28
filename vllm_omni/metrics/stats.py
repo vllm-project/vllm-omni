@@ -1043,10 +1043,12 @@ class OrchestratorAggregator:
         stage_evts = self._sorted_stage_events(rid)
         execution = self.diffusion_execution.pop(rid, {})
         log_execution(
-            "request",
+            "diffusion_request_completed",
             {
-                "request_id": rid,
-                "external_request_id": external_request_id,
+                # The id the client sees, to match its benchmark records; the
+                # engine id is the one ``[OmniTiming] req=`` logs.
+                "request_id": external_request_id or rid,
+                "engine_request_id": rid,
                 "status": "completed" if completed else "failed",
                 "failure_reason": None if completed else normalize_failure_reason(failure_reason),
                 "stages": [stage_entry(evt, execution.get(evt.stage_id)) for evt in stage_evts],

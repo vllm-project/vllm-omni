@@ -43,7 +43,7 @@ def _video_output() -> DiffusionOutput:
             value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
         ),
     )
-    return DiffusionOutput(media=DiffusionMediaOutput(video=video), num_scheduled_steps=50, num_completed_steps=50)
+    return DiffusionOutput(media=DiffusionMediaOutput(video=video), num_completed_steps=50)
 
 
 def test_diffusion_facts_report_generated_tensor_and_counted_steps():
@@ -58,7 +58,7 @@ def test_diffusion_facts_report_generated_tensor_and_counted_steps():
         "fps": 24,
         "seed": 42,
     }
-    assert (facts["num_inference_steps"], facts["num_scheduled_steps"], facts["num_completed_steps"]) == (50, 50, 50)
+    assert (facts["num_inference_steps"], facts["completed_steps"]) == (50, 50)
     assert (facts["guidance_scale"], facts["flow_shift"]) == (None, 5.0)
 
 
@@ -84,7 +84,6 @@ def test_diffusion_facts_prefer_values_the_pipeline_resolved():
         SimpleNamespace(images=[b"mp4"], multimodal_output={"metadata": {"video": {"fps": 24, "frame_counts": [209]}}})
     ]
     output = DiffusionOutput(
-        num_scheduled_steps=50,
         num_completed_steps=50,
         execution_facts={"width": 1344, "height": 768, "flow_shift": 12.0, "audio_flow_shift": 5.0},
     )
@@ -94,7 +93,7 @@ def test_diffusion_facts_prefer_values_the_pipeline_resolved():
     assert (facts["width"], facts["height"], facts["size_source"]) == (1344, 768, "pipeline")
     assert (facts["num_frames"], facts["frames_source"]) == (209, "metadata")
     assert (facts["flow_shift"], facts["audio_flow_shift"]) == (12.0, 5.0)
-    assert (facts["num_inference_steps"], facts["num_completed_steps"]) == (None, 50)
+    assert (facts["num_inference_steps"], facts["completed_steps"]) == (None, 50)
 
 
 def test_model_identity_resolves_hub_snapshot_behind_symlink_view(tmp_path):
@@ -118,6 +117,7 @@ def test_engine_runtime_reports_config():
         dtype=torch.bfloat16,
         quantization_config=None,
         cache_backend="none",
+        cache_config={"rel_l1_thresh": 0.2},
         parallel_config=SimpleNamespace(ulysses_degree=2),
         max_num_seqs=1,
     )
@@ -132,6 +132,10 @@ def test_engine_runtime_reports_config():
         "cache_backend": "none",
     }
     assert runtime["parallel_config"]["ulysses_degree"] == 2
+    # Cache settings only matter when a cache backend runs.
+    assert runtime["cache_config"] is None
+    od_config.cache_backend = "tea_cache"
+    assert execution.engine_runtime(od_config)["cache_config"] == {"rel_l1_thresh": 0.2}
 
 
 @pytest.mark.parametrize(
@@ -158,7 +162,7 @@ def test_request_event(monkeypatch, completed, reason, status, failure_reason):
         "diffusion",
         rid,
         SimpleNamespace(
-            metrics={"execution": {"diffusion": {"num_completed_steps": 50}, "runtime": {"dtype": "bfloat16"}}}
+            metrics={"execution": {"diffusion": {"completed_steps": 50}, "runtime": {"dtype": "bfloat16"}}}
         ),
         stage_id=0,
     )
@@ -168,11 +172,11 @@ def test_request_event(monkeypatch, completed, reason, status, failure_reason):
     agg.log_execution_summary(rid, "abc123", reason)
 
     [(event, payload)] = lines
-    assert event == "request"
-    assert (payload["request_id"], payload["external_request_id"]) == (rid, "abc123")
+    assert event == "diffusion_request_completed"
+    assert (payload["request_id"], payload["engine_request_id"]) == ("abc123", rid)
     assert (payload["status"], payload["failure_reason"]) == (status, failure_reason)
     [stage] = payload["stages"]
-    assert stage["diffusion"] == {"num_completed_steps": 50}
+    assert stage["diffusion"] == {"completed_steps": 50}
     assert stage["runtime"] == {"dtype": "bfloat16"}
     assert "num_tokens_in" not in stage
 
@@ -192,7 +196,7 @@ def test_counts_each_iterated_step_once(disable):
         for _ in pipeline.progress_bar(range(5)):
             pass
 
-    assert progress.result() == (5, 5)
+    assert progress.result() == 5
 
 
 @pytest.mark.parametrize("disable", [True, False])
@@ -206,7 +210,7 @@ def test_counts_a_partially_iterated_loop(disable):
                 break
 
     # The break leaves the third step's body unfinished.
-    assert progress.result() == (2, 5)
+    assert progress.result() == 2
 
 
 @pytest.mark.parametrize("disable", [True, False])
@@ -219,7 +223,7 @@ def test_counts_explicit_updates(disable):
             bar.update(2)
             bar.update()
 
-    assert progress.result() == (3, 4)
+    assert progress.result() == 3
 
 
 def test_counts_progress_bar_steps():
@@ -231,4 +235,4 @@ def test_counts_progress_bar_steps():
             for _ in range(3):
                 bar.update()
 
-    assert progress.result() == (3, 4)
+    assert progress.result() == 3
