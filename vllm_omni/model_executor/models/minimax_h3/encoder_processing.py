@@ -44,11 +44,14 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+    MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY,
     load_audio_file,
+    load_prepared_rgb_frames,
     load_video_audio,
     load_video_frames,
     prepare_edit_video,
     prepare_reference_videos,
+    resolve_reference_video_decode_reuse,
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
@@ -543,7 +546,9 @@ def _reuse_prepared_reference_videos(
     if len(prepared) != expected_count:
         raise OmniClientError("MiniMax H3 prepared-reference-video count does not match the request")
     for item in prepared:
-        if not os.path.isfile(item["prepared_path"]):
+        if ("prepared_path" in item) == ("rgb_path" in item):
+            raise OmniClientError("MiniMax H3 prepared-reference-video descriptor must contain exactly one media path")
+        if "rgb_path" not in item and not os.path.isfile(item["prepared_path"]):
             raise OmniClientError(f"MiniMax H3 prepared reference video is unavailable: {item['prepared_path']}")
     return prepared
 
@@ -610,6 +615,9 @@ def prepare_encoder_inputs(
     if lock_audio and len(audio_values) != 1:
         raise OmniClientError("MiniMax H3 lock_source requires exactly one driving audio")
     task = task if task is not None else _resolve_task(extra_args, multi_modal_data)
+    reference_video_decode_reuse = resolve_reference_video_decode_reuse(extra_args)
+    if reference_video_decode_reuse and task != "ref2va":
+        raise OmniClientError(f"MiniMax H3 {MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY} requires the ref2va task")
     raw_images = load_minimax_h3_images(image_values) if image_values else []
 
     if task == "t2va":
@@ -771,6 +779,7 @@ def prepare_encoder_inputs(
                         target_frame_count=num_frames,
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
+                        decode_reuse=reference_video_decode_reuse,
                     )
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
@@ -789,10 +798,15 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        full_frames = load_video_frames(item["prepared_path"])
+                        # The descriptor identifies the already-prepared media format.
+                        full_frames = (
+                            load_prepared_rgb_frames(item)
+                            if "rgb_path" in item
+                            else load_video_frames(item["prepared_path"])
+                        )
                         encoded_video_inputs.append(_frames_to_tensor(full_frames))
                         sampled = sample_reference_video_frames(
-                            item["prepared_path"],
+                            item.get("prepared_path"),
                             decoded_frames=full_frames,
                         )
                         video_timestamps.append(sampled["block_timestamps"])

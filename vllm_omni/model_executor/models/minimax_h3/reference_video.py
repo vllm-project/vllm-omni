@@ -8,6 +8,7 @@ import json
 import math
 import os
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,40 +18,20 @@ import torch
 from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY = "minimax_h3_prepared_reference_videos"
+MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY = "reference_video_decode_reuse"
 
 
-def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
-    fields = (
+def resolve_reference_video_decode_reuse(extra_args: Mapping[str, object]) -> bool:
+    """Resolve the boolean request option, disabled when omitted."""
+    value = extra_args.get(MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY, False)
+    if not isinstance(value, bool):
+        raise OmniClientError(f"MiniMax H3 {MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY} must be a boolean")
+    return value
+
+
+_REQUIRED_REFERENCE_FIELDS = frozenset(
+    {
         "original_path",
-        "prepared_path",
-        "input_has_audio",
-        "width",
-        "height",
-        "start_time_seconds",
-        "duration_seconds",
-        "audio_duration_seconds",
-    )
-    return json.dumps(
-        {
-            "artifact_dir": artifact_dir,
-            "videos": [{field: item[field] for field in fields} for item in items],
-        },
-        separators=(",", ":"),
-    )
-
-
-def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[str, Any]]]:
-    try:
-        payload = json.loads(value)
-        artifact_dir = payload["artifact_dir"]
-        videos = payload["videos"]
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor") from exc
-    if not isinstance(artifact_dir, str) or not isinstance(videos, list):
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
-    required = {
-        "original_path",
-        "prepared_path",
         "input_has_audio",
         "width",
         "height",
@@ -58,8 +39,43 @@ def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[st
         "duration_seconds",
         "audio_duration_seconds",
     }
-    if any(not isinstance(item, dict) or set(item) != required for item in videos):
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
+)
+_REFERENCE_FIELDS = _REQUIRED_REFERENCE_FIELDS | {"prepared_path", "rgb_path", "frame_count"}
+
+
+def _validate_prepared_reference_videos(artifact_dir: Any, videos: Any) -> None:
+    error = "invalid MiniMax H3 prepared-reference-video descriptor"
+    if not isinstance(artifact_dir, str) or not isinstance(videos, list):
+        raise ValueError(error)
+    for item in videos:
+        if not isinstance(item, dict) or not _REQUIRED_REFERENCE_FIELDS <= item.keys() <= _REFERENCE_FIELDS:
+            raise ValueError(error)
+        if ("prepared_path" in item) == ("rgb_path" in item):
+            raise ValueError(f"{error}: require exactly one media path")
+        if (
+            ("prepared_path" in item and not isinstance(item["prepared_path"], str))
+            or (("rgb_path" in item) != ("frame_count" in item))
+            or ("rgb_path" in item and not isinstance(item["rgb_path"], str))
+            or ("frame_count" in item and (type(item["frame_count"]) is not int or item["frame_count"] <= 0))
+        ):
+            raise ValueError(error)
+
+
+def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
+    # In-process items may hold extra metadata that is not part of the wire format.
+    videos = [{key: value for key, value in item.items() if key in _REFERENCE_FIELDS} for item in items]
+    _validate_prepared_reference_videos(artifact_dir, videos)
+    return json.dumps({"artifact_dir": artifact_dir, "videos": videos}, separators=(",", ":"))
+
+
+def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        payload = json.loads(value)
+        artifact_dir = payload["artifact_dir"]
+        videos = payload["videos"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor") from exc
+    _validate_prepared_reference_videos(artifact_dir, videos)
     return artifact_dir, videos
 
 
@@ -340,7 +356,8 @@ def _transcode_reference_video(
     duration_seconds: float | None = None,
     pad_last_frame: bool = False,
     cover: bool = False,
-) -> str:
+    rgb_output_path: str | None = None,
+) -> str | None:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
     frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
@@ -359,7 +376,7 @@ def _transcode_reference_video(
         # requested target; longer inputs are deterministically trimmed by the
         # same -frames:v limit without enabling this padding filter.
         filters.append("tpad=stop_mode=clone:stop=-1")
-    command = [
+    input_args = [
         "ffmpeg",
         "-nostdin",
         "-y",
@@ -369,11 +386,8 @@ def _transcode_reference_video(
         f"{float(start_time_seconds):.6f}",
         "-i",
         source,
-        "-map",
-        "0:v:0",
-        "-an",
-        "-vf",
-        ",".join(filters),
+    ]
+    video_output_args = [
         *duration_args,
         *frame_count_args,
         "-metadata:s:v:0",
@@ -392,8 +406,34 @@ def _transcode_reference_video(
         "rgb24",
         output,
     ]
+    if rgb_output_path is None:
+        command = [
+            *input_args,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            ",".join(filters),
+            *video_output_args,
+        ]
+    else:
+        command = [
+            *input_args,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            ",".join(filters),
+            *duration_args,
+            *frame_count_args,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            rgb_output_path,
+        ]
     subprocess.run(command, check=True, stdin=subprocess.DEVNULL)
-    return output
+    return output if rgb_output_path is None else None
 
 
 def prepare_edit_video(
@@ -425,6 +465,7 @@ def prepare_edit_video(
         pad_last_frame=True,
         cover=cover,
     )
+    assert prepared_path is not None
 
     return {
         "original_path": source,
@@ -442,6 +483,7 @@ def prepare_reference_videos(
     target_frame_count: int,
     workdir: str,
     start_time_seconds: Any = None,
+    decode_reuse: bool = False,
 ) -> list[dict[str, Any]]:
     if isinstance(values, (str, os.PathLike)):
         values = [values]
@@ -455,6 +497,7 @@ def prepare_reference_videos(
         raise OmniClientError("start_time_seconds must contain one value per reference video")
 
     prepared: list[dict[str, Any]] = []
+    capture_rgb = decode_reuse
     total_duration = 0.0
     for index, value in enumerate(values):
         item_start = start_times[index]
@@ -487,6 +530,7 @@ def prepare_reference_videos(
         width, height = _reference_video_shape(meta["width"], meta["height"])
         item_workdir = Path(workdir) / f"video_{index}"
         item_workdir.mkdir(parents=True)
+        rgb_path = str(item_workdir / "prepared.rgb") if capture_rgb else None
         prepared_path = _transcode_reference_video(
             source,
             target_width=width,
@@ -495,27 +539,62 @@ def prepare_reference_videos(
             workdir=str(item_workdir),
             start_time_seconds=start,
             duration_seconds=duration,
+            rgb_output_path=rgb_path,
         )
-        prepared.append(
-            {
-                "original_path": source,
-                "prepared_path": prepared_path,
-                "input_has_audio": bool(meta.get("audio_codecs")),
-                "width": width,
-                "height": height,
-                "start_time_seconds": start,
-                "duration_seconds": duration,
-                # Reference video frames and their soundtrack are conditioned
-                # only for the generated temporal extent. Keep the source
-                # segment duration for metadata/validation, and expose the
-                # bounded duration separately for audio extraction.
-                "audio_duration_seconds": min(
-                    duration,
-                    float(target_frame_count) / MINIMAX_H3_FPS if target_frame_count > 0 else duration,
-                ),
-            }
-        )
+        item: dict[str, Any] = {
+            "original_path": source,
+            "input_has_audio": bool(meta.get("audio_codecs")),
+            "width": width,
+            "height": height,
+            "start_time_seconds": start,
+            "duration_seconds": duration,
+            # Reference video frames and their soundtrack are conditioned
+            # only for the generated temporal extent. Keep the source
+            # segment duration for metadata/validation, and expose the
+            # bounded duration separately for audio extraction.
+            "audio_duration_seconds": min(
+                duration,
+                float(target_frame_count) / MINIMAX_H3_FPS if target_frame_count > 0 else duration,
+            ),
+        }
+        if prepared_path is not None:
+            item["prepared_path"] = prepared_path
+        if rgb_path is not None:
+            frame_size = int(width) * int(height) * 3
+            rgb_size = os.path.getsize(rgb_path)
+            if rgb_size == 0 or rgb_size % frame_size:
+                raise OmniClientError(
+                    f"prepared RGB sidecar has {rgb_size} bytes, expected whole {frame_size}-byte frames"
+                )
+            item["rgb_path"] = rgb_path
+            item["frame_count"] = rgb_size // frame_size
+        prepared.append(item)
     return prepared
+
+
+def load_prepared_rgb_frames(item: dict[str, Any]) -> np.ndarray:
+    try:
+        path = str(item["rgb_path"])
+        frame_count = int(item["frame_count"])
+        width = int(item["width"])
+        height = int(item["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OmniClientError("prepared reference video has no reusable RGB sidecar") from exc
+    if frame_count <= 0 or width <= 0 or height <= 0:
+        raise OmniClientError(f"prepared RGB sidecar has invalid shape {frame_count}x{height}x{width}")
+    expected_size = frame_count * height * width * 3
+    try:
+        actual_size = os.path.getsize(path)
+    except OSError as exc:
+        raise OmniClientError(f"prepared RGB sidecar is unavailable: {path}") from exc
+    if actual_size != expected_size:
+        raise OmniClientError(f"prepared RGB sidecar has {actual_size} bytes, expected {expected_size}: {path}")
+    return np.memmap(
+        path,
+        dtype=np.uint8,
+        mode="c",
+        shape=(frame_count, height, width, 3),
+    )
 
 
 def load_video_frames(path: str) -> np.ndarray:
@@ -604,11 +683,13 @@ def _decode_video_frames_ffmpeg(
 
 
 def sample_reference_video_frames(
-    prepared_path: str,
+    prepared_path: str | None,
     *,
     decoded_frames: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if decoded_frames is None:
+        if prepared_path is None:
+            raise OmniClientError("prepared reference video has neither reusable RGB nor a prepared MP4")
         meta = _probe_video(prepared_path)
         frame_count = int(meta["frame_count"])
     else:
@@ -629,7 +710,7 @@ def sample_reference_video_frames(
             indices.append(frame_index)
         cursor += ratio
     if not indices:
-        raise OmniClientError(f"no frames sampled from {prepared_path}")
+        raise OmniClientError("no frames sampled from prepared reference video")
 
     if decoded_frames is None:
         decoded_frames = _decode_video_frames_ffmpeg(
@@ -757,9 +838,12 @@ __all__ = [
     "load_audio_file",
     "load_video_audio",
     "load_video_frames",
+    "load_prepared_rgb_frames",
     "prepare_edit_video",
     "prepare_reference_videos",
     "sample_reference_video_frames",
+    "MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY",
+    "resolve_reference_video_decode_reuse",
     "validate_reference_audio_files",
     "validate_reference_audio_waveforms",
 ]
