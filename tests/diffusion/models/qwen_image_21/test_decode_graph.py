@@ -3,6 +3,7 @@
 
 import gc
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -137,6 +138,28 @@ def test_top_level_offload_hook_without_staging_disables_decode_graphs():
     registry.register_hook("sequential_offload", ModelHook())
     assert manager._offload_reason() is not None
     assert manager.eligible() is False
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("global_dtype", "has_spec_quantization", "eligible"),
+    [(None, False, True), ("fp8", False, False), (None, True, False)],
+    ids=["unquantized", "global-fp8", "spec-quantization"],
+)
+def test_attention_quantization_disables_decode_graphs(monkeypatch, global_dtype, has_spec_quantization, eligible):
+    model = DecodeModel()
+    attn_layer = SimpleNamespace(
+        _kv_cache_dtype=global_dtype,
+        _has_spec_quantization=has_spec_quantization,
+        _kv_cache_skip_steps={0, 1},
+    )
+    model.transformer_blocks = [SimpleNamespace(attn=SimpleNamespace(attn=attn_layer))]
+    # Exercise eligibility on CPU without allocating CUDA tensors or capturing a graph.
+    monkeypatch.setattr(model, "parameters", lambda: iter([SimpleNamespace(device=torch.device("cuda"))]))
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1)
+    manager = decode_graph.QwenImage21DecodeGraphManager(model)
+
+    assert manager.eligible() is eligible
 
 
 @pytest.mark.cpu
