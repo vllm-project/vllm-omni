@@ -14,6 +14,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.utils.attn_runtime_selector import can_sdpa_use_fused_gqa
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
 from vllm_omni.diffusion.attention.capabilities import (
     CapabilityResult,
     CompilationMode,
@@ -403,6 +404,8 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return self._forward_piecewise_npu(query, key, value, attn_metadata)
         if attn_metadata is not None and attn_metadata.packed_padding is not None:
             if self.causal or attn_metadata.attn_mask is not None:
                 raise ValueError("NPU SDPA packed padding requires non-causal attention without an explicit mask")
@@ -411,3 +414,68 @@ class SDPAImpl(AttentionImpl):
             length = attn_metadata.packed_padding.kv_length
             return self._forward_impl(query, key[:, :length], value[:, :length])
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")
+
+    @staticmethod
+    def _piecewise_segment_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        causal: bool,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """One piecewise segment through ``torch.nn.functional.scaled_dot_product_attention``.
+
+        The NPU platforms route that entry point through their own kernel, so
+        an unmasked segment can reach prompt flash attention while the masked
+        path stays the per-segment fallback.
+
+        ``piecewise_attn`` passes a causal segment as ``Q[:, s:e]`` over
+        ``K[:, :e]`` and expects FlashAttention's bottom-right diagonal
+        alignment. PyTorch defines ``is_causal`` with the diagonal anchored at
+        the top-left, which only agrees when the segment is square: a square
+        segment ends at its query range, and so does the query range of the
+        last span. Segments that follow an image block inside the prefix (the
+        condition images of an image-conditioned request) are rectangular, and
+        the top-left rule would drop the ``kv_len - q_len`` most recent keys of
+        every row. Build that shift as an explicit boolean mask instead.
+        """
+        query, key, value = (tensor.permute(0, 2, 1, 3) for tensor in (query, key, value))
+        attn_mask = None
+        if causal and query.shape[2] != key.shape[2]:
+            rows = torch.arange(query.shape[2], device=query.device).view(-1, 1)
+            rows = rows + (key.shape[2] - query.shape[2])
+            cols = torch.arange(key.shape[2], device=query.device).view(1, -1)
+            attn_mask = cols <= rows
+            causal = False
+        output = _sdpa_attention(query, key, value, attn_mask, causal, softmax_scale)
+        return output.permute(0, 2, 1, 3)
+
+    def _forward_piecewise_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Block-causal attention from ``full_attn_spans``, one segment at a time.
+
+        Same segment plan as the CUDA backends (``piecewise_attn``); only the
+        per-segment kernel differs. Paying for a dense mask instead is
+        expensive on the platforms where SDPA is the default: the 310P SDPA is
+        a chunked fp32 matmul/softmax loop, while each unmasked segment of this
+        plan goes to ``npu_prompt_flash_attention``. Only backends that declare
+        ``supports_piecewise_spans`` receive spans, so CUDA is unaffected.
+        """
+        spans = attn_metadata.full_attn_spans
+        if spans is None:
+            raise ValueError("piecewise attention requires full_attn_spans")
+        return piecewise_attn(
+            query,
+            key,
+            value,
+            spans,
+            self.softmax_scale,
+            self._piecewise_segment_attention,
+            query_ranges=attn_metadata.query_ranges,
+        )

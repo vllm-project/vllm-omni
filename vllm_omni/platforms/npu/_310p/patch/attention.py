@@ -234,5 +234,13 @@ def apply_attention_patches() -> None:
     F.scaled_dot_product_attention = _sdpa_310p
     # ``torch.nn.functional`` is the same module object for both spellings.
     torch.nn.functional.scaled_dot_product_attention = _sdpa_310p
+    # Block-causal prompts are cheaper as one call per segment than as a dense
+    # mask: the target span is unmasked and reaches prompt flash attention,
+    # while the masked path above is an fp32 matmul/softmax loop over the
+    # whole sequence. The segment plan itself is platform-neutral and already
+    # backs the CUDA backends; the SDPA impl consumes it on NPU.
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+    SDPABackend.supports_piecewise_spans = True
     _PATCHED = True
     logger.info("310P diffusion attention: SDPA routed through npu_prompt_flash_attention")
