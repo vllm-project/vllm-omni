@@ -744,6 +744,9 @@ def _unpad_qkv_input(
 
     # AllGather's local queries need not be a suffix of the global keys.
     # The mask covers keys only; keep every query row.
+    # Static caches can contain unused slots beyond the key mask.
+    if key.size(1) > (mask_len := attention_mask.shape[-1]):
+        key, value = key[:, :mask_len], value[:, :mask_len]
     k, indices_k, cu_k, max_k, _ = _unpad_input(key, attention_mask)
     v = _index_first_axis(value, indices_k)
     q = query.flatten(0, 1)
