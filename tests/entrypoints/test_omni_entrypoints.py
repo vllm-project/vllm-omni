@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import janus
 import pytest
+from huggingface_hub import constants
 from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
@@ -660,6 +661,43 @@ def test_get_diffusion_od_config_falls_back_to_inner_engine():
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
+
+
+@pytest.mark.parametrize(
+    ("pin_revision", "cache_main"),
+    [(True, False), (True, True), (False, True)],
+    ids=["pinned-only", "pinned-and-main", "default-revision"],
+)
+def test_get_diffusion_od_config_respects_revision_offline(tmp_path, monkeypatch, pin_revision, cache_main):
+    model_id = "revision-test/diffusion"
+    pinned_revision = "a" * 40
+    repo_cache = tmp_path / "models--revision-test--diffusion"
+    pinned_snapshot = repo_cache / "snapshots" / pinned_revision
+    pinned_snapshot.mkdir(parents=True)
+    (pinned_snapshot / "model_index.json").write_text('{"_class_name": "QwenImageEditPlusPipeline"}', encoding="utf-8")
+    if cache_main:
+        main_revision = "b" * 40
+        main_snapshot = repo_cache / "snapshots" / main_revision
+        main_snapshot.mkdir()
+        (main_snapshot / "model_index.json").write_text('{"_class_name": "QwenImagePipeline"}', encoding="utf-8")
+        (repo_cache / "refs").mkdir()
+        (repo_cache / "refs" / "main").write_text(main_revision, encoding="utf-8")
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+
+    # Simulate an out-of-process stage without starting a worker or loading weights.
+    def mark_ready(_engine, _stage_init_timeout, startup_future):
+        startup_future.set_result(None)
+
+    monkeypatch.setattr(AsyncOmniEngine, "_bootstrap_orchestrator", mark_ready)
+    omni = object.__new__(AsyncOmni)
+    omni.engine = AsyncOmniEngine(model_id, revision=pinned_revision if pin_revision else None)
+    try:
+        od_config = omni.get_diffusion_od_config()
+        assert od_config.model_class_name == ("QwenImageEditPlusPipeline" if pin_revision else "QwenImagePipeline")
+        assert od_config.supports_multimodal_inputs is pin_revision
+    finally:
+        omni.engine.shutdown()
 
 
 @pytest.mark.asyncio

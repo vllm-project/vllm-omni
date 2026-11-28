@@ -160,6 +160,7 @@ class OmniEngineBase:
     _output_sink: OutputQueueSink | None = None
     _watermark_config: WatermarkConfig | None = None
     _weight_sharing_config: WeightSharingConfig | None = None
+    _revision: str | None = None
 
     def __init__(
         self,
@@ -181,6 +182,7 @@ class OmniEngineBase:
         from vllm_omni.tracing import create_tracer_provider
 
         self.model = model
+        self._revision = kwargs.get("revision")
         self.tokenizer = tokenizer
         # Cached by get_diffusion_od_config().
         self._diffusion_od_config_view: Any = None
@@ -255,7 +257,7 @@ class OmniEngineBase:
             model=model,
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
-            revision=kwargs.get("revision"),
+            revision=self._revision,
         )
         self.pipeline_config = pipeline_config
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
@@ -413,7 +415,7 @@ class OmniEngineBase:
             from vllm_omni.diffusion.data import resolve_model_class_name
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            model_class_name = resolve_model_class_name(self.model)
+            model_class_name = resolve_model_class_name(self.model, revision=self._revision)
             if model_class_name is None:
                 # use registered diffusers cls name as fallback
                 model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
