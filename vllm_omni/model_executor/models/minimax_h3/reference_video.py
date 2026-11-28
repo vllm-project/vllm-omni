@@ -8,6 +8,7 @@ import json
 import math
 import os
 import subprocess
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -340,7 +341,8 @@ def _transcode_reference_video(
     duration_seconds: float | None = None,
     pad_last_frame: bool = False,
     cover: bool = False,
-) -> str:
+    decode_frames: bool = False,
+) -> str | np.ndarray:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
     frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
@@ -378,20 +380,17 @@ def _transcode_reference_video(
         *frame_count_args,
         "-metadata:s:v:0",
         "rotate=0",
-        # Keep the transformed RGB pixels lossless. The same prepared
-        # stream is decoded by Qwen3VL and the video VAE; a yuv420p
-        # intermediate would make the two consumers see different
-        # pixels from the model-card reference recipe.
-        "-c:v",
-        "libx264rgb",
-        "-crf",
-        "0",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "rgb24",
-        output,
     ]
+    if decode_frames:
+        return _read_rgb24_frames(
+            [*command, "-vsync", "0", "-threads:v", "1"],
+            source,
+            width=target_width,
+            height=target_height,
+        )
+
+    # Keep the transformed RGB pixels lossless for file-backed consumers.
+    command.extend(["-c:v", "libx264rgb", "-crf", "0", "-preset", "veryfast", "-pix_fmt", "rgb24", output])
     subprocess.run(command, check=True, stdin=subprocess.DEVNULL)
     return output
 
@@ -442,6 +441,7 @@ def prepare_reference_videos(
     target_frame_count: int,
     workdir: str,
     start_time_seconds: Any = None,
+    decode_frames: bool = False,
 ) -> list[dict[str, Any]]:
     if isinstance(values, (str, os.PathLike)):
         values = [values]
@@ -454,6 +454,9 @@ def prepare_reference_videos(
     if len(start_times) != len(values):
         raise OmniClientError("start_time_seconds must contain one value per reference video")
 
+    # Keep the file-backed reader for Decord and for multi-video requests, which
+    # decode one clip at a time instead of holding all decoded clips here.
+    decode_frames = decode_frames and len(values) == 1 and find_spec("decord") is None
     prepared: list[dict[str, Any]] = []
     total_duration = 0.0
     for index, value in enumerate(values):
@@ -487,7 +490,7 @@ def prepare_reference_videos(
         width, height = _reference_video_shape(meta["width"], meta["height"])
         item_workdir = Path(workdir) / f"video_{index}"
         item_workdir.mkdir(parents=True)
-        prepared_path = _transcode_reference_video(
+        video = _transcode_reference_video(
             source,
             target_width=width,
             target_height=height,
@@ -495,11 +498,12 @@ def prepare_reference_videos(
             workdir=str(item_workdir),
             start_time_seconds=start,
             duration_seconds=duration,
+            decode_frames=decode_frames,
         )
         prepared.append(
             {
                 "original_path": source,
-                "prepared_path": prepared_path,
+                ("decoded_frames" if decode_frames else "prepared_path"): video,
                 "input_has_audio": bool(meta.get("audio_codecs")),
                 "width": width,
                 "height": height,
@@ -572,31 +576,32 @@ def _decode_video_frames_ffmpeg(
     if indices is not None:
         select = "+".join(f"eq(n\\,{index})" for index in indices)
         command.extend(["-vf", f"select={select}"])
-    command.extend(
-        [
-            "-vsync",
-            "0",
-            "-frames:v",
-            str(output_frame_count),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]
-    )
+    command.extend(["-vsync", "0", "-frames:v", str(output_frame_count)])
+    return _read_rgb24_frames(command, path, width=width, height=height, frame_count=output_frame_count)
+
+
+def _read_rgb24_frames(
+    command: list[str],
+    path: str,
+    *,
+    width: int,
+    height: int,
+    frame_count: int | None = None,
+) -> np.ndarray:
     result = subprocess.run(
-        command,
+        [*command, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
         check=True,
         capture_output=True,
         stdin=subprocess.DEVNULL,
     )
     frame_size = width * height * 3
-    expected_size = output_frame_count * frame_size
-    if len(result.stdout) != expected_size:
-        raise OmniClientError(f"decoded {len(result.stdout)} bytes from {path}, expected {expected_size}")
+    if frame_count is not None and len(result.stdout) != frame_count * frame_size:
+        raise OmniClientError(f"decoded {len(result.stdout)} bytes from {path}, expected {frame_count * frame_size}")
+    decoded_frame_count, remainder = divmod(len(result.stdout), frame_size)
+    if decoded_frame_count == 0 or remainder:
+        raise OmniClientError(f"FFmpeg produced incomplete RGB frames for {path}")
     return np.frombuffer(result.stdout, dtype=np.uint8).reshape(
-        output_frame_count,
+        decoded_frame_count,
         height,
         width,
         3,
