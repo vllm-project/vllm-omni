@@ -266,10 +266,36 @@ every field.
   an HS read still accesses them. A late completion must never publish output
   for a cancelled attempt.
 
+### Validation
+
 Validation must cover first writes, confirmed full/partial hits, block-boundary
 and chunked-prefill cases, corrupted/missing objects, failure recovery, and
 request cleanup. Confirm the restored row positions and resulting Talker inputs
 as well as text/audio output; matching text alone cannot validate HS restoration.
+
+The vLLM `0.34.0` scheduler passes a request list to the save hook. The CPU
+regression below exercises the real `build_connector_meta()` entry point with
+both a local hit and an external hit. It checks that only the newly computed
+complete blocks are scheduled for saving, including a case with no new block:
+
+```bash
+python -m pytest tests/distributed/test_mooncake_connector.py \
+  -k test_build_connector_meta_saves_only_new_blocks_after_mixed_hit \
+  -v --run-level core_model
+```
+
+With a running Mooncake master, separately check native Store publication and
+read validation:
+
+```bash
+MOONCAKE_CONFIG_PATH=/path/to/mooncake-store.json \
+  python -m pytest tests/distributed/test_mooncake_hs_store.py \
+    -v --run-level core_model
+```
+
+These native tests use host-memory KV sentinels. They do not transfer model KV
+on a GPU. Both native Store and GPU acceptance tests skip when
+`MOONCAKE_CONFIG_PATH` is unset; a skipped run supplies no acceptance evidence.
 
 The opt-in full-pipeline acceptance tests require two H100-class GPUs and a
 running Store. `tests/engine/test_mooncake_duplex_consistency_qwen3.py` runs
@@ -305,3 +331,10 @@ The same test file also compares local-only and combined caching with those
 baselines, confirms the local/external token ranges, and covers mixed hits,
 promotion followed by local reuse, failed mixed reads, and changed image/audio
 content.
+
+Record the Omni commit, vLLM and Mooncake versions, model revision, hardware,
+deployment overrides, and actual test results together. After changing the
+native scheduler or worker integration, rerun the native and full-pipeline
+checks on that runtime. Earlier vLLM `0.33.0` results remain evidence for that
+environment; the CPU save-hook regression alone does not establish GPU
+correctness or performance on vLLM `0.34.0`.
