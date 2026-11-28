@@ -734,8 +734,9 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     silence_continuation_samples = 16000
 
     def interruption_payload(self) -> dict[str, object] | None:
-        # A text-only control unit closes the native turn without advancing the
-        # audio encoder or replaying history. Tokenization reserves its exact KV span.
+        # Stage0 places EOS before the previous unit's deferred closure, then
+        # opens a LISTEN control unit without advancing the audio encoder or
+        # replaying history. Tokenization reserves its exact KV span.
         return {"type": "text", "text": "<|turn_eos|>", "force_listen": True, INTERRUPTION_KEY: True}
 
     def __init__(self, encode_audio: EncodeAudio) -> None:

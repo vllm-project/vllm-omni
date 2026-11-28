@@ -33,7 +33,9 @@ _SERVER = OmniServerParams(
 )
 
 
-async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: str, event_path: Path):
+async def _run_interrupted_recall(
+    *, url: str, model: str, cancel: str, secret: str, event_path: Path, interruptions: int = 1
+):
     """Send the follow-up immediately after cancel, without playback ACKs or filler inputs."""
     events = []
     try:
@@ -75,30 +77,34 @@ async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: 
                     "force_listen": True,
                 }
             )
-            # Exercise the reported back-to-back inputs without a LISTEN barrier.
-            await send(
-                {
-                    "type": "input.text.append",
-                    "text": "Count slowly out loud from one to fifty in English. Say each number. Start now.",
-                }
-            )
             audio_types = {"response.output_audio.delta", "response.audio.delta"}
-            audio = await receive_until(lambda e: e.get("type") in audio_types and e.get("delta"))
-            old_id = audio["response_id"]
-            assert not any(
-                e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id for e in events
-            ), "The counting response must still be active when interrupted"
-            await send({"type": cancel, "response_id": old_id})
-            await send(
-                {
-                    "type": "input.text.append",
-                    "text": "What is the secret word I asked you to remember? Say only that word.",
-                }
-            )
-            cancelled = await receive_until(
-                lambda e: e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id
-            )
-            assert cancelled["response"]["status"] == "cancelled", cancelled
+            for index in range(interruptions):
+                # Exercise the reported back-to-back inputs without a LISTEN barrier.
+                await send(
+                    {
+                        "type": "input.text.append",
+                        "text": "Count slowly out loud from one to fifty in English. Say each number. Start now.",
+                    }
+                )
+                audio = await receive_until(lambda e: e.get("type") in audio_types and e.get("delta"))
+                old_id = audio["response_id"]
+                assert not any(
+                    e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id for e in events
+                ), "The counting response must still be active when interrupted"
+                await send({"type": cancel, "response_id": old_id})
+                if index == interruptions - 1:
+                    await send(
+                        {
+                            "type": "input.text.append",
+                            "text": "What is the secret word I asked you to remember? Say only that word.",
+                        }
+                    )
+                cancelled = await receive_until(
+                    lambda e: e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id
+                )
+                assert cancelled["response"]["status"] == "cancelled", cancelled
+                if index < interruptions - 1:
+                    await asyncio.sleep(0.2)
             boundary = len(events)
             done = await receive_until(
                 lambda e: e.get("type") == "response.done" and e.get("response", {}).get("id") != old_id
@@ -119,7 +125,17 @@ async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: 
             assert done["response"]["status"] == "completed", done
             assert packets, tail
             assert all(e["response_id"] == done["response"]["id"] for e in packets), tail
-            assert secret.casefold() in transcript.casefold(), transcript
+            # A new response ID alone cannot rule out old text leaking through
+            # a resident downstream bridge (for example, "Five. Robin."). The
+            # follow-up must recall the word without continuing the counting
+            # task. Allow a short answer such as "The secret word is robin."
+            words = "".join(c if c.isalnum() else " " for c in transcript.casefold()).split()
+            counting_words = set(
+                "one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+                "fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty".split()
+            )
+            assert secret.casefold() in words, transcript
+            assert not counting_words.intersection(words) and not any(word.isdigit() for word in words), transcript
             return transcript
     finally:
         event_path.write_text(json.dumps(events, ensure_ascii=False, indent=2))
@@ -128,15 +144,18 @@ async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 @pytest.mark.parametrize(
-    "cancel,sessions",
+    "cancel,sessions,interruptions",
     [
-        ("response.cancel", 1),
-        ("output_audio_buffer.clear", 1),
-        ("barge_in", 1),
-        ("response.cancel", 2),
+        ("response.cancel", 1, 1),
+        ("output_audio_buffer.clear", 1, 1),
+        ("barge_in", 1, 1),
+        ("response.cancel", 2, 1),
+        ("response.cancel", 1, 2),
     ],
 )
-def test_mrv2_duplex_immediate_recall_after_interrupt(omni_server, tmp_path: Path, cancel: str, sessions: int):
+def test_mrv2_duplex_immediate_recall_after_interrupt(
+    omni_server, tmp_path: Path, cancel: str, sessions: int, interruptions: int = 1
+):
     async def recall():
         return await asyncio.gather(
             *(
@@ -146,6 +165,7 @@ def test_mrv2_duplex_immediate_recall_after_interrupt(omni_server, tmp_path: Pat
                     cancel=cancel,
                     secret=secret,
                     event_path=tmp_path / f"{secret}.json",
+                    interruptions=interruptions,
                 )
                 for secret in ("robin", "squirrel")[:sessions]
             )

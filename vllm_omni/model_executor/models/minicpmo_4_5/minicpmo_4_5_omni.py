@@ -399,6 +399,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 pending_speech_context = (
                     bool(getattr(state, "pending_speech_context", False)) if state is not None else False
                 )
+                if payload.get("type") == "text" and not force_listen and getattr(state, "interrupted_turn", False):
+                    # An unforced text append explicitly requests a new answer.
+                    # After interruption, sampling a continuation marker or EOS
+                    # here can resume the old answer or finish without content.
+                    # Frame this reply with BOS; recording that sample consumes
+                    # the latch. Audio keeps its native listen/speak decision.
+                    bos_id = token_ids.get("tts_bos_token_id", -1)
+                    if 0 <= bos_id < logits.shape[-1]:
+                        logits[row_idx].fill_(float("-inf"))
+                        logits[row_idx].narrow(0, bos_id, 1).fill_(0.0)
+                        continue
                 if is_speech is True:
                     if state is not None:
                         with suppress(Exception):

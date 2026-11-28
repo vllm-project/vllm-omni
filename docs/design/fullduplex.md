@@ -1025,9 +1025,13 @@ for queue updates and the final validity check before delivery.
 - **Native MiniCPM interruption retains the Thinker.** For automatic resumable
   sessions, `response.cancel`, `output_audio_buffer.clear`, explicit barge-in
   and overlap-policy barge-in stop the response and invalidate its queued
-  audio immediately. The plugin appends a text-only `<unit><|turn_eos|>`
-  control with forced LISTEN through the existing append tail. The preceding
-  unit's terminator and `</unit>` are included as usual. No request is aborted,
+  audio immediately. Through the existing append tail, the plugin inserts
+  `<|turn_eos|><|listen|></unit>` to close the preceding unit, replacing its
+  uncomputed speech terminator, then opens an empty `<unit>` with forced LISTEN.
+  EOS must close the old speech
+  unit; placing it in the new control unit can leave the model continuing the
+  cancelled answer after a follow-up. Window accounting includes EOS in the
+  closed unit rather than the new control unit. No request is aborted,
   no epoch is advanced, and no system/reference prefix or retained history is
   replayed. Buffered and already submitted input remains owned by that stream.
   Output is suppressed until Stage 0 confirms the control; that boundary
@@ -1046,6 +1050,11 @@ for queue updates and the final validity check before delivery.
   if the previous turn sent payloads, and rejects late older-turn callbacks.
   If no payload was sent, the next turn still owns the initial reference-audio
   payload. Normal turn ends advance the cache epoch only once.
+  The first unforced text reply after interruption starts with `<|tts_bos|>`:
+  the text API requests an answer, rather than a continuation of the old speech
+  or an empty turn. Forced-listen inputs retain this restart until a reply;
+  generated speech consumes it, so later text does not restart an active turn.
+  Audio input retains the native listen/speak decision.
   If control submission fails, including behind
   a rejected append, the runner uses destructive input cancellation with
   reason `interruption_control_failed`. This retires the epoch and queued

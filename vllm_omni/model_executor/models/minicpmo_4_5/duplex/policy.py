@@ -25,6 +25,7 @@ class MiniCPMO45TurnState:
     pending_speech_context: bool = False
     pending_speech_response_open: bool = False
     explicit_response_awaiting_content: bool = False
+    interrupted_turn: bool = False
 
     def interrupt(self) -> None:
         """Close the answer, retaining input, generated history and decoder KV."""
@@ -32,6 +33,7 @@ class MiniCPMO45TurnState:
         self.pending_speech_context = False
         self.pending_speech_response_open = False
         self.explicit_response_awaiting_content = False
+        self.interrupted_turn = True
 
     def observe_text_prefill(self, *, force_listen: bool, backend_result: bool) -> None:
         """Apply the newly accepted client text or delegated result before sampling."""
@@ -57,6 +59,7 @@ def record_turn_sample(
         state.explicit_response_awaiting_content = False
         state.pending_speech_response_open = False
     else:
+        state.interrupted_turn = False
         # A seeded prefix can open a response before tts_bos. Its pending
         # input stays available until the first content token is accepted.
         opening = getattr(state, "pending_speech_response_open", False)

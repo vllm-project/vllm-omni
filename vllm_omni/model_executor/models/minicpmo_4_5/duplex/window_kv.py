@@ -132,6 +132,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     cdiv,
     plan_position_reanchor,
     prepare_stage0_window,
+    stage0_unit_closure_tokens,
 )
 
 if TYPE_CHECKING:
@@ -643,7 +644,7 @@ class MiniCPMO45DuplexWindowPolicy:
                 if seq > 1 and segment_output_ids is not None:
                     preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
                     old_prompt_tokens = int(getattr(session, "num_prompt_tokens", 0) or 0)
-                    boundary_cur = old_prompt_tokens + len(segment_output_ids) + 2
+                    boundary_cur = old_prompt_tokens + len(segment_output_ids) + stage0_unit_closure_tokens(duplex)
                     recorded_open = getattr(session, "_minicpmo45_window_open_start", None)
                     open_start = preserve_len if recorded_open is None else int(recorded_open)
                     closing_len = boundary_cur - open_start
@@ -782,7 +783,7 @@ class MiniCPMO45SchedulerWindowPolicy:
             stage0_window["completed_terminator_token_id"] = int(completed_terminator)
 
         # Synchronize scheduler window units and coordinates atomically with compaction
-        boundary_before = old_prompt_tokens + len(generated_ids) + 2
+        boundary_before = old_prompt_tokens + len(generated_ids) + stage0_unit_closure_tokens(duplex)
         recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
         open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
         unit_len = boundary_before - open_start

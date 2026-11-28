@@ -746,6 +746,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         # pad again here: the first processor chunk is hop-aligned below 1035ms
         # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
+        close_interrupted_unit = interruption and state.audio_chunk_idx > 0
         while True:
             if vision_only and units_built:
                 break
@@ -785,6 +786,16 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # seeing its own past decisions in context.
                 pending_terminator = state.pending_terminator_token
                 closure_token_ids: list[int] = []
+                if close_interrupted_unit and units_built == 0:
+                    # End the speech inside the unit that produced it, before
+                    # </unit>, matching the official forced-listen tail:
+                    # turn_eos + listen + </unit>. Its deferred speech
+                    # terminator has not reached KV and must yield to LISTEN.
+                    # EOS in the next unit leaves old speech as a continuation.
+                    embed_parts.append(self._embed_token(self.turn_eos_token_id))
+                    token_ids.append(self.turn_eos_token_id)
+                    closure_token_ids.append(self.turn_eos_token_id)
+                    pending_terminator = self.listen_token_id
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None
                     embed_parts.append(self._embed_token(pending_terminator))
@@ -843,7 +854,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.extend(
                         [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
                     )
-            if input_text_token_ids and units_built == 0:
+            if input_text_token_ids and units_built == 0 and not close_interrupted_unit:
                 # Match native streaming_prefill(text_list=...): raw text after
                 # this unit's media, without a new chat template or audio clock.
                 text_ids = torch.tensor(input_text_token_ids, dtype=torch.long, device=self._model_device())

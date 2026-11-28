@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import importlib.util
+import json
 import subprocess
 import sys
 import wave
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import websockets
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,6 +45,50 @@ def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch():
     assert state.stale_audio_delta_count() == 0
     state.events.append({"type": "response.output_audio.delta", "response_id": "old", "metadata": {"epoch": 0}})
     assert state.stale_audio_delta_count() == 1
+
+
+@pytest.mark.parametrize(
+    "transcript,valid",
+    [("Robin.", True), ("The secret word is robin.", True), ("Five. Robin.", False), ("5, robin", False)],
+)
+def test_interrupt_recall_rejects_counting_under_the_new_response_id(tmp_path, transcript, valid):
+    from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _run_interrupted_recall
+
+    async def exercise():
+        async def serve(ws):
+            async def send(event):
+                await ws.send(json.dumps(event))
+
+            assert json.loads(await ws.recv())["type"] == "session.update"
+            await send({"type": "session.updated"})
+            for _ in range(2):
+                assert json.loads(await ws.recv())["type"] == "input.text.append"
+            await send({"type": "response.output_audio.delta", "response_id": "old", "delta": "AA=="})
+            assert json.loads(await ws.recv())["type"] == "response.cancel"
+            assert json.loads(await ws.recv())["type"] == "input.text.append"
+            await send({"type": "response.done", "response": {"id": "old", "status": "cancelled"}})
+            await send({"type": "response.output_audio_transcript.delta", "response_id": "new", "delta": transcript})
+            await send({"type": "response.output_audio.delta", "response_id": "new", "delta": "AA=="})
+            await send({"type": "response.done", "response": {"id": "new", "status": "completed"}})
+            assert json.loads(await ws.recv())["type"] == "session.close"
+            await send({"type": "session.closed"})
+
+        async with websockets.serve(serve, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            result = _run_interrupted_recall(
+                url=f"ws://127.0.0.1:{port}/v1/realtime",
+                model="fixture",
+                cancel="response.cancel",
+                secret="robin",
+                event_path=tmp_path / "events.json",
+            )
+            if valid:
+                assert await result == transcript
+            else:
+                with pytest.raises(AssertionError, match=transcript):
+                    await result
+
+    asyncio.run(exercise())
 
 
 def _load_multi_demo_module():
