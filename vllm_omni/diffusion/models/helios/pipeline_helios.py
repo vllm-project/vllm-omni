@@ -37,9 +37,11 @@ from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransform
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -181,9 +183,22 @@ def get_helios_post_process_func(
     video_processor = VideoProcessor(vae_scale_factor=8)
 
     def post_process_func(
-        video: torch.Tensor,
+        video: torch.Tensor | dict[str, Any],
         output_type: str = "np",
     ):
+        if isinstance(video, dict) and isinstance(video.get("payload"), dict):
+            # Envelope emitted by post_decode()/forward() when worker-side
+            # frame interpolation ran: postprocess the payload tensors and
+            # forward the metadata (e.g. video_fps_multiplier) unchanged.
+            payload = {
+                key: (
+                    video_processor.postprocess_video(value, output_type=output_type)
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for key, value in video["payload"].items()
+            }
+            return {"payload": payload, "metadata": video.get("metadata") or {}}
         if output_type == "latent":
             return video
         return video_processor.postprocess_video(video, output_type=output_type)
@@ -949,6 +964,38 @@ class HeliosPipeline(
             extra["stage2_start_point_list"].append(state.latents)
         self._set_stage2_timesteps(state)
 
+    def _apply_frame_interpolation(
+        self,
+        sampling: OmniDiffusionSamplingParams,
+        video: torch.Tensor,
+    ) -> torch.Tensor | dict[str, Any]:
+        """Opt-in RIFE frame interpolation for a decoded video tensor.
+
+        Runs worker-side while the decoded tensor still lives on the worker
+        accelerator, before the chunk output is shipped to the engine. The
+        generated frames are restored bit-exactly; only the intermediate
+        frames come from the interpolator. Returns the tensor unchanged when
+        the feature is disabled, otherwise an output envelope carrying the
+        interpolated video and the FPS multiplier metadata consumed by the
+        serving layer.
+        """
+        if not getattr(sampling, "enable_frame_interpolation", False):
+            return video
+        interpolated, multiplier = interpolate_video_tensor(
+            video,
+            exp=sampling.frame_interpolation_exp,
+            scale=sampling.frame_interpolation_scale,
+            model_path=sampling.frame_interpolation_model_path,
+        )
+        # The interpolator's float32 range round-trip ([-1, 1] -> [0, 1] ->
+        # [-1, 1]) is not bit-exact for small half-precision pixels, so put
+        # the decoded frames back into their slots.
+        interpolated[:, :, :: int(multiplier)] = video
+        return {
+            "payload": {"video": interpolated},
+            "metadata": {"video": {"video_fps_multiplier": int(multiplier)}},
+        }
+
     def post_decode(
         self,
         state: StepRequestState,
@@ -977,7 +1024,12 @@ class HeliosPipeline(
         else:
             extra["history_video"] = torch.cat([extra["history_video"], current_video], dim=2)
 
-        output = current_latents if extra["output_type"] == "latent" else current_video
+        if extra["output_type"] == "latent":
+            output: torch.Tensor | dict[str, Any] = current_latents
+        else:
+            # Interpolate while the decoded chunk is still on the worker
+            # accelerator; the output is shipped to the engine afterwards.
+            output = self._apply_frame_interpolation(state.sampling, current_video)
         completed_chunk_index = state.chunk_index
         state.chunk_index += 1
         finished = state.request_denoise_completed
@@ -1394,9 +1446,9 @@ class HeliosPipeline(
         self._current_timestep = None
 
         if output_type == "latent":
-            output = real_history_latents
+            output: torch.Tensor | dict[str, Any] = real_history_latents
         else:
-            output = history_video
+            output = self._apply_frame_interpolation(req.sampling_params, history_video)
 
         return DiffusionOutput(
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
