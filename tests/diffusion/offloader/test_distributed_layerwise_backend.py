@@ -1648,6 +1648,97 @@ class TestMmapWeightLoading:
         assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
         backend.disable()
 
+    def test_multirank_allgather_keeps_checkpoint_qkv_reordering(self, tmp_path, patched_offload_runtime, monkeypatch):
+        """Regression test: a multi-rank AllGather still applies plan transforms.
+
+        The loader skips ordinary DiT loading once a checkpoint-mmap plan
+        exists, so every transport must apply the plan's layout conversion
+        while packing. Dropping it on AllGather preserves every shape and
+        silently consumes grouped QKV in the wrong runtime order.
+        """
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Two heads; the checkpoint groups rows per head as (q, k, v)
+                # while the runtime expects every q row, then k, then v.
+                self.qkv = nn.Linear(6, 2, bias=False)
+
+        class Transformer(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block(), Block()])
+
+        class Pipeline(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = Transformer()
+
+        def to_runtime_layout(tensor):
+            return tensor.view(2, 3, 2).transpose(0, 1).reshape(6, 2)
+
+        # Ordinary loading yields these runtime weights.
+        ordinary = {index: torch.arange(12, dtype=torch.float32).view(6, 2) + 12 * index for index in range(2)}
+        checkpoint = {
+            f"blocks.{index}.qkv.weight": weight.view(3, 2, 2).transpose(0, 1).reshape(6, 2)
+            for index, weight in ordinary.items()
+        }
+        checkpoint_file = tmp_path / "model.safetensors"
+        save_file(checkpoint, str(checkpoint_file))
+
+        def build_rank(rank):
+            pipeline = Pipeline()
+            bindings = {
+                f"transformer.blocks.{index}.qkv.weight": TensorBinding(
+                    checkpoint_key=f"blocks.{index}.qkv.weight",
+                    file_path=str(checkpoint_file),
+                    transform=to_runtime_layout,
+                )
+                for index in range(2)
+            }
+            backend = DistributedLayerwiseOffloadBackend(
+                OffloadConfig(
+                    strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                    pin_cpu_memory=False,
+                    dp_size=2,
+                    dlo_use_allgather=True,
+                ),
+                torch.device("cpu"),
+                host_weight_plan=HostWeightPlan(backing_kind="checkpoint_mmap", bindings=bindings),
+            )
+            backend.dp_group = object()
+            backend.rank = rank
+            backend.enable(pipeline)
+            assert not backend._using_rank_local_mmap
+            return pipeline, backend
+
+        ranks = [build_rank(rank) for rank in range(2)]
+
+        # Emulate the collective: the gathered output is rank 0's shard
+        # followed by rank 1's.  The test runs the ranks one hook at a time.
+        pending = {}
+
+        def fake_all_gather(output, local_shard, group=None):
+            if output.numel() not in pending:
+                pending[output.numel()] = (output, local_shard.clone())
+                return
+            first_output, first_shard = pending.pop(output.numel())
+            gathered = torch.cat([first_shard, local_shard])
+            first_output.copy_(gathered)
+            output.copy_(gathered)
+
+        monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
+
+        for index in range(2):
+            for rank in range(2):
+                ranks[rank][1]._all_hook_groups[0][index].prefetch_layer(slot=index, non_blocking=False)
+            # Both ranks now hold the gathered runtime weights.
+            for rank in range(2):
+                assert torch.equal(ranks[rank][0].transformer.blocks[index].qkv.weight, ordinary[index])
+        assert not pending
+
     def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
         """A warm HWR plan uses the existing two-slot rank-local transport."""
         pipeline, backend, carrier, lease = _hwr_backend()
@@ -2227,7 +2318,7 @@ class TestMmapValidation:
         )
 
         assert result.plan is None
-        assert "1 required DiT tensors" in result.fallback_reason
+        assert "1 required component tensors" in result.fallback_reason
         assert pipeline.transformer.blocks[0].weight is original_weight
         assert not original_weight.is_meta
 

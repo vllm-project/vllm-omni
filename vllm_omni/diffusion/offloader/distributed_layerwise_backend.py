@@ -55,6 +55,7 @@ from .host_registration import (
     HostRegistrationError,
     register_host_mappings,
 )
+from .offload_plan import BackingKind
 from .plan_resolver import BlockStack, ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
     clear_block_storage,
@@ -1567,6 +1568,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         components = self.config.components or frozenset({DIT_COMPONENT})
         return self.dp_size > 1 and any(self.config.uses_allgather(component) for component in components)
 
+    def _component_mmap_eligible(self, component: ResolvedComponent) -> bool:
+        """Whether a resolved component streams its checkpoint-mmap source rank-locally.
+
+        This selects the transport only.  The plan's checkpoint transforms are
+        required by every transport, because the loader skipped ordinary
+        loading for every planned tensor.
+        """
+        return component.selected and self._using_rank_local_mmap and component.backing is BackingKind.CHECKPOINT_MMAP
+
     def _install_hook_group(
         self,
         blocks: Sequence[nn.Module] | nn.ModuleList,
@@ -1574,7 +1584,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         *,
         use_dit_mmap: bool = False,
     ) -> list[DistributedLayerwiseOffloadHook]:
-        """Install one circular block ring with the shared slot protocol."""
+        """Install one circular block ring with the shared slot protocol.
+
+        ``use_dit_mmap`` selects rank-local staging from the checkpoint mmap
+        source.  Plan-owned transforms are passed for every transport: a
+        multi-rank AllGather still packs each rank's shard from the raw
+        checkpoint view, so it needs the same layout conversion as the
+        ordinary loader.  The map is keyed by tensor identity, so tensors
+        loaded by the ordinary loader are never transformed.
+        """
         block_list = list(blocks)
         if len(block_list) <= 1:
             raise ValueError("A distributed layerwise hook group requires at least two blocks")
@@ -1602,7 +1620,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
-                    tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
+                    tensor_transforms=self._mmap_transforms_by_tensor_id,
                     materialization_probe_tensor=probes[id(block)],
                     chunk_size_bytes=self.config.chunk_size_bytes,
                 )
@@ -1632,7 +1650,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         module = component.module
         encoder_hooks: list[DistributedLayerwiseOffloadHook] = []
         for blocks in block_groups:
-            encoder_hooks.extend(self._install_hook_group(blocks, TEXT_ENCODER_COMPONENT))
+            encoder_hooks.extend(
+                self._install_hook_group(
+                    blocks,
+                    TEXT_ENCODER_COMPONENT,
+                    use_dit_mmap=self._component_mmap_eligible(component),
+                )
+            )
         # Track the module before placement, which may fail, so outer rollback
         # also removes its partially-installed block hooks and marker state.
         self._encoder_modules.append(module)
@@ -1667,7 +1691,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Keep the submodule's own non-block state resident by block identity,
         # so an attribute aliasing a streamed block is not placed with it.
         move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
-        self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=True)
+        self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=self._component_mmap_eligible(component))
 
     def _prepare_dit_non_block_modules(
         self,
@@ -1865,7 +1889,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 logger.info("All blocks for %s are resident; no streaming hooks required", component.path)
                 continue
 
-            self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=True)
+            self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=self._component_mmap_eligible(component))
         if self._resident_blocks:
             self._resident_layer_group = PinnedResidentLayerGroup(
                 self._resident_blocks,
