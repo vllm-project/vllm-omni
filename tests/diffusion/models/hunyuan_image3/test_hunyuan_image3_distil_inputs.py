@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HunyuanImage3 prepare_inputs_for_generation to ensure
 distilled model parameters (guidance, timesteps_r) are properly passed."""
 
@@ -76,8 +76,8 @@ class TestPrepareInputsForGenerationDistilled:
             kwargs["timesteps_r_scatter_index"] = None
         return kwargs
 
-    def test_guidance_passed_to_model_inputs(self):
-        """Test that guidance is passed through prepare_inputs_for_generation."""
+    def test_distilled_fields_passed_to_model_inputs(self):
+        """Distilled inputs retain all fields in one generation call."""
         kwargs = self._create_mock_kwargs(include_distilled_params=True)
         input_ids = torch.tensor([[1, 2, 3]])
         attention_mask = torch.ones(1, 3)
@@ -93,90 +93,10 @@ class TestPrepareInputsForGenerationDistilled:
             **kwargs,
         )
 
-        assert "guidance" in model_inputs, "guidance should be in model_inputs"
-        assert model_inputs["guidance"] is not None, "guidance should not be None"
-        assert torch.equal(model_inputs["guidance"], kwargs["guidance"])
-
-    def test_guidance_scatter_index_passed_to_model_inputs(self):
-        """Test that guidance_scatter_index is passed through."""
-        kwargs = self._create_mock_kwargs(include_distilled_params=True)
-        input_ids = torch.tensor([[1, 2, 3]])
-        attention_mask = torch.ones(1, 3)
-
-        model_inputs = self.pipeline.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            past_key_values=None,
-            attention_mask=attention_mask,
-            inputs_embeds=None,
-            tokenizer_output=None,
-            batch_gen_image_info=None,
-            generator=None,
-            **kwargs,
-        )
-
-        assert "guidance_scatter_index" in model_inputs
-        assert model_inputs["guidance_scatter_index"] is not None
-        assert torch.equal(model_inputs["guidance_scatter_index"], kwargs["guidance_scatter_index"])
-
-    def test_timesteps_r_passed_to_model_inputs(self):
-        """Test that timesteps_r is passed through for MeanFlow models."""
-        kwargs = self._create_mock_kwargs(include_distilled_params=True)
-        input_ids = torch.tensor([[1, 2, 3]])
-        attention_mask = torch.ones(1, 3)
-
-        model_inputs = self.pipeline.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            past_key_values=None,
-            attention_mask=attention_mask,
-            inputs_embeds=None,
-            tokenizer_output=None,
-            batch_gen_image_info=None,
-            generator=None,
-            **kwargs,
-        )
-
-        assert "timesteps_r" in model_inputs, "timesteps_r should be in model_inputs"
-        assert model_inputs["timesteps_r"] is not None
-        assert torch.equal(model_inputs["timesteps_r"], kwargs["timesteps_r"])
-
-    def test_timesteps_r_scatter_index_passed_to_model_inputs(self):
-        """Test that timesteps_r_scatter_index is passed through."""
-        kwargs = self._create_mock_kwargs(include_distilled_params=True)
-        input_ids = torch.tensor([[1, 2, 3]])
-        attention_mask = torch.ones(1, 3)
-
-        model_inputs = self.pipeline.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            past_key_values=None,
-            attention_mask=attention_mask,
-            inputs_embeds=None,
-            tokenizer_output=None,
-            batch_gen_image_info=None,
-            generator=None,
-            **kwargs,
-        )
-
-        assert "timesteps_r_scatter_index" in model_inputs
-        assert model_inputs["timesteps_r_scatter_index"] is not None
-        assert torch.equal(model_inputs["timesteps_r_scatter_index"], kwargs["timesteps_r_scatter_index"])
-
-    def test_num_special_tokens_passed_to_model_inputs(self):
-        """Test that num_special_tokens is passed through."""
-        kwargs = self._create_mock_kwargs(include_distilled_params=True)
-        input_ids = torch.tensor([[1, 2, 3]])
-        attention_mask = torch.ones(1, 3)
-
-        model_inputs = self.pipeline.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            past_key_values=None,
-            attention_mask=attention_mask,
-            inputs_embeds=None,
-            tokenizer_output=None,
-            batch_gen_image_info=None,
-            generator=None,
-            **kwargs,
-        )
-
+        for key in ("guidance", "guidance_scatter_index", "timesteps_r", "timesteps_r_scatter_index"):
+            assert key in model_inputs, key
+            assert model_inputs[key] is not None, key
+            assert torch.equal(model_inputs[key], kwargs[key]), key
         assert "num_special_tokens" in model_inputs
         assert model_inputs["num_special_tokens"] == kwargs["num_special_tokens"]
 
@@ -228,32 +148,6 @@ class TestPrepareInputsForGenerationDistilled:
         assert model_inputs["timesteps_r"] is None
         assert "timesteps_r_scatter_index" in model_inputs
         assert model_inputs["timesteps_r_scatter_index"] is None
-
-    def test_all_distilled_keys_present_in_model_inputs(self):
-        """Test that all 4 distilled keys are always present (even if None)."""
-        kwargs = self._create_mock_kwargs(include_distilled_params=False)
-        input_ids = torch.tensor([[1, 2, 3]])
-        attention_mask = torch.ones(1, 3)
-
-        model_inputs = self.pipeline.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            past_key_values=None,
-            attention_mask=attention_mask,
-            inputs_embeds=None,
-            tokenizer_output=None,
-            batch_gen_image_info=None,
-            generator=None,
-            **kwargs,
-        )
-
-        required_distilled_keys = [
-            "guidance",
-            "guidance_scatter_index",
-            "timesteps_r",
-            "timesteps_r_scatter_index",
-        ]
-        for key in required_distilled_keys:
-            assert key in model_inputs, f"{key} must be in model_inputs dict"
 
 
 def test_ar_kv_reuse_rebases_distilled_scatter_indices():

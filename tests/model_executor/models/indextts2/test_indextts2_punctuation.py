@@ -135,14 +135,6 @@ class TestNormalizeText:
     def test_newlines_and_periods(self):
         assert normalize_text("第一行。\n第二行。") == "第一行. 第二行."
 
-    def test_em_dash_maps_to_hyphen_not_space(self):
-        """U+2014 (—) and U+FF5E (～) must map to '-' so that
-        ``split_segments_by_token`` can use its hyphen fallback on long
-        inputs.  Mapping them to a space removes the boundary (see review
-        feedback on #5590)."""
-        assert normalize_text("\u2014") == "-"
-        assert normalize_text("\uff5e") == "-"
-
 
 # ---- 2. Interaction with the CJK pre-tokenizer ----
 

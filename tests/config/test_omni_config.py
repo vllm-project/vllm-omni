@@ -3123,18 +3123,6 @@ def test_diffusion_config_entrypoints_reject_unknown_none(factory):
         factory(enable_sleep_mod=None)
 
 
-def test_diffusion_config_projection_rejects_unknown_none():
-    with pytest.raises(ValueError, match="enable_sleep_mod"):
-        omni_config_module._DiffusionConfigProjection.from_kwargs(enable_sleep_mod=None)
-
-
-def test_runtime_diffusion_config_rejects_unknown_none():
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    with pytest.raises(ValueError, match="enable_sleep_mod"):
-        OmniDiffusionConfig.from_kwargs(enable_sleep_mod=None)
-
-
 def test_direct_diffusion_aliases_promote_none_and_reject_real_conflicts(monkeypatch):
     from vllm_omni.diffusion import data as diffusion_data
     from vllm_omni.diffusion.data import OmniDiffusionConfig

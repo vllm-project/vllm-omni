@@ -58,8 +58,18 @@ class TestCreateAudio:
     def audio_tensor(self):
         return np.sin(np.linspace(0, 2 * np.pi, 24000)).astype(np.float32)
 
-    @pytest.mark.parametrize("fmt", ["wav", "mp3", "flac", "opus", "pcm"])
-    def test_create_audio_supported_formats(self, mixin, audio_tensor, fmt):
+    @pytest.mark.parametrize(
+        ("fmt", "media_type", "magic_prefix", "forbidden_prefix"),
+        [
+            ("wav", "audio/wav", b"RIFF", None),
+            ("mp3", "audio/mpeg", None, b"RIFF"),
+            ("flac", "audio/flac", b"fLaC", None),
+            ("opus", None, None, None),
+            ("pcm", None, None, None),
+        ],
+        ids=["wav", "mp3", "flac", "opus", "pcm"],
+    )
+    def test_create_audio_supported_formats(self, mixin, audio_tensor, fmt, media_type, magic_prefix, forbidden_prefix):
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
             sample_rate=24000,
@@ -77,41 +87,12 @@ class TestCreateAudio:
             "channels": 1,
         }
 
-    def test_wav_magic_bytes(self, mixin, audio_tensor):
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=24000,
-            response_format="wav",
-            speed=1.0,
-            base64_encode=False,
-        )
-        response = mixin.create_audio(audio_obj)
-        assert response.audio_data[:4] == b"RIFF"
-        assert response.media_type == "audio/wav"
-
-    def test_mp3_encoding(self, mixin, audio_tensor):
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=24000,
-            response_format="mp3",
-            speed=1.0,
-            base64_encode=False,
-        )
-        response = mixin.create_audio(audio_obj)
-        assert response.media_type == "audio/mpeg"
-        assert response.audio_data[:4] != b"RIFF"
-
-    def test_flac_magic_bytes(self, mixin, audio_tensor):
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=24000,
-            response_format="flac",
-            speed=1.0,
-            base64_encode=False,
-        )
-        response = mixin.create_audio(audio_obj)
-        assert response.audio_data[:4] == b"fLaC"
-        assert response.media_type == "audio/flac"
+        if media_type is not None:
+            assert response.media_type == media_type
+        if magic_prefix is not None:
+            assert response.audio_data.startswith(magic_prefix)
+        if forbidden_prefix is not None:
+            assert not response.audio_data.startswith(forbidden_prefix)
 
     def test_unsupported_format_falls_back_to_default(self, mixin, audio_tensor):
         audio_obj = CreateAudio(
