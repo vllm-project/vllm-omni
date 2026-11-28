@@ -128,6 +128,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64_with_compression,
+    parse_size,
     validate_layered_layers,
 )
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
@@ -4464,18 +4465,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     @staticmethod
     def _resolve_height_width_from_extra_body(extra_body: dict[str, Any]) -> tuple[Any, Any]:
-        """Extract generation height/width with optional size string fallback."""
+        """Extract generation height/width with optional size string fallback.
+
+        Aspect-ratio "W:H" sizes (e.g., "16:9") are only resolved for image
+        generation. A text-to-video request sets ``num_frames``; for those the
+        ratio is logged and ignored so the video canvas keeps the model
+        defaults (explicit WIDTHxHEIGHT strings still apply).
+        """
         height = extra_body.get("height")
         width = extra_body.get("width")
 
         if "size" in extra_body and (height is None or width is None):
-            try:
-                size_str = extra_body["size"]
-                if isinstance(size_str, str) and "x" in size_str.lower():
-                    w, h = size_str.lower().split("x")
-                    width, height = int(w), int(h)
-            except ValueError:
-                logger.warning("Invalid size format: %s", extra_body.get("size"))
+            size_str = extra_body["size"]
+            if isinstance(size_str, str):
+                try:
+                    if ":" in size_str.lower() and extra_body.get("num_frames") is not None:
+                        logger.warning(
+                            "Invalid size format: %s (aspect-ratio sizes are not supported for video generation)",
+                            size_str,
+                        )
+                    else:
+                        width, height = parse_size(size_str.lower(), allow_ratio=True)
+                except ValueError:
+                    logger.warning("Invalid size format: %s", extra_body.get("size"))
 
         return height, width
 
