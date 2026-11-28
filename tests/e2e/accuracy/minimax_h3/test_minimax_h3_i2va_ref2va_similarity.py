@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -23,6 +22,7 @@ from tests.e2e.accuracy.helpers import (
     reset_artifact_dir,
     write_accuracy_result,
 )
+from tests.e2e.accuracy.minimax_h3.asset_download import download_reference_asset
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
@@ -176,25 +176,6 @@ def _server_args() -> list[str]:
     return args
 
 
-def _download_reference_asset(
-    output_dir: Path,
-    *,
-    filename: str,
-    url: str,
-    sha256: str,
-    label: str,
-) -> Path:
-    reference_path = output_dir / filename
-    download_url = url.replace("/blob/", "/resolve/", 1)
-    response = requests.get(download_url, timeout=120)
-    response.raise_for_status()
-    content = response.content
-    digest = hashlib.sha256(content).hexdigest()
-    assert digest == sha256, f"Official MiniMax H3 {label} reference changed: got {digest}, expected {sha256}"
-    reference_path.write_bytes(content)
-    return reference_path
-
-
 def _probe_audio(path: Path) -> dict[str, str | int]:
     probe_binary("ffprobe")
     result = subprocess.run(
@@ -285,14 +266,14 @@ def test_minimax_h3_i2va_matches_official_reference(
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     output_dir = reset_artifact_dir(accuracy_artifact_root / "minimax_h3_i2va")
-    reference_path = _download_reference_asset(
+    reference_path = download_reference_asset(
         output_dir,
         filename="reference.mp4",
         url=I2VA_REFERENCE_VIDEO_URL,
         sha256=I2VA_REFERENCE_VIDEO_SHA256,
         label="I2VA",
     )
-    image_path = _download_reference_asset(
+    image_path = download_reference_asset(
         output_dir,
         filename="input.png",
         url=I2VA_IMAGE_URL,
@@ -366,21 +347,21 @@ def test_minimax_h3_ref2va_matches_official_reference(
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     output_dir = reset_artifact_dir(accuracy_artifact_root / "minimax_h3_ref2va")
-    reference_path = _download_reference_asset(
+    reference_path = download_reference_asset(
         output_dir,
         filename="reference.mp4",
         url=REF2VA_REFERENCE_VIDEO_URL,
         sha256=REF2VA_REFERENCE_VIDEO_SHA256,
         label="Ref2VA",
     )
-    input_video_path = _download_reference_asset(
+    input_video_path = download_reference_asset(
         output_dir,
         filename="input_video.mp4",
         url=REF2VA_INPUT_VIDEO_URL,
         sha256=REF2VA_INPUT_VIDEO_SHA256,
         label="Ref2VA input video",
     )
-    input_audio_path = _download_reference_asset(
+    input_audio_path = download_reference_asset(
         output_dir,
         filename="input_audio.mp3",
         url=REF2VA_INPUT_AUDIO_URL,
