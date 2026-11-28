@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -355,6 +356,10 @@ class HeliosPipeline(
         frame_num = int(extra.get("frame_num", 132))
         height = round_down(int(state.sampling.height or extra.get("height", 384)), REQUEST_RESOLUTION_ALIGNMENT)
         width = round_down(int(state.sampling.width or extra.get("width", 640)), REQUEST_RESOLUTION_ALIGNMENT)
+        is_enable_stage2 = bool(extra.get("is_enable_stage2", False))
+        pyramid_num_stages = self._parse_pyramid_num_stages(extra.get("pyramid_num_stages", 3))
+        if is_enable_stage2:
+            self._validate_stage2_resolution(height, width, pyramid_num_stages)
         num_frames = max(int(state.sampling.num_frames or frame_num), 1)
         num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
         output_type = extra.get("output_type", "np")
@@ -557,7 +562,7 @@ class HeliosPipeline(
                 "indices_latents_history_mid": indices_latents_history_mid.unsqueeze(0),
                 "indices_latents_history_short": indices_latents_history_short.unsqueeze(0),
                 "is_amplify_first_chunk": bool(extra.get("is_amplify_first_chunk", False)),
-                "is_enable_stage2": bool(extra.get("is_enable_stage2", False)),
+                "is_enable_stage2": is_enable_stage2,
                 "is_skip_first_chunk": bool(extra.get("is_skip_first_chunk", False)),
                 "keep_first_frame": keep_first_frame,
                 "latents_mean": latents_mean,
@@ -568,7 +573,7 @@ class HeliosPipeline(
                 "num_steps": num_steps,
                 "output_type": output_type,
                 "pyramid_num_inference_steps_list": extra.get("pyramid_num_inference_steps_list", [10, 10, 10]),
-                "pyramid_num_stages": int(extra.get("pyramid_num_stages", 3)),
+                "pyramid_num_stages": pyramid_num_stages,
                 "total_generated_latent_frames": total_generated_latent_frames,
                 "use_cfg_zero_star": bool(extra.get("use_cfg_zero_star", False)),
                 "use_zero_init": bool(extra.get("use_zero_init", True)),
@@ -1089,6 +1094,8 @@ class HeliosPipeline(
 
         height = round_down(height, REQUEST_RESOLUTION_ALIGNMENT)
         width = round_down(width, REQUEST_RESOLUTION_ALIGNMENT)
+        if is_enable_stage2:
+            self._validate_stage2_resolution(height, width, pyramid_num_stages)
         num_frames = max(num_frames, 1)
 
         device = self.device
@@ -1509,6 +1516,66 @@ class HeliosPipeline(
                 pbar.update()
 
         return latents
+
+    @staticmethod
+    def _parse_pyramid_num_stages(raw_value: Any) -> int:
+        """Parse integer or string-integer Stage2 stage counts for STEP execution."""
+        if isinstance(raw_value, bool):
+            raise OmniClientError("Helios Stage2 pyramid_num_stages must be a positive integer")
+        if isinstance(raw_value, int):
+            return raw_value
+        if isinstance(raw_value, str):
+            try:
+                return int(raw_value)
+            except ValueError as exc:
+                raise OmniClientError("Helios Stage2 pyramid_num_stages must be a positive integer") from exc
+        raise OmniClientError("Helios Stage2 pyramid_num_stages must be a positive integer")
+
+    def _validate_stage2_resolution(self, height: int, width: int, pyramid_num_stages: int) -> None:
+        """Reject pyramid grids that truncate patches or lose the final latent extent."""
+        if isinstance(pyramid_num_stages, bool) or not isinstance(pyramid_num_stages, int) or pyramid_num_stages < 1:
+            raise OmniClientError("Helios Stage2 pyramid_num_stages must be a positive integer")
+
+        _, patch_height, patch_width = self.transformer.config.patch_size
+        spatial_scale = self.vae_scale_factor_spatial
+        base_height_multiple = spatial_scale * patch_height
+        base_width_multiple = spatial_scale * patch_width
+        if height <= 0 or width <= 0 or height < base_height_multiple or width < base_width_multiple:
+            raise OmniClientError(
+                f"Helios Stage2 height and width must be positive multiples of at least "
+                f"{base_height_multiple} and {base_width_multiple}, respectively, for "
+                f"vae_scale_factor_spatial={spatial_scale}, patch_size={self.transformer.config.patch_size}; "
+                f"got {height}x{width} after 16-pixel alignment"
+            )
+
+        # Bound stages by how many halvings still retain >= 1 full patch per axis before
+        # computing 2 ** (pyramid_num_stages - 1), avoiding huge ints and str-limit errors.
+        max_supported_stages = min(
+            (height // base_height_multiple).bit_length(),
+            (width // base_width_multiple).bit_length(),
+        )
+        if pyramid_num_stages > max_supported_stages:
+            try:
+                stages_repr = str(pyramid_num_stages)
+            except ValueError:
+                stages_repr = f"~2^{pyramid_num_stages.bit_length()}"
+            raise OmniClientError(
+                f"Helios Stage2 pyramid_num_stages={stages_repr} exceeds the maximum {max_supported_stages} "
+                f"stage(s) supported for {height}x{width} with "
+                f"vae_scale_factor_spatial={spatial_scale}, patch_size={self.transformer.config.patch_size}"
+            )
+
+        # Each halving must be exact, and the smallest grid must contain whole patches.
+        pyramid_scale = 2 ** (pyramid_num_stages - 1)
+        height_multiple = base_height_multiple * pyramid_scale
+        width_multiple = base_width_multiple * pyramid_scale
+        if height % height_multiple or width % width_multiple:
+            raise OmniClientError(
+                f"Helios Stage2 height and width must be positive multiples of {height_multiple} and "
+                f"{width_multiple}, respectively, for pyramid_num_stages={pyramid_num_stages}, "
+                f"vae_scale_factor_spatial={spatial_scale}, patch_size={self.transformer.config.patch_size}; "
+                f"got {height}x{width} after 16-pixel alignment"
+            )
 
     def _stage2_sample(
         self,
