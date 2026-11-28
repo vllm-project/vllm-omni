@@ -49,6 +49,14 @@ computation must have completed, communication must no longer use the storage,
 no planned consumer may need it, and history policy must no longer retain it.
 Failed transfer waits leave storage and pending work intact for cleanup retry.
 
+A model may expose its retention as a selectable policy (TaoMate-H3 does, as
+`taomate_h3_history_policy`). The policy only selects an ordered subset of the
+segment handles the model already committed; storage, publication and rollback
+stay with the engine. The model ledger moves after the engine transaction
+succeeds, so a failed commit, eviction or audio reset never advances history.
+The selected subset must fit `max_retained_segments`, which is checked when the
+policy is constructed rather than at the first commit.
+
 Clean-history policies retain clean outputs. Same-Step retains the window's
 step-specific versions plus the absolute chunk-zero clean sink. A persistent
 single-chunk bootstrap produces the sink for later requests; an ephemeral
