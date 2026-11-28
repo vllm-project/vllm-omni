@@ -386,12 +386,16 @@ class _ProgressBarPipeline(ProgressBarMixin):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("requested_steps", [4, None])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_request_forward_attaches_counted_denoise_steps(enabled, monkeypatch):
+def test_request_forward_attaches_counted_denoise_steps(enabled, requested_steps, monkeypatch):
+    # The counts come from the loop the pipeline ran, also when the request
+    # omitted num_inference_steps and the pipeline resolved its own schedule.
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.od_config.enable_execution_summary = enabled
     runner.pipeline = _ProgressBarPipeline()
     request = _make_request()
+    request.sampling_params.num_inference_steps = requested_steps
     monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: real_set_forward_context())
 
     result = runner._execute_request_list(
