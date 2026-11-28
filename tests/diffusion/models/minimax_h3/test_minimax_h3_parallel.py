@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -92,6 +94,57 @@ def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
     layout = branch.static_kwargs["video_token_layout"]
     assert not hasattr(layout, "prefix_segments")
     assert branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] == (2, 3)
+
+
+@pytest.mark.parametrize("has_vdn", [False, True])
+@pytest.mark.parametrize("route", ["eagle", "fallback", "no_rope"])
+def test_h3_project_qkv_retains_raw_qk_for_vdn(monkeypatch, has_vdn, route):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+
+    tokens, head_dim = 5, 16
+    num_heads, num_kv_heads = 4, 2
+    qkv = torch.randn(tokens, (num_heads + 2 * num_kv_heads) * head_dim, dtype=torch.bfloat16)
+    q, k, v = qkv.unflatten(-1, (-1, head_dim)).split([num_heads, num_kv_heads, num_kv_heads], dim=1)
+    q_weight = torch.ones(head_dim, dtype=torch.bfloat16)
+    k_weight = torch.ones(head_dim, dtype=torch.bfloat16)
+    rope_table = None if route == "no_rope" else torch.zeros(tokens, head_dim, dtype=torch.bfloat16)
+
+    raw_pair = (None, None) if route == "eagle" else (q, k)
+    fused_mock = Mock(return_value=(q.neg(), k.square(), v.clone(), *raw_pair))
+    monkeypatch.setattr(blocks, "fused_qkv_split_norm_rope", fused_mock)
+
+    attention = object.__new__(blocks.MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads = num_heads
+    attention.num_kv_heads = num_kv_heads
+    attention.head_dim = head_dim
+    attention._prefix = "test.attn"
+    attention.vdn = nn.Identity() if has_vdn else None
+    attention.qkv_proj = Mock(return_value=(qkv, None))
+    attention.q_norm = Mock(side_effect=torch.neg, weight=q_weight, variance_epsilon=1e-5)
+    attention.k_norm = Mock(side_effect=torch.square, weight=k_weight)
+    x = torch.empty(tokens, 8)
+
+    q_out, k_out, v_out, q_raw, k_raw = attention._project_qkv(x, rope_table, vdn_window=object())
+
+    torch.testing.assert_close(q_out, q.neg(), atol=0, rtol=0)
+    torch.testing.assert_close(k_out, k.square(), atol=0, rtol=0)
+    torch.testing.assert_close(v_out, v, atol=0, rtol=0)
+    if route == "no_rope":
+        fused_mock.assert_not_called()
+        attention.q_norm.assert_called_once()
+        attention.k_norm.assert_called_once()
+    else:
+        fused_mock.assert_called_once()
+    if has_vdn:
+        assert q_raw is not None and k_raw is not None
+        assert q_raw.data_ptr() == qkv.data_ptr()
+        torch.testing.assert_close(q_raw, q, atol=0, rtol=0)
+        torch.testing.assert_close(k_raw, k, atol=0, rtol=0)
+        with pytest.raises(ValueError, match="received no VDN window"):
+            attention._project_qkv(x, rope_table)
+    elif route == "eagle":
+        assert q_raw is None and k_raw is None
 
 
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
