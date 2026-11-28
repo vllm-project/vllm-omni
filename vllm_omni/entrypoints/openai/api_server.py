@@ -129,6 +129,7 @@ from vllm_omni.entrypoints.openai.diffusion import (
 from vllm_omni.entrypoints.openai.errors import (
     InvalidPresetVoiceReferenceError,
     InvalidVoiceReferenceError,
+    _create_client_error_json_response,
     _create_speech_error_json_response,
     _error_response_to_json_response,
 )
@@ -1572,6 +1573,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         generator = await handler.create_chat_completion(request, raw_request)
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
+    except (VLLMClientError, OmniClientError) as exc:
+        return _create_client_error_json_response(exc)
     except Exception as e:
         logger.exception("Chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
@@ -1649,6 +1652,8 @@ async def create_batch_chat_completion(request: BatchChatCompletionRequest, raw_
         result = await handler.create_batch_chat_completion(request, raw_request)
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
+    except (VLLMClientError, OmniClientError) as exc:
+        return _create_client_error_json_response(exc)
     except Exception as e:
         logger.exception("Batched chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
