@@ -807,7 +807,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             assert isinstance(self.connector, SharedMemoryConnector)
             key_prefix, num_puts = task["cleanup_shm"]
             for chunk_id in range(num_puts):
-                self.connector.cleanup(f"{key_prefix}_{chunk_id}")
+                self.connector.cleanup_tracked(f"{key_prefix}_{chunk_id}", defer_if_busy=True)
             return
         if "release_shm" in task:
             self._release_shm_prefix(task["release_shm"])
@@ -1218,9 +1218,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._clear_sender_state_locked(external_req_id)
 
     def _queue_shm_cleanup_locked(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
-        # Successful terminal chunks must remain readable by downstream. On
-        # abort, queue exact keys on the same save thread as puts: the scheduler
-        # never performs SHM I/O, and cleanup precedes reuse of this external id.
         if (
             isinstance(self.connector, SharedMemoryConnector)
             and sender_token.num_puts
@@ -1270,7 +1267,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _release_shm_prefix(self, key_prefix: str) -> None:
-        reclaimed = self.connector.cleanup_prefix(key_prefix)
+        reclaimed = self.connector.cleanup_prefix(key_prefix, defer_if_busy=True)
         if not reclaimed:
             return
         # Non-zero means a consumer stopped before draining the producer.

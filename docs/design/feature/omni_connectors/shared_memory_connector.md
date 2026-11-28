@@ -51,7 +51,8 @@ This makes `SharedMemoryConnector` the simplest connector in the OmniConnector f
 Within the larger system:
 
 - `load_omni_transfer_config()` automatically fills missing edges with `SharedMemoryConnector`.
-- Callers interact with the connector exclusively through the `put()` / `get()` / `cleanup()` contract — the connector does not require caller-specific logic.
+- Stages transfer payloads through `put()` and `get()`. On request completion or abort, the sender
+  can reclaim the chunks it published.
 
 Compared with the remote Mooncake-based connectors, `SharedMemoryConnector` is intentionally minimal and local-only.
 
@@ -70,10 +71,12 @@ It is not intended to provide cross-node transfer, RDMA, or raw tensor zero-copy
 
 #### 4.1 Serialization Model
 
-`SharedMemoryConnector` always starts from a Python object and serializes it through the shared Omni serializer:
+`SharedMemoryConnector` serializes the Python object into the sending thread's reusable buffer:
 
 ```python
-payload = self.serialize_obj(data)
+buffer = self._thread_encode_buffer()
+size = self._serde.serialize_into(data, buffer)
+payload = memoryview(buffer)[:size]
 ```
 
 This keeps the connector behavior consistent with the rest of the connector stack:
@@ -102,18 +105,21 @@ This metadata is passed over the control plane and allows the downstream stage t
 
 #### 4.3 Locking Model
 
-To avoid races between the producer and consumer, the connector uses a lock file per request. The default Linux path is:
+On Linux, the default connector uses one lock file per shared-memory segment name.
 
 ```text
-/dev/shm/shm_{put_key}_lockfile.lock
+/dev/shm/shm_{segment_name}_lockfile.lock
 ```
 
-Locking is done with `fcntl.flock`:
+The writer waits for an exclusive `flock` and checks that the file it locked still has the same
+device and inode as the file at that path. If the path changed while the writer was waiting, the
+writer reopens it before publishing. The reader tries a nonblocking exclusive `flock` before
+opening the segment.
 
-- producer uses `LOCK_EX`
-- consumer uses `LOCK_EX`
-
-Both sides acquire an exclusive lock. This ensures that the shared-memory segment is not read while it is still being written and makes the handoff safer in a multi-process environment.
+The orphan checks below use the default file-backed layout to establish that a segment is absent.
+Backends with custom segment existence checks or lock paths skip those checks. When a backend
+stores segments elsewhere, use a separate lock directory or a filename pattern outside
+`shm_*_lockfile.lock` to keep its live locks out of the default connector's scan.
 
 ### 5. Put / Get Flow
 
@@ -123,8 +129,9 @@ The producer-side flow is:
 
 1. Serialize the input object to bytes.
 2. Compute the payload size.
-3. Acquire the per-request lock file.
-4. Write the bytes into shared memory.
+3. Acquire the lock for this transfer key and verify its identity.
+4. Write the bytes into shared memory. If the write fails and the segment is absent, the writer
+   attempts to remove the lock while holding it. A surviving segment keeps its lock.
 5. Return lightweight metadata to the caller.
 
 The returned tuple is:
@@ -135,28 +142,38 @@ The returned tuple is:
 
 where `metadata` contains the shared-memory handle needed by the consumer.
 
-#### 5.2 Consumer Flow: `get(metadata=...)`
+#### 5.2 Reading with a SHM Handle
 
-The primary consumer path is metadata-driven:
+When the metadata contains a SHM handle, the reader uses its segment name:
 
 1. Extract the shared-memory handle from `metadata`.
-2. Acquire the exclusive lock.
-3. Read the raw bytes from shared memory.
-4. Deserialize the bytes back into the original Python object.
-5. Remove the lock file if it still exists.
+2. Acquire the nonblocking exclusive lock.
+3. Copy the bytes. The default connector unlinks the segment before returning them. If it has
+   already disappeared at unlink time, the read succeeds. Other unlink errors leave the lock and
+   tracking record in place while the segment still exists, so the receiver can retry.
+4. While holding the lock, verify that the path still names the same file and attempt to remove it.
+5. Release the lock and deserialize the bytes. Deserialization can fail after the bytes have been read.
 
-This is the path used by the current stage-to-stage connector flow.
+If the read fails and the supplied handle's segment has disappeared, the reader can reclaim the
+orphan lock immediately while holding it.
 
-#### 5.3 Key-Based Reads: `get(metadata=None)`
+#### 5.3 Reading by Transfer Key
 
-Streaming receivers can address a chunk by key without its storage metadata:
+When the metadata is absent or contains only source host/port information, streaming receivers locate the chunk by key:
 
 1. Acquire the segment's nonblocking exclusive lock.
 2. Open and read the segment after the writer has sized and populated it.
 3. Deserialize the bytes and return the object.
 
 If the writer holds the lock or the segment is absent, the call returns `None`
-so the receiver can retry later.
+so the receiver can retry later. A key-only poll can reclaim an orphan lock once its modification
+time is at least 60 seconds old. A failed read leaves a live segment's lock in place for a later
+attempt.
+
+`get_with_deadline()` follows the same per-key read path and skips the directory scan. It checks
+the monotonic deadline on entry and again under the verified lock before reading. If time has run
+out, the payload remains available to a later call. A read that has already started can finish
+copying and deserializing its payload.
 
 ### 6. Key Implementation Characteristics
 
@@ -165,22 +182,60 @@ so the receiver can retry later.
 `put()` writes every serialized payload to shared memory. The connector has no
 inline-payload path or size threshold.
 
-#### 6.2 Cleanup Is Currently Passive
+#### 6.2 Explicit Cleanup and Orphan Locks
 
-`cleanup()` is currently a no-op. The intended assumption is:
+`cleanup(key)` tries the exact key's exclusive lock without waiting, even if another sender published it.
+If the lock is busy, it returns `False` and the caller can retry. Cleanup removes the lock and
+tracking record only after unlinking the segment or confirming its absence. Other storage errors
+preserve both. Acquiring the lock can briefly create its file if the path is missing.
 
-- the consumer reads the segment
-- the underlying shared-memory helpers unlink it
+Under the publication lock, `put()` records the segment's stable identity (device and inode on
+the default Linux backend). If the backend supplies no identity or the lookup fails, `put()`
+still returns the handle and discards any previous record for that key. Completion, abort and
+`close()` skip that publication. The receiver can still consume it with `get()`, and callers
+can explicitly release it with `cleanup(key)`.
 
-If the consumer never executes `get()`, the shared-memory segment may remain allocated. This means the connector relies on the normal success path for resource reclamation.
+Prefix cleanup selects tracked keys whose suffix is a numeric chunk ID. Before unlinking a
+tracked segment, the sender checks its identity under the lock. If a peer has replaced it,
+the sender retires the old record and leaves the replacement and its lock untouched.
 
-#### 6.3 Close Is Currently Minimal
+The V1 chunk adapter processes aborts and completions on its send thread. The native model
+runner v2 (MRv2) handles release requests under the lock that also protects request registration
+and output state. Both paths try each publication lock without waiting, so a peer holding one
+chunk's lock cannot stall unrelated requests. If a release arrives before an MRv2 request's
+terminal delivery, MRv2 records it and tries cleanup when that delivery finishes. Prefix cleanup
+counts only segments removed during the call.
 
-`close()` is also a no-op. There is no connector-owned background thread, socket, or memory pool to tear down, so the lifecycle is simple. The trade-off is that `close()` does not scan or recover leaked shared-memory resources.
+When a tracked publication's lock is busy, the sender schedules cleanup for retry during later
+`put()` calls or from its idle send loop. If a retry encounters a temporary error opening the
+lock, checking the segment's identity or unlinking the segment, the publication stays scheduled
+for a later pass after the retry delay. An idle MRv2 sender checks at most four records per pass
+and waits at least 100 ms between passes.
+
+A crashed process can leave a lock file behind after its segment disappears. With the default
+file layout, initialization, `put()` and ordinary `get()` can trigger a scan of the lock directory. Each
+process scans a directory at most once per 60 seconds. The triggering call walks the whole
+directory synchronously. For an empty regular lock file at least 60 seconds old, the scan tries a
+nonblocking exclusive lock. Before removing the lock, it checks that the current user owns the
+file, its identity and age still match, and the segment is still absent. An idle connector waits
+until its next operation to scan again.
+
+#### 6.3 Closing the Connector
+
+`close()` makes one nonblocking cleanup attempt per tracked publication, including deferred
+releases. It leaves a busy segment and its lock available to the peer, continues to other
+publications, then removes its own visibility marker and closes its wakeup FIFO. A stopped
+sender has no idle loop to retry a skipped release. An unread segment can therefore remain
+after shutdown.
+
+On Linux, independently launched Python processes can have separate resource trackers.
+If an old publisher exits after a peer has reused its segment name, its `resource_tracker`
+can unlink the replacement by name without taking the connector lock. The lock file can
+remain even though a new reader can no longer open the segment.
 
 ### 7. Data Flow in the Pipeline
 
-The typical flow with `SharedMemoryConnector` is:
+When a stage passes the SHM handle over the control plane, the flow is:
 
 ```mermaid
 sequenceDiagram
@@ -216,7 +271,8 @@ This is a classic split-control-plane / data-plane design, but constrained to a 
 
 - Same-node only.
 - Full object serialization and deserialization are still required.
-- Resource cleanup depends on the normal consumer path.
+- Orphan lock recovery is best effort. An untracked segment that still exists lies outside the
+  lock scan.
 - Shared memory capacity is limited by host configuration.
 
 ### 9. Summary

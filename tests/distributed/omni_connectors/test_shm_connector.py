@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
+import errno
 import fcntl
 import os
 import time
@@ -36,6 +37,53 @@ class TestKeyBasedReadWrite:
             assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1) is None
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() - 1) is None
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1)[0] == {"value": 7}
+
+    @pytest.mark.parametrize("with_handle", [False, True], ids=["key", "handle"])
+    def test_deadline_receive_leaves_due_sweep_for_ordinary_get(self, connector, mocker, monkeypatch, with_handle):
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+        key = f"deadline_sweep_{uuid.uuid4().hex}"
+        ok, size, metadata = connector.put("0", "1", key, "ready")
+        assert ok
+        monkeypatch.delitem(module._next_sweep, connector.shm_directory, raising=False)
+        sweep = mocker.patch.object(module, "_sweep_orphan_locks")
+        monkeypatch.setattr(time, "monotonic", lambda: 1.0)
+        source = metadata if with_handle else {"source_host": "localhost"}
+
+        assert connector.get_with_deadline("0", "1", key, source, deadline=1.001) == ("ready", size)
+        sweep.assert_not_called()
+        assert connector.get("0", "1", key) is None
+        sweep.assert_called_once_with(connector.shm_directory)
+
+    def test_deadline_expiring_before_read_preserves_payload(self, connector, monkeypatch):
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+        key = f"deadline_unread_{uuid.uuid4().hex}"
+        ok, size, _ = connector.put("0", "1", key, "still here")
+        assert ok
+        now = 1.0
+        current_lock = module._current_lock
+
+        def check_lock_after_deadline(fd, path):
+            nonlocal now
+            now = 2.0
+            return current_lock(fd, path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(time, "monotonic", lambda: now)
+            patch.setattr(module, "_current_lock", check_lock_after_deadline)
+            assert connector.get_with_deadline("0", "1", key, deadline=2.0) is None
+        assert connector.get("0", "1", key) == ("still here", size)
+
+    def test_reading_other_handle_preserves_tracked_publication(self, connector):
+        prefix = f"handle_alias_{uuid.uuid4().hex}_"
+        key = f"{prefix}0"
+        ok, size, handle = connector.put("0", "1", f"{prefix}source", "source payload")
+        assert ok
+        assert connector.put("0", "1", key, "keep tracked")[0]
+
+        assert connector.get("0", "1", key, metadata=handle) == ("source payload", size)
+        assert connector.cleanup_prefix(prefix) == 1
 
     def test_put_then_get_by_key(self, connector):
         data = {"hello": "world", "n": 42}
@@ -86,7 +134,7 @@ class TestKeyBasedReadWrite:
         from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
         # Isolate the publication lock from the host's coordination directory.
-        monkeypatch.setattr(module, "open", lambda path, mode: (tmp_path / "writer.lock").open(mode), raising=False)
+        monkeypatch.setattr(connector, "_lock_file", lambda name: str(tmp_path / "writer.lock"))
         entered, release = threading.Event(), threading.Event()
         original = os.ftruncate
         opens = mocker.spy(module.shm_pkg, "SharedMemory")
@@ -136,6 +184,28 @@ class TestKeyBasedReadWrite:
 
 
 class TestMetadataFallback:
+    def test_read_can_retry_after_segment_unlink_fails(self, connector, monkeypatch):
+        from multiprocessing.shared_memory import SharedMemory
+
+        key = f"read_retry_{uuid.uuid4().hex}"
+        ok, size, metadata = connector.put("0", "1", key, "unread")
+        assert ok
+
+        def fail_unlink(segment):
+            raise PermissionError("temporary unlink failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(SharedMemory, "unlink", fail_unlink)
+            assert connector.get("0", "1", key, metadata) is None
+            assert key in connector._pending_keys
+            assert connector._shm_exists(key)
+            assert os.path.exists(connector._lock_file(key))
+
+        assert connector.get("0", "1", key, metadata) == ("unread", size)
+        assert key not in connector._pending_keys
+        assert not connector._shm_exists(key)
+        assert not os.path.exists(connector._lock_file(key))
+
     def test_rdma_style_metadata_falls_back_to_key(self, connector):
         """source_host/source_port metadata should be ignored; key read used."""
         data = {"payload": True}
@@ -248,6 +318,139 @@ class TestCleanup:
         assert connector.cleanup("consumed_req_99") is False
         assert "consumed_req_99" not in connector._pending_keys
 
+    def test_deferred_cleanup_keeps_lock_through_segment_gap(self, connector, monkeypatch):
+        key = f"release_gap_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        lock_path = connector._lock_file(key)
+        now = time.monotonic()
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        with open(lock_path, "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert not connector.cleanup_tracked(key, defer_if_busy=True)
+            connector._unlink_segment(key)
+            now += 60
+            connector.reap_consumed()
+            assert key in connector._pending_keys
+            assert os.path.exists(lock_path)
+
+        now += 60
+        connector.reap_consumed()
+        assert key not in connector._pending_keys
+        assert not os.path.exists(lock_path)
+
+    def test_busy_release_without_storage_identity_preserves_replacement(self, connector, monkeypatch):
+        monkeypatch.setattr(connector, "_segment_identity", lambda name: None)
+        key = f"release_no_identity_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        with open(connector._lock_file(key), "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert not connector.cleanup_tracked(key, defer_if_busy=True)
+
+        writer = SharedMemoryConnector({})
+        try:
+            assert writer.put("0", "1", key, "replacement")[0]
+            with monkeypatch.context() as patch:
+                later = time.monotonic() + 60
+                patch.setattr(time, "monotonic", lambda: later)
+                connector.reap_consumed()
+            assert writer.get("0", "1", key)[0] == "replacement"
+        finally:
+            writer.close()
+
+    @pytest.mark.parametrize("release", ["tracked", "close"])
+    @pytest.mark.parametrize("lookup_fails", [False, True], ids=["no-identity", "stat-error"])
+    def test_unidentified_publication_preserves_completed_replacement(self, connector, mocker, release, lookup_fails):
+        key = f"no_identity_{uuid.uuid4().hex}"
+        error = OSError(errno.EIO, "temporary stat failure") if lookup_fails else None
+        lookup = mocker.patch.object(connector, "_segment_identity", return_value=None, side_effect=error)
+        assert connector.put("0", "1", key, "original")[0]
+        if lookup_fails:
+            mocker.stop(lookup)
+
+        writer = SharedMemoryConnector({})
+        try:
+            ok, size, _ = writer.put("0", "1", key, "replacement")
+            assert ok
+            exact_key = f"{key}_exact"
+            assert writer.put("0", "1", exact_key, "explicit cleanup")[0]
+            assert connector.cleanup(exact_key)
+            assert not writer._shm_exists(exact_key)
+            if release == "close":
+                connector.close()
+            else:
+                connector.cleanup_tracked(key, defer_if_busy=True)
+            assert writer.get("0", "1", key) == ("replacement", size)
+            assert key not in connector._pending_keys
+        finally:
+            writer.close()
+
+    @pytest.mark.parametrize(
+        ("failed_operation", "replace"),
+        [("open", False), ("_segment_identity", True), ("_unlink_segment", False)],
+        ids=["lock-open", "stat-then-replace", "unlink"],
+    )
+    def test_deferred_cleanup_retries_after_storage_error(
+        self, connector, monkeypatch, mocker, failed_operation, replace
+    ):
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+        key = f"retry_error_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        lock_path = connector._lock_file(key)
+        now = time.monotonic()
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        with open(lock_path, "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert not connector.cleanup_tracked(key, defer_if_busy=True)
+
+        now += 60
+        with monkeypatch.context() as patch:
+            failure = mocker.Mock(side_effect=OSError(errno.EMFILE, "temporary storage failure"))
+            if failed_operation == "open":
+                patch.setattr(module, "open", failure, raising=False)
+            else:
+                patch.setattr(connector, failed_operation, failure)
+            connector.reap_consumed()
+            connector.reap_consumed()
+            failure.assert_called_once()
+        assert connector._shm_exists(key) and os.path.exists(lock_path)
+
+        writer = SharedMemoryConnector({})
+        try:
+            if replace:
+                ok, size, _ = writer.put("0", "1", key, "replacement")
+                assert ok
+            now += 60
+            connector.reap_consumed()
+            assert key not in connector._pending_keys
+            if replace:
+                assert writer.get("0", "1", key) == ("replacement", size)
+            else:
+                assert not connector._shm_exists(key)
+                assert not os.path.exists(lock_path)
+        finally:
+            writer.close()
+
+    def test_unlink_error_preserves_lock_and_tracking_for_retry(self, connector, monkeypatch):
+        prefix = f"cleanup_error_{uuid.uuid4().hex}_"
+        key = f"{prefix}0"
+        assert connector.put("0", "1", key, "payload")[0]
+
+        def fail_unlink(name):
+            raise OSError("temporary failure unlinking the segment")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(connector, "_unlink_segment", fail_unlink)
+            assert connector.cleanup(key) is False
+        assert key in connector._pending_keys
+        assert connector._shm_exists(key)
+        assert os.path.exists(connector._lock_file(key))
+
+        assert connector.cleanup_prefix(prefix) == 1
+        assert key not in connector._pending_keys
+        assert not connector._shm_exists(key)
+        assert not os.path.exists(connector._lock_file(key))
+
     def test_close_cleans_all_pending(self, connector):
         for i in range(3):
             connector.put("s0", "s1", f"close_test_{i}", {"i": i})
@@ -255,6 +458,60 @@ class TestCleanup:
         assert len(connector._pending_keys) == 3
         connector.close()
         assert len(connector._pending_keys) == 0
+
+    def test_repeated_close_preserves_busy_replacement_without_storage_identity(self, connector, monkeypatch):
+        monkeypatch.setattr(connector, "_segment_identity", lambda name: None)
+        key = f"close_no_identity_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        with open(connector._lock_file(key), "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            connector.close()
+
+        writer = SharedMemoryConnector({})
+        try:
+            ok, size, _ = writer.put("0", "1", key, "replacement")
+            assert ok
+            connector.close()
+            assert writer.get("0", "1", key) == ("replacement", size)
+        finally:
+            writer.close()
+
+    def test_v1_shutdown_finishes_while_peer_holds_publication_lock(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
+
+        monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "1")
+        scope = uuid.uuid4().hex
+        sender = SharedMemoryConnector({"stage_id": 0, "wakeup_scope": scope})
+        receiver = SharedMemoryConnector({"stage_id": 1, "wakeup_scope": scope})
+        adapter = OmniTransferAdapterBase({})
+        adapter.connector = sender
+        busy, idle = f"busy_{scope}", f"idle_{scope}"
+        try:
+            assert sender.put("0", "1", busy, "busy payload")[0]
+            assert sender.put("0", "1", idle, "idle payload")[0]
+            assert sender.get_wakeup_generation() is not None
+            marker, fifo = sender._visibility_path, sender._wake_path
+            assert os.path.exists(marker) and os.path.exists(fifo)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with open(sender._lock_file(busy), "rb") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX)
+                    shutdown = executor.submit(adapter.shutdown)
+                    assert adapter.stop_event.wait(5)
+                    shutdown.result(timeout=2)
+                    assert os.path.samefile(holder.fileno(), sender._lock_file(busy))
+                    assert sender._shm_exists(busy)
+                    assert not sender._shm_exists(idle)
+                    assert not os.path.exists(sender._lock_file(idle))
+                    assert not os.path.exists(marker)
+                    assert not os.path.exists(fifo)
+
+            assert receiver.get("0", "1", busy)[0] == "busy payload"
+        finally:
+            adapter.shutdown()
+            receiver.close()
 
 
 @pytest.mark.parametrize("suffix", ["_1_2", "_1", "_suffix"])
@@ -270,6 +527,182 @@ def test_cleanup_preserves_other_request_keys(connector, suffix):
     assert connector.get("0", "1", own_key)[0] == "own"
     connector.cleanup(own_key)
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
+
+
+class TestLockFileLifecycle:
+    @pytest.mark.parametrize("has_segment", [False, True])
+    def test_failed_put_keeps_lock_only_for_live_segment(self, connector, monkeypatch, has_segment):
+        key = f"failed_put_{uuid.uuid4().hex}"
+        lock = connector._lock_file(key)
+        if has_segment:
+            assert connector.put("0", "1", key, "existing")[0]
+
+        def fail_write(payload, name):
+            raise OSError("injected write failure")
+
+        monkeypatch.setattr(connector, "_write_bytes", fail_write)
+        try:
+            assert not connector.put("0", "1", key, "replacement")[0]
+            assert os.path.exists(lock) == has_segment
+            if has_segment:
+                assert connector.get("0", "1", key)[0] == "existing"
+        finally:
+            connector.cleanup(key)
+
+    def test_poll_keeps_fresh_or_busy_lock_then_reclaims_orphan(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(SharedMemoryConnector, "shm_directory", str(tmp_path))
+        receiver = SharedMemoryConnector({})
+        key = f"poll_{uuid.uuid4().hex}"
+        lock = tmp_path / f"shm_{key}_lockfile.lock"
+        source = {"source_host": "localhost", "source_port": 1234}
+        try:
+            lock.touch()
+            assert receiver.get("0", "1", key, metadata=source) is None
+            assert lock.exists()
+            os.utime(lock, (1, 1))
+            with lock.open("rb") as active:
+                fcntl.flock(active, fcntl.LOCK_EX)
+                assert receiver.get("0", "1", key, metadata=source) is None
+                assert lock.exists()
+            assert receiver.get("0", "1", key, metadata=source) is None
+            assert not lock.exists()
+        finally:
+            receiver.close()
+
+    @pytest.mark.parametrize("segment_gone", [False, True], ids=["live", "reaped"])
+    def test_handle_read_failure_preserves_only_live_segment_lock(self, connector, monkeypatch, segment_gone):
+        key = f"handle_{uuid.uuid4().hex}"
+        ok, _, metadata = connector.put("0", "1", key, "payload")
+        assert ok
+
+        def fail_read(handle):
+            raise OSError("temporary read failure")
+
+        with monkeypatch.context() as patch:
+            if segment_gone:
+                connector._unlink_segment(metadata["shm"]["name"])
+            else:
+                patch.setattr(connector, "_read_bytes", fail_read)
+            assert connector.get("0", "1", key, metadata) is None
+        assert os.path.exists(connector._lock_file(key)) == (not segment_gone)
+        if not segment_gone:
+            assert connector.get("0", "1", key, metadata)[0] == "payload"
+
+    def test_sweep_revisits_young_orphans_and_preserves_live_segments(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(SharedMemoryConnector, "shm_directory", str(tmp_path))
+        now = time.monotonic()
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        orphan = tmp_path / "shm_orphan_lockfile.lock"
+        young = tmp_path / "shm_young_lockfile.lock"
+        live = tmp_path / "shm_live_lockfile.lock"
+        unrelated = tmp_path / "unrelated.lock"
+        nonempty = tmp_path / "shm_nonempty_lockfile.lock"
+        symlink = tmp_path / "shm_symlink_lockfile.lock"
+        for path in (orphan, live, unrelated):
+            path.touch()
+            os.utime(path, (1, 1))
+        nonempty.write_bytes(b"preserve")
+        os.utime(nonempty, (1, 1))
+        symlink.symlink_to(unrelated)
+        os.utime(symlink, (1, 1), follow_symlinks=False)
+        (tmp_path / "live").touch()
+        young.touch()
+
+        receiver = SharedMemoryConnector({})
+        try:
+            assert not orphan.exists()
+            assert live.exists() and young.exists() and unrelated.exists()
+            os.utime(young, (1, 1))
+            receiver.get("0", "1", "unrelated_key")
+            assert young.exists()
+            now += 61
+            receiver.get("0", "1", "unrelated_key")
+            assert not young.exists()
+            assert live.exists() and unrelated.exists()
+            assert nonempty.read_bytes() == b"preserve"
+            assert symlink.is_symlink()
+        finally:
+            receiver.close()
+
+    def test_separate_segment_storage_cannot_reclaim_by_lock_directory(self, tmp_path):
+        class SeparateStorage(SharedMemoryConnector):
+            shm_directory = str(tmp_path)
+
+            def _shm_exists(self, key):
+                return key == "external"
+
+            def _read_bytes(self, metadata):
+                raise OSError("temporarily unavailable")
+
+        lock = tmp_path / "shm_external_lockfile.lock"
+        lock.touch()
+        os.utime(lock, (1, 1))
+        receiver = SeparateStorage({})
+        try:
+            assert lock.exists()
+            assert receiver.get("0", "1", "external") is None
+            assert lock.exists()
+        finally:
+            receiver.close()
+
+    def test_cleanup_preserves_busy_tracked_key_for_retry(self, connector):
+        key = f"busy_cleanup_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "payload")[0]
+        lock = connector._lock_file(key)
+        with open(lock, "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert connector.cleanup(key) is False
+            assert key in connector._pending_keys and connector._shm_exists(key)
+            assert os.path.exists(lock)
+        assert connector.cleanup(key) is True
+        assert key not in connector._pending_keys
+        assert not os.path.exists(lock) and not connector._shm_exists(key)
+
+    @pytest.mark.parametrize("retire", ["get", "cleanup"])
+    def test_waiting_same_key_writer_publishes_readable_replacement(self, connector, monkeypatch, retire):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        key = f"same_key_{uuid.uuid4().hex}"
+        receiver = SharedMemoryConnector({})
+        retiring, writer_opened = threading.Event(), threading.Event()
+        hook = "_read_bytes" if retire == "get" else "_unlink_segment"
+        backend = getattr(receiver, hook)
+        flock = fcntl.flock
+
+        def wait_for_writer(arg):
+            try:
+                with open(receiver._lock_file(key), "rb") as probe, pytest.raises(BlockingIOError):
+                    flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                retiring.set()
+            assert writer_opened.wait(timeout=5)
+            return backend(arg)
+
+        def observe_write_lock(file, operation):
+            if operation == fcntl.LOCK_EX and retiring.is_set():
+                writer_opened.set()
+            return flock(file, operation)
+
+        try:
+            assert connector.put("0", "1", key, "first")[0]
+            with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as executor:
+                patch.setattr(receiver, hook, wait_for_writer)
+                patch.setattr(fcntl, "flock", observe_write_lock)
+                args = ("0", "1", key) if retire == "get" else (key,)
+                first = executor.submit(getattr(receiver, retire), *args)
+                assert retiring.wait(timeout=5)
+                assert connector.put("0", "1", key, "second")[0]
+                previous = first.result(timeout=5)
+                if retire == "get":
+                    assert previous[0] == "first"
+                else:
+                    assert previous is True
+            result = receiver.get("0", "1", key)
+            assert result is not None and result[0] == "second"
+            assert not os.path.exists(connector._lock_file(key))
+        finally:
+            receiver.close()
 
 
 def test_sender_reaps_keys_consumed_by_another_connector(connector):
@@ -356,12 +789,12 @@ def test_wakeup_discovery_only_scans_deployment_directory(monkeypatch, tmp_path)
         scanned.append(path)
         return original_scandir(path)
 
-    monkeypatch.setattr(module.glob.os, "scandir", scoped_scandir)
     sender, receiver = _stage_connector(86), _stage_connector(87)
     try:
         generation = receiver.get_wakeup_generation()
         assert generation is not None
         assert os.path.dirname(receiver._wake_path) == str(directory)
+        monkeypatch.setattr(module.glob.os, "scandir", scoped_scandir)
         sender._wake_receiver(87)
         assert receiver.wait_for_change(generation, timeout=0.5)
         assert scanned

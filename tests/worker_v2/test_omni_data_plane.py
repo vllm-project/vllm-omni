@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Lifecycle contracts for OmniRunnerDataPlane/NativeOutputWorker."""
 
+import os
 import threading
 import time
 import uuid
@@ -1398,6 +1399,65 @@ def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
     assert next_snapshot.last_output_token_id == 2150
     assert next_snapshot.sampled_token_ids == []
     assert first.sampled_token_ids == [2150]
+
+
+@pytest.mark.parametrize("replace", [False, True], ids=["original", "replacement"])
+def test_release_busy_shm_allows_unrelated_request(plane, monkeypatch, replace):
+    external_id = f"release_{uuid.uuid4().hex}"
+    key = f"{external_id}_0_0"
+    sender, peer = SharedMemoryConnector({}), SharedMemoryConnector({})
+    writer_locked, allow_write = threading.Event(), threading.Event()
+    cleanup_started = threading.Event()
+    write_bytes = peer._write_bytes
+    cleanup_prefix = sender.cleanup_prefix
+
+    def hold_write(payload, name):
+        writer_locked.set()
+        allow_write.wait()
+        if not replace:
+            raise OSError("write failed before replacing the original segment")
+        return write_bytes(payload, name)
+
+    def observe_cleanup(*args, **kwargs):
+        cleanup_started.set()
+        return cleanup_prefix(*args, **kwargs)
+
+    monkeypatch.setattr(peer, "_write_bytes", hold_write)
+    monkeypatch.setattr(sender, "cleanup_prefix", observe_cleanup)
+    _start_save_thread(plane, sender)
+    try:
+        assert sender.put("0", "1", key, "original")[0]
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            writer = executor.submit(peer.put, "0", "1", key, "replacement")
+            try:
+                assert writer_locked.wait(timeout=5)
+                release = executor.submit(plane.release_shm_resources, [external_id])
+                assert cleanup_started.wait(timeout=5)
+                other = executor.submit(plane.register_request, _new_request("other", "other"))
+                other.result(timeout=5)
+                assert "other" in plane._native_requests
+                assert release.result(timeout=5) == 0
+            finally:
+                allow_write.set()
+            assert writer.result(timeout=5)[0] is replace
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with sender._pending_keys_lock:
+                if key not in sender._pending_keys and (replace or not os.path.exists(sender._lock_file(key))):
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("idle MRv2 did not finish cleanup of the original publication")
+        if replace:
+            assert os.path.exists(sender._lock_file(key))
+            assert peer.get("0", "1", key)[0] == "replacement"
+        else:
+            assert not sender._shm_exists(key)
+    finally:
+        _stop_save_thread(plane)
+        peer.close()
+        sender.close()
 
 
 def test_release_reclaims_segments_no_downstream_stage_consumed(plane):

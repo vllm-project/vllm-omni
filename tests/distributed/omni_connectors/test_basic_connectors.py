@@ -187,7 +187,7 @@ def test_put_get_shm(mocker: MockerFixture, shm_connector, monkeypatch: pytest.M
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_2", metadata)
 
     assert data == retrieved_data
-    mock_read.assert_called_once_with(mock_handle)
+    mock_read.assert_called_once_with(mock_handle, require_unlink=True)
 
 
 def test_get_invalid_metadata(shm_connector):
