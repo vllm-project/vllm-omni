@@ -256,10 +256,10 @@ _MODEL_REQUEST_SCOPE = (
     "VLLM_GEPARD_GREEDY",
 )
 
-# No audited model variable is currently owned by a supported third-party
-# contract. Keep the disposition explicit so future reviews cannot silently
-# fold an externally owned name into "promote".
-_MODEL_EXTERNAL: tuple[str, ...] = ()
+_MODEL_EXTERNAL = (
+    # The MiniMax H3 checkpoint controls compilation of its native decoder RoPE.
+    "MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE",
+)
 
 _MODEL_INTERNALIZE = (
     "COSYVOICE3_BATCH_FLOW_DEBUG",
