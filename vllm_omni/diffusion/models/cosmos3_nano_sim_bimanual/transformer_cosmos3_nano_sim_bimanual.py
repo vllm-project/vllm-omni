@@ -248,13 +248,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
         )
-        if not self.action_gen:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoints must enable action_gen")
-        if self.action_dim != self.manifest.max_action_dim:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Bimanual action dimension differs between transformer and manifest: "
-                f"{self.action_dim} != {self.manifest.max_action_dim}"
-            )
+        self._validate_conditioning_config()
         if self.temporal_compression_factor != self.manifest.temporal_compression_factor:
             raise ValueError(
                 "Cosmos3-Nano-Sim-Bimanual temporal compression differs between VAE and manifest: "
@@ -264,9 +258,79 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         self.base_fps = self.manifest.base_fps
         self.enable_fps_modulation = self.manifest.enable_fps_modulation
 
+    def _validate_conditioning_config(self) -> None:
+        """Check the loaded action modules against the manifest's action schema."""
+        if not self.action_gen:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoints must enable action_gen")
+        if self.action_dim != self.manifest.max_action_dim:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual action dimension differs between transformer and manifest: "
+                f"{self.action_dim} != {self.manifest.max_action_dim}"
+            )
+
+    def _prepare_conditioning_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        num_frames: int,
+        action_latents: torch.Tensor | None,
+        action_domain_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Project actions into the ``[1, T, A, D]`` tokens packed before each vision frame."""
+        action_count = self.manifest.action_tokens_per_frame
+        if action_latents is None:
+            action_latents = hidden_states.new_zeros(1, num_frames * action_count, self.action_dim)
+        elif action_latents.ndim == 2:
+            action_latents = action_latents.unsqueeze(0)
+        expected_action_shape = (1, num_frames * action_count, self.action_dim)
+        if tuple(action_latents.shape) != expected_action_shape:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual actions must have shape "
+                f"{expected_action_shape}, got {tuple(action_latents.shape)}"
+            )
+        if action_domain_ids is None:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual actions require action_domain_ids")
+        if action_domain_ids.ndim == 2:
+            if action_domain_ids.shape != action_latents.shape[:2]:
+                raise ValueError("Per-token domain IDs must match [batch, action tokens]")
+            action_hidden = self.action_proj_in(
+                action_latents.reshape(-1, self.action_dim), action_domain_ids.reshape(-1)
+            ).reshape(1, num_frames * action_count, self.hidden_size)
+        else:
+            action_hidden = self.action_proj_in(action_latents, action_domain_ids)
+        action_hidden = action_hidden + self.action_modality_embed.to(action_hidden.dtype)
+        return action_hidden.view(1, num_frames, action_count, self.hidden_size)
+
     @property
     def num_kv_heads_local(self) -> int:
         return self.num_key_value_heads // get_tensor_model_parallel_world_size()
+
+    def _build_position_ids(
+        self,
+        *,
+        frame_start: int,
+        num_frames: int,
+        grid_h: int,
+        grid_w: int,
+        real_text_kv_len: int,
+        fps: float,
+        null_action_frames: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Build ``[3, S]`` mRoPE IDs for one AR span; ``null_action_frames`` are absolute."""
+        return build_interleaved_mrope_position_ids(
+            frame_start=frame_start,
+            num_frames=num_frames,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            text_temporal_offset=real_text_kv_len,
+            temporal_modality_margin=self.temporal_modality_margin,
+            fps=fps,
+            base_fps=self.base_fps,
+            temporal_compression_factor=self.temporal_compression_factor,
+            enable_fps_modulation=self.enable_fps_modulation,
+            action_tokens_per_frame=self.manifest.action_tokens_per_frame,
+            null_action_frames=null_action_frames,
+        )
 
     def _current_rope(
         self,
@@ -289,18 +353,13 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         position_ids = (
             torch.cat(
                 [
-                    build_interleaved_mrope_position_ids(
+                    self._build_position_ids(
                         frame_start=start,
                         num_frames=count,
                         grid_h=grid_h,
                         grid_w=grid_w,
-                        text_temporal_offset=real_text_kv_len,
-                        temporal_modality_margin=self.temporal_modality_margin,
+                        real_text_kv_len=real_text_kv_len,
                         fps=fps,
-                        base_fps=self.base_fps,
-                        temporal_compression_factor=self.temporal_compression_factor,
-                        enable_fps_modulation=self.enable_fps_modulation,
-                        action_tokens_per_frame=self.manifest.action_tokens_per_frame,
                         null_action_frames=absolute_null_frames,
                     )
                     for start, count in spans
@@ -323,8 +382,8 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         real_text_kv_len: int,
         frame_start: int,
         fps: float,
-        action_latents: torch.Tensor | None,
-        action_domain_ids: torch.Tensor,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
         dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         dense_attention: CosmosSimDenseAttentionCache | None = None,
         condition_vision: bool = False,
@@ -388,28 +447,15 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                 time_embed = self.time_embedder((timestep.reshape(1) * self.timestep_scale).float())
             vision_tokens = vision_tokens + time_embed.to(vision_tokens.dtype).view(1, 1, 1, -1)
 
-        action_count = self.manifest.action_tokens_per_frame
+        action_hidden = self._prepare_conditioning_tokens(
+            hidden_states,
+            num_frames=num_frames,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+        )
+        # Zero for action-free subclasses: interleaving and splitting then reduce to the vision tokens.
+        action_count = action_hidden.shape[2]
         actual_tokens_per_frame = action_count + grid_h * grid_w
-        if action_latents is None:
-            action_latents = hidden_states.new_zeros(1, num_frames * action_count, self.action_dim)
-        elif action_latents.ndim == 2:
-            action_latents = action_latents.unsqueeze(0)
-        expected_action_shape = (1, num_frames * action_count, self.action_dim)
-        if tuple(action_latents.shape) != expected_action_shape:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Bimanual actions must have shape "
-                f"{expected_action_shape}, got {tuple(action_latents.shape)}"
-            )
-        if action_domain_ids.ndim == 2:
-            if action_domain_ids.shape != action_latents.shape[:2]:
-                raise ValueError("Per-token domain IDs must match [batch, action tokens]")
-            action_hidden = self.action_proj_in(
-                action_latents.reshape(-1, self.action_dim), action_domain_ids.reshape(-1)
-            ).reshape(1, num_frames * action_count, self.hidden_size)
-        else:
-            action_hidden = self.action_proj_in(action_latents, action_domain_ids)
-        action_hidden = action_hidden + self.action_modality_embed.to(action_hidden.dtype)
-        action_hidden = action_hidden.view(1, num_frames, action_count, self.hidden_size)
         hidden = interleave_action_vision_tokens(action_hidden, vision_tokens)
         freqs_cos, freqs_sin = self._current_rope(
             hidden,

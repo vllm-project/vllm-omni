@@ -15,6 +15,7 @@ __all__ = [
     "Cosmos3NanoSimBimanualManifest",
     "Cosmos3NanoSimBimanualPipeline",
     "Cosmos3NanoSimBimanualResolutionPolicy",
+    "Cosmos3NanoSimTransferPipeline",
     "get_cosmos3_nano_sim_bimanual_pre_process_func",
     "resolve_cosmos3_nano_sim_bimanual_geometry",
 ]
@@ -28,4 +29,8 @@ def __getattr__(name: str):
         from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_bimanual
 
         return getattr(pipeline_cosmos3_nano_sim_bimanual, name)
+    if name == "Cosmos3NanoSimTransferPipeline":
+        from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_transfer
+
+        return getattr(pipeline_cosmos3_nano_sim_transfer, name)
     raise AttributeError(name)

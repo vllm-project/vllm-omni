@@ -1,0 +1,904 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Offline full-clip Cosmos3-Nano-Sim-Transfer with dense paired control/generated history."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from functools import partial
+from numbers import Integral
+from typing import Any, ClassVar
+
+import torch
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.cosmos3.action import find_closest_target_size
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    COSMOS3_DURATION_TEMPLATE,
+    COSMOS3_RESOLUTION_TEMPLATE,
+    COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
+    COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    _format_json_object_prompt,
+    _json_object_aspect_ratio,
+    get_cosmos3_pre_process_func,
+)
+
+# Re-exported: the registry resolves the process functions on this module.
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    get_cosmos3_ir_op_priority_func as get_cosmos3_ir_op_priority_func,  # noqa: F401
+)
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    get_cosmos3_post_process_func as get_cosmos3_post_process_func,  # noqa: F401
+)
+from vllm_omni.diffusion.models.cosmos3.transfer import (
+    Cosmos3TransferHint,
+    load_or_compute_control_frames,
+    media_hw,
+    normalized_video_to_uint8_cthw,
+    pad_temporal_frames,
+    parse_transfer_hint,
+    uint8_cthw_to_normalized_5d,
+)
+from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
+    TRANSFER_HINTS,
+    TransferHint,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
+    Cosmos3NanoSimBimanualGeometry,
+    Cosmos3NanoSimBimanualResolutionPolicy,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
+    ARDiffusionRequestRejectedError,
+    Cosmos3NanoSimBimanualPipeline,
+    _admission_float,
+    _admission_int,
+    _RequestControls,
+    _resolution_policy,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualSessionState,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_transfer import (
+    Cosmos3NanoSimTransferTransformer,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import iter_clean_commit_frames, prompt_token_hash
+
+_TRANSFER_RESOLUTION = "480"
+
+
+@dataclass(frozen=True, slots=True)
+class _TransferRequestContract:
+    """One validated full-clip request: control hint, clip length and dense history window."""
+
+    hint: TransferHint
+    hint_config: Mapping[str, Any]
+    control_video: Any
+    num_pixel_frames: int
+    # Padded to a VAE-supported frame count; the output is trimmed back to num_pixel_frames.
+    processing_pixel_frames: int
+    window_frames: int
+    sink_frames: int
+    emphasize_control_in_prompt: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TransferConditioning:
+    request: _TransferRequestContract
+    control_latents: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _TransferSessionFingerprint:
+    """Fail-closed identity of one Transfer session, compared field by field on reuse."""
+
+    prompt_hash: str
+    real_text_kv_lengths: tuple[tuple[str, int], ...]
+    height: int
+    width: int
+    fps: float
+    control_hint: str
+    clip_num_frames: int
+    control_contract_sha256: str
+    window_frames: int
+    sink_frames: int
+    emphasize_control_in_prompt: bool
+    checkpoint_id: str
+    manifest_id: str
+    sampler_id: str
+    inference_id: str
+
+
+def _prompt_value(prompt_data: Any, key: str) -> Any:
+    if not isinstance(prompt_data, Mapping):
+        return None
+    if prompt_data.get(key) is not None:
+        return prompt_data[key]
+    additional = prompt_data.get("additional_information")
+    if isinstance(additional, Mapping):
+        return additional.get(key)
+    return None
+
+
+def _request_value(
+    sampling_params: Any, prompt_data: Any, key: str, default: Any = None, *, preserve_none: bool = False
+) -> Any:
+    extra = getattr(sampling_params, "extra_args", None)
+    if isinstance(extra, Mapping) and key in extra and (preserve_none or extra[key] is not None):
+        return extra[key]
+    value = getattr(sampling_params, key, None)
+    if value is not None or (preserve_none and hasattr(sampling_params, key)):
+        return value
+    if preserve_none and isinstance(prompt_data, Mapping):
+        for source in (prompt_data, prompt_data.get("additional_information")):
+            if isinstance(source, Mapping) and key in source:
+                return source[key]
+    value = _prompt_value(prompt_data, key)
+    return default if value is None else value
+
+
+def _transfer_media_source(sampling_params: Any, prompt_data: Any) -> Any:
+    """Select the same bucket-driving source used by Transfer execution."""
+
+    if isinstance(prompt_data, Mapping):
+        additional = prompt_data.get("additional_information")
+        if isinstance(additional, Mapping) and additional.get("preprocessed_transfer_video") is not None:
+            return additional["preprocessed_transfer_video"]
+        multi_modal = prompt_data.get("multi_modal_data")
+        if isinstance(multi_modal, Mapping):
+            for key in ("video", "image"):
+                if multi_modal.get(key) is not None:
+                    return multi_modal[key]
+
+    control_video = _request_value(sampling_params, prompt_data, "control_video")
+    if control_video is not None:
+        return control_video
+    for hint in TRANSFER_HINTS:
+        raw_hint = _request_value(sampling_params, prompt_data, hint)
+        if isinstance(raw_hint, Mapping):
+            for key in ("control", "control_path"):
+                if raw_hint.get(key) is not None:
+                    return raw_hint[key]
+    return None
+
+
+def _transfer_media_hw(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, Mapping):
+        height, width = value.get("height"), value.get("width")
+        if height is not None and width is not None:
+            return int(height), int(width)
+        for key in ("video", "frames", "data", "image", "control", "control_path"):
+            if value.get(key) is not None:
+                resolved = _transfer_media_hw(value[key])
+                if resolved is not None:
+                    return resolved
+        return None
+    return media_hw(value)
+
+
+def _transfer_resolution_policy(
+    od_config: OmniDiffusionConfig,
+    manifest: Cosmos3NanoSimBimanualManifest,
+) -> Cosmos3NanoSimBimanualResolutionPolicy:
+    policy = _resolution_policy(od_config, manifest, default_resolution=(480, 832), max_pixels=409_600)
+    height, width = policy.default_resolution
+    if (width, height) not in VIDEO_RES_SIZE_INFO[_TRANSFER_RESOLUTION].values():
+        raise ValueError(
+            f"Cosmos3-Nano-Sim-Transfer default_resolution must be a canonical 480p bucket, got {height}x{width}."
+        )
+    return policy
+
+
+def resolve_cosmos3_nano_sim_transfer_geometry(
+    sampling_params: Any,
+    prompt_data: Any,
+    policy: Cosmos3NanoSimBimanualResolutionPolicy,
+) -> Cosmos3NanoSimBimanualGeometry:
+    """Snap the prioritized Transfer source to a policy-valid 480p bucket."""
+
+    resolution = _request_value(
+        sampling_params,
+        prompt_data,
+        "resolution",
+        _request_value(sampling_params, prompt_data, "image_size", _TRANSFER_RESOLUTION),
+    )
+    if str(resolution) != _TRANSFER_RESOLUTION:
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer supports only resolution '480', got {resolution!r}.")
+
+    aspect_ratio = _request_value(sampling_params, prompt_data, "aspect_ratio")
+    try:
+        if aspect_ratio is not None:
+            target_width, target_height = VIDEO_RES_SIZE_INFO[_TRANSFER_RESOLUTION][str(aspect_ratio)]
+        else:
+            source_hw = _transfer_media_hw(_transfer_media_source(sampling_params, prompt_data))
+            if source_hw is None:
+                source_hw = policy.default_resolution
+            target_width, target_height = find_closest_target_size(*source_hw, _TRANSFER_RESOLUTION)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            f"Cosmos3-Nano-Sim-Transfer invalid resolution/aspect_ratio: {resolution!r}/{aspect_ratio!r}."
+        ) from exc
+    geometry = policy.resolve(target_height, target_width)
+
+    requested_height = getattr(sampling_params, "height", None)
+    requested_width = getattr(sampling_params, "width", None)
+    if (requested_height is None) != (requested_width is None):
+        raise ValueError("Cosmos3-Nano-Sim-Transfer height and width must be supplied together.")
+    if requested_height is not None and (int(requested_height), int(requested_width)) != (
+        geometry.height,
+        geometry.width,
+    ):
+        raise ValueError(
+            "Cosmos3-Nano-Sim-Transfer serialized dimensions do not match the control-selected bucket: "
+            f"requested {requested_height}x{requested_width}, selected {geometry.height}x{geometry.width}."
+        )
+    return geometry
+
+
+def _strict_integer(value: Any, name: str = "num_frames") -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ARDiffusionRequestRejectedError(
+            f"Cosmos3-Nano-Sim-Transfer {name} must be an integer without coercion, got {value!r}."
+        )
+    return int(value)
+
+
+def _strict_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ARDiffusionRequestRejectedError(
+            f"Cosmos3-Nano-Sim-Transfer {name} must be a JSON boolean, got {value!r}."
+        )
+    return value
+
+
+def format_cosmos3_nano_sim_transfer_prompt(
+    prompt: str,
+    *,
+    hint: str,
+    num_frames: int,
+    fps: float,
+    height: int,
+    width: int,
+    emphasize_control_in_prompt: bool = True,
+) -> str:
+    """Replicate the reference non-AR full-clip Transfer prompt."""
+
+    prompt_fps = int(round(fps))
+    if prompt_fps <= 0:
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer prompt FPS must round to a positive integer, got {fps}.")
+    formatted = _format_json_object_prompt(
+        prompt,
+        num_frames=num_frames,
+        frame_rate=prompt_fps,
+        height=height,
+        width=width,
+        # Caption metadata can describe the source video rather than the
+        # selected output canvas. Use the same canonical ratio as the preset.
+        aspect_ratio=next(
+            (
+                ratio
+                for sizes in VIDEO_RES_SIZE_INFO.values()
+                for ratio, size in sizes.items()
+                if tuple(size) == (width, height)
+            ),
+            _json_object_aspect_ratio(prompt),
+        ),
+    )
+    if formatted is None:
+        formatted = prompt.strip()
+        duration_text = COSMOS3_DURATION_TEMPLATE.format(duration=num_frames / prompt_fps, fps=prompt_fps)
+        formatted = formatted.rstrip(".") + ". " + duration_text
+        formatted = formatted.strip()
+        resolution_text = COSMOS3_RESOLUTION_TEMPLATE.format(height=height, width=width)
+        formatted = formatted.rstrip(".") + ". " + resolution_text
+    if emphasize_control_in_prompt:
+        suffix = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint)
+        return f"{formatted.rstrip()} {suffix}"
+    return formatted
+
+
+def _trim_transfer_history(
+    history: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    tokens_per_frame: int,
+    window_frames: int,
+    sink_frames: int,
+    dense_cache: CosmosSimDenseAttentionCache,
+) -> None:
+    """Select paired sinks and recent past in joint storage before the next control forward.
+
+    W includes S sink frames and the current temporal frame. A past frame
+    occupies two entries (control, generated latent). The current control is
+    appended afterwards, so denoising and clean commit additionally see C_t.
+    Sinks stay in place and the recent tail shifts down behind them.
+    Positions in the retained K/V remain absolute; eviction never renumbers RoPE.
+    """
+    sink_tokens = 2 * sink_frames * tokens_per_frame
+    recent_tokens = 2 * (window_frames - sink_frames - 1) * tokens_per_frame
+    end = dense_cache.text_length + sink_tokens + recent_tokens
+    for layer_idx, (key, value) in enumerate(history):
+        if key.shape[1] <= sink_tokens + recent_tokens:
+            continue
+        for buffer, source in zip(dense_cache.kv[layer_idx], (key, value)):
+            if recent_tokens:
+                # The source tail can overlap its destination; preserve it before shifting.
+                buffer[:, end - recent_tokens : end].copy_(source[:, -recent_tokens:].clone())
+        history[layer_idx] = tuple(buffer[:, dense_cache.text_length : end] for buffer in dense_cache.kv[layer_idx])
+    dense_cache.history_length = history[0][0].shape[1]
+
+
+def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfig):
+    """Resolve a Transfer bucket, preprocess to it, and serialize final H/W."""
+
+    manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
+    manifest.require_control_video_conditioning()
+    policy = _transfer_resolution_policy(od_config, manifest)
+
+    def transfer_target_size(request) -> tuple[int, int]:
+        try:
+            geometry = resolve_cosmos3_nano_sim_transfer_geometry(request.sampling_params, request.prompt, policy)
+        except (TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        return geometry.height, geometry.width
+
+    cosmos3_pre_process = get_cosmos3_pre_process_func(
+        od_config,
+        transfer_target_size=transfer_target_size,
+        transfer_direct_resize=True,
+    )
+
+    def pre_process_func(request):
+        sp = request.sampling_params
+        extra = sp.extra_args
+        if extra is None:
+            extra = {}
+            sp.extra_args = extra
+        if not isinstance(extra, dict):
+            raise ValueError("Cosmos3-Nano-Sim-Transfer extra_args must be a mutable mapping during preprocessing.")
+        prompt_data = request.prompt
+        sp.height, sp.width = transfer_target_size(request)
+
+        generic_hint = _request_value(sp, prompt_data, "control_hint")
+        named = [key for key in (*TRANSFER_HINTS, "wsm") if _request_value(sp, prompt_data, key) is not None]
+        hint = None
+        value = True
+        if generic_hint is not None and not named:
+            hint = str(generic_hint).strip().lower()
+        elif generic_hint is None and len(named) == 1:
+            hint = named[0]
+            value = _request_value(sp, prompt_data, hint)
+
+        # The shared video decoder selects its frame budget and output slot
+        # from extra_args. Expose the resolved hint only for that call.
+        if hint in TRANSFER_HINTS and extra.get(hint) is None:
+            present = hint in extra
+            extra[hint] = value
+            try:
+                processed = cosmos3_pre_process(request)
+            finally:
+                if present:
+                    extra[hint] = None
+                else:
+                    del extra[hint]
+        else:
+            processed = cosmos3_pre_process(request)
+        final_sp = processed.sampling_params
+        final_sp.height, final_sp.width = transfer_target_size(processed)
+        return processed
+
+    return pre_process_func
+
+
+class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
+    """Offline full-clip Transfer inference with dense full or paired sliding history."""
+
+    _transformer_cls_override: ClassVar[type[Cosmos3NanoSimTransferTransformer]] = Cosmos3NanoSimTransferTransformer
+    _build_resolution_policy = staticmethod(_transfer_resolution_policy)
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        super().__init__(od_config=od_config, prefix=prefix)
+        if not isinstance(self.transformer, Cosmos3NanoSimTransferTransformer):
+            raise TypeError(
+                "Cosmos3-Nano-Sim-Transfer pipeline resolved the wrong transformer type: "
+                f"{type(self.transformer).__name__}."
+            )
+
+    def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
+        """Require the control-video contract instead of an action schema."""
+
+        contract = self.manifest.require_control_video_conditioning()
+        if self.manifest.chunk_size != 1 and (self.manifest.sink_frames != 0 or not contract.no_eviction):
+            raise ValueError("Cosmos3-Nano-Sim-Transfer sliding history requires chunk_size=1.")
+        kv_cache_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
+        if kv_cache_dtype not in (None, "auto"):
+            raise ValueError("Cosmos3-Nano-Sim-Transfer does not support a quantized diffusion KV cache.")
+
+    @staticmethod
+    def _is_action_weight(name: str) -> bool:
+        key = name.removeprefix("transformer.").removeprefix("model.")
+        return key.startswith(
+            ("action2llm.", "llm2action.", "action_proj_in.", "action_proj_out.", "action_pos_embed.")
+        ) or key in {
+            "action_modality_embed",
+            "action_modality_embed.weight",
+        }
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Require an action-free Transfer checkpoint inventory."""
+
+        action_weights: list[str] = []
+
+        def checked_weights():
+            for name, tensor in weights:
+                if self._is_action_weight(name):
+                    action_weights.append(name)
+                    continue
+                yield name, tensor
+
+        loaded = super().load_weights(checked_weights())
+        if action_weights:
+            preview = ", ".join(sorted(action_weights)[:12])
+            raise ValueError(f"Cosmos3-Nano-Sim-Transfer checkpoint contains forbidden action weights: {preview}.")
+        return loaded
+
+    # -- Request admission ------------------------------------------------
+
+    def _request_controls(self, sp, extra: Mapping, typed_tick) -> _RequestControls:
+        """Accept only offline full-clip requests; Transfer has no tick transport."""
+
+        if typed_tick is not None or bool(self._get_sp_param(sp, "chunk_only", False)):
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer supports only offline full-clip requests, not tick transport."
+            )
+        return _RequestControls(
+            session_id=str(extra.get("session_id") or "default"),
+            reset=bool(extra.get("reset", False)),
+            close_session=bool(extra.get("close_session", False)),
+            tick=False,
+            measure_tick_latency=False,
+            domain_id=None,
+            domain_name=None,
+            frame_idx=extra.get("frame_idx"),
+            num_latent_frames=None,
+            action=None,
+        )
+
+    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> Cosmos3NanoSimBimanualGeometry:
+        """Re-resolve the control-selected bucket and check the serialized canvas against it."""
+
+        return resolve_cosmos3_nano_sim_transfer_geometry(sp, prompt_data, self.resolution_policy)
+
+    def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
+        """Prefer the decoded input video's FPS over request FPS fields.
+
+        A missing input FPS falls back to the request and deployment FPS; a
+        present but invalid one is rejected so it cannot change the generated
+        duration or conditioning.
+        """
+
+        input_fps = _prompt_value(prompt_data, "transfer_input_fps")
+        if input_fps is None:
+            return super()._resolve_request_fps(sp, prompt_data)
+        try:
+            resolved_input_fps = float(input_fps)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos3-Nano-Sim-Transfer transfer_input_fps must be numeric, got {input_fps!r}."
+            ) from exc
+        if not math.isfinite(resolved_input_fps) or resolved_input_fps <= 0:
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos3-Nano-Sim-Transfer transfer_input_fps must be positive and finite, got {input_fps!r}."
+            )
+        return resolved_input_fps
+
+    def _validate_conditioning_request(
+        self, sp: Any, controls: _RequestControls, *, prompt_data: Any
+    ) -> _TransferRequestContract:
+        """Validate the single control hint, clip length and history window of one request."""
+
+        del controls  # Transfer controls carry no conditioning.
+        for action_key in ("action", "domain_id", "domain_name", "embodiment"):
+            if _request_value(sp, prompt_data, action_key) is not None:
+                raise ARDiffusionRequestRejectedError(
+                    f"Cosmos3-Nano-Sim-Transfer does not accept action conditioning field {action_key!r}."
+                )
+        # Transfer generates every frame from its control video.
+        additional = prompt_data.get("additional_information") if isinstance(prompt_data, Mapping) else None
+        multi_modal = prompt_data.get("multi_modal_data") if isinstance(prompt_data, Mapping) else None
+        if (
+            _request_value(sp, prompt_data, "initial_latent") is not None
+            or (isinstance(prompt_data, Mapping) and prompt_data.get("seed_image") is not None)
+            or (isinstance(additional, Mapping) and additional.get("preprocessed_image") is not None)
+            or (isinstance(multi_modal, Mapping) and multi_modal.get("image") is not None)
+        ):
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer does not accept initial_latent or seed images."
+            )
+
+        named_hints = []
+        hint_values: dict[str, Any] = {}
+        for hint in (*TRANSFER_HINTS, "wsm"):
+            value = _request_value(sp, prompt_data, hint)
+            if value is not None:
+                named_hints.append(hint)
+                hint_values[hint] = value
+        generic_hint = _request_value(sp, prompt_data, "control_hint")
+        control_video = _request_value(sp, prompt_data, "control_video")
+        if generic_hint is not None and named_hints:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer accepts either control_hint/control_video or one named hint, not both."
+            )
+        if generic_hint is not None:
+            hint = str(generic_hint).strip().lower()
+            named_hints = [hint]
+            hint_values[hint] = {}
+        if len(named_hints) != 1:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer requires exactly one edge, blur, depth, or seg control hint."
+            )
+        hint = named_hints[0]
+        if hint not in TRANSFER_HINTS:
+            raise ARDiffusionRequestRejectedError(
+                f"Unsupported Cosmos3-Nano-Sim-Transfer control hint {hint!r}; expected one of {list(TRANSFER_HINTS)}."
+            )
+
+        try:
+            parsed_hint = parse_transfer_hint(hint, hint_values[hint])
+        except (TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if control_video is not None and (parsed_hint.control is not None or parsed_hint.control_path is not None):
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer control_video cannot be combined with a named control/control_path."
+            )
+        if parsed_hint.control_weight != 1.0:
+            raise ARDiffusionRequestRejectedError("Cosmos3-Nano-Sim-Transfer single-control weight must equal 1.0.")
+        hint_config: dict[str, Any] = {"control_weight": parsed_hint.control_weight}
+        if parsed_hint.control_path is not None:
+            hint_config["control_path"] = parsed_hint.control_path
+        if parsed_hint.control is not None:
+            hint_config["control"] = parsed_hint.control
+        if hint == "edge":
+            hint_config["preset_edge_threshold"] = parsed_hint.preset_edge_threshold
+        elif hint == "blur":
+            hint_config["preset_blur_strength"] = parsed_hint.preset_blur_strength
+
+        control_guidance = _admission_float(
+            _request_value(sp, prompt_data, "control_guidance", 1.0),
+            "control_guidance",
+        )
+        if control_guidance != 1.0:
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos3-Nano-Sim-Transfer distilled inference requires control_guidance=1.0, got {control_guidance}."
+            )
+        first_conditional = _admission_int(
+            _request_value(sp, prompt_data, "num_first_chunk_conditional_frames", 0),
+            "num_first_chunk_conditional_frames",
+        )
+        if first_conditional != 0:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer requires num_first_chunk_conditional_frames=0."
+            )
+        share_positions = _strict_bool(
+            _request_value(sp, prompt_data, "share_vision_temporal_positions", True),
+            "share_vision_temporal_positions",
+        )
+        if not share_positions:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer requires share_vision_temporal_positions=True."
+            )
+        emphasize = _strict_bool(
+            _request_value(
+                sp,
+                prompt_data,
+                "emphasize_control_in_prompt",
+                self.manifest.require_control_video_conditioning().emphasize_control_in_prompt,
+            ),
+            "emphasize_control_in_prompt",
+        )
+
+        window = _request_value(
+            sp, prompt_data, "kv_cache_inference_size", self.manifest.window_frames, preserve_none=True
+        )
+        full_history = window is None
+        sink = _strict_integer(
+            _request_value(sp, prompt_data, "attention_sink_size", 0 if full_history else self.manifest.sink_frames),
+            "attention_sink_size",
+        )
+
+        num_pixel_frames = _strict_integer(_request_value(sp, prompt_data, "num_frames", 1))
+        factor = self.manifest.temporal_compression_factor
+        frame_stride = factor * self.manifest.chunk_size
+        minimum_frames = 1 if self.manifest.chunk_size == 1 else 1 + frame_stride
+        if num_pixel_frames < minimum_frames or (
+            self.manifest.chunk_size != 1 and (num_pixel_frames - 1) % frame_stride != 0
+        ):
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos3-Nano-Sim-Transfer requires F >= {minimum_frames} and (F - 1) % {frame_stride} == 0 "
+                f"pixel frames; got F={num_pixel_frames}."
+            )
+        processing_frames = (num_pixel_frames - 1 + factor - 1) // factor * factor + 1
+        latent_frames = (processing_frames - 1) // factor + 1
+        required_history_frames = 2 * latent_frames + 1
+        if full_history:
+            if sink != 0:
+                raise ARDiffusionRequestRejectedError("Transfer full history requires attention_sink_size=0.")
+            # Explicit null selects the complete rollout. Framewise windows count
+            # temporal frames; chunkwise capacity counts control/generated spans.
+            window = latent_frames if self.manifest.chunk_size == 1 else required_history_frames
+        else:
+            window = _strict_integer(window, "kv_cache_inference_size")
+        if window <= 0 or not 0 <= sink < window:
+            raise ARDiffusionRequestRejectedError("Require kv_cache_inference_size > attention_sink_size >= 0.")
+        if self.manifest.chunk_size != 1 and sink != 0:
+            raise ARDiffusionRequestRejectedError("Transfer sink history requires chunk_size=1.")
+        # Framewise inference uses window/sink retention regardless of
+        # conditioning.no_eviction. Chunkwise inference requires full-history capacity.
+        if self.manifest.chunk_size != 1 and required_history_frames > window:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer full history exceeds the artifact's no-eviction window: "
+                f"required {required_history_frames}, configured {window}."
+            )
+        return _TransferRequestContract(
+            hint=hint,
+            hint_config=hint_config,
+            control_video=control_video,
+            num_pixel_frames=num_pixel_frames,
+            processing_pixel_frames=processing_frames,
+            window_frames=window,
+            sink_frames=sink,
+            emphasize_control_in_prompt=emphasize,
+        )
+
+    def _build_prompt_tokens(
+        self,
+        prompt: str,
+        request: _TransferRequestContract,
+        *,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        fps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize the reference full-clip Transfer prompt under the Transfer system prompt."""
+
+        formatted = format_cosmos3_nano_sim_transfer_prompt(
+            prompt,
+            hint=request.hint,
+            num_frames=request.num_pixel_frames,
+            fps=fps,
+            height=geometry.height,
+            width=geometry.width,
+            emphasize_control_in_prompt=request.emphasize_control_in_prompt,
+        )
+        return self._tokenize_prompt(
+            formatted,
+            max_sequence_length=1 << 30,
+            use_system_prompt=True,
+            system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+        )
+
+    def _resolve_pixel_frames(self, sp: Any, request: _TransferRequestContract) -> tuple[int, int]:
+        """Generate a VAE-aligned clip and trim the output to the requested length."""
+
+        del sp
+        return request.num_pixel_frames, request.processing_pixel_frames
+
+    def _fingerprint(
+        self,
+        text_ids: torch.Tensor,
+        *,
+        real_text_kv_len: int,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        fps: float,
+        request: _TransferRequestContract,
+    ) -> _TransferSessionFingerprint:
+        """Identify the session's prompt, canvas, control contract and history window."""
+
+        return _TransferSessionFingerprint(
+            prompt_hash=prompt_token_hash(text_ids),
+            real_text_kv_lengths=((self._MAIN_BRANCH, real_text_kv_len),),
+            height=geometry.height,
+            width=geometry.width,
+            fps=fps,
+            control_hint=request.hint,
+            clip_num_frames=request.num_pixel_frames,
+            control_contract_sha256=self.manifest.require_control_video_conditioning().digest,
+            window_frames=request.window_frames,
+            sink_frames=request.sink_frames,
+            emphasize_control_in_prompt=request.emphasize_control_in_prompt,
+            checkpoint_id=self.checkpoint_id,
+            manifest_id=self.manifest.digest,
+            sampler_id=self.manifest.sampler_id,
+            inference_id=self.manifest.digest,
+        )
+
+    def _initial_condition_latent(self, prompt_data: Any, sp, geometry: Cosmos3NanoSimBimanualGeometry) -> None:
+        """Never seed from media: admission rejects seed inputs and the input video only drives controls."""
+
+        del prompt_data, sp, geometry
+        return None
+
+    def _prepare_conditioning(
+        self,
+        request: _TransferRequestContract,
+        *,
+        prompt_data: Any,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        start_frame: int,
+        target_frame: int,
+    ) -> _TransferConditioning:
+        """Encode the control video, padded to the generated clip, into one latent per generated frame."""
+
+        del start_frame  # Transfer sessions always start a fresh clip at frame 0.
+        try:
+            additional = prompt_data.get("additional_information", {}) if isinstance(prompt_data, Mapping) else {}
+            source_video = additional.get("preprocessed_transfer_video") if isinstance(additional, Mapping) else None
+            input_frames = normalized_video_to_uint8_cthw(source_video) if source_video is not None else None
+
+            control_value = request.control_video
+            if control_value is None:
+                control_value = request.hint_config.get("control")
+            control_path = request.hint_config.get("control_path")
+            hint = Cosmos3TransferHint(
+                key=request.hint,
+                control_path=str(control_path) if control_path is not None else None,
+                control=control_value,
+                control_weight=1.0,
+                preset_edge_threshold=str(request.hint_config.get("preset_edge_threshold", "medium")).lower(),
+                preset_blur_strength=str(request.hint_config.get("preset_blur_strength", "medium")).lower(),
+            )
+            control_frames = load_or_compute_control_frames(
+                hint,
+                height=geometry.height,
+                width=geometry.width,
+                max_frames=request.num_pixel_frames,
+                input_frames=input_frames,
+                direct_resize=True,
+            )
+            if control_frames.shape[1] != request.num_pixel_frames:
+                raise ValueError(
+                    "Cosmos3-Nano-Sim-Transfer control video must cover the complete requested clip: "
+                    f"expected {request.num_pixel_frames} frames, got {control_frames.shape[1]}."
+                )
+            control_frames = pad_temporal_frames(control_frames, request.processing_pixel_frames)
+            control_video = uint8_cthw_to_normalized_5d(control_frames, dtype=torch.float32)
+            control_latents = self._encode_video_tensor(control_video)
+            expected = (
+                1,
+                self.transformer.latent_channel_size,
+                target_frame,
+                geometry.latent_height,
+                geometry.latent_width,
+            )
+            if tuple(control_latents.shape) != expected:
+                raise ValueError(
+                    "Cosmos3-Nano-Sim-Transfer control/target latent shape mismatch: "
+                    f"expected {expected}, got {tuple(control_latents.shape)}."
+                )
+        except (OSError, TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        return _TransferConditioning(request=request, control_latents=control_latents)
+
+    # -- Dense history ----------------------------------------------------
+
+    def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
+        """Reserve joint storage for text plus the retained control/generated frame pairs.
+
+        Transfer history lives only in this storage, which serves one session.
+        """
+
+        state.dense_attention = None
+        if self._SESSION_CAPACITY != 1:
+            raise RuntimeError("Cosmos3-Nano-Sim-Transfer joint K/V storage supports exactly one session.")
+        frames = target_frame
+        if self.manifest.chunk_size == 1:
+            frames = min(frames, state.fingerprint.window_frames)
+        # Each temporal frame owns control and generated latent spans, including current scratch.
+        capacity = real_text_kv_len + 2 * frames * geometry.vision_tokens_per_frame
+        cache = getattr(self, "_dense_attention_cache", None)
+        if cache is None:
+            cache = CosmosSimDenseAttentionCache()
+        elif not cache.fits(text_kv, capacity):
+            self.release_captured_graphs()
+        cache.activate(state, text_kv, real_text_kv_len, capacity, state.dense_kv_by_branch.get(self._MAIN_BRANCH))
+        self._dense_attention_cache = cache
+        state.dense_attention = cache
+
+    def _run_chunk(
+        self,
+        state: Cosmos3NanoSimBimanualSessionState,
+        conditioning: _TransferConditioning,
+        *,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        chunk_start: int,
+        chunk_end: int,
+        target_frame: int,
+        terminal_request: bool,
+        seed: int,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        fps: float,
+        tick_durations: dict[str, float],
+        measure_tick_latency: bool,
+    ) -> torch.Tensor:
+        """Commit the chunk's control latents, denoise it, then commit its clean frames one by one."""
+
+        del tick_durations, measure_tick_latency  # Transfer has no tick transport to time.
+        request = conditioning.request
+        if self.manifest.chunk_size == 1:
+            history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
+            if history is not None:
+                _trim_transfer_history(
+                    history,
+                    tokens_per_frame=geometry.vision_tokens_per_frame,
+                    window_frames=request.window_frames,
+                    sink_frames=request.sink_frames,
+                    dense_cache=state.dense_attention,
+                )
+        forward = partial(
+            self._transformer_forward,
+            state,
+            geometry=geometry,
+            text_kv=text_kv,
+            real_text_kv_len=real_text_kv_len,
+            frame_start=chunk_start,
+            fps=fps,
+            action_latents=None,
+            action_domain_ids=None,
+            null_action_frame_indexes=(),
+        )
+        control_chunk = conditioning.control_latents[:, :, chunk_start:chunk_end]
+        forward(
+            control_chunk.to(self.dtype),
+            torch.zeros(1, device=self.device, dtype=torch.float32),
+            condition_vision=True,
+            commit_current=True,
+        )
+
+        noise_generator = torch.Generator(device=self.device).manual_seed(seed + chunk_start)
+        initial_noise = torch.randn(
+            1,
+            self.transformer.latent_channel_size,
+            chunk_end - chunk_start,
+            geometry.latent_height,
+            geometry.latent_width,
+            generator=noise_generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        def velocity_fn(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            return forward(x.to(self.dtype), timestep, condition_vision=False, commit_current=False).video.float()
+
+        clean_chunk = self._denoise_chunk(velocity_fn, initial_noise, generator=noise_generator).to(self.dtype)
+        if self._decode_queue is not None:
+            self._decode_queue.submit(clean_chunk)
+        for local_idx, frame_idx in iter_clean_commit_frames(
+            chunk_start,
+            chunk_end,
+            target_frame=target_frame,
+            terminal_request=terminal_request,
+        ):
+            self._commit_clean_frame(
+                state,
+                clean_chunk[:, :, local_idx : local_idx + 1],
+                geometry=geometry,
+                frame_idx=frame_idx,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                fps=fps,
+                action=None,
+                domain_ids=None,
+                null_action=False,
+            )
+        return clean_chunk
+
+
+__all__ = [
+    "Cosmos3NanoSimTransferPipeline",
+    "format_cosmos3_nano_sim_transfer_prompt",
+    "get_cosmos3_nano_sim_transfer_pre_process_func",
+    "resolve_cosmos3_nano_sim_transfer_geometry",
+]

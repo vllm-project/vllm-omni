@@ -4,6 +4,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -50,3 +51,32 @@ def test_singleton_domain_representations_share_session_identity(domain):
     baseline, baseline_state = fake_pipeline()
     baseline.forward(request(9, domain_id=15, close_session=False))
     assert state.fingerprint == baseline_state.fingerprint
+
+
+@pytest.mark.parametrize("clean_mode", ["framewise", "batched"])
+def test_mixed_domains_reach_denoising_and_clean_commits(clean_mode):
+    pipe, _ = fake_pipeline()
+    pipe.clean_commit_mode = clean_mode
+    pipe._set_mixed_precision_step = Mock()
+    pipe._reset_mixed_precision = Mock()
+    pipe.forward(request(13, action=torch.zeros(12, 59), domain_id=[15] * 4 + [2] * 4 + [15] * 4))
+    forwards = pipe._transformer_forward.call_args_list
+    denoise = [call for call in forwards if not call.kwargs["condition_vision"]]
+    assert denoise[0].kwargs["action_domain_ids"].tolist() == [[15] * 4 + [2] * 4]
+    assert denoise[1].kwargs["action_domain_ids"].tolist() == [15]
+    if clean_mode == "batched":
+        clean = [call for call in forwards if call.kwargs.get("frame_causal")]
+        assert len(clean) == 1
+        assert clean[0].kwargs["action_domain_ids"].tolist() == [[15] * 4 + [2] * 4]
+    else:
+        clean = [call for call in pipe._commit_clean_frame.call_args_list if call.kwargs["frame_idx"] > 0]
+        assert [call.kwargs["domain_ids"].tolist() for call in clean] == [[15], [2]]
+
+
+def test_mixed_camera_rows_reject_non_camera_action_slots():
+    pipe, _ = fake_pipeline()
+    action = torch.zeros(8, 59)
+    action[4, 9] = 1
+    with pytest.raises(ValueError, match="Camera rows must have zero"):
+        pipe.forward(request(9, action=action, domain_id=[15] * 4 + [2] * 4))
+    pipe._transformer_forward.assert_not_called()

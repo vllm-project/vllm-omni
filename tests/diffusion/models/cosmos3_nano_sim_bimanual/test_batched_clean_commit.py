@@ -198,6 +198,7 @@ def test_clean_rope_matches_individual_frames(nulls, fps):
         enable_fps_modulation=True,
         language_model=SimpleNamespace(rotary_emb=rotary),
     )
+    model._build_position_ids = Cosmos3NanoSimBimanualTransformer._build_position_ids.__get__(model)
     common = dict(grid_h=2, grid_w=2, real_text_kv_len=5, fps=fps)
     hidden = torch.empty(1, 32, WIDTH)
     batched, _ = Cosmos3NanoSimBimanualTransformer._current_rope(

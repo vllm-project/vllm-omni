@@ -90,7 +90,14 @@ def pipeline_methods() -> type:
     }
     tree = ast.parse((SOURCE / "pipeline_cosmos3_nano_sim_bimanual.py").read_text())
     body = [node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "__future__"]
-    helpers = {"_first_not_none", "_admission_int", "_admission_float", "_RequestControls"}
+    helpers = {
+        "_first_not_none",
+        "_admission_int",
+        "_admission_float",
+        "_RequestControls",
+        "_ActionRequest",
+        "_ActionConditioning",
+    }
     body += [node for node in tree.body if getattr(node, "name", None) in helpers]
     pipeline = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Cosmos3NanoSimBimanualPipeline"
@@ -99,6 +106,14 @@ def pipeline_methods() -> type:
         "forward",
         "_forward_impl",
         "_request_controls",
+        "_resolve_request_geometry",
+        "_resolve_request_fps",
+        "_validate_conditioning_request",
+        "_build_prompt_tokens",
+        "_resolve_pixel_frames",
+        "_prepare_conditioning",
+        "_frame_domains",
+        "_run_chunk",
         "_validate_session_mode",
         "_prepare_action",
         "_fingerprint",
@@ -135,6 +150,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
     pipe._states = {}
+    pipe._decode_queue = None
     pipe._distilled_num_steps = 4
     pipe.default_domain_id = 15
     pipe.default_fps = 30
@@ -212,6 +228,15 @@ def test_full_video_decodes_incrementally_without_retaining_latents(frames: int,
     )
     pipe._decode_latents.assert_not_called()
     assert state.terminal
+
+
+def test_padded_processing_trims_streamed_video_to_requested_frames() -> None:
+    pipe, state = fake_pipeline(prefix=False)
+    # A subclass may process more pixel frames than requested (e.g. aligned to the VAE stride).
+    pipe._resolve_pixel_frames = lambda _sp, _request: (600, 601)
+    output = pipe.forward(request(600, action=torch.zeros(600, 59))).media.video.tensor
+    assert output.shape == (1, 3, 600, 32, 32)
+    assert state.next_frame_idx == 151
 
 
 def test_latent_output_keeps_existing_path() -> None:

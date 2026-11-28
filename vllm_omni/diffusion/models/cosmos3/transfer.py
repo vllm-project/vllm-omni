@@ -229,6 +229,47 @@ def transfer_max_frames_from_extra_args(extra_args: Mapping[str, Any] | None) ->
     return max(1, int(value))
 
 
+def parse_transfer_hint(key: str, raw: Any) -> Cosmos3TransferHint:
+    """Parse and validate one Transfer hint using the shared Cosmos3 contract."""
+
+    if key not in _TRANSFER_HINT_FIELDS:
+        raise ValueError(f"Unsupported Cosmos3 transfer hint: {key!r}.")
+    if raw is True:
+        raw = {}
+    elif isinstance(raw, str | Path):
+        raw = {"control_path": str(raw)}
+    if not isinstance(raw, Mapping):
+        raise TypeError(f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}.")
+    unknown_fields = set(raw) - _TRANSFER_HINT_FIELDS[key]
+    if unknown_fields:
+        raise ValueError(
+            f"Unsupported Cosmos3 transfer hint '{key}' fields: {sorted(unknown_fields)}. "
+            f"Supported fields are: {sorted(_TRANSFER_HINT_FIELDS[key])}."
+        )
+    try:
+        control_weight = float(raw.get("control_weight", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cosmos3 transfer hint '{key}' control_weight must be a finite non-negative number.") from exc
+    if not math.isfinite(control_weight) or control_weight < 0.0:
+        raise ValueError(
+            f"Cosmos3 transfer hint '{key}' control_weight must be finite and non-negative, got {control_weight!r}."
+        )
+
+    hint = Cosmos3TransferHint(
+        key=key,
+        control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
+        control=raw.get("control"),
+        control_weight=control_weight,
+        preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
+        preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
+    )
+    if hint.key == "edge" and hint.preset_edge_threshold not in EDGE_PRESETS:
+        raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
+    if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
+        raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
+    return hint
+
+
 def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3TransferConfig | None:
     extra = _extra_args(sp)
     hints: dict[str, Cosmos3TransferHint] = {}
@@ -236,38 +277,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
         raw = _param(extra, sp, prompt_data, key, None)
         if raw is None:
             continue
-        if raw is True:
-            raw = {}
-        elif isinstance(raw, str | Path):
-            raw = {"control_path": str(raw)}
-        if not isinstance(raw, Mapping):
-            raise TypeError(
-                f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}."
-            )
-        unknown_fields = set(raw) - _TRANSFER_HINT_FIELDS[key]
-        if unknown_fields:
-            raise ValueError(
-                f"Unsupported Cosmos3 transfer hint '{key}' fields: {sorted(unknown_fields)}. "
-                f"Supported fields are: {sorted(_TRANSFER_HINT_FIELDS[key])}."
-            )
-        try:
-            control_weight = float(raw.get("control_weight", 1.0))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"Cosmos3 transfer hint '{key}' control_weight must be a finite non-negative number."
-            ) from exc
-        if not math.isfinite(control_weight) or control_weight < 0.0:
-            raise ValueError(
-                f"Cosmos3 transfer hint '{key}' control_weight must be finite and non-negative, got {control_weight!r}."
-            )
-        hints[key] = Cosmos3TransferHint(
-            key=key,
-            control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
-            control=raw.get("control"),
-            control_weight=control_weight,
-            preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
-            preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
-        )
+        hints[key] = parse_transfer_hint(key, raw)
 
     if not hints:
         transfer_only = (
@@ -369,11 +379,6 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
         raise ValueError("Cosmos3 transfer max_frames must be positive.")
     if config.num_first_chunk_conditional_frames < 0:
         raise ValueError("Cosmos3 transfer num_first_chunk_conditional_frames must be non-negative.")
-    for hint in hints.values():
-        if hint.key == "edge" and hint.preset_edge_threshold not in EDGE_PRESETS:
-            raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
-        if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
-            raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
     _ = config.normalized_control_weights
     return config
 
@@ -550,7 +555,15 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
     return torch.stack(stacked, dim=1).contiguous()
 
 
-def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:
+def media_to_uint8_cthw(
+    value: Any,
+    *,
+    height: int,
+    width: int,
+    max_frames: int | None = None,
+    direct_resize_mode: str | None = None,
+    preserve_float: bool = False,
+) -> torch.Tensor:
     if isinstance(value, str | Path):
         frames = _path_media_to_uint8_cthw(value, max_frames=max_frames)
     elif isinstance(value, torch.Tensor):
@@ -567,6 +580,20 @@ def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int 
         raise TypeError(f"Unsupported Cosmos3 transfer control payload type: {type(value)!r}.")
     if max_frames is not None:
         frames = frames[:, : int(max_frames)]
+    if direct_resize_mode is not None:
+        from torchvision.transforms import functional as TF
+
+        if direct_resize_mode not in ("bicubic", "bilinear", "nearest"):
+            raise ValueError(f"Unsupported Transfer resize mode: {direct_resize_mode!r}")
+        # Preserve fractional depth values after resizing.
+        pixels = frames.permute(1, 0, 2, 3)
+        resized = TF.resize(
+            pixels.float() if preserve_float else pixels,
+            [int(height), int(width)],
+            interpolation=TF.InterpolationMode[direct_resize_mode.upper()],
+            antialias=direct_resize_mode != "nearest",
+        )
+        return resized.permute(1, 0, 2, 3).contiguous()
     return resize_center_crop_uint8_cthw(frames, int(height), int(width))
 
 
@@ -641,11 +668,29 @@ def load_or_compute_control_frames(
     width: int,
     max_frames: int,
     input_frames: torch.Tensor | None,
+    direct_resize: bool = False,
 ) -> torch.Tensor:
+    resize_mode = None
+    if direct_resize:
+        resize_mode = {"seg": "nearest", "edge": "nearest", "depth": "bilinear", "blur": "bicubic"}[hint.key]
     if hint.control is not None:
-        return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control,
+            height=height,
+            width=width,
+            max_frames=max_frames,
+            direct_resize_mode=resize_mode,
+            preserve_float=direct_resize and hint.key == "depth",
+        )
     if hint.control_path is not None:
-        return media_to_uint8_cthw(hint.control_path, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control_path,
+            height=height,
+            width=width,
+            max_frames=max_frames,
+            direct_resize_mode=resize_mode,
+            preserve_float=direct_resize and hint.key == "depth",
+        )
     if hint.key == "edge":
         if input_frames is None:
             raise ValueError(

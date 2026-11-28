@@ -1,0 +1,502 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Transfer request geometry, prompt, and sliding-history contracts."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
+    Cosmos3NanoSimBimanualControlVideoConditioning,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import Cosmos3NanoSimBimanualGeometry
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
+    ARDiffusionRequestRejectedError,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_transfer import (
+    Cosmos3NanoSimTransferPipeline,
+    _TransferConditioning,
+    format_cosmos3_nano_sim_transfer_prompt,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualSessionState,
+)
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+from vllm_omni.model_extras import get_extra_body_params
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _sampling_params(
+    *,
+    height: int | None = None,
+    width: int | None = None,
+    **extra,
+):
+    return SimpleNamespace(
+        height=height,
+        width=width,
+        extra_args=extra,
+    )
+
+
+def test_transfer_input_video_drives_bucket_before_hint_control() -> None:
+    params = _sampling_params(edge={"control": {"height": 480, "width": 480}})
+    prompt = {
+        "multi_modal_data": {"video": {"height": 720, "width": 1280}},
+    }
+
+    geometry = pipeline()._resolve_request_geometry(params, prompt)
+
+    assert (geometry.height, geometry.width) == (480, 832)
+
+
+@pytest.fixture
+def transfer_preprocess(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_transfer import (
+        get_cosmos3_nano_sim_transfer_pre_process_func,
+    )
+
+    manifest = pipeline().manifest
+    monkeypatch.setattr(Cosmos3NanoSimBimanualManifest, "from_od_config", lambda _: manifest)
+    return get_cosmos3_nano_sim_transfer_pre_process_func(SimpleNamespace(model_config={"guardrails": False}))
+
+
+@pytest.mark.parametrize("source", ["prompt", "additional_information"])
+def test_named_prompt_hint_preprocesses_source_video(transfer_preprocess, source):
+    from PIL import Image
+
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    prompt = {"prompt": "test", "multi_modal_data": {"video": [Image.new("RGB", (32, 32))]}}
+    (prompt if source == "prompt" else prompt.setdefault(source, {}))["edge"] = True
+    sp = OmniDiffusionSamplingParams(height=None, width=None, num_frames=1)
+    request = OmniDiffusionRequest(request_id="edge", prompt=prompt, sampling_params=sp)
+    processed = transfer_preprocess(request)
+    assert (processed.sampling_params.height, processed.sampling_params.width) == (640, 640)
+    additional = processed.prompt["additional_information"]
+    assert additional["preprocessed_transfer_video"].shape == (1, 3, 1, 640, 640)
+    assert "edge" not in sp.extra_args
+
+
+@pytest.mark.parametrize(
+    "sp,message",
+    [
+        (_sampling_params(resolution="720"), "supports only resolution"),
+        (_sampling_params(height=720, width=1280), "serialized dimensions do not match"),
+    ],
+)
+def test_transfer_preprocessor_rejects_720p_output(transfer_preprocess, sp, message):
+    request = SimpleNamespace(sampling_params=sp, prompt={"prompt": "test"})
+    with pytest.raises(ARDiffusionRequestRejectedError, match=message):
+        transfer_preprocess(request)
+
+
+@pytest.mark.parametrize("key", ["resolution", "image_size"])
+@pytest.mark.parametrize("resolution", ["256", "704", "720"])
+def test_transfer_rejects_other_output_families(key, resolution):
+    with pytest.raises(ValueError, match="supports only resolution '480'"):
+        pipeline()._resolve_request_geometry(_sampling_params(**{key: resolution}), {})
+
+
+@pytest.mark.parametrize(
+    "model_config,expected",
+    [({}, (480, 832)), ({"default_resolution": [640, 640]}, (640, 640))],
+)
+def test_transfer_default_canvas_without_media(model_config, expected):
+    p = pipeline()
+    p.resolution_policy = p._build_resolution_policy(SimpleNamespace(model_config=model_config), p.manifest)
+    geometry = p._resolve_request_geometry(_sampling_params(), {})
+    assert (geometry.height, geometry.width) == expected
+
+
+@pytest.mark.parametrize("default_resolution", [[256, 256], [480, 800], [720, 1280]])
+def test_transfer_deployment_default_must_be_canonical_480p(default_resolution):
+    p = pipeline()
+    config = SimpleNamespace(model_config={"default_resolution": default_resolution, "max_pixels": 921_600})
+    with pytest.raises(ValueError, match="default_resolution must be a canonical 480p bucket"):
+        p._build_resolution_policy(config, p.manifest)
+
+
+def test_transfer_hint_control_drives_bucket_without_input_video() -> None:
+    params = _sampling_params(depth={"control": {"height": 832, "width": 480}})
+
+    geometry = pipeline()._resolve_request_geometry(params, {"prompt": "test"})
+
+    assert (geometry.height, geometry.width) == (832, 480)
+
+
+def test_transfer_serialized_dimensions_must_match_generated_bucket() -> None:
+    params = _sampling_params(
+        height=720,
+        width=1280,
+        edge={"control": {"height": 480, "width": 832}},
+    )
+
+    with pytest.raises(ValueError, match="serialized dimensions do not match"):
+        pipeline()._resolve_request_geometry(params, {"prompt": "test"})
+
+
+def test_transfer_generated_bucket_must_pass_deployment_pixel_cap() -> None:
+    p = pipeline()
+    config = SimpleNamespace(model_config={"max_pixels": 480 * 832})
+    p.resolution_policy = p._build_resolution_policy(config, p.manifest)
+
+    with pytest.raises(ValueError, match="max_pixels"):
+        p._resolve_request_geometry(_sampling_params(aspect_ratio="1,1"), {})
+
+
+def pipeline(chunk_size: int = 1) -> Cosmos3NanoSimTransferPipeline:
+    instance = Cosmos3NanoSimTransferPipeline.__new__(Cosmos3NanoSimTransferPipeline)
+    torch.nn.Module.__init__(instance)
+    contract = Cosmos3NanoSimBimanualControlVideoConditioning(
+        mode="control_video",
+        hints=("edge", "blur", "depth", "seg"),
+        transfer_control_attention_mode="causal_control_with_rgb_history",
+        share_vision_temporal_positions=True,
+        system_prompt_id="cosmos3_transfer_v1",
+        emphasize_control_in_prompt=True,
+        no_eviction=True,
+    )
+    instance.manifest = SimpleNamespace(
+        chunk_size=chunk_size,
+        window_frames=51 if chunk_size == 1 else 96,
+        sink_frames=1 if chunk_size == 1 else 0,
+        temporal_compression_factor=4,
+        vae_spatial_compression_factor=16,
+        latent_patch_size=2,
+        require_control_video_conditioning=lambda: contract,
+    )
+    instance.resolution_policy = instance._build_resolution_policy(SimpleNamespace(), instance.manifest)
+    instance.dtype = torch.float32
+    instance.device = torch.device("cpu")
+    return instance
+
+
+def params(frames: int = 121, **extra) -> SimpleNamespace:
+    return SimpleNamespace(extra_args={"depth": {"control_path": "control.mp4"}, "num_frames": frames, **extra})
+
+
+@pytest.mark.parametrize("frames", [1, 2, 4, 5, 121, 593, 600])
+def test_chunk1_admission(frames: int) -> None:
+    p = pipeline()
+    p._init_conditioning(SimpleNamespace())
+    request = p._validate_conditioning_request(
+        params(frames, kv_cache_inference_size=30, attention_sink_size=3, emphasize_control_in_prompt=False),
+        None,
+        prompt_data=None,
+    )
+    assert (request.window_frames, request.sink_frames, request.emphasize_control_in_prompt) == (30, 3, False)
+
+
+@pytest.mark.parametrize("window,sink", [(0, 0), (3, 3), (3, -1), (True, 0), (3.5, 0)])
+def test_invalid_windows(window, sink) -> None:
+    with pytest.raises(ValueError):
+        pipeline()._validate_conditioning_request(
+            params(kv_cache_inference_size=window, attention_sink_size=sink), None, prompt_data=None
+        )
+
+
+def test_omitted_history_uses_checkpoint_defaults() -> None:
+    request = pipeline()._validate_conditioning_request(params(257), None, prompt_data=None)
+    assert (request.window_frames, request.sink_frames) == (51, 1)
+
+
+@pytest.mark.parametrize("frames", [1, 121, 257, 600, 901])
+@pytest.mark.parametrize("source", ["extra_args", "attribute", "prompt", "additional_information"])
+def test_explicit_null_selects_complete_rollout(frames: int, source: str) -> None:
+    sp = params(frames)
+    prompt = {}
+    if source == "extra_args":
+        sp.extra_args["kv_cache_inference_size"] = None
+        sp.kv_cache_inference_size = 7  # Lower-precedence values must not mask explicit null.
+    elif source == "attribute":
+        sp.kv_cache_inference_size = None
+        prompt["kv_cache_inference_size"] = 7
+    elif source == "prompt":
+        prompt = {"kv_cache_inference_size": None, "additional_information": {"kv_cache_inference_size": 7}}
+    else:
+        prompt = {"additional_information": {"kv_cache_inference_size": None}}
+    request = pipeline()._validate_conditioning_request(sp, None, prompt_data=prompt)
+    assert (request.window_frames, request.sink_frames) == ((frames - 1 + 3) // 4 + 1, 0)
+
+
+@pytest.mark.parametrize("frames", [1, 2, 4, 5, 600, 601])
+def test_control_padding_preserves_source_and_uses_shared_helper(monkeypatch, frames) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transfer import pad_temporal_frames
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_transfer as module
+
+    p = pipeline()
+    p.transformer = SimpleNamespace(latent_channel_size=48)
+    source = torch.arange(frames, dtype=torch.float32).view(1, frames, 1, 1).expand(3, -1, 32, 32).clone()
+    original = source.clone()
+    monkeypatch.setattr(module, "load_or_compute_control_frames", lambda *args, **kwargs: source)
+    request = p._validate_conditioning_request(params(frames, kv_cache_inference_size=None), None, prompt_data=None)
+    processed = request.processing_pixel_frames
+    assert processed == (frames - 1 + 3) // 4 * 4 + 1
+    latent_frames = (processed - 1) // 4 + 1
+
+    def encode(video):
+        expected = pad_temporal_frames(original, processed).div(127.5).sub(1).unsqueeze(0)
+        torch.testing.assert_close(video, expected)
+        return torch.zeros(1, 48, latent_frames, 2, 2)
+
+    p._encode_video_tensor = encode
+    p._prepare_conditioning(
+        request,
+        prompt_data=None,
+        geometry=Cosmos3NanoSimBimanualGeometry(height=32, width=32),
+        start_frame=0,
+        target_frame=latent_frames,
+    )
+    assert request.num_pixel_frames == frames
+    torch.testing.assert_close(source, original)
+
+
+def test_short_control_still_rejected(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_transfer as module
+
+    p = pipeline()
+    monkeypatch.setattr(module, "load_or_compute_control_frames", lambda *args, **kwargs: torch.zeros(3, 599, 32, 32))
+    request = p._validate_conditioning_request(params(600), None, prompt_data=None)
+    with pytest.raises(ARDiffusionRequestRejectedError, match="expected 600 frames, got 599"):
+        p._prepare_conditioning(
+            request,
+            prompt_data=None,
+            geometry=Cosmos3NanoSimBimanualGeometry(height=32, width=32),
+            start_frame=0,
+            target_frame=151,
+        )
+
+
+def test_integer_history_override_takes_precedence_over_prompt_null() -> None:
+    request = pipeline()._validate_conditioning_request(
+        params(257, kv_cache_inference_size=30, attention_sink_size=3),
+        None,
+        prompt_data={"kv_cache_inference_size": None},
+    )
+    assert (request.window_frames, request.sink_frames) == (30, 3)
+
+
+def test_full_history_rejects_nonzero_sinks() -> None:
+    with pytest.raises(ValueError, match="full history requires attention_sink_size=0"):
+        pipeline()._validate_conditioning_request(
+            params(kv_cache_inference_size=None, attention_sink_size=1), None, prompt_data=None
+        )
+
+
+def test_chunk4_full_history_contract() -> None:
+    p = pipeline(4)
+    assert p._validate_conditioning_request(params(113), None, prompt_data=None).num_pixel_frames == 113
+    with pytest.raises(ValueError, match="% 16"):
+        p._validate_conditioning_request(params(121), None, prompt_data=None)
+    with pytest.raises(ValueError, match="full history"):
+        p._validate_conditioning_request(params(193), None, prompt_data=None)
+    request = p._validate_conditioning_request(params(193, kv_cache_inference_size=None), None, prompt_data=None)
+    assert (request.window_frames, request.sink_frames) == (99, 0)
+
+
+@pytest.mark.parametrize("window,sink", [(None, 0), (1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
+def test_rollout_history_matches_reference_visibility(window: int | None, sink: int) -> None:
+    p = pipeline()
+    p.transformer = SimpleNamespace(latent_channel_size=48)
+    state = Cosmos3NanoSimBimanualSessionState(session_id="test")
+    geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
+    total = 65 if window is None else 3 * window + 1
+    request = p._validate_conditioning_request(
+        params(1 + 4 * (total - 1), kv_cache_inference_size=window, attention_sink_size=sink),
+        None,
+        prompt_data=None,
+    )
+    window = request.window_frames
+    conditioning = _TransferConditioning(request, torch.zeros(1, 48, total, 2, 2))
+    state.fingerprint = SimpleNamespace(window_frames=window)
+    text = [(torch.zeros(1, 1, 1), torch.zeros(1, 1, 1))]
+    p._prepare_dense_attention(state, text, 1, geometry, total)
+    reads = []
+
+    def visible() -> list[int]:
+        kv = state.dense_kv_by_branch.get("main")
+        return [] if kv is None else [int(v) for v in kv[0][0].flatten()]
+
+    def commit(label: int) -> None:
+        kv = torch.tensor([[[float(label)]]])
+        cache = state.dense_attention
+        offset = cache.text_length + cache.history_length
+        for buffer in cache.kv[0]:
+            buffer[:, offset : offset + 1].copy_(kv)
+        state.dense_kv_by_branch["main"] = cache.commit(1)
+
+    def transformer_forward(_state, latent, _timestep, *, frame_start, condition_vision, commit_current, **_kwargs):
+        reads.append(("control" if condition_vision else "denoise", frame_start, visible()))
+        if commit_current:
+            commit(2 * frame_start)
+        return SimpleNamespace(video=latent)
+
+    def denoise(velocity_fn, noise, **_kwargs):
+        for _ in range(4):
+            velocity_fn(noise, torch.ones(1))
+        return torch.zeros(1, 48, 1, 2, 2)
+
+    def clean_commit(*args, frame_idx, **kwargs):
+        reads.append(("clean", frame_idx, visible()))
+        commit(2 * frame_idx + 1)
+
+    p._transformer_forward = transformer_forward
+    p._denoise_chunk = denoise
+    p._commit_clean_frame = clean_commit
+    for frame in range(total):
+        p._run_chunk(
+            state,
+            geometry=geometry,
+            chunk_start=frame,
+            chunk_end=frame + 1,
+            target_frame=total,
+            terminal_request=True,
+            seed=42,
+            text_kv=[],
+            real_text_kv_len=1,
+            fps=30,
+            conditioning=conditioning,
+            tick_durations={},
+            measure_tick_latency=False,
+        )
+        assert len(visible()) <= 2 * window
+
+    for phase, frame, actual in reads:
+        # Independent temporal-frame visibility, then expand each past frame
+        # to its control/latent pair. The current frame contributes only C_t.
+        past = [j for j in range(frame) if j < sink or j >= frame - (window - sink - 1)]
+        expected = [entry for j in past for entry in (2 * j, 2 * j + 1)]
+        if phase != "control":
+            expected.append(2 * frame)
+        assert actual == expected, (phase, frame)
+    assert not any(phase == "clean" and frame == total - 1 for phase, frame, _ in reads)
+
+
+@pytest.mark.parametrize("chunk,window,target", [(1, 3, 8), (1, 30, 4), (4, 96, 9)])
+def test_transfer_joint_storage_capacity_and_reset(chunk, window, target) -> None:
+    p = pipeline(chunk)
+    p.release_captured_graphs = lambda: None
+    text = [(torch.randn(1, 5, 2, 8), torch.randn(1, 5, 2, 8))]
+    geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
+    state = Cosmos3NanoSimBimanualSessionState(session_id="test")
+    state.fingerprint = SimpleNamespace(window_frames=window)
+    p._prepare_dense_attention(state, text, 5, geometry, target)
+    cache = state.dense_attention
+    assert cache is not None
+    frames = min(target, window) if chunk == 1 else target
+    assert cache.kv[0][0].shape[1] == 5 + 2 * frames * geometry.vision_tokens_per_frame
+    address = cache.kv[0][0].data_ptr()
+    cache.commit(geometry.vision_tokens_per_frame)
+    replacement = [(k + 1, v + 2) for k, v in text]
+    state.reset()
+    state.fingerprint = SimpleNamespace(window_frames=window)
+    p._prepare_dense_attention(state, replacement, 5, geometry, target)
+    assert state.dense_attention is cache
+    assert cache.history_length == 0 and cache.kv[0][0].data_ptr() == address
+    assert all(torch.equal(a[:, :5], b) for a, b in zip(cache.kv[0], replacement[0]))
+
+
+def test_transfer_joint_storage_requires_single_session() -> None:
+    p = pipeline()
+    p._SESSION_CAPACITY = 2
+    state = Cosmos3NanoSimBimanualSessionState(session_id="test")
+    with pytest.raises(RuntimeError, match="exactly one session"):
+        p._prepare_dense_attention(state, [], 1, None, 1)
+    assert state.dense_attention is None
+
+
+def test_online_declared_fields_reach_admission_and_geometry() -> None:
+    sp = SimpleNamespace(height=None, width=None, num_frames=121, extra_args=None)
+    body = {
+        "depth": {"control_path": "control.mp4"},
+        "resolution": "480",
+        "aspect_ratio": "16,9",
+        "kv_cache_inference_size": 30,
+        "attention_sink_size": 3,
+    }
+    apply_declared_extra_args(sp, get_extra_body_params("Cosmos3NanoSimTransferPipeline"), body)
+    assert sp.extra_args == body
+    request = pipeline()._validate_conditioning_request(sp, None, prompt_data=None)
+    assert (request.hint, request.window_frames, request.sink_frames) == ("depth", 30, 3)
+    geometry = pipeline()._resolve_request_geometry(sp, {})
+    assert (geometry.height, geometry.width) == (480, 832)
+
+
+def test_emphasis_and_explicit_geometry() -> None:
+    kwargs = dict(hint="depth", num_frames=121, fps=30, height=480, width=832)
+    plain = format_cosmos3_nano_sim_transfer_prompt("A robot moves.", emphasize_control_in_prompt=False, **kwargs)
+    emphasized = format_cosmos3_nano_sim_transfer_prompt("A robot moves.", **kwargs)
+    assert "Follow the depth control video precisely" not in plain
+    assert emphasized.startswith(plain)
+    assert "Follow the depth control video precisely" in emphasized
+    sp = SimpleNamespace(
+        extra_args={"image_size": 480, "aspect_ratio": "16,9", "depth": {"control": {"height": 832, "width": 480}}}
+    )
+    geometry = pipeline()._resolve_request_geometry(sp, {})
+    assert (geometry.height, geometry.width) == (480, 832)
+
+
+def test_prompt_tokens_use_transfer_system_prompt_without_cache_cap() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import COSMOS3_TRANSFER_SYSTEM_PROMPT
+
+    p = pipeline()
+    calls = []
+    p._tokenize_prompt = lambda text, **kwargs: calls.append((text, kwargs)) or (torch.ones(1, 2), torch.ones(1, 2))
+    request = p._validate_conditioning_request(params(121), None, prompt_data=None)
+    geometry = Cosmos3NanoSimBimanualGeometry(height=480, width=832)
+    p._build_prompt_tokens("A robot moves.", request, geometry=geometry, fps=30)
+    expected = format_cosmos3_nano_sim_transfer_prompt(
+        "A robot moves.", hint="depth", num_frames=121, fps=30, height=480, width=832
+    )
+    assert calls == [
+        (
+            expected,
+            dict(max_sequence_length=1 << 30, use_system_prompt=True, system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT),
+        )
+    ]
+
+
+@pytest.mark.parametrize("extra,tick", [({"chunk_only": True}, None), ({}, object())])
+def test_tick_transport_is_rejected(extra, tick) -> None:
+    p = pipeline()
+    sp = params(**extra)
+    with pytest.raises(ARDiffusionRequestRejectedError, match="offline full-clip"):
+        p._request_controls(sp, sp.extra_args, tick)
+    full_clip = params()
+    assert not p._request_controls(full_clip, full_clip.extra_args, None).tick
+
+
+@pytest.mark.parametrize(
+    "extra,prompt_data",
+    [
+        ({"initial_latent": [0.0]}, None),
+        ({}, {"seed_image": object()}),
+        ({}, {"additional_information": {"preprocessed_image": object()}}),
+        ({}, {"multi_modal_data": {"image": object()}}),
+    ],
+)
+def test_seed_media_is_rejected_at_admission(extra, prompt_data) -> None:
+    with pytest.raises(ARDiffusionRequestRejectedError, match="seed images"):
+        pipeline()._validate_conditioning_request(params(**extra), None, prompt_data=prompt_data)
+    assert pipeline()._initial_condition_latent(prompt_data, params(), None) is None
+
+
+def test_transfer_input_fps_overrides_request_fps() -> None:
+    p = pipeline()
+    p.default_fps = 15.0
+    sp = SimpleNamespace(extra_args={"fps": 24})
+    assert p._resolve_request_fps(sp, {"additional_information": {"transfer_input_fps": 30.0}}) == 30.0
+    assert p._resolve_request_fps(sp, {"additional_information": {}}) == 24.0
+
+
+@pytest.mark.parametrize("value", ["thirty", 0, -1.0, float("nan"), float("inf")])
+def test_invalid_transfer_input_fps_is_rejected(value) -> None:
+    p = pipeline()
+    p.default_fps = 15.0
+    with pytest.raises(ARDiffusionRequestRejectedError, match="transfer_input_fps"):
+        p._resolve_request_fps(SimpleNamespace(extra_args={}), {"transfer_input_fps": value})

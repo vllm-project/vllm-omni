@@ -136,13 +136,37 @@ class _RequestControls:
     action_space: str = "normalized_unified_v1"
 
 
+@dataclass(frozen=True)
+class _ActionRequest:
+    """Validated domain routing and raw actions of one request, before preparation."""
+
+    domain_id: int
+    embodiment: str
+    domains: Any
+    action: Any
+    action_space: str
+
+
+@dataclass(frozen=True)
+class _ActionConditioning:
+    """Prepared actions of one admitted request and how their rows map to latent frames."""
+
+    action: torch.Tensor
+    layout: str | None
+    domains: torch.Tensor
+    start_frame: int
+
+
 def _resolution_policy(
     od_config: OmniDiffusionConfig,
     manifest: Cosmos3NanoSimBimanualManifest,
+    *,
+    default_resolution: tuple[int, int] = (720, 1280),
+    max_pixels: int = 921_600,
 ) -> Cosmos3NanoSimBimanualResolutionPolicy:
     return Cosmos3NanoSimBimanualResolutionPolicy(
-        default_resolution=deploy_option(od_config, "default_resolution", (720, 1280)),
-        max_pixels=deploy_option(od_config, "max_pixels", 921_600),
+        default_resolution=deploy_option(od_config, "default_resolution", default_resolution),
+        max_pixels=deploy_option(od_config, "max_pixels", max_pixels),
         vae_spatial_compression_factor=manifest.vae_spatial_compression_factor,
         latent_patch_size=manifest.latent_patch_size,
     )
@@ -204,6 +228,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _vae_decode_stream: torch.cuda.Stream | None = None
     _streaming_decoder: WanStreamingDecoder | None = None
 
+    @staticmethod
+    def _build_resolution_policy(
+        od_config: OmniDiffusionConfig, manifest: Cosmos3NanoSimBimanualManifest
+    ) -> Cosmos3NanoSimBimanualResolutionPolicy:
+        return _resolution_policy(od_config, manifest)
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         self._ar_compile_mode = resolve_ar_compile_mode(od_config)
         validate_sim_parallel_config(od_config)
@@ -213,7 +243,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", True))
         if self.clean_commit_mode not in {"framewise", "batched"}:
             raise ValueError("clean_commit_mode must be 'framewise' or 'batched'")
-        self.resolution_policy = _resolution_policy(od_config, self.manifest)
+        self.resolution_policy = self._build_resolution_policy(od_config, self.manifest)
         self.manifest.require_exported_artifact()
         if not isinstance(self.transformer, Cosmos3NanoSimBimanualTransformer):
             raise TypeError(
@@ -244,6 +274,18 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3-Nano-Sim-Bimanual supports tensor parallelism but not sequence parallelism; "
                 f"got sequence_parallel_size={od_config.parallel_config.sequence_parallel_size}."
             )
+        self._init_conditioning(od_config)
+        self.default_fps = float(deploy_option(od_config, "default_fps", 15.0))
+        if not math.isfinite(self.default_fps) or self.default_fps <= 0:
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual default_fps must be positive, got {self.default_fps}.")
+        self.checkpoint_id = (
+            self.manifest.checkpoint_id if self.manifest.checkpoint_id != "unknown" else str(od_config.model)
+        )
+        self._states: OrderedDict[str, Cosmos3NanoSimBimanualSessionState] = OrderedDict()
+
+    def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
+        """Validate the artifact's conditioning contract and resolve its request defaults."""
+
         action_schema = self.manifest.action_schema
         if action_schema is None:
             raise ValueError(
@@ -257,13 +299,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             action_schema.default_embodiment,
             self.default_domain_id,
         )
-        self.default_fps = float(deploy_option(od_config, "default_fps", 15.0))
-        if not math.isfinite(self.default_fps) or self.default_fps <= 0:
-            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual default_fps must be positive, got {self.default_fps}.")
-        self.checkpoint_id = (
-            self.manifest.checkpoint_id if self.manifest.checkpoint_id != "unknown" else str(od_config.model)
-        )
-        self._states: OrderedDict[str, Cosmos3NanoSimBimanualSessionState] = OrderedDict()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Reject artifact tensors that do not map into this exact model."""
@@ -400,6 +435,84 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             action_space=action_space,
         )
 
+    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> Cosmos3NanoSimBimanualGeometry:
+        """Resolve the request's serialized canvas."""
+
+        del prompt_data
+        return resolve_cosmos3_nano_sim_bimanual_geometry(sp, None, self.resolution_policy)
+
+    def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
+        """Resolve the FPS used by mRoPE and the session fingerprint."""
+
+        del prompt_data
+        return _admission_float(
+            _first_not_none(
+                self._get_sp_param(sp, "resolved_frame_rate", None),
+                self._get_sp_param(sp, "frame_rate", None),
+                self._get_sp_param(sp, "fps", None),
+                self.default_fps,
+            ),
+            "FPS",
+        )
+
+    def _validate_conditioning_request(self, sp: Any, controls: _RequestControls, *, prompt_data: Any) -> Any:
+        """Validate the request's conditioning before any session side effect; here domain and embodiment."""
+
+        del sp, prompt_data
+        domain_name = controls.domain_name
+        domain_value = controls.domain_id
+        if isinstance(domain_value, (list, tuple)) and len(domain_value) == 1:
+            domain_value = domain_value[0]
+        elif isinstance(domain_value, torch.Tensor) and domain_value.numel() == 1:
+            domain_value = domain_value.item()
+        per_row_domains = isinstance(domain_value, (list, tuple, torch.Tensor))
+        if per_row_domains:
+            domain_value = self.manifest.resolve_domain_name(domain_name) if domain_name else self.default_domain_id
+        if domain_value is None and domain_name is None:
+            domain_value = self.default_domain_id
+        if domain_value is not None:
+            domain_id = _admission_int(domain_value, "domain_id")
+            if domain_id < 0:
+                raise ARDiffusionRequestRejectedError(
+                    f"Cosmos3-Nano-Sim-Bimanual domain_id must be non-negative, got {domain_id}."
+                )
+        else:
+            try:
+                domain_id = self.manifest.resolve_domain_name(str(domain_name))
+            except ValueError as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if domain_id >= self.manifest.num_embodiment_domains:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Bimanual domain_id is outside the exported embodiment table: "
+                f"{domain_id} not in [0, {self.manifest.num_embodiment_domains})."
+            )
+        try:
+            embodiment = self.manifest.resolve_embodiment(domain_name, domain_id)
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        return _ActionRequest(
+            domain_id=domain_id,
+            embodiment=embodiment,
+            domains=controls.domain_id if per_row_domains else domain_id,
+            action=controls.action,
+            action_space=controls.action_space,
+        )
+
+    def _build_prompt_tokens(
+        self, prompt: str, request: Any, *, geometry: Cosmos3NanoSimBimanualGeometry, fps: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize the raw request prompt; Bimanual uses no system prompt."""
+
+        del request, geometry, fps
+        return self._tokenize_prompt(prompt, max_sequence_length=1 << 30, use_system_prompt=False)
+
+    def _resolve_pixel_frames(self, sp: Any, request: Any) -> tuple[int, int]:
+        """Return a full rollout's requested and generated pixel-frame counts."""
+
+        del request
+        frames = _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
+        return frames, frames
+
     # -- Session and conditioning -----------------------------------------
 
     def _get_or_create_state(self, session_id: str) -> Cosmos3NanoSimBimanualSessionState:
@@ -434,24 +547,24 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         real_text_kv_len: int,
         geometry: Cosmos3NanoSimBimanualGeometry,
         fps: float,
-        domain_id: int,
-        embodiment: str,
-        action_space: str = "normalized_unified_v1",
+        request: Any,
     ) -> Cosmos3NanoSimBimanualSessionFingerprint:
+        """Identify the session's prompt, canvas and conditioning for fail-closed reuse."""
+
         return Cosmos3NanoSimBimanualSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
             real_text_kv_lengths=((self._MAIN_BRANCH, real_text_kv_len),),
             height=geometry.height,
             width=geometry.width,
             fps=fps,
-            domain_id=domain_id,
-            embodiment=embodiment,
+            domain_id=request.domain_id,
+            embodiment=request.embodiment,
             action_contract_sha256=self.manifest.action_contract_sha256,
             checkpoint_id=self.checkpoint_id,
             manifest_id=self.manifest.digest,
             sampler_id=self.manifest.sampler_id,
             inference_id=self.manifest.digest,
-            action_space=action_space,
+            action_space=request.action_space,
         )
 
     # -- Dense transformer bridge -----------------------------------------
@@ -634,6 +747,58 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 start = (frame_idx - local_base_frame) * action_count
             rows.append(action[start : start + action_count])
         return torch.cat(rows, dim=0).unsqueeze(0), tuple(null_indexes)
+
+    def _prepare_conditioning(
+        self,
+        request: Any,
+        *,
+        prompt_data: Any,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        start_frame: int,
+        target_frame: int,
+    ) -> Any:
+        """Prepare conditioning for latent frames ``[start_frame, target_frame)``; here actions and routing.
+
+        Runs during admission and raises ``ARDiffusionRequestRejectedError`` for invalid input.
+        """
+
+        del prompt_data, geometry
+        try:
+            action = self._prepare_action(
+                embodiment=request.embodiment, action_value=request.action, action_space=request.action_space
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if action is None:
+            raise ARDiffusionRequestRejectedError("Forward dynamics requires prepared actions")
+        try:
+            prepared_domains = prepare_domain_ids(
+                request.domains,
+                rows=action.shape[0],
+                allowed=set(self.manifest.require_action_schema().embodiment_to_domain.values()),
+            )
+            camera_rows = prepared_domains.eq(2)
+            if camera_rows.numel() == 1:
+                camera_rows = camera_rows.expand(action.shape[0])
+            if torch.count_nonzero(action[camera_rows.to(action.device), 9:59]):
+                raise ValueError("Camera rows must have zero non-camera action slots")
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        layout = self._resolve_action_layout(action, start_frame=start_frame, target_frame=target_frame)
+        return _ActionConditioning(action=action, layout=layout, domains=prepared_domains, start_frame=start_frame)
+
+    def _frame_domains(self, conditioning: _ActionConditioning, begin: int, end: int) -> torch.Tensor:
+        """Slice domain routing for frames ``[begin, end)`` like their action rows."""
+
+        return domains_for_frames(
+            conditioning.domains,
+            layout=conditioning.layout,
+            request_start_frame=conditioning.start_frame,
+            frame_start=begin,
+            frame_end=end,
+            action_count=self.manifest.action_tokens_per_frame,
+            device=self.device,
+        )
 
     def _initial_condition_latent(
         self,
@@ -858,6 +1023,127 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         finally:
             self._reset_mixed_precision()
 
+    def _run_chunk(
+        self,
+        state: Cosmos3NanoSimBimanualSessionState,
+        conditioning: Any,
+        *,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        chunk_start: int,
+        chunk_end: int,
+        target_frame: int,
+        terminal_request: bool,
+        seed: int,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        fps: float,
+        tick_durations: dict[str, float],
+        measure_tick_latency: bool,
+    ) -> torch.Tensor:
+        """Denoise one action-conditioned chunk, then commit its clean K/V; return the clean latents."""
+
+        chunk_frames = chunk_end - chunk_start
+        action_chunk, null_action_indexes = self._actions_for_frames(
+            conditioning.action,
+            layout=conditioning.layout,
+            request_start_frame=conditioning.start_frame,
+            frame_start=chunk_start,
+            frame_end=chunk_end,
+        )
+        domain_ids = self._frame_domains(conditioning, chunk_start, chunk_end)
+        noise_generator = torch.Generator(device=self.device).manual_seed(seed + chunk_start)
+        initial_noise = torch.randn(
+            1,
+            self.transformer.latent_channel_size,
+            chunk_frames,
+            geometry.latent_height,
+            geometry.latent_width,
+            generator=noise_generator,
+            device=self.device,
+            # The reference draws checkpoint-dtype noise, then promotes it
+            # to fp32 before the scheduler loop.
+            dtype=self.dtype,
+        )
+
+        def velocity_fn(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            output = self._transformer_forward(
+                state,
+                x.to(self.dtype),
+                timestep,
+                geometry=geometry,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                frame_start=chunk_start,
+                fps=fps,
+                action_latents=action_chunk,
+                action_domain_ids=domain_ids,
+                condition_vision=False,
+                null_action_frame_indexes=null_action_indexes,
+                commit_current=False,
+            )
+            return output.video.float()
+
+        with self._timed_tick_stage(
+            tick_durations,
+            "denoise_s",
+            enabled=measure_tick_latency,
+        ):
+            clean_chunk = self._denoise_chunk(
+                velocity_fn,
+                initial_noise,
+                generator=noise_generator,
+            ).to(self.dtype)
+
+        if self._decode_queue is not None:
+            self._decode_queue.submit(clean_chunk)
+        action_count = self.manifest.action_tokens_per_frame
+        with self._timed_tick_stage(
+            tick_durations,
+            "clean_cache_commit_s",
+            enabled=measure_tick_latency,
+        ):
+            commit_frames = list(
+                iter_clean_commit_frames(
+                    chunk_start,
+                    chunk_end,
+                    target_frame=target_frame,
+                    terminal_request=terminal_request,
+                )
+            )
+            if getattr(self, "clean_commit_mode", "batched") == "batched" and commit_frames:
+                # The helper returns a contiguous prefix, excluding only
+                # the global terminal frame when no continuation is needed.
+                count = len(commit_frames)
+                self._commit_clean_chunk(
+                    state,
+                    clean_chunk[:, :, :count],
+                    geometry=geometry,
+                    frame_start=chunk_start,
+                    text_kv=text_kv,
+                    real_text_kv_len=real_text_kv_len,
+                    fps=fps,
+                    action=action_chunk[:, : count * action_count],
+                    domain_ids=self._frame_domains(conditioning, chunk_start, chunk_start + count),
+                    null_action_frame_indexes=tuple(i for i in null_action_indexes if i < count),
+                )
+            else:
+                for local_idx, frame_idx in commit_frames:
+                    action_start = local_idx * action_count
+                    action_frame = action_chunk[:, action_start : action_start + action_count]
+                    self._commit_clean_frame(
+                        state,
+                        clean_chunk[:, :, local_idx : local_idx + 1],
+                        geometry=geometry,
+                        frame_idx=frame_idx,
+                        text_kv=text_kv,
+                        real_text_kv_len=real_text_kv_len,
+                        fps=fps,
+                        action=action_frame,
+                        domain_ids=self._frame_domains(conditioning, frame_idx, frame_idx + 1),
+                        null_action=local_idx in null_action_indexes,
+                    )
+        return clean_chunk
+
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         try:
@@ -940,51 +1226,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         )
 
         try:
-            geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, None, self.resolution_policy)
+            geometry = self._resolve_request_geometry(sp, prompt_data)
         except (TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
-        fps = _admission_float(
-            _first_not_none(
-                self._get_sp_param(sp, "resolved_frame_rate", None),
-                self._get_sp_param(sp, "frame_rate", None),
-                self._get_sp_param(sp, "fps", None),
-                self.default_fps,
-            ),
-            "FPS",
-        )
+        fps = self._resolve_request_fps(sp, prompt_data)
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos3-Nano-Sim-Bimanual FPS must be positive, got {fps}.")
-        domain_name = controls.domain_name
-        domain_value = controls.domain_id
-        if isinstance(domain_value, (list, tuple)) and len(domain_value) == 1:
-            domain_value = domain_value[0]
-        elif isinstance(domain_value, torch.Tensor) and domain_value.numel() == 1:
-            domain_value = domain_value.item()
-        per_row_domains = isinstance(domain_value, (list, tuple, torch.Tensor))
-        if per_row_domains:
-            domain_value = self.manifest.resolve_domain_name(domain_name) if domain_name else self.default_domain_id
-        if domain_value is None and domain_name is None:
-            domain_value = self.default_domain_id
-        if domain_value is not None:
-            domain_id = _admission_int(domain_value, "domain_id")
-            if domain_id < 0:
-                raise ARDiffusionRequestRejectedError(
-                    f"Cosmos3-Nano-Sim-Bimanual domain_id must be non-negative, got {domain_id}."
-                )
-        else:
-            try:
-                domain_id = self.manifest.resolve_domain_name(str(domain_name))
-            except ValueError as exc:
-                raise ARDiffusionRequestRejectedError(str(exc)) from exc
-        if domain_id >= self.manifest.num_embodiment_domains:
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos3-Nano-Sim-Bimanual domain_id is outside the exported embodiment table: "
-                f"{domain_id} not in [0, {self.manifest.num_embodiment_domains})."
-            )
-        try:
-            embodiment = self.manifest.resolve_embodiment(domain_name, domain_id)
-        except ValueError as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        request = self._validate_conditioning_request(sp, controls, prompt_data=prompt_data)
 
         guidance_scale = _admission_float(
             _first_not_none(self._get_sp_param(sp, "guidance_scale", None), 1.0),
@@ -1000,20 +1248,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 f"got num_inference_steps={sp.num_inference_steps}."
             )
 
-        text_ids, text_mask = self._tokenize_prompt(
-            prompt,
-            max_sequence_length=1 << 30,
-            use_system_prompt=False,
-        )
+        text_ids, text_mask = self._build_prompt_tokens(prompt, request, geometry=geometry, fps=fps)
         real_text_kv_len = int(text_mask[0].sum().item())
         fingerprint = self._fingerprint(
             text_ids,
             real_text_kv_len=real_text_kv_len,
             geometry=geometry,
             fps=fps,
-            domain_id=domain_id,
-            embodiment=embodiment,
-            action_space=controls.action_space,
+            request=request,
         )
         start_frame = 0 if state_was_new else existing_state.next_frame_idx
         requested_frame_idx = _admission_int(_first_not_none(controls.frame_idx, start_frame), "frame_idx")
@@ -1032,28 +1274,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     "Cosmos3-Nano-Sim-Bimanual tick output_type cannot change within a session; session reset required."
                 )
 
-        try:
-            action = self._prepare_action(
-                embodiment=embodiment, action_value=controls.action, action_space=controls.action_space
-            )
-        except (OSError, TypeError, ValueError) as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
-        prepared_domains = None
-        if action is None:
-            raise ARDiffusionRequestRejectedError("Forward dynamics requires prepared actions")
-        try:
-            prepared_domains = prepare_domain_ids(
-                controls.domain_id if per_row_domains else domain_id,
-                rows=action.shape[0],
-                allowed=set(self.manifest.require_action_schema().embodiment_to_domain.values()),
-            )
-            camera_rows = prepared_domains.eq(2)
-            if camera_rows.numel() == 1:
-                camera_rows = camera_rows.expand(action.shape[0])
-            if torch.count_nonzero(action[camera_rows.to(action.device), 9:59]):
-                raise ValueError("Camera rows must have zero non-camera action slots")
-        except ValueError as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if tick:
             tick_frames = _admission_int(
                 _first_not_none(controls.num_latent_frames, self.manifest.chunk_size),
@@ -1075,22 +1295,30 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     f"chunk_size={self.manifest.chunk_size}, target latent frame={target_frame}."
                 )
         else:
-            requested_pixel_frames = _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
+            requested_pixel_frames, processing_pixel_frames = self._resolve_pixel_frames(sp, request)
             if requested_pixel_frames <= 0:
                 raise ARDiffusionRequestRejectedError(
                     f"Cosmos3-Nano-Sim-Bimanual num_frames must be positive, got {requested_pixel_frames}."
                 )
-            if (requested_pixel_frames - 1) % self.manifest.temporal_compression_factor:
+            if (processing_pixel_frames - 1) % self.manifest.temporal_compression_factor:
                 raise ARDiffusionRequestRejectedError(
                     "num_frames must satisfy (num_frames - 1) % temporal_compression_factor == 0; "
                     f"got {requested_pixel_frames} with factor {self.manifest.temporal_compression_factor}."
                 )
-            target_frame = (requested_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
+            target_frame = (processing_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
             if target_frame < start_frame:
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos3-Nano-Sim-Bimanual full rollout target precedes existing "
                     "session state; session reset required."
                 )
+        # Validate the request's conditioning before encoding any seed media.
+        conditioning = self._prepare_conditioning(
+            request,
+            prompt_data=prompt_data,
+            geometry=geometry,
+            start_frame=start_frame,
+            target_frame=target_frame,
+        )
         try:
             initial_latent = self._initial_condition_latent(prompt_data, sp, geometry)
         except (TypeError, ValueError) as exc:
@@ -1099,12 +1327,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError(
                 "Cosmos3-Nano-Sim-Bimanual initial media may only be supplied at frame 0; session reset required."
             )
-
-        action_layout = self._resolve_action_layout(
-            action,
-            start_frame=start_frame,
-            target_frame=target_frame,
-        )
 
         # ---- Side effects begin ---------------------------------------------
         tick_durations: dict[str, float] = {}
@@ -1117,20 +1339,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             state.initialize(fingerprint)
         if tick and state.tick_output_type is None:
             state.tick_output_type = tick_output_type
-        routing = prepared_domains if prepared_domains is not None else torch.tensor([domain_id])
-
-        def frame_domains(begin: int, end: int) -> torch.Tensor:
-            return domains_for_frames(
-                routing,
-                layout=action_layout,
-                request_start_frame=start_frame,
-                frame_start=begin,
-                frame_end=end,
-                action_count=self.manifest.action_tokens_per_frame,
-                device=self.device,
-            )
-
-        domain_ids = frame_domains(0, 1)
         text_kv = self._ensure_text_kv(state, text_ids, text_mask)
         self._prepare_dense_attention(state, text_kv, real_text_kv_len, geometry, target_frame)
 
@@ -1161,8 +1369,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
         if initial_latent is not None and state.next_frame_idx == 0:
             initial_action, initial_null = self._actions_for_frames(
-                action,
-                layout=action_layout,
+                conditioning.action,
+                layout=conditioning.layout,
                 request_start_frame=start_frame,
                 frame_start=0,
                 frame_end=1,
@@ -1184,7 +1392,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         real_text_kv_len=real_text_kv_len,
                         fps=fps,
                         action=initial_action,
-                        domain_ids=domain_ids,
+                        domain_ids=self._frame_domains(conditioning, 0, 1),
                         null_action=bool(initial_null),
                     )
             state.append_chunk(initial_latent, frame_start=0, retain_latent=not tick and not stream_video)
@@ -1198,106 +1406,21 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             target_frame,
             self.manifest.chunk_size,
         ):
-            chunk_frames = chunk_end - chunk_start
-            action_chunk, null_action_indexes = self._actions_for_frames(
-                action,
-                layout=action_layout,
-                request_start_frame=start_frame,
-                frame_start=chunk_start,
-                frame_end=chunk_end,
+            clean_chunk = self._run_chunk(
+                state,
+                conditioning,
+                geometry=geometry,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                target_frame=target_frame,
+                terminal_request=terminal_request,
+                seed=seed,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                fps=fps,
+                tick_durations=tick_durations,
+                measure_tick_latency=measure_tick_latency,
             )
-            domain_ids = frame_domains(chunk_start, chunk_end)
-            noise_generator = torch.Generator(device=self.device).manual_seed(seed + chunk_start)
-            initial_noise = torch.randn(
-                1,
-                self.transformer.latent_channel_size,
-                chunk_frames,
-                geometry.latent_height,
-                geometry.latent_width,
-                generator=noise_generator,
-                device=self.device,
-                # The reference draws checkpoint-dtype noise, then promotes it
-                # to fp32 before the scheduler loop.
-                dtype=self.dtype,
-            )
-
-            def velocity_fn(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-                output = self._transformer_forward(
-                    state,
-                    x.to(self.dtype),
-                    timestep,
-                    geometry=geometry,
-                    text_kv=text_kv,
-                    real_text_kv_len=real_text_kv_len,
-                    frame_start=chunk_start,
-                    fps=fps,
-                    action_latents=action_chunk,
-                    action_domain_ids=domain_ids,
-                    condition_vision=False,
-                    null_action_frame_indexes=null_action_indexes,
-                    commit_current=False,
-                )
-                return output.video.float()
-
-            with self._timed_tick_stage(
-                tick_durations,
-                "denoise_s",
-                enabled=measure_tick_latency,
-            ):
-                clean_chunk = self._denoise_chunk(
-                    velocity_fn,
-                    initial_noise,
-                    generator=noise_generator,
-                ).to(self.dtype)
-
-            if overlap_decode:
-                self._decode_queue.submit(clean_chunk)
-            action_count = self.manifest.action_tokens_per_frame
-            with self._timed_tick_stage(
-                tick_durations,
-                "clean_cache_commit_s",
-                enabled=measure_tick_latency,
-            ):
-                commit_frames = list(
-                    iter_clean_commit_frames(
-                        chunk_start,
-                        chunk_end,
-                        target_frame=target_frame,
-                        terminal_request=terminal_request,
-                    )
-                )
-                if getattr(self, "clean_commit_mode", "batched") == "batched" and commit_frames:
-                    # The helper returns a contiguous prefix, excluding only
-                    # the global terminal frame when no continuation is needed.
-                    count = len(commit_frames)
-                    self._commit_clean_chunk(
-                        state,
-                        clean_chunk[:, :, :count],
-                        geometry=geometry,
-                        frame_start=chunk_start,
-                        text_kv=text_kv,
-                        real_text_kv_len=real_text_kv_len,
-                        fps=fps,
-                        action=action_chunk[:, : count * action_count],
-                        domain_ids=frame_domains(chunk_start, chunk_start + count),
-                        null_action_frame_indexes=tuple(i for i in null_action_indexes if i < count),
-                    )
-                else:
-                    for local_idx, frame_idx in commit_frames:
-                        action_start = local_idx * action_count
-                        action_frame = action_chunk[:, action_start : action_start + action_count]
-                        self._commit_clean_frame(
-                            state,
-                            clean_chunk[:, :, local_idx : local_idx + 1],
-                            geometry=geometry,
-                            frame_idx=frame_idx,
-                            text_kv=text_kv,
-                            real_text_kv_len=real_text_kv_len,
-                            fps=fps,
-                            action=action_frame,
-                            domain_ids=frame_domains(frame_idx, frame_idx + 1),
-                            null_action=local_idx in null_action_indexes,
-                        )
             state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick and not stream_video)
             if not overlap_decode:
                 retain_output(clean_chunk)
@@ -1313,10 +1436,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             raise RuntimeError("Cosmos3-Nano-Sim-Bimanual full rollout produced no accumulated latent frames.")
         if stream_video:
             output_value = torch.cat(decoded_chunks, dim=2)
-            if output_value.shape[2] != requested_pixel_frames:
+            if output_value.shape[2] != processing_pixel_frames:
                 raise RuntimeError(
-                    f"Causal decoder returned {output_value.shape[2]} frames; expected {requested_pixel_frames}."
+                    f"Causal decoder returned {output_value.shape[2]} frames; expected {processing_pixel_frames}."
                 )
+            output_value = output_value[:, :, :requested_pixel_frames]
         elif sp.output_type == "latent":
             output_value = request_latents if tick else accumulated
         else:
@@ -1330,7 +1454,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 else:
                     output_value = self._decode_latents(accumulated).clamp(-1, 1)
             if not tick:
-                output_value = output_value[:, :, : int(sp.num_frames or 1)]
+                output_value = output_value[:, :, :requested_pixel_frames]
 
         if not tick:
             state.terminal = True

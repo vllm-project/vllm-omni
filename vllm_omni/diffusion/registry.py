@@ -444,6 +444,11 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3_nano_sim_bimanual",
         "Cosmos3NanoSimBimanualPipeline",
     ),
+    "Cosmos3NanoSimTransferPipeline": (
+        "cosmos3_nano_sim_bimanual",
+        "pipeline_cosmos3_nano_sim_transfer",
+        "Cosmos3NanoSimTransferPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -574,6 +579,7 @@ _NO_CACHE_ACCELERATION = {
     # Cache-DiT has not been validated with the model-local FlexAttention mask.
     "Cosmos3MultiviewPipeline",
     "Cosmos3NanoSimBimanualPipeline",
+    "Cosmos3NanoSimTransferPipeline",
     "TaoMateH3Pipeline",
     # PDD release: one fused output head per step, nothing to cache or skip.
     "MiniMaxH3ImagePipeline",
@@ -860,6 +866,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_post_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3NanoSimTransferPipeline": "get_cosmos3_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
@@ -880,6 +887,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3MultiviewPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3NanoSimTransferPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -919,6 +927,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_pre_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_pre_process_func",
+    "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
     "Flux3Pipeline": "get_flux3_pre_process_func",
