@@ -445,7 +445,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
 
         # --- Build base output ---
-        model_runner_output = OmniModelRunnerOutput(
+        model_runner_output = OmniModelRunnerOutput._from_components(
             req_ids=input_batch.req_ids,
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,

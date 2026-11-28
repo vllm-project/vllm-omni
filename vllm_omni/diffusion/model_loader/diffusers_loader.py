@@ -733,6 +733,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         a failed shared load must not be replayed with a replacement backend.
         The runner validates the load format before requesting shared loading.
         """
+        from vllm_omni.diffusion.offloader.npu_cpu_affinity import maybe_bind_npu_offload_cpu
+
+        self.cpu_affinity_bound = maybe_bind_npu_offload_cpu(self.od_config, device)
         self.host_weight_plan = None
         self._hwr_state = None
         self._last_load_request = {

@@ -371,6 +371,14 @@ or in-stage streaming audio) raises `OmniPrefixCacheUnmatchError`. Staging
 depth is raised to `2 * max_concurrent_batches + 1` to cover outputs still in
 flight.
 
+MiniMax-H3 text encoders opt into MRv2 stage-output replay. Their
+`hidden_states.output` and `meta.token_role_ids` are two-dimensional per-token
+payloads: both cached prefix rows and scheduled tail rows must be emitted to the
+DiT stage. They keep `requires_full_prefix_cached_hidden_states=False` because
+the named multimodal hidden-state payload already carries those rows; adding
+the generic `hidden` payload would duplicate them. Native KV-only reuse is
+insufficient for this encoder and would silently drop cached text conditioning.
+
 All of this lives in `MRv2PrefixCacheMixin`
 (`vllm_omni/worker_v2/prefix_cache.py`), which takes the cache lifecycle
 through the runner's `load_model` / `initialize_kv_cache` / `shutdown`

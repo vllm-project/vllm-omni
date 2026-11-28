@@ -119,7 +119,7 @@ class OmniRequest(Request):
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
-            block_hashes=block_hashes,
+            **({"block_hashes": block_hashes} if block_hashes is not None else {}),
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             payload_sender_info=request.payload_sender_info,

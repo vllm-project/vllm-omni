@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -63,11 +64,20 @@ def test_omni_manages_vllm_distributed_state(monkeypatch):
 
 def _fake_new_group_factory(created_groups: list[SimpleNamespace]):
     def _fake_new_group(ranks, *args, **kwargs):
-        group = SimpleNamespace(ranks=list(ranks))
+        group = SimpleNamespace(ranks=list(ranks), kwargs=kwargs)
         created_groups.append(group)
         return group
 
     return _fake_new_group
+
+
+@pytest.fixture
+def hccl_mode(request, monkeypatch):
+    monkeypatch.setattr(omni_parallel_state.current_omni_platform, "is_npu", lambda: True)
+    options = SimpleNamespace(Options=lambda: SimpleNamespace(hccl_config={}))
+    extension = SimpleNamespace(_C=SimpleNamespace(_distributed_c10d=SimpleNamespace(ProcessGroupHCCL=options)))
+    monkeypatch.setitem(sys.modules, "torch_npu", extension)
+    return request.param
 
 
 @pytest.mark.cpu
@@ -101,8 +111,9 @@ def test_set_seq_parallel_pg_uses_explicit_sp_groups(rank, expected_ulysses, exp
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("hccl_mode", [None, 2, 3], indirect=True)
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-def test_set_seq_parallel_pg_builds_independent_allgather_group(rank, monkeypatch):
+def test_set_seq_parallel_pg_builds_independent_allgather_group(rank, monkeypatch, hccl_mode):
     created_groups: list[SimpleNamespace] = []
     monkeypatch.setattr(torch.distributed, "new_group", _fake_new_group_factory(created_groups))
     sp_group_ranks = [[0, 2], [1, 3]]
@@ -114,14 +125,24 @@ def test_set_seq_parallel_pg_builds_independent_allgather_group(rank, monkeypatc
         rank=rank,
         world_size=4,
         sp_group_ranks=sp_group_ranks,
+        hccl_expansion_mode=hccl_mode,
     )
 
     assert ulysses_pg.ranks == [rank]
     assert ring_pg.ranks == [rank]
     assert allgather_pg.ranks == ([0, 2] if rank % 2 == 0 else [1, 3])
+    assert (
+        allgather_pg.kwargs == {}
+        if hccl_mode is None
+        else (
+            allgather_pg.kwargs["backend"] == "hccl"
+            and allgather_pg.kwargs["pg_options"].hccl_config == {"hccl_op_expansion_mode": hccl_mode}
+        )
+    )
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("hccl_mode", [None, 2, 3], indirect=True)
 @pytest.mark.parametrize(
     "rank, expected_ulysses, expected_allgather, expected_ring",
     [
@@ -132,7 +153,7 @@ def test_set_seq_parallel_pg_builds_independent_allgather_group(rank, monkeypatc
     ],
 )
 def test_set_seq_parallel_pg_builds_orthogonal_ulysses_allgather_groups(
-    rank, expected_ulysses, expected_allgather, expected_ring, monkeypatch
+    rank, expected_ulysses, expected_allgather, expected_ring, monkeypatch, hccl_mode
 ):
     """Ulysses x AllGather-KV: contiguous Ulysses blocks + stride-U AllGather groups."""
     created_groups: list[SimpleNamespace] = []
@@ -145,11 +166,29 @@ def test_set_seq_parallel_pg_builds_orthogonal_ulysses_allgather_groups(
         rank=rank,
         world_size=4,
         sp_group_ranks=[[0, 1, 2, 3]],
+        hccl_expansion_mode=hccl_mode,
     )
 
     assert ulysses_pg.ranks == expected_ulysses
     assert allgather_pg.ranks == expected_allgather
     assert ring_pg.ranks == expected_ring
+    communication = [g for g in created_groups if len(g.ranks) > 1]
+    if hccl_mode is None:
+        assert all(not g.kwargs for g in created_groups)
+    else:
+        assert all(g.kwargs["backend"] == "hccl" for g in communication)
+        assert all(g.kwargs["pg_options"].hccl_config == {"hccl_op_expansion_mode": hccl_mode} for g in communication)
+        assert len({id(g.kwargs["pg_options"]) for g in communication}) == len(communication)
+
+
+@pytest.mark.parametrize("mode,npu", [(1, True), (2, False)])
+def test_invalid_hccl_mode_rejects_before_creating_groups(monkeypatch, mode, npu):
+    created: list[SimpleNamespace] = []
+    monkeypatch.setattr(torch.distributed, "new_group", _fake_new_group_factory(created))
+    monkeypatch.setattr(omni_parallel_state.current_omni_platform, "is_npu", lambda: npu)
+    with pytest.raises(ValueError, match="requires NPU"):
+        set_seq_parallel_pg(8, 1, 0, 16, sp_allgather_degree=2, hccl_expansion_mode=mode)
+    assert not created
 
 
 @pytest.mark.cpu

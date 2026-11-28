@@ -610,12 +610,34 @@ def build_ulysses_allgather_rank_groups(
     return ulysses_groups, allgather_groups
 
 
+def _new_sequence_parallel_group(ranks: list[int], kind: str, mode: int | None):
+    """Apply the selected HCCL engine to both Ulysses and AllGather-KV."""
+    if mode is None:
+        return torch.distributed.new_group(ranks)
+    if type(mode) is not int or mode not in (2, 3) or not current_omni_platform.is_npu():
+        raise ValueError("hccl_expansion_mode requires NPU and mode 2 (AICPU) or 3 (AIV)")
+    import torch_npu
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_op_expansion_mode": mode}
+    group = torch.distributed.new_group(ranks, backend="hccl", pg_options=options)
+    logger.debug(
+        "%s HCCL group ranks=%s expansion_mode=%d",
+        kind,
+        ranks,
+        mode,
+        extra={"parallel_kind": kind, "group_ranks": ranks, "hccl_expansion_mode": mode},
+    )
+    return group
+
+
 def _set_ulysses_allgather_pg(
     sp_ulysses_degree: int,
     sp_allgather_degree: int,
     rank: int,
     world_size: int,
     sp_group_ranks: list[list[int]] | None,
+    hccl_expansion_mode: int | None = None,
 ) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
     """Build the orthogonal process groups of the Ulysses x AllGather-KV topology.
 
@@ -635,11 +657,11 @@ def _set_ulysses_allgather_pg(
         sp_allgather_degree,
     )
     for ranks in ulysses_groups:
-        group = torch.distributed.new_group(ranks)
+        group = _new_sequence_parallel_group(ranks, "Ulysses", hccl_expansion_mode)
         if rank in ranks:
             ulysses_pg = group
     for ranks in allgather_groups:
-        group = torch.distributed.new_group(ranks)
+        group = _new_sequence_parallel_group(ranks, "AllGather-KV", hccl_expansion_mode)
         if rank in ranks:
             allgather_pg = group
     for singleton_rank in range(world_size):
@@ -659,6 +681,7 @@ def set_seq_parallel_pg(
     use_ulysses_low: bool = True,
     sp_group_ranks: list[list[int]] | None = None,
     sp_allgather_degree: int = 1,
+    hccl_expansion_mode: int | None = None,
 ) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
     """
     Initialize Ulysses, Ring, and AllGather-KV process groups.
@@ -718,6 +741,7 @@ def set_seq_parallel_pg(
                 rank=rank,
                 world_size=world_size,
                 sp_group_ranks=sp_group_ranks,
+                hccl_expansion_mode=hccl_expansion_mode,
             )
 
         sp_size = sp_allgather_degree
@@ -728,7 +752,7 @@ def set_seq_parallel_pg(
 
         ulysses_pg = ring_pg = allgather_pg = None
         for group_ranks in sp_group_ranks:
-            group = torch.distributed.new_group(group_ranks)
+            group = _new_sequence_parallel_group(group_ranks, "AllGather-KV", hccl_expansion_mode)
             if rank in group_ranks:
                 allgather_pg = group
         for singleton_rank in range(world_size):
@@ -773,7 +797,7 @@ def set_seq_parallel_pg(
                 # Ulysses groups are contiguous chunks; Ring groups are strided.
                 for i in range(num_ulysses_pgs):
                     ulysses_ranks = group_ranks[i * sp_ulysses_degree : (i + 1) * sp_ulysses_degree]
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_sequence_parallel_group(ulysses_ranks, "Ulysses", hccl_expansion_mode)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
@@ -793,7 +817,7 @@ def set_seq_parallel_pg(
                         local_ring = list(ring_ranks)
                 for i in range(num_ulysses_pgs):
                     ulysses_ranks = group_ranks[i::num_ulysses_pgs]
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_sequence_parallel_group(ulysses_ranks, "Ulysses", hccl_expansion_mode)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
@@ -816,7 +840,7 @@ def set_seq_parallel_pg(
                             (i + 1) * sp_ulysses_degree + offset,
                         )
                     )
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_sequence_parallel_group(ulysses_ranks, "Ulysses", hccl_expansion_mode)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
 
@@ -837,7 +861,7 @@ def set_seq_parallel_pg(
 
                 for i in range(num_ulysses_pgs):
                     ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_sequence_parallel_group(ulysses_ranks, "Ulysses", hccl_expansion_mode)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
 
@@ -864,6 +888,7 @@ def _initialize_model_parallel(
     use_hsdp: bool = False,
     hsdp_data_parallel: bool = False,
     backend: str | None = None,
+    hccl_expansion_mode: int | None = None,
 ) -> None:
     global _FS, _HSDP_REPLICATE
 
@@ -1056,6 +1081,7 @@ def _initialize_model_parallel(
         rank=get_world_group().rank_in_group,
         world_size=world_size,
         sp_group_ranks=sp_group_ranks,
+        hccl_expansion_mode=hccl_expansion_mode,
     )
     _SP = init_model_parallel_group(  # type: ignore[assignment]
         group_ranks=sp_group_ranks,
@@ -1157,6 +1183,7 @@ def initialize_model_parallel(
     use_hsdp: bool = False,
     hsdp_data_parallel: bool = False,
     backend: str | None = None,
+    hccl_expansion_mode: int | None = None,
 ) -> None:
     """Atomically initialize diffusion parallel groups.
 
@@ -1196,6 +1223,7 @@ def initialize_model_parallel(
             use_hsdp=use_hsdp,
             hsdp_data_parallel=hsdp_data_parallel,
             backend=backend,
+            hccl_expansion_mode=hccl_expansion_mode,
         )
     except BaseException:
         destroy_model_parallel()

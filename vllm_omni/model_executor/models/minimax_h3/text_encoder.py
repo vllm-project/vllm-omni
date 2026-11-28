@@ -190,6 +190,7 @@ class MiniMaxH3TextEncoderBackbone(Qwen3VLForConditionalGeneration):
     have_multimodal_outputs = True
     omni_pooler_payload_include_hidden = False
     requires_full_prefix_cached_hidden_states = False
+    supports_mrv2_prefix_cache_outputs = True
     num_encoder_layers = 50
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):

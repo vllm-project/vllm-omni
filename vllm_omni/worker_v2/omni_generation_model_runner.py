@@ -571,7 +571,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # stays RUNNING until the orchestrator marks it done via
         # chunk_transfer_adapter.finished_requests.
         sampled_token_ids: list[list[int]] = [[] for _ in range(len(req_ids))]
-        output = OmniModelRunnerOutput(
+        output = OmniModelRunnerOutput._from_components(
             req_ids=req_ids,
             sampled_token_ids=sampled_token_ids,
             # Match the V1 generation runner contract: final generation stages

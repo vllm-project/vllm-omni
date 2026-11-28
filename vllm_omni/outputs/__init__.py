@@ -113,8 +113,15 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None
 
     @classmethod
+    def _from_components(cls, **kwargs) -> "OmniModelRunnerOutput":
+        """Supply the legacy vLLM 0.33 index only when the base declares it."""
+        if "req_id_to_index" in ModelRunnerOutput.__dataclass_fields__:
+            kwargs.setdefault("req_id_to_index", {rid: i for i, rid in enumerate(kwargs["req_ids"])})
+        return cls(**kwargs)
+
+    @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
-        return cls(
+        return cls._from_components(
             req_ids=[],
             sampled_token_ids=[],
             logprobs=None,

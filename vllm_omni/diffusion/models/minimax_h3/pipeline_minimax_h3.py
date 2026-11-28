@@ -1860,6 +1860,15 @@ class MiniMaxH3Pipeline(
         if text_encoder_tp_size == 1:
             return _SingleRankEncoderGroup(rank=self._dit_rank)
         ranks = list(range(text_encoder_tp_size))
+        if self._dit_rank >= text_encoder_tp_size:
+            # Ranks outside the encoder group still have to join the collective
+            # group creation in the same order as the members, but they never
+            # run encoder collectives. Returning the placeholder instead of a
+            # GroupCoordinator keeps a 16-rank DiT service with tp=8 valid; the
+            # text hidden states reach these ranks through the DiT broadcast.
+            torch.distributed.new_group(ranks, backend=current_omni_platform.dist_backend)
+            torch.distributed.new_group(ranks, backend="gloo")
+            return _SingleRankEncoderGroup(rank=self._dit_rank)
         return init_world_group(
             ranks=ranks,
             local_rank=envs.LOCAL_RANK,

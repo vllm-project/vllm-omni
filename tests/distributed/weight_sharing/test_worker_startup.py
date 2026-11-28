@@ -4,6 +4,7 @@
 import importlib
 import multiprocessing
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import cast
 
@@ -46,6 +47,8 @@ def test_startup_registry_stays_out_of_request_rpc(mocker, sharing):
     config = _StartupConfig()
     if sharing:
         setattr(config, "_sharing_worker_registry", registry)
+    from vllm_omni.diffusion.executor import multiproc_executor
+
     executor_cls = load_class_methods(
         "vllm_omni/diffusion/executor/multiproc_executor.py",
         "MultiprocDiffusionExecutor",
@@ -53,6 +56,9 @@ def test_startup_registry_stays_out_of_request_rpc(mocker, sharing):
         dict(
             mp=ctx,
             os=os,
+            current_omni_platform=multiproc_executor.current_omni_platform,
+            npu_worker_start_affinity=lambda *_args, **_kwargs: nullcontext(),
+            _ExecutorShutdownCleaner=multiproc_executor._ExecutorShutdownCleaner,
             cast=cast,
             logger=mocker.Mock(),
             set_multiprocessing_worker_envs=mocker.Mock(),
