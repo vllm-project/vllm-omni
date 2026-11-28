@@ -496,6 +496,7 @@ class BatchedToken2Wav(nn.Module):
         cfm_tf32: bool = False,
         encoder_graph_config: Mapping[str, Any] | None = None,
         cfm_float16: bool = False,
+        cfm_npu_float16: bool = False,
         watchdog: Code2WavWatchdog | None = None,
     ):
         super().__init__()
@@ -517,22 +518,27 @@ class BatchedToken2Wav(nn.Module):
         self.flow = token2wav.flow
         self.hift = token2wav.hift
         flow_parameter = next(self.flow.parameters(), None)
-        self._cfm_only_float16 = bool(cfm_float16 and not token2wav.float16)
+        self._cfm_npu_float16 = cfm_npu_float16 and flow_parameter is not None and flow_parameter.device.type == "npu"
+        self._cfm_only_float16 = self._cfm_npu_float16 or bool(cfm_float16 and not token2wav.float16)
         if self._cfm_only_float16:
-            if flow_parameter is None or flow_parameter.device.type != "cuda":
-                raise ValueError("cfm_float16 requires CUDA")
+            if not self._cfm_npu_float16 and (flow_parameter is None or flow_parameter.device.type != "cuda"):
+                raise ValueError("cfm_float16 requires CUDA or ROCm; use cfm_npu_float16 on NPU")
             self.flow.decoder.estimator.half()
-            self.flow.decoder.rand_noise = self.flow.decoder.rand_noise.half()
+            if not self._cfm_npu_float16:
+                self.flow.decoder.rand_noise = self.flow.decoder.rand_noise.half()
 
         if flow_parameter is not None and flow_parameter.device.type == "npu":
             from vllm_omni.platforms.npu.models.minicpmo_fused import prepare_estimator
 
             # Step graphs and Whole-Euler graphs must capture the same stable
             # weight storage, even when the step path is warmed first.
+            estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
             prepare_estimator(
-                getattr(getattr(self.flow, "decoder", None), "estimator", None),
+                estimator,
                 pack_convs=bool(cfm_graph_cfg.get("enabled", False) and cfm_graph_cfg.get("fused_body", False)),
             )
+            if self._cfm_npu_float16:
+                logger.info("MiniCPM-o NPU CFM FP16 enabled (attention=SDPA)")
         encoder_cfg = dict(chunk_encoder_graph_config or {})
         connector = connector_config or {}
         left_context = int(connector.get("codec_left_context_frames", 0) or 0)
@@ -654,7 +660,7 @@ class BatchedToken2Wav(nn.Module):
                 enable_whole_euler = bool(cfm_graph_cfg.get("enable_whole_euler", True))
                 if bool(cfm_graph_cfg.get("fused_body", False)):
                     # A BF16 storage-only cache still uses the ragged body.
-                    # CUDA FP16 flow can keep its matching FP16 cache resident.
+                    # FP16 CFM can use a matching FP16 attention cache.
                     # NPU uses the same schedule with AddLayerNorm and packed QKV.
                     self._ragged_fused_body = (
                         flow_parameter.device.type in {"cuda", "npu"}
@@ -662,7 +668,7 @@ class BatchedToken2Wav(nn.Module):
                         and (
                             self._estimator_att_cache_dtype == torch.float32
                             or (
-                                flow_parameter.device.type == "cuda"
+                                (flow_parameter.device.type == "cuda" or self._cfm_npu_float16)
                                 and self._estimator_att_cache_dtype == torch.float16
                                 and self._estimator_att_compute_dtype == torch.float16
                             )
@@ -841,6 +847,9 @@ class BatchedToken2Wav(nn.Module):
     def _hift_from_parts(
         self, old_mel: torch.Tensor, chunk_mel: torch.Tensor, source_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._cfm_npu_float16:
+            # HiFT and its graph inputs still use the original mel dtype.
+            chunk_mel = chunk_mel.to(dtype=old_mel.dtype)
         outputs = None
         if self.hift_graph_wrapper is not None:
             outputs = self.hift_graph_wrapper.replay_from_parts(old_mel, chunk_mel, source_cache)
@@ -965,7 +974,8 @@ class BatchedToken2Wav(nn.Module):
         return [int(feature.mels.shape[1]) for feature in features], projected
 
     def _cfm_autocast(self, device: torch.device):
-        if self._cfm_only_float16:
+        # NPU weights and inputs are already cast before eager execution and graph capture.
+        if self._cfm_only_float16 and device.type == "cuda":
             return torch.amp.autocast(device.type, dtype=torch.float16)
         return self._autocast(device)
 
@@ -1567,7 +1577,7 @@ class BatchedToken2Wav(nn.Module):
         """
         estimator_input = args[1]
         fused_dtype = estimator_input.dtype == torch.float32 or (
-            estimator_input.is_cuda and estimator_input.dtype == torch.float16
+            (estimator_input.is_cuda or self._cfm_npu_float16) and estimator_input.dtype == torch.float16
         )
         if slots is not None or (self._ragged_fused_body and fused_dtype):
             # Slot-pool graphs are only built over the fused body (``slot_pool`` above).
@@ -1644,7 +1654,12 @@ class BatchedToken2Wav(nn.Module):
         is copied there once. CUDA and NPU share this inference path. Other
         devices keep upstream's attention and copy its cache into ``kv``.
         """
-        if x.device.type == "npu" and x.dtype == kv.dtype == torch.float32 and not attn.training:
+        if (
+            x.device.type == "npu"
+            and x.dtype == kv.dtype
+            and x.dtype in {torch.float32, torch.float16}
+            and not attn.training
+        ):
             from vllm_omni.platforms.npu.models.minicpmo_fused import attention, supports_packed_qkv
 
             if not torch.is_grad_enabled() and supports_packed_qkv(attn):
@@ -1695,12 +1710,7 @@ class BatchedToken2Wav(nn.Module):
             mask = _expand_attn_mask_for_npu(attn_mask, frames, span)
         else:
             mask = None if attn_mask is None else attn_mask.unsqueeze(1)
-        out = F.scaled_dot_product_attention(
-            q,
-            keys[:, :, :span],
-            values[:, :, :span],
-            attn_mask=mask,
-        )
+        out = F.scaled_dot_product_attention(q, keys[:, :, :span], values[:, :, :span], attn_mask=mask)
         return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))
 
     @staticmethod
@@ -1910,7 +1920,12 @@ class BatchedToken2Wav(nn.Module):
             # is what removes them; zeroing alone would not, since a zero row
             # still occupies part of the softmax denominator.
             x[:, :, mel_frames:] = 0.0
-        timeline, dt_steps = self._get_timeline(mu.device, mu.dtype)
+        if self._cfm_npu_float16:
+            x = x.float()
+            timeline, dt_steps = self._get_timeline(mu.device, torch.float32)
+            timeline = timeline.to(dtype=mu.dtype)
+        else:
+            timeline, dt_steps = self._get_timeline(mu.device, mu.dtype)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
@@ -2011,9 +2026,10 @@ class BatchedToken2Wav(nn.Module):
                 else:
                     old_att = att_cache[step] if att_cache is not None else None
                 step_time = timeline[step].expand(2 * batch_size)
+                model_x = x.to(dtype=mu.dtype) if self._cfm_npu_float16 else x
                 estimate, step_cnn, step_att = self._estimator_step(
                     estimator,
-                    x=torch.cat((x, x), dim=0),
+                    x=torch.cat((model_x, model_x), dim=0),
                     mu=mu_cfg,
                     time=step_time,
                     speakers=speakers_cfg,
@@ -2030,6 +2046,8 @@ class BatchedToken2Wav(nn.Module):
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
                     # Both cache layouts must exclude padding from later chunks.
                     step_att[..., mel_frames : mel_frames + pad_frames, :] = 0.0
+                if self._cfm_npu_float16:
+                    estimate = estimate.float()
                 x = _euler_step(x, estimate, dt_steps[step], decoder.inference_cfg_rate, batch_size)
                 if pad_frames:
                     _zero_padded_frames(x, mel_frames)

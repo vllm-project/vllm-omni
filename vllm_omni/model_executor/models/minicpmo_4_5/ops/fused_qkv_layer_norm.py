@@ -18,10 +18,10 @@ def _use_npu_triton(
     k_norm: torch.nn.LayerNorm,
     head_dim: int,
 ) -> bool:
-    """The NPU path preserves the existing FP32, per-head LayerNorm contract."""
+    """Accept matching FP32 or FP16 storage for per-head FP32 LayerNorm math."""
     if not (HAS_TRITON and qkv.device.type == "npu" and kv.device == qkv.device) or torch.is_grad_enabled():
         return False
-    if qkv.dtype != torch.float32 or kv.dtype != torch.float32:
+    if qkv.dtype not in (torch.float32, torch.float16) or kv.dtype != qkv.dtype:
         return False
     for norm in (q_norm, k_norm):
         if type(norm) is not torch.nn.LayerNorm or norm.normalized_shape != (head_dim,):
@@ -30,7 +30,7 @@ def _use_npu_triton(
             return False
         for value in (norm.weight, norm.bias):
             if value is not None and (
-                value.device != qkv.device or value.dtype != torch.float32 or not value.is_contiguous()
+                value.device != qkv.device or value.dtype != qkv.dtype or not value.is_contiguous()
             ):
                 return False
     return True

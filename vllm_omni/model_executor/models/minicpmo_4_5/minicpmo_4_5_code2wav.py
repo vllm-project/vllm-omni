@@ -994,18 +994,19 @@ class MiniCPMO45Code2Wav(nn.Module):
             return "Whole-Euler ragged execution is inactive"
         if wrapper.device.type != "npu":
             return "wrapper device must be NPU"
-        if getattr(wrapper, "dtype", None) != torch.float32:
-            return "wrapper dtype must be FP32"
+        dtype = getattr(wrapper, "dtype", None)
+        if dtype not in {torch.float32, torch.float16}:
+            return "wrapper dtype must be FP32 or FP16"
         if getattr(wrapper, "att_slots", 0) != 0:
             return "attention slot pool must be disabled"
         if not getattr(self.backend, "_ragged_fused_body", False):
             return "fused ragged body is required"
-        if getattr(self.backend, "_estimator_att_cache_dtype", None) != torch.float32:
-            return "attention cache dtype must be FP32"
+        if getattr(self.backend, "_estimator_att_cache_dtype", None) != dtype:
+            return "attention cache dtype must match the wrapper dtype"
         return None
 
     def _npu_cross_reference_active(self) -> bool:
-        """Admit only the already-supported FP32 fused Whole-Euler arena."""
+        """Admit the fused Whole-Euler arena with matching precision."""
         return self._npu_cross_reference_inactive_reason() is None
 
     @staticmethod
@@ -2024,6 +2025,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
+            cfm_npu_float16=read_bool_flag(extra, "cfm_npu_float16", False),
             watchdog=self._watchdog,
         )
         wrapper = self.backend._whole_euler_graph_wrapper
@@ -2032,10 +2034,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             wrapper.npu_mixed_history = inactive_reason is None
         if self._npu_cross_reference_batching and (wrapper is None or not wrapper.npu_mixed_history):
             logger.warning(
-                "NPU cross-reference CFM batching is inactive: requires NPU FP32 fused Whole-Euler, "
-                "FP32 attention caches, no slot pool and code2wav_min_batch_size=1; reason: %s",
+                "NPU cross-reference CFM batching is inactive: requires NPU FP32 or FP16 fused Whole-Euler, "
+                "matching attention caches, no slot pool and code2wav_min_batch_size=1; reason: %s",
                 inactive_reason,
             )
+        elif wrapper is not None and wrapper.npu_mixed_history:
+            logger.info("NPU cross-reference CFM batching enabled (dtype=%s)", wrapper.dtype)
         # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
         # runners without that hook, the first chunk that needs a graph. Capturing
         # under vLLM's weight load held GiBs, so the sweep must not run here.

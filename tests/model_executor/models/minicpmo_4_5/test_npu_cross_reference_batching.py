@@ -3,6 +3,7 @@
 """CPU dispatch/state tests. Fake NPU routing here is not hardware validation."""
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,7 +11,9 @@ import pytest
 import torch
 
 import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs as wrapper_module
+from tests.helpers.stage_config import get_deploy_config_path
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import _config, _forward, _info, _model
+from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
 from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import WholeEulerCFMGraphWrapper
 from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2WavState,
@@ -18,6 +21,31 @@ from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav, _WorkItem
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("platform", "disable_fp16", "expected"),
+    [("npu", False, True), ("npu", True, False), ("cuda", False, None)],
+    ids=["npu-default-fp16", "npu-explicit-fp32", "cuda-no-npu-flag"],
+)
+def test_cfm_npu_float16_deploy_default(platform, disable_fp16, expected, tmp_path):
+    base = load_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
+    if disable_fp16:
+        load_path = tmp_path / "fp32.yaml"
+        load_path.write_text(
+            f'base_config: "{base.as_posix()}"\n'
+            "platforms:\n"
+            "  npu:\n"
+            "    connectors:\n"
+            "      connector_of_shared_memory:\n"
+            "        extra:\n"
+            "          cfm_npu_float16: false\n",
+            encoding="utf-8",
+        )
+    deploy = _apply_platform_overrides(load_deploy_config(load_path), platform=platform)
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    assert extra.get("cfm_npu_float16") is expected
+    assert extra["cfm_npu_cross_reference_batching"] is True
 
 
 def _voice_prompt(path):
@@ -600,7 +628,9 @@ def test_ragged_npu_staggered_final_and_fresh_request():
     [
         ("eligible", True),
         ("disabled", False),
-        ("fp16", False),
+        ("fp16", True),
+        ("mismatched_cache", False),
+        ("bf16_wrapper", False),
         ("slots", False),
         ("bf16_cache", False),
         ("unfused", False),
@@ -624,6 +654,11 @@ def test_backend_initialization_gates_actual_wrapper_flag(policy, expected, monk
         model._npu_cross_reference_batching = False
     elif policy == "fp16":
         wrapper.dtype = torch.float16
+        backend._estimator_att_cache_dtype = torch.float16
+    elif policy == "mismatched_cache":
+        wrapper.dtype = torch.float16
+    elif policy == "bf16_wrapper":
+        wrapper.dtype = torch.bfloat16
     elif policy == "slots":
         wrapper.att_slots = 4
     elif policy == "bf16_cache":
@@ -666,12 +701,13 @@ def test_backend_initialization_gates_actual_wrapper_flag(policy, expected, monk
     inactive_warnings = [
         call for call in warning.call_args_list if "NPU cross-reference CFM batching is inactive" in str(call)
     ]
-    assert bool(inactive_warnings) is (policy not in ("eligible", "disabled"))
+    assert bool(inactive_warnings) is (not expected and policy != "disabled")
 
     reasons = {
-        "fp16": "wrapper dtype must be FP32",
+        "mismatched_cache": "attention cache dtype must match the wrapper dtype",
+        "bf16_wrapper": "wrapper dtype must be FP32 or FP16",
         "slots": "attention slot pool must be disabled",
-        "bf16_cache": "attention cache dtype must be FP32",
+        "bf16_cache": "attention cache dtype must match the wrapper dtype",
         "unfused": "fused ragged body is required",
         "no_ragged": "ragged Whole-Euler body is unavailable",
         "disabled_graph": "Whole-Euler graph is disabled",
