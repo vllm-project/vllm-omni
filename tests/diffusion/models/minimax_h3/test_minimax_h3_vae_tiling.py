@@ -153,6 +153,7 @@ def _dispatch_vae(parallel_size):
 
     def decode_base(sample):
         seen["sp_size"] = state["sp_size"]
+        seen["sp_rank"] = state["sp_rank"]
         seen["sp_enabled"] = state["sp_enabled"]
         seen["sp_process_group"] = state["sp_process_group"]
         seen["parallel_tiling"] = vae.model.parallel_tiling
@@ -164,26 +165,94 @@ def _dispatch_vae(parallel_size):
 
 
 @pytest.mark.parametrize(
-    ("parallel_size", "h", "w", "falls_back"),
+    ("parallel_size", "h", "w", "rank_local", "sp_size"),
     [
-        (4, 24, 16, True),  # 2 tiles, ranks 2 and 3 would get none
-        (4, 16, 16, True),  # 1 tile
-        (4, 24, 24, False),  # 4 tiles, exactly enough
-        (4, 48, 84, False),  # 28 tiles, the shipped 768x1344 request
-        (4, 96, 168, False),  # 112 tiles, 1536x2688
-        (2, 24, 16, False),  # 2 tiles across 2 ranks
-        (1, 16, 16, False),  # never parallel, nothing to guard
+        (4, 24, 16, False, 2),  # 2 tiles: one per rank, ranks 2 and 3 repeat tiles 0 and 1
+        (8, 24, 40, False, 6),  # 6 tiles across 8 ranks
+        (4, 16, 16, True, 1),  # 1 tile: nothing to share out
+        (4, 24, 24, False, 4),  # 4 tiles, exactly enough
+        (4, 48, 84, False, 4),  # 28 tiles, the shipped 768x1344 request
+        (4, 96, 168, False, 4),  # 112 tiles, 1536x2688
+        (2, 24, 16, False, 2),  # 2 tiles across 2 ranks
+        (1, 16, 16, False, 1),  # never parallel, nothing to guard
     ],
 )
-def test_decode_latent_falls_back_exactly_when_tiles_are_short(parallel_size, h, w, falls_back):
+def test_decode_latent_never_leaves_a_rank_without_a_tile(parallel_size, h, w, rank_local, sp_size):
     """Fewer tiles than ranks is the hang condition; equal or more is fine."""
     vae, _, seen = _dispatch_vae(parallel_size)
 
     MiniMaxH3VideoVAE.decode_latent(vae, _latent(h, w))
 
-    # only the guard clears ``parallel_tiling``, so it is the signal that it fired
-    assert (seen["parallel_tiling"] is False) is falls_back
-    assert seen["sp_size"] == (1 if falls_back else parallel_size)
+    # only the rank-local guard clears ``parallel_tiling``, so it is the signal that it fired
+    assert (seen["parallel_tiling"] is False) is rank_local
+    assert seen["sp_size"] == sp_size
+
+
+def _checkpoint_tile_shares(state_by_rank, num_tiles):
+    """The checkpoint's ownership and gather reconstruction, for every rank of the group.
+
+    Mirrors ``_local_tile_indices`` and ``_all_gather_tiled_results`` in the
+    checkpoint's ``klvae.py``: a rank decodes ``range(sp_rank, num_tiles,
+    sp_size)``, and the grid is rebuilt from the shares of every group rank.
+    """
+    shares = [list(range(state["sp_rank"], num_tiles, state["sp_size"])) for state in state_by_rank]
+    if any(not share for share in shares):
+        raise ValueError("Found empty tasks")
+    sp_size = state_by_rank[0]["sp_size"]
+    results = [None] * num_tiles
+    for rank, share in enumerate(shares):
+        for k, tile in enumerate(share):
+            global_idx = k * sp_size + rank
+            if global_idx >= num_tiles:
+                break
+            results[global_idx] = tile
+    return shares, results
+
+
+@pytest.mark.parametrize(("parallel_size", "num_tiles"), [(8, 6), (8, 2), (4, 3), (8, 7)])
+def test_wrapped_ownership_gives_each_rank_one_tile_and_rebuilds_the_whole_grid(parallel_size, num_tiles):
+    states = []
+    for rank in range(parallel_size):
+        state = {"sp_size": parallel_size, "sp_rank": rank, "sp_enabled": True, "sp_process_group": "pg"}
+        vae = _vae(parallel_size, state)
+        with vae._wrapped_tile_ownership(num_tiles):
+            states.append(dict(state))
+        # the group state is restored once the decode leaves the context
+        assert state == {"sp_size": parallel_size, "sp_rank": rank, "sp_enabled": True, "sp_process_group": "pg"}
+
+    shares, results = _checkpoint_tile_shares(states, num_tiles)
+
+    assert all(len(share) == 1 for share in shares), "every rank decodes exactly one tile"
+    assert results == list(range(num_tiles)), "the gather rebuilds every tile in order"
+    assert all(state["sp_process_group"] == "pg" and state["sp_enabled"] for state in states)
+
+    # Without it the surplus ranks hold an empty share, which is the hang the guard exists for.
+    unwrapped = [{"sp_size": parallel_size, "sp_rank": rank} for rank in range(parallel_size)]
+    with pytest.raises(ValueError, match="Found empty tasks"):
+        _checkpoint_tile_shares(unwrapped, num_tiles)
+
+
+def test_wrapped_ownership_restores_the_group_state_after_an_exception():
+    state = {"sp_size": 8, "sp_rank": 7, "sp_enabled": True, "sp_process_group": "pg"}
+    vae = _vae(8, state)
+
+    with pytest.raises(RuntimeError, match="decode failed"):
+        with vae._wrapped_tile_ownership(6):
+            assert (state["sp_size"], state["sp_rank"]) == (6, 1)
+            raise RuntimeError("decode failed")
+
+    assert (state["sp_size"], state["sp_rank"]) == (8, 7)
+
+
+def test_short_grid_keeps_the_rank_local_fallback_under_the_equal_shape_gather():
+    """The replacement gather sizes its buffer for one share per group rank."""
+    vae, _, seen = _dispatch_vae(4)
+    vae._checkpoint_tile_gather = lambda tasks, num_tiles: tasks
+    vae._decoder_tile_grid_hw = lambda latent: None
+
+    MiniMaxH3VideoVAE.decode_latent(vae, _latent(24, 16))
+
+    assert seen["parallel_tiling"] is False and seen["sp_size"] == 1
 
 
 def test_decode_latent_isolates_and_restores_the_whole_group_state():
