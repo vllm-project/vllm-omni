@@ -44,6 +44,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
+    "MisoTTSTalkerForConditionalGeneration": "miso_tts",
+    "MisoTTSMimiDecoder": "miso_tts",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
@@ -63,7 +65,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
 # Model types whose official Hub repo ships no config.json, so
 # ``_patch_empty_hf_config`` writes one for a Hub id as well as for a local
 # directory instead of letting transformers fail on the missing file.
-_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox"})
+_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox", "miso_tts"})
 
 # Model types whose local bundles may hold only checkpoint files; a missing
 # config.json is patched for a local directory only.
