@@ -165,7 +165,11 @@ def _model_identity(model: Any) -> tuple[Any, str | None]:
     """(hub repo id, snapshot commit) when ``model`` (or a symlink in it) resolves into a hub snapshot."""
     if not isinstance(model, str) or not os.path.isdir(model):
         return model, None
-    for path in [model, *(os.path.join(model, n) for n in sorted(os.listdir(model))[:16])]:
+    try:
+        entries = sorted(os.listdir(model))[:16]
+    except OSError:
+        entries = []
+    for path in [model, *(os.path.join(model, n) for n in entries)]:
         match = _HF_SNAPSHOT.search(os.path.realpath(path))
         if match:
             return f"{match[1]}/{match[2]}", match[3]

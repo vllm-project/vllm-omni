@@ -105,6 +105,16 @@ def test_model_identity_resolves_hub_snapshot_behind_symlink_view(tmp_path):
     (view / "model_index.json").symlink_to(snapshot / "model_index.json")
 
     assert execution._model_identity(str(view)) == ("MiniMaxAI/MiniMax-H3", commit)
+    assert execution._model_identity("org/name") == ("org/name", None)
+
+
+def test_model_identity_survives_an_unreadable_directory(tmp_path, monkeypatch):
+    def unreadable(path):
+        raise PermissionError(path)
+
+    monkeypatch.setattr(execution.os, "listdir", unreadable)
+
+    assert execution._model_identity(str(tmp_path)) == (str(tmp_path), None)
 
 
 def test_engine_runtime_reports_cache_config_only_with_a_cache_backend():
