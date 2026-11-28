@@ -1202,7 +1202,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
-        self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
+        self.copy_event = (
+            copy_event if copy_event is not None else torch.get_device_module(main_stream.device).Event(blocking=True)
+        )
         self._async_chunk = bool(async_chunk)
         self._engine_output_type = engine_output_type
         # None preserves the historical split whenever async_chunk is on.
@@ -1245,11 +1247,12 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
 
         @contextlib.contextmanager
         def _stream(to_stream, from_stream):
+            device_module = torch.get_device_module(to_stream.device)
             try:
-                torch.cuda.set_stream(to_stream)
+                device_module.set_stream(to_stream)
                 yield
             finally:
-                torch.cuda.set_stream(from_stream)
+                device_module.set_stream(from_stream)
 
         with _stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
