@@ -1410,6 +1410,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         return decoded.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
 
 
+def resolve_audio_vae_optimized_decode(additional_config: Mapping[str, object] | None) -> bool:
+    """Read the H3 audio decoder opt-in from pipeline configuration."""
+    enabled = (additional_config or {}).get("audio_vae_optimized_decode", False)
+    if type(enabled) is not bool:
+        raise ValueError("audio_vae_optimized_decode must be a boolean")
+    return enabled
+
+
 class MiniMaxH3AudioVAE(nn.Module):
     def __init__(
         self,
@@ -1420,6 +1428,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        optimize_decode: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -1440,14 +1449,32 @@ class MiniMaxH3AudioVAE(nn.Module):
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         self._stager = None
+        self.model = self.remote.model
+        if optimize_decode and not self.encode_only:
+            self._install_optimized_decode(device)
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
                 self.remote,
                 device,
                 pin_memory=True,
             )
-        self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])
+
+    def _install_optimized_decode(self, device: torch.device) -> None:
+        """Install the experimental FP32 decoder kernels on the validated NPU family."""
+        device_name = current_omni_platform.get_device_name(device.index or 0) if device.type == "npu" else device.type
+        if device_name not in {"Ascend910B4", "Ascend910B4-1"}:
+            logger.info("MiniMax-H3 audio VAE optimization is unavailable on %s; using the native decoder", device_name)
+            return
+
+        from .npu.audio_tconv import install_bigvgan_upsamplers
+        from .vae_audio_fir_channel_pack import install
+
+        fir_modules = install(self.model)
+        stage_upsamplers = install_bigvgan_upsamplers(self.model.decoder)
+        logger.info(
+            "MiniMax-H3 audio VAE: installed %d packed FIR and %d polyphase stages", fir_modules, stage_upsamplers
+        )
 
     def load_to_device(self) -> None:
         if self._stager is not None:

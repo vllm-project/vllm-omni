@@ -692,3 +692,19 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Audio VAE decoder optimizations
+
+MiniMax-H3 uses the reference audio decoder by default. On Ascend 910B4,
+merge the following into `--additional-config` to try dense C16 FIR packing
+and phase-decomposed convolution for the BigVGAN stage upsamplers:
+
+```bash
+--additional-config '{"audio_vae_optimized_decode": true}'
+```
+
+The optimized decoder can change the FP32 waveform in the last bits. Remove
+this key or set it to `false` for the reference decoder. Reference audio
+encoding, video, and other devices are unaffected. See the
+[diffusion feature guide](../../docs/user_guide/diffusion_features.md#experimental-minimax-h3-audio-decoder)
+for the scope and limitations.

@@ -226,6 +226,7 @@ from .vae import (
     MiniMaxH3VideoVAE,
     _load_component_config,
     _VideoVAEPartProxy,
+    resolve_audio_vae_optimized_decode,
     vae_compile_allowed,
 )
 from .variant import BASE_H3, FASTH3_PREVIEW, H3Variant, control_task
@@ -1128,6 +1129,7 @@ class MiniMaxH3Pipeline(
         # rejects; fail here instead of on every such request.
         service_schedule = od_config.diffusion_attention_schedule
         additional_config = od_config.additional_config or {}
+        optimize_audio_decode = resolve_audio_vae_optimized_decode(additional_config)
         if (
             service_schedule is not None
             and service_schedule.default
@@ -1522,6 +1524,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                optimize_decode=optimize_audio_decode,
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
