@@ -307,7 +307,7 @@ def main(args):
 
     # Get the query function and call it with appropriate parameters
     query_func = query_map[args.query_type]
-    if args.query_type == "mixed_modalities":
+    if args.query_type == "use_mixed_modalities":
         query_result = query_func(
             video_path=video_path,
             image_path=image_path,
@@ -317,13 +317,11 @@ def main(args):
         )
     elif args.query_type == "use_audio_in_video":
         query_result = query_func(video_path=video_path, num_frames=num_frames, sampling_rate=sampling_rate)
-    elif args.query_type == "multi_audios":
-        query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     elif args.query_type == "use_image":
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_video":
         query_result = query_func(video_path=video_path, num_frames=num_frames)
-    elif args.query_type == "use_audio":
+    elif args.query_type in ("use_audio", "use_multi_audios"):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
@@ -453,7 +451,7 @@ def parse_args():
         type=str,
         default="use_mixed_modalities",
         choices=query_map.keys(),
-        help="Query type.",
+        help="For use_mixed_modalities, override demo inputs with --video-path, --image-path, or --audio-path.",
     )
     parser.add_argument(
         "--log-stats",
@@ -516,7 +514,7 @@ def parse_args():
         "-a",
         type=str,
         default=None,
-        help="Path to local audio file. If not provided, uses default audio asset.",
+        help="Path to a local audio file. For use_multi_audios, replaces the first demo clip.",
     )
     parser.add_argument(
         "--num-frames",
