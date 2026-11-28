@@ -1743,8 +1743,10 @@ def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
     assert step["agent_pool"] == "mi300_2"
     assert step["grade"] == "Blocking"
     assert step["source_file_dependencies"] == "omni_qwen3_omni_duplex_playback_function"
-    assert "assert-pytest-collection.sh 30" in commands
-    assert "if tests != 30 or skipped != 0" in commands
+    expected_cases = 31
+    assert f"assert-pytest-collection.sh {expected_cases} " in commands
+    assert f"if tests != {expected_cases} or skipped != 0" in commands
+    assert f"Expected exactly {expected_cases} executed Qwen3-Omni" in commands
     assert commands.count(marker) == 2
     for path in (
         "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py",
@@ -6284,6 +6286,7 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
         "tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py",
         "tests/assets/minicpmo_4_5/",
         "vllm_omni/deploy/qwen3_omni_duplex.yaml",
+        "vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml",
         "vllm_omni/engine/duplex/",
         "vllm_omni/model_executor/models/qwen3_omni/",
     } <= qwen_paths

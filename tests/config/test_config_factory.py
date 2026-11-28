@@ -2218,6 +2218,7 @@ stages:
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("qwen3_omni_moe_codec.yaml", "cuda", False),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),

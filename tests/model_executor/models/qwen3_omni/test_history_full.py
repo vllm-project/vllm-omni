@@ -9,12 +9,18 @@ from unittest.mock import Mock
 import numpy as np
 import pybase64
 import pytest
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, MultiModalConfig
 from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import Harness
 from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
-from tests.model_executor.models.qwen3_omni.test_history_policy import Processor, audio_message, runtime, text_history
+from tests.model_executor.models.qwen3_omni.test_history_policy import (
+    Processor,
+    audio_message,
+    bind_history,
+    runtime,
+    text_history,
+)
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexStageSubmission
@@ -26,14 +32,62 @@ from vllm_omni.protocol.duplex.events import ErrorEvent
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def plugin_for(policy=None, *, max_audio=8, max_images=12):
+def plugin_for(policy=None, *, max_audio=8, max_images=12, history_limits=None):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     options = {} if policy is None else {"history_policy": policy}
+    if history_limits is not None:
+        options["history_limits"] = history_limits
     plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options=options))
     plugin.processor = Processor()
     media = Mock(get_limit_per_prompt=lambda kind: {"audio": max_audio, "image": max_images}[kind])
     plugin._history_runtime.bind(plugin.processor, Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=media))
     return plugin
+
+
+@pytest.mark.parametrize("policy", [None, "bounded_recent", "incremental", "recent"])
+def test_history_media_limits_follow_deployment_and_strategy_budgets(policy):
+    plugin = plugin_for(policy, max_audio=12, max_images=16)
+    owner = plugin._history_runtime
+    assert (owner.max_audio, owner.max_images) == ((4, 8) if policy == "recent" else (12, 16))
+    if policy in {"bounded_recent", "incremental"}:
+        owner = type(owner)(policy, {"max_audio_items": 6})
+        media = MultiModalConfig(limit_per_prompt={"audio": 12, "image": 16})
+        owner.bind(plugin.processor, Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=media))
+        assert (owner.max_audio, owner.max_images) == (6, 16)
+
+
+@pytest.mark.parametrize("policy", [None, "bounded_recent", "incremental"])
+def test_nonlegacy_policies_keep_six_audio_inputs_and_nine_images(policy):
+    plugin = plugin_for(policy, max_audio=12, max_images=16)
+    state = plugin.create_session_state()
+    history = [{"role": "user", "content": image_message()["content"] * 9}]
+    for index in range(6):
+        message, payload = audio_message(index)
+        history.append(message)
+        bind_history(state.history_policy_state, history)
+        prompt = plan(plugin, history, state=state, payload=payload)
+        history.append({"role": "assistant", "content": f"heard {index}"})
+    assert len(prompt["multi_modal_data"]["audio"]) == 6
+    assert len(prompt["multi_modal_data"]["image"]) == 9
+    assert "heard 0" in prompt["prompt"]
+
+
+@pytest.mark.parametrize("policy", ["bounded_recent", "incremental"])
+@pytest.mark.parametrize("budget", ["items", "bytes"])
+def test_budgeted_audio_cache_inherits_strategy_limits(policy, budget):
+    _, payload = audio_message(0)
+    limits = {"max_audio_items": 2} if budget == "items" else {"max_audio_bytes": len(payload["audio"])}
+    plugin = plugin_for(policy, history_limits=limits)
+    state = plugin.create_session_state()
+    history = []
+    for index in range(3):
+        message, payload = audio_message(index)
+        history.append(message)
+        bind_history(state.history_policy_state, history)
+        plugin.prepare_prompt_config({"conversation": history}, state=state, payload=payload)
+        history.append({"role": "assistant", "content": f"heard {index}"})
+    assert len(state.audio_history) == (2 if budget == "items" else 1)
+    assert state.audio_history[-1][1]["audio"] == payload["audio"]
 
 
 def validate_engine_capacity(value: DuplexAppendPlan | DuplexStageSubmission, processor: Processor) -> None:
@@ -123,6 +177,22 @@ def test_default_keeps_all_audio_allocations_until_sources_are_deleted():
     assert len(state.audio_history) == 5
     assert [audio[0][0] for audio in prompt["multi_modal_data"]["audio"]] == [2, 3, 4, 5, 6]
     assert plugin.create_session_state().audio_history == []
+
+
+def test_full_history_explicit_audio_limit_rejects_without_losing_sources():
+    plugin = plugin_for(max_audio=4)
+    state = plugin.create_session_state()
+    history = []
+    for index in range(5):
+        message, payload = audio_message(index)
+        history.append(message)
+        plugin.prepare_prompt_config({"conversation": history}, state=state, payload=payload)
+        history.append({"role": "assistant", "content": f"heard {index}"})
+    with pytest.raises(DuplexInputCapacityError, match="5 audio inputs"):
+        plan(plugin, history, state=state)
+    assert len(state.audio_history) == 5 and len(history) == 10
+    prompt = plan(plugin, history[2:], state=state)
+    assert len(prompt["multi_modal_data"]["audio"]) == 4
 
 
 @pytest.mark.parametrize("image_limit", [8, 12])
@@ -653,19 +723,17 @@ def test_custom_recent_policy_reserves_its_only_audio_slot_for_current_input(mon
     np.testing.assert_array_equal(audio[0][0], np.full(160, 3, dtype="<f4"))
 
 
-@pytest.mark.parametrize("kind", ["original_bytes", "original_items", "bounded_without_items"])
+@pytest.mark.parametrize("kind", ["original_bytes", "original_items"])
 def test_audio_retention_rejects_limits_that_would_be_ignored(kind):
     from dataclasses import replace
 
-    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import FullHistoryPolicy, HistoryBehavior
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import FullHistoryPolicy
 
     with pytest.raises(ValueError, match="audio"):
         if kind == "original_bytes":
             replace(FullHistoryPolicy.behavior, audio_cache_bytes=64)
-        elif kind == "original_items":
-            replace(FullHistoryPolicy.behavior, audio_cache_items=1)
         else:
-            HistoryBehavior(original_messages=True, audio_cache_items=None, audio_cache_bytes=64)
+            replace(FullHistoryPolicy.behavior, audio_cache_items=1)
 
 
 @pytest.mark.parametrize("use_view", [False, True])

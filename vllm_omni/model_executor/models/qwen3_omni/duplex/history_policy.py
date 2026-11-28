@@ -550,17 +550,17 @@ class HistoryBehavior:
     Original rendering preserves the existing tool protocol. Budgeted rendering
     uses Session summaries. A rejected overflow never drops accepted sources.
     Original audio is retained until source deletion and requires both cache
-    limits to be None. Bounded audio requires an item cap and has an optional
-    byte target, retaining at least the newest binding for legacy compatibility.
+    limits to be None. Bounded audio inherits the strategy's item and byte
+    budgets unless overridden, retaining at least the newest binding.
     """
 
     original_messages: bool = False
     overflow: Literal["fit", "reject"] = "fit"
-    message_window: int | None = RECENT_MESSAGE_WINDOW
+    message_window: int | None = None
     audio_retention: Literal["original", "bounded"] = "bounded"
-    audio_cache_items: int | None = RECENT_AUDIO_ITEMS
-    audio_cache_bytes: int | None = RECENT_AUDIO_BYTES
-    prompt_images: int | None = RECENT_PROMPT_IMAGES
+    audio_cache_items: int | None = None
+    audio_cache_bytes: int | None = None
+    prompt_images: int | None = None
     use_media_view: bool = True
 
     def __post_init__(self) -> None:
@@ -574,10 +574,7 @@ class HistoryBehavior:
         if self.audio_retention == "original":
             if self.audio_cache_items is not None or self.audio_cache_bytes is not None:
                 raise ValueError("original audio retention does not accept cache limits; select bounded retention")
-        elif self.audio_retention == "bounded":
-            if self.audio_cache_items is None:
-                raise ValueError("bounded audio retention requires audio_cache_items")
-        else:
+        elif self.audio_retention != "bounded":
             raise ValueError("audio_retention must be original or bounded")
 
 
@@ -679,7 +676,13 @@ class FullHistoryPolicy(NonCompressingHistoryPolicy):
 class RecentHistoryPolicy(FullHistoryPolicy):
     """Explicit legacy window, audio eviction and media-dropped view support."""
 
-    behavior = HistoryBehavior(original_messages=True)
+    behavior = HistoryBehavior(
+        original_messages=True,
+        message_window=RECENT_MESSAGE_WINDOW,
+        audio_cache_items=RECENT_AUDIO_ITEMS,
+        audio_cache_bytes=RECENT_AUDIO_BYTES,
+        prompt_images=RECENT_PROMPT_IMAGES,
+    )
 
     def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
         """Round the legacy message window out to original complete groups."""

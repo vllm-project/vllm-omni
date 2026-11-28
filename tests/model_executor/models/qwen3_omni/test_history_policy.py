@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import numpy as np
 import pybase64
 import pytest
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, MultiModalConfig
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
@@ -50,7 +50,8 @@ class Processor:
 
 def runtime(name="incremental", **limits):
     result = QwenHistoryRuntime(name, limits)
-    result.bind(Processor(), Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=None))
+    media = MultiModalConfig(limit_per_prompt={"audio": 4, "image": 8})
+    result.bind(Processor(), Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=media))
     return result
 
 

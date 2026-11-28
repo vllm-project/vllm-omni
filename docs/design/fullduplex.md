@@ -245,6 +245,11 @@ playback calibration still determine the effective Session records.
 | `bounded_recent` | Recent complete turns under the configured context/media budget. | Remove older turns until the request fits. |
 | `incremental` | Published memory plus selected uncompressed turns. | Compress older sources and fit the foreground request to budget. |
 
+Only `recent` applies the legacy four-audio/eight-image window. The budgeted
+policies use the deployment's media counts, with audio additionally bounded by
+`history_limits.max_audio_items`. Their retained-media byte budgets and
+compression triggers remain separate from these per-request counts.
+
 The default now changes from `recent` to `full_history`. Deployments that need the
 previous bounded window must explicitly set `history_policy: recent`. Full-history
 requests preserve system-message order and the existing tool-call protocol. They
@@ -261,8 +266,10 @@ limit includes `max_context_tokens` when configured. Overflow
 raises a recoverable `input_capacity_exceeded` error without submitting a partial
 request or deleting history. Clients can delete source items and retry. Session
 input-admission limits still reject additional material before it is accepted.
-The base deployment permits four audio inputs and eight images per request;
-full history does not raise these deployment limits automatically. Direct plugin
+The MRv2 duplex deployment leaves per-request media counts at vLLM defaults
+(currently 999 per modality). Deployments can set `limit_mm_per_prompt` explicitly;
+full history does not raise those limits automatically. Session image admission
+remains bounded separately, as described below. Direct plugin
 calls without a resolved model configuration leave validation to the downstream
 engine.
 
@@ -295,8 +302,9 @@ Existing custom bounded/compression strategies retain the four required hooks.
 
 Audio retention is selected explicitly with `audio_retention`. `original` keeps
 PCM until source deletion and requires both audio cache limits to be `None`.
-`bounded` requires a positive `audio_cache_items` limit and accepts an optional
-`audio_cache_bytes` target; it keeps at least the newest binding, including when
+`bounded` inherits `history_limits.max_audio_items` and `max_audio_bytes` when its
+cache limits are `None`. A policy can set positive `audio_cache_items` and
+`audio_cache_bytes` overrides; it keeps at least the newest binding, including when
 that binding exceeds the byte target. Unsupported combinations fail at policy
 construction. With original-message rendering, `original` also rejects selected
 sources whose PCM is unavailable, independently of the context overflow action.
@@ -432,7 +440,7 @@ and combines repeated observations across frames into one memory.
 Configure the policy in a deployment overlay:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   model_custom_options:
     history_policy: incremental
@@ -457,7 +465,7 @@ selection/compression interface. They independently replace message-count
 triggering and batching:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   model_custom_options:
     history_policy: incremental

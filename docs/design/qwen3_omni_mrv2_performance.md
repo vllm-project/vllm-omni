@@ -1,5 +1,11 @@
 # Qwen3-Omni MRv2 performance
 
+For streaming workloads, `qwen3_omni_moe_codec.yaml` opts into one-frame first
+audio on CUDA and length-grouped codec graphs on CUDA/ROCm. It keeps Thinker
+prefix caching disabled. The base turn-serving profile enables that cache on
+CUDA and uses a four-frame first chunk. Existing deployments can continue using
+`qwen3_omni_moe_mrv2.yaml`, a compatibility alias for the codec profile.
+
 This model adaptation builds on #8184's existing stage runtime and output
 contracts. It adds Talker CPU metadata parsing, sampled-token embedding
 handoff, an optional first-frame decoder, length-grouped Code2Wav graph

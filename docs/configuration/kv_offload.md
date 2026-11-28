@@ -139,7 +139,7 @@ serving pipeline.
 ### Configuration
 
 Use an explicit Qwen3-Omni MRv2 deployment with CUDA and an unquantized
-Thinker at TP=1: `qwen3_omni_moe_mrv2.yaml` for turn serving or
+Thinker at TP=1: `qwen3_omni_moe_codec.yaml` for turn serving or
 `qwen3_omni_duplex_mrv2.yaml` for duplex sessions. The V1 duplex profile,
 `qwen3_omni_duplex.yaml`, is not supported. Runtime quantization is rejected
 to prevent incompatible effective models from sharing cached KV and hidden

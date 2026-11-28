@@ -116,8 +116,8 @@ class QwenHistoryRuntime:
         self.limits = HistoryLimits(**dict(options))
         self.processor: ProcessorMixin | None = None
         self.max_model_len = 0
-        self.max_audio = 4
-        self.max_images = 8
+        self.max_audio = self.limits.max_audio_items
+        self.max_images = self.limits.max_visual_items
 
     def bind(self, processor: ProcessorMixin, model_config: ModelConfig | None) -> None:
         """Bind initialized processor/model capacity; reject unusable context limits."""
@@ -129,6 +129,8 @@ class QwenHistoryRuntime:
                 audio_limit = mm.get_limit_per_prompt("audio")
                 image_limit = mm.get_limit_per_prompt("image")
                 audio_cap = self.behavior.audio_cache_items
+                if self.behavior.audio_retention == "bounded" and audio_cap is None:
+                    audio_cap = self.limits.max_audio_items
                 image_cap = self.behavior.prompt_images
                 self.max_audio = audio_limit if audio_cap is None else min(audio_cap, audio_limit)
                 self.max_images = image_limit if image_cap is None else min(image_cap, image_limit)

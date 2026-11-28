@@ -47,6 +47,12 @@ items and retry. It does not silently switch to a smaller history window. Origin
 input audio remains retained while its source items exist, so session storage can
 grow with the conversation. Session input-admission limits also remain in effect.
 
+The MRv2 deployment does not impose the legacy four-audio/eight-image request
+window. It inherits vLLM's media-count defaults (currently 999 per modality).
+Set `stages[0].limit_mm_per_prompt` in a deployment overlay to impose smaller
+counts. Session image admission remains capped at 200 images / 32 MiB of encoded
+URLs by default, separately from per-request counts and context tokens.
+
 To restore the previous clipping behavior, select `recent` in a deployment overlay:
 
 ```yaml
@@ -109,7 +115,7 @@ Save this as `qwen3_history.yaml`, replacing `base_config` with the absolute pat
 to the repository's Qwen3-Omni duplex deployment:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   history_ms_per_token: 383
   history_calibration_timeout_ms: 1000
@@ -169,7 +175,7 @@ short calibration deadline.
 Use this overlay as `qwen3_history.yaml` instead of the fixed-rate overlay:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   history_asr_url: http://127.0.0.1:18942/v1/audio/transcriptions
   history_asr_model: history-asr
@@ -1042,7 +1048,7 @@ With the serving environment active, start Qwen's duplex server:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml --port 8099
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml --port 8099
 ```
 
 In your working directory, define an async tool and its declaration:
