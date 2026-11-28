@@ -35,6 +35,7 @@ def _cache(**kwargs) -> NoisyKVCache:
         block_size=4,
         max_chunk_tokens=kwargs.get("max_chunk_tokens", 4),
         max_history_chunks=6,
+        max_external_sink_tokens=kwargs.get("max_external_sink_tokens", 0),
     )
     return NoisyKVCache(
         spec,
@@ -43,6 +44,8 @@ def _cache(**kwargs) -> NoisyKVCache:
         layer_groups=kwargs.get("layer_groups", 2),
         max_batch_size=kwargs.get("max_batch_size", 1),
         step_replicas=kwargs.get("step_replicas", 1),
+        layer_offset=kwargs.get("layer_offset", 0),
+        available_bytes=kwargs.get("available_bytes"),
     )
 
 
@@ -87,6 +90,57 @@ def test_capacity_accepts_complete_schedule_budget(extra_bytes):
     )
     assert bounded.capacity == cache.capacity == 11
     assert bounded.reserved_bytes == cache.reserved_bytes
+
+
+def test_external_sink_has_a_separate_memory_budget():
+    ordinary = _cache(max_batch_size=2)
+    sink_bytes = 2 * 3 * ordinary.bytes_per_version * ordinary.spec.num_layers
+    budget = ordinary.reserved_bytes + sink_bytes
+    with_sink = _cache(max_batch_size=2, max_external_sink_tokens=12, available_bytes=budget)
+    assert with_sink.capacity == ordinary.capacity
+    assert with_sink.reserved_bytes == budget
+    with pytest.raises(RuntimeError, match=f"required_bytes={budget}"):
+        _cache(max_batch_size=2, max_external_sink_tokens=12, available_bytes=budget - 1)
+
+
+@pytest.mark.parametrize("release", ["finish", "release_before_admit", "reset_before_admit"])
+def test_external_sink_lifetime(release):
+    cache = _cache(max_external_sink_tokens=12)
+    state = NoisyKVState(cache)
+    key = torch.arange(96, dtype=torch.float32).reshape(12, 4, 2).transpose(1, 2)
+    state.store_external_sink("A", 0, key, -key)
+    with pytest.raises(RuntimeError, match="sink request capacity exceeded"):
+        state.store_external_sink("B", 0, key, -key)
+
+    if release == "finish":
+        state.begin_request("A", _history_plan(), chunk_tokens=4)
+        layer = state.prepare((("A", (0, 0, 0)),))[0][0]
+        assert layer.seq_len == 4
+        actual_key, actual_value = layer.external_sink
+        assert actual_key.is_contiguous() and actual_value.is_contiguous()
+        torch.testing.assert_close(actual_key, key)
+        torch.testing.assert_close(actual_value, -key)
+        state.finish_request("A")
+    elif release == "release_before_admit":
+        cache.release_session("A")
+    else:
+        state.reset_all()
+
+    state.store_external_sink("B", 0, 2 * key, key)
+    state.begin_request("A", _history_plan(), chunk_tokens=4)
+    assert state.prepare((("A", (0, 0, 0)),))[0][0].external_sink is None
+
+
+def test_external_sink_validates_local_layer_and_geometry():
+    state = NoisyKVState(_cache(max_external_sink_tokens=12, layer_offset=2))
+    key = torch.zeros(12, 2, 4)
+    with pytest.raises(ValueError, match="block 1 is not local"):
+        state.store_external_sink("A", 1, key, key)
+    with pytest.raises(ValueError, match="configured geometry"):
+        state.store_external_sink("A", 2, key.repeat(2, 1, 1), key.repeat(2, 1, 1))
+    with pytest.raises(ValueError, match="pool dtype and device"):
+        state.store_external_sink("A", 2, key.double(), key.double())
+    state.store_external_sink("A", 2, key, key)
 
 
 def test_reset_all_releases_versions():

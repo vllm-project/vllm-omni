@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -17,6 +18,7 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan impor
     Inflight,
     Ordering,
     build_cell_plan,
+    build_same_step_bootstrap,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
@@ -75,6 +77,12 @@ class _SinkAdapter(CellAdapter):
         self.fixed_shape = fixed_shape
         self.clean_calls = 0
         self.completed: dict[int, torch.Tensor] = {}
+        self.finished = {"A": self.completed}
+        self.clean_latent: torch.Tensor | None = None
+
+    def seed_clean_sink(self, req, latent):
+        assert req == "A" and self.clean_latent is None
+        self.clean_latent = latent
 
     def compatibility_key(self, cell):
         return cell
@@ -94,6 +102,10 @@ class _SinkAdapter(CellAdapter):
         chunk, step, block = cell
         self.clean_calls += int(step == self.steps)
         payload = member_inputs[0] if member_inputs else None
+        if (chunk, step, block) == (0, self.steps, 0) and self.clean_latent is not None:
+            assert payload is None
+            payload = {"latent": self.clean_latent}
+            self.clean_latent = None
         if block == 0:
             if step > 0:
                 assert payload is not None, "step input must come from the executor or transport"
@@ -107,7 +119,8 @@ class _SinkAdapter(CellAdapter):
         table = context.block_table[0, :n].long()
         past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=self.device)
         slot = context.video_slots.long()
-        context.key_pool[slot] = value.reshape(1, 1, 1)
+        key = value - 3 if context.write_raw_sink_key else value
+        context.key_pool[slot] = key.reshape(1, 1, 1)
         context.value_pool[slot] = value.reshape(1, 1, 1)
         result = value + past * 0.01 + 0.1 * (block + 1)
         torch.testing.assert_close(result, torch.tensor([self.outputs[cell]], device=self.device), rtol=1e-5, atol=1e-5)
@@ -267,6 +280,7 @@ def _sink_pipeline_worker(
     history: int = 1,
     fixed_shape: bool = False,
     device_kind: str = "cpu",
+    standalone: bool = False,
 ) -> None:
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel import noisy_pp_executor as cell_executor
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
@@ -306,6 +320,7 @@ def _sink_pipeline_worker(
             block_size=1,
             max_chunk_tokens=1,
             max_history_chunks=max(1, history),
+            materialize_sink_key=standalone,
         )
         cache = NoisyKVCache(
             spec,
@@ -350,8 +365,19 @@ def _sink_pipeline_worker(
         ctx = ARDiffusionCellContext(
             spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
         )
-        ctx.enqueue("A", plan, chunk_tokens=1)
-        run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
+        if standalone:
+            from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+
+            state.set_sink_key_transform("A", lambda key: key + 3)
+
+            bootstrap = build_same_step_bootstrap(schedule)
+            assert bootstrap is not None
+            ctx.enqueue("A", bootstrap.head, chunk_tokens=1)
+            pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+            pipeline._run_admitted_cells(ctx, {"A": adapter}, {"A": bootstrap})
+        else:
+            ctx.enqueue("A", plan, chunk_tokens=1)
+            run_cell_pipeline(ctx=ctx, members={"A": adapter})
         assert state.resident_versions == 0
         assert bool(fixed_recorder.calls) == fixed_shape
         expected_clean = sum(
@@ -371,6 +397,8 @@ def _sink_pipeline_worker(
             assert len(adapter.completed) == chunks
             for chunk, value in adapter.completed.items():
                 torch.testing.assert_close(value, torch.tensor([latent[chunk]], device=device), rtol=1e-5, atol=1e-5)
+        if standalone:
+            _check_physis_sink_distribution(rank, pp)
         pp.destroy()
         torch.distributed.destroy_process_group()
     finally:
@@ -400,3 +428,84 @@ def test_same_step_fixed_shape_activation_pipeline_matches_serial(steps, groups,
         nprocs=steps * groups,
         join=True,
     )
+
+
+def test_standalone_same_step_sinks_across_layer_groups():
+    torch.multiprocessing.spawn(
+        _sink_pipeline_worker,
+        args=(2, 2, 4, f"tcp://127.0.0.1:{get_open_port()}", 1, True, "cpu", True),
+        nprocs=4,
+        join=True,
+    )
+
+
+class _PhysisSinkTransformer:
+    def __init__(self, group: int):
+        self.start_layer = 2 * group
+        self.end_layer = self.start_layer + 2
+        self.capture_sink: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None
+        self.seen: list[int] = []
+
+    @staticmethod
+    def embed(latent):
+        return latent
+
+    @staticmethod
+    def seq_len_for_latent(shape):
+        return shape[2]
+
+    def block(self, index, hidden, **kwargs):
+        self.seen.append(index)
+        key = hidden.flatten().view(3, 1, 1)
+        assert self.capture_sink is not None
+        self.capture_sink(index, key, -key)
+        return hidden + 1
+
+
+def _check_physis_sink_distribution(rank, pp):
+    from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanPipeline
+
+    world, groups = 4, 2
+    pipeline = PhysisWanPipeline.__new__(PhysisWanPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pp_rank, pipeline.step_replicas, pipeline.layer_groups = rank, world // groups, groups
+    group = rank % groups
+    pipeline.transformer = _PhysisSinkTransformer(group)
+    spec = ARDiffusionNoisyKVSpec(2, 1, 1, 1, 1, 2, max_external_sink_tokens=3)
+    cache = NoisyKVCache(
+        spec,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=groups,
+        max_batch_size=1,
+        step_replicas=2,
+        layer_offset=2 * group,
+    )
+    state = NoisyKVState(cache)
+    latent = torch.arange(3, dtype=torch.float32).reshape(1, 1, 3, 1, 1)
+    pipeline._prepare_clean_sink("A", latent, pp=pp, kv=state)
+    assert pipeline.transformer.seen == (list(range(2 * group, 2 * group + 2)) if rank >= groups else [])
+    assert pipeline.transformer.capture_sink is None
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=1,
+            num_denoise_steps=2,
+            step_replicas=2,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=1,
+            blocks=4,
+            same_step_external_sink=True,
+        )
+    )
+    state.bind_rank(rank, pp)
+    state.begin_request("A", plan, chunk_tokens=1)
+    for block in range(2 * group, 2 * group + 2):
+        task = (0, rank // groups, block)
+        view = state.prepare((("A", task),))[0][0]
+        assert view.external_sink is not None
+        key, value = view.external_sink
+        expected = latent.reshape(3, 1, 1) + block
+        torch.testing.assert_close(key, expected)
+        torch.testing.assert_close(value, -expected)
+    state.finish_request("A")
