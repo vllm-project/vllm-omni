@@ -2097,6 +2097,7 @@ class Cosmos3OmniDiffusersPipeline(
             sp=sp,
             clean_action=inputs.action_tensor,
             condition_indexes=inputs.action_condition_indexes,
+            latents=sp.action_latents,
         )
         action_offset = int(inputs.action_start_frame_offset)
 
@@ -2108,6 +2109,7 @@ class Cosmos3OmniDiffusersPipeline(
             num_frames,
             generator,
             image_size=inputs.image_size,
+            latents=sp.latents,
         )
         image_latent = condition_latents[:, :, 0:1]
 
@@ -2507,12 +2509,96 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Latent preparation --------------------------------------------------
 
+    def _initial_noise(
+        self,
+        shape: tuple[int, ...],
+        generator: torch.Generator,
+        latents: torch.Tensor | None = None,
+        *,
+        name: str = "video",
+    ) -> torch.Tensor:
+        """Return initial noise for one stream, drawn from ``generator`` or supplied by the request.
+
+        ``latents`` is the caller-supplied noise for the stream ``name`` (see
+        ``_check_request_noise``), in the normalized latent space and
+        shaped like ``shape`` (the batch dimension may be omitted). It replaces
+        the random draw only; conditioning is still written over it by the
+        caller. This makes a request reproducible across implementations whose
+        random number generators differ, which a shared seed cannot do.
+        """
+        if latents is None:
+            return randn_tensor(shape, generator=generator, device=self.device, dtype=self.sampling_dtype)
+        if not isinstance(latents, torch.Tensor):
+            raise ValueError(f"Cosmos3 initial {name} noise must be a torch.Tensor, got {type(latents).__name__}.")
+        if latents.ndim == len(shape) - 1:
+            latents = latents.unsqueeze(0)
+        if tuple(latents.shape) != tuple(shape):
+            raise ValueError(
+                f"Cosmos3 initial {name} noise shape mismatch: "
+                f"got {tuple(latents.shape)}, expected {tuple(shape)} for this request."
+            )
+        # Copy: latent preparation writes conditioning in place.
+        return latents.to(device=self.device, dtype=self.sampling_dtype, copy=True)
+
+    @staticmethod
+    def _check_request_noise(
+        sp: OmniDiffusionSamplingParams,
+        *,
+        sound_enabled: bool,
+        action_enabled: bool,
+    ) -> None:
+        """Reject caller-supplied initial noise for a stream this request does not generate.
+
+        A request draws one noise tensor per generated stream, and each can be
+        supplied in its own field: ``sampling_params.latents`` (video),
+        ``sampling_params.audio_latents`` (sound) and
+        ``sampling_params.action_latents`` (action). A stream whose field is
+        unset is drawn from the request generator.
+        """
+        if sp.audio_latents is not None and not sound_enabled:
+            raise ValueError(
+                "Cosmos3 sampling_params.audio_latents was supplied, but this request does not generate sound."
+            )
+        if sp.action_latents is not None and not action_enabled:
+            raise ValueError(
+                "Cosmos3 sampling_params.action_latents was supplied, but this request does not generate actions."
+            )
+
+    @staticmethod
+    def _per_draw_request_latents(
+        latents: torch.Tensor | None,
+        num_draws: int,
+        what: str,
+    ) -> list[torch.Tensor | None]:
+        """Split caller-supplied video noise for a request that draws it ``num_draws`` times.
+
+        Transfer draws one video noise tensor per chunk and text-to-image with
+        ``num_outputs_per_prompt > 1`` one per image, each ``[1, C, T_lat,
+        H_lat, W_lat]``. The caller stacks them along the first dimension, in
+        draw order: ``sampling_params.latents`` is ``[num_draws, C, T_lat,
+        H_lat, W_lat]``. Returns one ``[1, ...]`` slice per draw, or ``None``
+        per draw when nothing was supplied.
+        """
+        if latents is None:
+            return [None] * num_draws
+        if not isinstance(latents, torch.Tensor):
+            raise ValueError(f"Cosmos3 initial video noise must be a torch.Tensor, got {type(latents).__name__}.")
+        if num_draws == 1 and latents.ndim == 4:
+            latents = latents.unsqueeze(0)
+        if latents.ndim != 5 or latents.shape[0] != num_draws:
+            raise ValueError(
+                f"Cosmos3 sampling_params.latents must have shape [{num_draws}, C, T_lat, H_lat, W_lat] "
+                f"for this request ({what}), got {tuple(latents.shape)}."
+            )
+        return [latents[index : index + 1] for index in range(num_draws)]
+
     def _prepare_latents(
         self,
         height: int,
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_channels_latents = self.transformer.latent_channel_size
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
@@ -2523,7 +2609,7 @@ class Cosmos3OmniDiffusersPipeline(
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
-        return randn_tensor(shape, generator=generator, device=self.device, dtype=self.sampling_dtype)
+        return self._initial_noise(shape, generator, latents)
 
     def _prepare_sound_latents(
         self,
@@ -2532,6 +2618,7 @@ class Cosmos3OmniDiffusersPipeline(
         *,
         sp_video_shape: tuple[int, int, int] | None = None,
         sp_num_vision_items: int = 1,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         sound_tokenizer = self._get_sound_tokenizer()
         hop_size = int(
@@ -2551,12 +2638,7 @@ class Cosmos3OmniDiffusersPipeline(
                 "Cosmos3 sound tokenizer latent channels do not match transformer "
                 f"sound_dim: tokenizer={sound_dim}, transformer={transformer_sound_dim}."
             )
-        latents = randn_tensor(
-            (1, sound_dim, latent_frames),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        latents = self._initial_noise((1, sound_dim, latent_frames), generator, latents, name="sound")
         return latents, latent_frames
 
     def _resolve_sound_target_samples(
@@ -2840,6 +2922,7 @@ class Cosmos3OmniDiffusersPipeline(
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare initial latents with frame 0 conditioned on the input image.
 
@@ -2853,12 +2936,7 @@ class Cosmos3OmniDiffusersPipeline(
         H_lat = height // self.vae_scale_factor_spatial
         W_lat = width // self.vae_scale_factor_spatial
 
-        noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_noise((1, C, T_lat, H_lat, W_lat), generator, latents)
 
         image_latent = self._encode_conditioning_image_latent(image_tensor)
         latents = noise
@@ -2876,6 +2954,7 @@ class Cosmos3OmniDiffusersPipeline(
         num_frames: int,
         generator: torch.Generator,
         condition_frame_indexes_vision: Iterable[int] | int | str | None = None,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare V2V latents with explicit clean conditioned latent frames."""
         del height, width
@@ -2898,12 +2977,7 @@ class Cosmos3OmniDiffusersPipeline(
                 f"indexes={indexes}, latent_frames={T_lat}."
             )
 
-        noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_noise((1, C, T_lat, H_lat, W_lat), generator, latents)
         condition_pixel_frames = condition_pixel_frame_count(indexes, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :condition_pixel_frames]
         if condition_video.shape[2] < condition_pixel_frames:
@@ -2941,6 +3015,7 @@ class Cosmos3OmniDiffusersPipeline(
         num_frames: int,
         generator: torch.Generator,
         image_size: Any | None = None,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare video latents for action modes with mode-specific conditioning.
 
@@ -2966,12 +3041,7 @@ class Cosmos3OmniDiffusersPipeline(
         else:
             H_lat, W_lat = latent_hw
 
-        noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_noise((1, C, T_lat, H_lat, W_lat), generator, latents)
         condition_indexes = vision_condition_indexes(mode, num_frames, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :1] if condition_indexes == [0] else video_tensor
         cond_prefix_latent = self._encode_video_tensor(condition_video, image_size=image_size)
@@ -3011,6 +3081,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp,
         clean_action: torch.Tensor | None = None,
         condition_indexes: list[int] | None = None,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         action_dim = int(getattr(self.transformer, "action_dim", 64))
         if clean_action is not None:
@@ -3063,12 +3134,7 @@ class Cosmos3OmniDiffusersPipeline(
                 device=self.device,
                 dtype=self.sampling_dtype,
             )
-        noise = randn_tensor(
-            (1, action_chunk_size, action_dim),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_noise((1, action_chunk_size, action_dim), generator, latents, name="action")
         noise[:, :, raw_action_dim:] = 0
         clean_action[:, :, raw_action_dim:] = 0
         action_latents = condition_mask * clean_action + (1.0 - condition_mask) * noise
@@ -3549,14 +3615,10 @@ class Cosmos3OmniDiffusersPipeline(
         target_video: torch.Tensor,
         current_conditional_frames: int,
         generator: torch.Generator,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         condition_latents = self._encode_video_tensor(target_video)
-        noise = randn_tensor(
-            condition_latents.shape,
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_noise(tuple(condition_latents.shape), generator, latents)
         condition_mask = torch.zeros(
             1,
             1,
@@ -4037,6 +4099,9 @@ class Cosmos3OmniDiffusersPipeline(
             aspect_ratio_override=transfer_aspect_ratio,
         )
 
+        # Caller-supplied initial noise: one tensor per chunk, stacked in chunk order.
+        chunk_noise = self._per_draw_request_latents(sp.latents, num_chunks, f"transfer in {num_chunks} chunk(s)")
+
         output_chunks: list[torch.Tensor] = []
         control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
         previous_output: torch.Tensor | None = None
@@ -4104,6 +4169,7 @@ class Cosmos3OmniDiffusersPipeline(
                 target_norm,
                 current_conditional_frames,
                 generator,
+                latents=chunk_noise[chunk_id],
             )
             video_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
             shared_kwargs = dict(
@@ -4206,6 +4272,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp = req.sampling_params
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
+            self._check_request_noise(sp, sound_enabled=False, action_enabled=True)
             return self._forward_robolab_policy(
                 sp,
                 robolab_inputs,
@@ -4284,6 +4351,7 @@ class Cosmos3OmniDiffusersPipeline(
                 raise ValueError("Cosmos3 transfer inference accepts video inputs or control_path values, not images.")
             if transfer_video_tensor is None and video_tensor is not None:
                 transfer_video_tensor = video_tensor
+            self._check_request_noise(sp, sound_enabled=False, action_enabled=False)
             return self._forward_transfer(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -4418,6 +4486,17 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
+        # Caller-supplied initial noise, one tensor per generated stream
+        # (video, sound, action). Several images per prompt draw the video
+        # noise once per image; the caller stacks those along the first dim.
+        self._check_request_noise(sp, sound_enabled=sound_enabled, action_enabled=action_enabled)
+        if is_t2i and batch_size > 1:
+            image_noise = self._per_draw_request_latents(sp.latents, batch_size, f"num_outputs_per_prompt={batch_size}")
+            request_latents = image_noise[0]
+        else:
+            image_noise = [sp.latents]
+            request_latents = sp.latents
+
         # --- Format prompts & tokenize (B=1; shared by every T2I output when
         # num_outputs_per_prompt > 1) ---
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
@@ -4479,6 +4558,7 @@ class Cosmos3OmniDiffusersPipeline(
                 sp=sp,
                 clean_action=clean_action,
                 condition_indexes=action_condition_indexes,
+                latents=sp.action_latents,
             )
             action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = action_prepared
             action_offset = action_start_frame_offset(action_mode, action_chunk_size, num_frames)
@@ -4491,6 +4571,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
+                latents=request_latents,
             )
             image_latent = condition_latents[:, :, 0:1]
         elif is_v2v:
@@ -4508,6 +4589,7 @@ class Cosmos3OmniDiffusersPipeline(
                 num_frames,
                 generator,
                 condition_frame_indexes_vision,
+                latents=request_latents,
             )
             image_latent = None
         elif image_tensor is not None and not is_t2i:
@@ -4517,10 +4599,11 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
+                latents=request_latents,
             )
             condition_latents = None
         else:
-            latents = self._prepare_latents(height, width, num_frames, generator)
+            latents = self._prepare_latents(height, width, num_frames, generator, latents=request_latents)
             velocity_mask = None
             image_latent = None
             condition_latents = None
@@ -4539,6 +4622,7 @@ class Cosmos3OmniDiffusersPipeline(
                 target_audio_samples,
                 generator,
                 sp_video_shape=video_shape,
+                latents=sp.audio_latents,
             )
 
         # --- Denoising loop ---
@@ -4589,16 +4673,16 @@ class Cosmos3OmniDiffusersPipeline(
             # from the same generator, matching the serial loop's draws. The
             # transformer broadcasts the batch-1 UND text K/V to B=N.
             samples = [latents]
-            for _ in range(batch_size - 1):
-                samples.append(self._prepare_latents(height, width, num_frames, generator))
+            for index in range(1, batch_size):
+                samples.append(self._prepare_latents(height, width, num_frames, generator, latents=image_noise[index]))
             latents = _run_diffusion(torch.cat(samples, dim=0))
         elif is_t2i and batch_size > 1:
             # Serial fallback: re-run the full diffusion loop per output,
             # drawing each latent just before its loop so stochastic
             # schedulers keep the generator order.
             samples = [_run_diffusion(latents)]
-            for _ in range(batch_size - 1):
-                next_latents = self._prepare_latents(height, width, num_frames, generator)
+            for index in range(1, batch_size):
+                next_latents = self._prepare_latents(height, width, num_frames, generator, latents=image_noise[index])
                 samples.append(_run_diffusion(next_latents))
             latents = torch.cat(samples, dim=0)
         else:

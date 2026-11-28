@@ -370,6 +370,9 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "guidance_scale": None,
         "guidance_scale_provided": False,
         "generator": None,
+        "latents": None,
+        "audio_latents": None,
+        "action_latents": None,
         "seed": 123,
         "num_outputs_per_prompt": 1,
         "frame_rate": None,
@@ -1373,6 +1376,187 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
 
     torch.testing.assert_close(first, second)
     assert not torch.equal(first, different_seed)
+
+
+def _run_request_latents_video(pipeline, *, seed: int = 123, latents: Any = None, **sampling_overrides):
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    pipeline.scheduler = FlowUniPCMultistepScheduler(
+        shift=1.0,
+        use_dynamic_shifting=False,
+        prediction_type="flow_prediction",
+    )
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    params: dict[str, Any] = dict(
+        seed=seed,
+        latents=latents,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+        num_inference_steps=4,
+        num_frames=5,
+        height=16,
+        width=16,
+        extra_args={"flow_shift": 3.0},
+    )
+    params.update(sampling_overrides)
+    request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, make_sampling_params(**params))
+    return pipeline.forward(request).media.video.tensor
+
+
+def test_request_latents_replace_the_random_draw(make_cosmos3_pipeline) -> None:
+    """``sampling_params.latents`` is the initial noise: the seed stops mattering."""
+    from diffusers.utils.torch_utils import randn_tensor
+
+    pipeline = make_cosmos3_pipeline()
+    shape = (1, 2, 2, 2, 2)  # [1, C, (5 - 1) // 4 + 1, 16 // 8, 16 // 8]
+    noise = randn_tensor(shape, generator=torch.Generator().manual_seed(123), dtype=torch.float32)
+    supplied = noise.clone()
+
+    seeded = _run_request_latents_video(pipeline, seed=123)
+    from_latents = _run_request_latents_video(pipeline, seed=456, latents=supplied)
+    without_batch_dim = _run_request_latents_video(pipeline, seed=789, latents=supplied[0])
+    other_noise = _run_request_latents_video(pipeline, seed=123, latents=torch.zeros(shape))
+
+    # Supplying the noise the seed would have drawn reproduces the seeded run.
+    torch.testing.assert_close(from_latents, seeded)
+    torch.testing.assert_close(without_batch_dim, seeded)
+    assert not torch.equal(other_noise, seeded)
+    # The caller's tensor is not modified.
+    torch.testing.assert_close(supplied, noise)
+
+
+def test_request_latents_reject_wrong_shape(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+
+    with pytest.raises(ValueError, match="initial video noise shape mismatch"):
+        _run_request_latents_video(pipeline, latents=torch.zeros(1, 2, 3, 2, 2))
+
+
+def _capture_diffuse_inputs(pipeline) -> list[dict[str, Any]]:
+    """Stub everything around latent preparation and record what reaches the denoising loop."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_diffuse(**kwargs):
+        calls.append(kwargs)
+        outputs = [kwargs["latents"]]
+        if kwargs.get("action_latents") is not None:
+            outputs.append(kwargs["action_latents"])
+        if kwargs.get("sound_latents") is not None:
+            outputs.append(kwargs["sound_latents"])
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    pipeline.diffuse = fake_diffuse
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
+    pipeline._set_flow_shift = lambda target: setattr(pipeline, "_current_flow_shift", float(target))
+    pipeline._decode_latents = lambda latents: latents
+    return calls
+
+
+def _run_sound_request(pipeline, calls, **sampling_overrides):
+    pipeline.forward(
+        make_request_batch(
+            {"prompt": "A robot", "modalities": ["video"], "generate_sound": True},
+            make_sampling_params(num_frames=9, frame_rate=3.0, height=16, width=16, **sampling_overrides),
+        )
+    )
+    return calls[-1]
+
+
+def test_request_noise_for_sound_uses_audio_latents(make_cosmos3_pipeline) -> None:
+    """``sampling_params.audio_latents`` is the initial sound noise; video noise stays seeded."""
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_diffuse_inputs(pipeline)
+    pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
+    # The stub transformer has no sequence-parallel layout; keep the frame count as is.
+    pipeline.transformer.sound_latent_frames_for_sequence_parallel = lambda **kwargs: kwargs["sound_frames"]
+    pipeline._sound_tokenizer = SimpleNamespace(sample_rate=10, latent_ch=3, hop_size=4)
+    pipeline._resolve_sound_target_samples = lambda *args: (20, 2.0, 10)
+    pipeline._decode_sound_latents = lambda *args: torch.ones(1, 2, 20)
+
+    seeded = _run_sound_request(pipeline, calls, seed=123)
+    sound_noise = seeded["sound_latents"].clone()
+    assert tuple(sound_noise.shape) == (1, 3, 5)
+
+    # Same sound noise under another seed: sound is reproduced, video is not.
+    supplied = _run_sound_request(pipeline, calls, seed=456, audio_latents=sound_noise)
+    torch.testing.assert_close(supplied["sound_latents"], sound_noise)
+    assert not torch.equal(supplied["latents"], seeded["latents"])
+
+    # Video and sound noise together reproduce the seeded request exactly.
+    both = _run_sound_request(
+        pipeline, calls, seed=789, latents=seeded["latents"].clone(), audio_latents=sound_noise[0]
+    )
+    torch.testing.assert_close(both["latents"], seeded["latents"])
+    torch.testing.assert_close(both["sound_latents"], sound_noise)
+
+    with pytest.raises(ValueError, match="initial sound noise shape mismatch"):
+        _run_sound_request(pipeline, calls, audio_latents=torch.zeros(1, 3, 7))
+
+
+def test_request_noise_for_action_uses_action_latents(make_cosmos3_pipeline) -> None:
+    """``sampling_params.action_latents`` is the initial action noise."""
+    from diffusers.utils.torch_utils import randn_tensor
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_diffuse_inputs(pipeline)
+    pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
+    pipeline._prepare_latents_i2v = lambda *args, **kwargs: (
+        torch.zeros(1, 2, 1, 1, 1),
+        torch.ones(1, 1, 1, 1, 1),
+        torch.zeros(1, 2, 1, 1, 1),
+    )
+
+    def run(seed: int, action_latents: torch.Tensor | None = None):
+        pipeline.forward(
+            make_request_batch(
+                {
+                    "prompt": "Pick the block.",
+                    "modalities": ["video"],
+                    "additional_information": {"preprocessed_image": torch.zeros(1, 3, 16, 16)},
+                },
+                make_sampling_params(
+                    seed=seed,
+                    height=16,
+                    width=16,
+                    action_latents=action_latents,
+                    extra_args={
+                        "action_mode": "policy",
+                        "action_chunk_size": 2,
+                        "raw_action_dim": 2,
+                        "domain_name": "bridge_orig_lerobot",
+                    },
+                ),
+            )
+        )
+        return calls[-1]["action_latents"]
+
+    seeded = run(123)
+    # The action noise is the first draw of the request generator.
+    noise = randn_tensor((1, 2, 4), generator=torch.Generator().manual_seed(123), dtype=torch.float32)
+    supplied_noise = noise.clone()
+    supplied = run(456, action_latents=supplied_noise)
+
+    torch.testing.assert_close(supplied, seeded)
+    assert not torch.equal(run(456), seeded)
+    # Dimensions beyond raw_action_dim are zeroed as for drawn noise; the caller's tensor is untouched.
+    assert torch.count_nonzero(supplied[:, :, 2:]) == 0
+    torch.testing.assert_close(supplied_noise, noise)
+
+    with pytest.raises(ValueError, match="initial action noise shape mismatch"):
+        run(123, action_latents=torch.zeros(1, 3, 4))
+
+
+def test_request_noise_rejects_streams_the_request_does_not_generate(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+
+    with pytest.raises(ValueError, match="audio_latents was supplied, but this request does not generate sound"):
+        _run_request_latents_video(pipeline, audio_latents=torch.zeros(1, 3, 5))
+    with pytest.raises(ValueError, match="action_latents was supplied, but this request does not generate actions"):
+        _run_request_latents_video(pipeline, action_latents=torch.zeros(1, 2, 4))
+    with pytest.raises(ValueError, match="initial video noise must be a torch.Tensor"):
+        _run_request_latents_video(pipeline, latents=[[0.0]])
 
 
 def test_distilled_set_timesteps_uses_fixed_sigma_schedule(make_cosmos3_pipeline) -> None:
@@ -3351,7 +3535,7 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
             max(1, video.shape[-1] // pipeline.vae_scale_factor_spatial),
         )
 
-    def fake_prepare(target_norm, current_conditional_frames, generator):
+    def fake_prepare(target_norm, current_conditional_frames, generator, latents=None):
         del current_conditional_frames, generator
         latent = fake_encode(target_norm)
         velocity_mask = torch.ones(1, 1, latent.shape[2], 1, 1)
@@ -3439,10 +3623,12 @@ def test_forward_transfer_runs_multichunk_overlap_path(
 
     original_prepare = pipeline._prepare_transfer_latents
 
-    def recording_prepare(target_norm, current_conditional_frames, generator):
+    def recording_prepare(target_norm, current_conditional_frames, generator, latents=None):
         captured["targets"].append(target_norm.detach().clone())
         captured["conditional_frames"].append(current_conditional_frames)
-        return original_prepare(target_norm, current_conditional_frames, generator)
+        prepared = original_prepare(target_norm, current_conditional_frames, generator, latents=latents)
+        captured.setdefault("prepared", []).append(tuple(item.detach().clone() for item in prepared))
+        return prepared
 
     pipeline._prepare_transfer_latents = recording_prepare
 
@@ -3492,6 +3678,26 @@ def test_forward_transfer_runs_multichunk_overlap_path(
 
     assert captured["conditional_frames"] == [2, 1]
     assert len(captured["decode_calls"]) == 2
+
+    # Caller-supplied noise: one tensor per chunk, stacked in chunk order.
+    chunk_shape = captured["prepared"][0][0].shape  # [1, C, T_lat, H_lat, W_lat]
+    noise = torch.randn((2, *chunk_shape[1:]), generator=torch.Generator().manual_seed(7))
+    prepared_by_seed = []
+    for seed in (1, 2):
+        captured["prepared"].clear()
+        captured["decode_calls"].clear()
+        request.sampling_params.seed = seed
+        request.sampling_params.latents = noise
+        pipeline.forward(request)
+        prepared_by_seed.append([chunk[0] for chunk in captured["prepared"]])
+    for chunk_id in range(2):
+        # The seed no longer matters, and frames that are not conditioned hold the supplied noise.
+        torch.testing.assert_close(prepared_by_seed[0][chunk_id], prepared_by_seed[1][chunk_id])
+        torch.testing.assert_close(prepared_by_seed[0][chunk_id][:, :, -1], noise[chunk_id : chunk_id + 1, :, -1])
+    request.sampling_params.latents = noise[:1]
+    with pytest.raises(ValueError, match=r"must have shape \[2, C, T_lat, H_lat, W_lat\]"):
+        pipeline.forward(request)
+    request.sampling_params.latents = None
     assert output.output["payload"]["video"].shape == (1, 3, 8, 16, 16)
     torch.testing.assert_close(
         output.output["payload"]["video"][0, 0, :, 0, 0],
@@ -3601,7 +3807,8 @@ class TestForwardRouting:
             }
             return _ids(2), _mask(), _ids(1), _mask()
 
-        def fake_prepare(height, width, num_frames, generator):
+        def fake_prepare(height, width, num_frames, generator, latents=None):
+            assert latents is None
             captured["prepare_calls"].append((height, width, num_frames, generator.initial_seed()))
             return torch.zeros(1, 2, 1, 1, 1)
 
@@ -3682,9 +3889,9 @@ class TestForwardRouting:
         events: list[Any] = []
         real_prepare = type(pipeline)._prepare_latents.__get__(pipeline)
 
-        def prepare(height, width, num_frames, generator):
+        def prepare(height, width, num_frames, generator, latents=None):
             events.append("prepare")
-            return real_prepare(height, width, num_frames, generator)
+            return real_prepare(height, width, num_frames, generator, latents=latents)
 
         def diffuse(**kwargs):
             latents = kwargs["latents"]
@@ -3759,6 +3966,36 @@ class TestForwardRouting:
         torch.testing.assert_close(
             image, expected + torch.arange(3, dtype=expected.dtype).view(-1, 1, 1, 1, 1), atol=0, rtol=0
         )
+
+    @pytest.mark.parametrize(
+        "additional_config",
+        [
+            pytest.param({}, id="batched"),
+            pytest.param({"cosmos3_batch_t2i_outputs": False}, id="serial"),
+        ],
+    )
+    def test_t2i_outputs_use_request_noise_per_image(self, make_cosmos3_pipeline, additional_config) -> None:
+        pipeline = make_cosmos3_pipeline()
+        pipeline.od_config = self._t2i_od_config(additional_config=additional_config)
+        self._install_forward_stubs(pipeline)
+        events = self._record_t2i_events(pipeline)
+        # One noise tensor per image, stacked in draw order; the seed is a different one.
+        noise = torch.cat(self._serial_t2i_draws(3, seed=123), dim=0)
+
+        def run(latents):
+            events.clear()
+            pipeline.forward(
+                make_request_batch(
+                    {"prompt": "A painted robot", "modalities": ["image"]},
+                    make_sampling_params(height=16, width=16, num_outputs_per_prompt=3, seed=999, latents=latents),
+                )
+            )
+            return torch.cat([event[1] for event in events if not isinstance(event, str)], dim=0)
+
+        assert torch.equal(run(noise), noise)
+        assert not torch.equal(run(None), noise)
+        with pytest.raises(ValueError, match=r"must have shape \[3, C, T_lat, H_lat, W_lat\]"):
+            run(noise[:2])
 
     @pytest.mark.parametrize(
         ("fallback", "od_config_kwargs"),
@@ -3999,7 +4236,8 @@ class TestForwardRouting:
         assert pipeline.scheduler.set_timesteps_calls == []
         assert captured["prepare_action"]["clean_action"] is inputs.action_tensor
         assert captured["prepare_action"]["condition_indexes"] == [0]
-        assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
+        assert captured["prepare_action_video"]["kwargs"] == {"image_size": None, "latents": None}
+        assert captured["prepare_action"]["latents"] is None
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
         assert output.output["payload"]["actions"].shape == (1, 2, 2)
@@ -4011,6 +4249,17 @@ class TestForwardRouting:
         assert output.output["metadata"]["common"]["action_only_output"] is True
         assert "robolab_action_postprocess" in output.output["metadata"]["internal"]
         assert "robolab_policy_inputs" not in output.output["metadata"]
+
+        # Caller-supplied initial noise reaches both latent preparations.
+        video_noise = torch.ones(1, 2, 1, 1, 1)
+        action_noise = torch.ones(1, 2, 4)
+        pipeline.forward(
+            make_request_batch("ignored", make_sampling_params(latents=video_noise, action_latents=action_noise))
+        )
+        assert captured["prepare_action_video"]["kwargs"]["latents"] is video_noise
+        assert captured["prepare_action"]["latents"] is action_noise
+        with pytest.raises(ValueError, match="audio_latents was supplied, but this request does not generate sound"):
+            pipeline.forward(make_request_batch("ignored", make_sampling_params(audio_latents=torch.zeros(1, 3, 4))))
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),
