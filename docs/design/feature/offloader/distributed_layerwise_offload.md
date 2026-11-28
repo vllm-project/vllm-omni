@@ -211,6 +211,25 @@ topologies and platforms receive the same bounded policy but are not claimed
 performance targets; other DLO models remain unchanged unless they explicitly
 adopt it.
 
+### Manual MiniMax-H3 component cache reuse
+
+Set `component_cache_reuse: true` in `--additional-config` to skip the
+unconditional idle allocator-cache purge on MiniMax-H3's manual offload paths
+for the text encoder, Video VAE encode/decode and Audio VAE decode. The value
+must be a JSON boolean and defaults to `false`. This option does not enable
+manual offload or change tensor placement, synchronization or model math.
+
+An explicitly installed `BoundedAllocatorCache` remains authoritative even when
+reuse is requested: its cache and physical-free-memory bounds and conservative
+telemetry fallback still run. Staging failure, allocation retry, forced stage
+release, and executor shutdown retain their existing cleanup behavior.
+
+Without a bounded owner, reuse can retain more reserved device memory between
+components and requests. The fixed-latent benchmark measures unbounded, staged
+Video+Audio decode on Ascend nightly; it excludes text encoding, denoising,
+MP4 encoding and HTTP. Older Ascend 0.26 results are historical and do not
+validate this configuration or the current main branch.
+
 ### Final-layout Host Weight Runtime consumer
 
 > **Status:** PR2 landed in

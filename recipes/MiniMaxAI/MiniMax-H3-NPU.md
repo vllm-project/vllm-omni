@@ -230,6 +230,23 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
+#### Reuse idle component allocator cache
+
+Append the option to the MiniMax-H3 serve command when using ordinary manual
+component offload. If an `--additional-config` object is already supplied, add
+the key to that object:
+
+```bash
+--additional-config '{"component_cache_reuse":true}'
+```
+
+The default is `false`. Enabling the option can skip the unconditional purge
+of idle allocator blocks after text encoder, Video VAE encode/decode, or Audio
+VAE decode offload. It does not enable offload or keep component weights on the
+device. An explicit bounded cache, including the existing DLO policy, keeps its
+original thresholds; forced cleanup also remains unchanged. Enable reuse only
+where retaining more reserved device memory between components is acceptable.
+
 #### Cache-DiT
 
 Append to enable DiT block caching with TaylorSeer extrapolation — see the
@@ -692,3 +709,23 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Component cache reuse benchmark
+
+In an Ascend environment with the candidate checkout installed, run the
+following using a Ref2VA partition and a fixed `(video_latent, audio_latent)`
+PyTorch input file:
+
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  benchmarks/diffusion/minimax_h3_vae_lifecycle.py --arm aba \
+  --model "$MODEL" --inputs "$LATENTS" --output-dir lifecycle-results \
+  --warmups 3 --formals 5 --precision
+```
+
+The three arms use new component instances with reuse off, on, then off.
+The benchmark reports load/decode/offload latency, purge counts, and allocated,
+reserved and free device memory per rank. `--precision` saves full pre-codec
+video, RGB and audio from each arm outside the timed requests. The benchmark
+excludes text encoding, denoising, MP4 encoding and HTTP. It does not measure
+bounded-owner DLO or establish a serving speedup.

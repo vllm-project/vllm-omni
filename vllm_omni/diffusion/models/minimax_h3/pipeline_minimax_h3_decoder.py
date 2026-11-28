@@ -18,6 +18,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_partition
 
+from .component_cache_policy import resolve_component_cache_reuse
 from .latent_cache import trim_decoded_overlap
 from .lightvae import resolve_h3_lightvae_decoder_path
 from .pipeline_minimax_h3 import (
@@ -77,6 +78,7 @@ class MiniMaxH3DecoderPipeline(
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.device = get_local_device()
+        component_cache_reuse = resolve_component_cache_reuse(od_config.additional_config)
         model_path = Path(
             resolve_minimax_h3_decoder_model_path(str(od_config.model), od_config.revision, od_config.task_type)
         )
@@ -85,6 +87,7 @@ class MiniMaxH3DecoderPipeline(
             device=self.device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
+            component_cache_reuse=component_cache_reuse,
             lightvae_decoder_path=resolve_h3_lightvae_decoder_path(od_config.additional_config),
             stack_decode_tiles=od_config.vae_stack_tiles,
         )
@@ -93,6 +96,7 @@ class MiniMaxH3DecoderPipeline(
             device=self.device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
+            component_cache_reuse=component_cache_reuse,
         )
         self.vae = self.video_vae
         self.weights_sources = []
