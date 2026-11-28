@@ -54,6 +54,12 @@ prompt positions: the input embeddings and the hidden states of
 | `OmniMooncakeStoreConnector`, worker role | Worker | HS reads and writes, staging budget, restored rows, receive completion |
 | `vllm_omni/worker_v2/mooncake_capture.py` | Worker | Step snapshots and the Thinker capture rewrite before output publication |
 
+With vLLM's extensible KV allocation, warmup runs before the native connector
+is activated. The local capture pool can be created earlier, but promotion is
+bound only after `GPUARWorker.extend_kv_cache()` commits the final KV views and
+activates the connector. Warmup requests do not access the inactive connector.
+Without extensible allocation, promotion is bound during KV initialization.
+
 ## Stored data and identity
 
 - **Namespace digest.** SHA-256 of the configured `namespace` and

@@ -172,7 +172,9 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         # Built now, not on the first step: the adapter's block ledger must
         # observe every request from its first scheduled step.
         self._ensure_omni_prefix_cache()
-        if mooncake:
+        # Extensible KV allocation activates the native connector only after
+        # warmup. GPUARWorker binds promotion after extend_kv_cache instead.
+        if mooncake and not self.cache_config.enable_extensible_kv_cache:
             from vllm_omni.worker_v2.mooncake_capture import bind_mooncake_prefix_cache
 
             bind_mooncake_prefix_cache(self)

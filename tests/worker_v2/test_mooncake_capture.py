@@ -14,6 +14,7 @@ import torch
 from numpy.typing import NDArray
 from vllm.config import DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR, ActiveKVConnector, KVConnector
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.mooncake_capture import (
@@ -32,7 +33,7 @@ def test_promotion_binding_flushes_decode_before_installing_capture_rows(monkeyp
     connector = CaptureConnector()
     monkeypatch.setattr(connector, "set_prefix_cache_promoter", promoters.append, raising=False)
     runner = SimpleNamespace(
-        kv_connector=SnapshotConnector(connector),
+        kv_connector=_active_connector(connector),
         omni_prefix_cache=SimpleNamespace(promote_blocks=lambda blocks, rows: calls.append((blocks, rows))),
         _prefix_cache_flush_decode=lambda: calls.append("flush"),
     )
@@ -205,9 +206,10 @@ class SnapshotRequestState:
     prompt_len: PromptLengthMirror
 
 
-@dataclass
-class SnapshotConnector:
-    kv_connector: CaptureConnector
+def _active_connector(connector: CaptureConnector) -> ActiveKVConnector:
+    active = ActiveKVConnector.__new__(ActiveKVConnector)
+    active.kv_connector = connector
+    return active
 
 
 @dataclass
@@ -215,7 +217,7 @@ class SnapshotRunner:
     """Only runner-owned fields read by snapshot_mooncake_output."""
 
     vllm_config: VllmConfig
-    kv_connector: SnapshotConnector
+    kv_connector: KVConnector
     req_states: SnapshotRequestState
 
 
@@ -230,7 +232,7 @@ def _runner_batch(connector: CaptureConnector) -> tuple[SnapshotRunner, InputBat
                 kv_load_failure_policy="recompute",
             ),
         ),
-        kv_connector=SnapshotConnector(connector),
+        kv_connector=_active_connector(connector),
         req_states=SnapshotRequestState(PromptLengthMirror(np.array([10, 6], dtype=np.int32))),
     )
     # The real upstream factory establishes the tensor/CPU-mirror shapes.
@@ -255,11 +257,14 @@ def test_snapshot_preserves_positions_after_batch_reuse():
     )
 
 
-def test_no_connector_or_warmup_is_a_noop():
+@pytest.mark.parametrize("connector_active", [False, True])
+def test_no_connector_or_warmup_is_a_noop(connector_active):
     runner, batch = _runner_batch(CaptureConnector())
     runner.vllm_config.kv_transfer_config = None
     assert snapshot_mooncake_output(runner, batch) is None
     runner, batch = _runner_batch(CaptureConnector())
+    if not connector_active:
+        runner.kv_connector = NO_OP_KV_CONNECTOR
     batch.req_ids = ["_warmup_0", "_v2_mixed_warmup_1"]
     assert snapshot_mooncake_output(runner, batch) is None
 

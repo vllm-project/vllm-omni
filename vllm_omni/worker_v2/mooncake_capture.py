@@ -134,6 +134,9 @@ def snapshot_mooncake_output(runner: OmniARModelRunner, input_batch: InputBatch)
     config = runner.vllm_config.kv_transfer_config
     if config is None or config.kv_connector != "OmniMooncakeStoreConnector":
         return None
+    # Extensible-KV warmup runs before the native connector is activated.
+    if all(is_warmup_request(req_id) for req_id in input_batch.req_ids[: input_batch.num_reqs]):
+        return None
     connector = cast("OmniMooncakeStoreConnector", runner.kv_connector.kv_connector)
     rows = []
     for row, req_id in enumerate(input_batch.req_ids[: input_batch.num_reqs]):
