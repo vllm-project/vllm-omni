@@ -321,6 +321,10 @@ class TTSModelAdapter(ABC):
     reports_length_truncation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Whether the model honors the request-level ``temperature`` on its first
+    #: autoregressive stage. Models with checkpoint-fixed sampling set ``False``
+    #: so the serving layer rejects the field instead of silently applying it.
+    supports_temperature: ClassVar[bool] = True
     supports_incremental_input: ClassVar[bool] = False
     #: None disables commitment. Opt-in adapters describe their complete
     #: commitment contract so the handler can validate every requested feature.

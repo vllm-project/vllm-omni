@@ -56,6 +56,8 @@ def speech_sampling_server(mocker):
         return PreparedRequest(prompt={"prompt": request.input}, model_type="higgs_audio_v3")
 
     adapter = SimpleNamespace(
+        name="higgs_audio_v3",
+        supports_temperature=True,
         normalize=lambda request: None,
         validate=lambda request: None,
         build=mocker.AsyncMock(side_effect=build),

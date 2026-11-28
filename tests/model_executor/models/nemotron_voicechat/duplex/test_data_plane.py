@@ -33,10 +33,18 @@ def _projector(encode_audio=lambda *_: None) -> NemotronVoiceChatDataPlaneSessio
     return projector
 
 
-def _stage0_output(request_id: str = "req-0", *, text_token: int = 12, function_token: int | None = None) -> object:
+def _stage0_output(
+    request_id: str = "req-0",
+    *,
+    text_token: int = 12,
+    function_token: int | None = None,
+    fast_path: bool | None = None,
+) -> SimpleNamespace:
     metadata: dict[str, object] = {"nvc_text_token_ids": [text_token]}
     if function_token is not None:
         metadata["nvc_function_token"] = [function_token]
+    if fast_path is not None:
+        metadata["nvc_function_fast_path"] = int(fast_path)
     completion = SimpleNamespace(multimodal_output=metadata)
     return SimpleNamespace(
         stage_id=0,
@@ -94,3 +102,58 @@ def test_new_epoch_request_does_not_inherit_partial_function_or_frame_state() ->
     )
     audio_events = list(projector.project_output(audio))
     assert sum(event.get("end_of_turn") is True for event in audio_events) == 1
+
+
+def test_delayed_tool_audio_counts_coverage_without_swallowing_speech_across_responses():
+    encoded = []
+
+    def encode(audio, *_):
+        encoded.append(np.asarray(audio).copy())
+        return "audio"
+
+    projector = _projector(encode)
+    projector._decode = lambda ids: '{"name":"lookup","arguments":{}}' if ids == [99] else "text"
+
+    def text(token, fast=False, function=None):
+        output = _stage0_output(text_token=token, function_token=function, fast_path=fast)
+        return list(projector.project_output(output))
+
+    def audio(values):
+        output = SimpleNamespace(
+            stage_id=2,
+            request_id="req-0",
+            outputs=[
+                SimpleNamespace(
+                    multimodal_output={
+                        "audio": np.repeat(np.asarray(values, dtype=np.float32), 1764),
+                        "sr": 22050,
+                    }
+                )
+            ],
+        )
+        return list(projector.project_output(output))
+
+    for _ in range(3):
+        text(42)
+        text(12, fast=True, function=20)
+        # Speech from before SOTC arrives while the call is active.
+        assert audio([1])[0]["audio_data"] == "audio"
+        text(12, fast=True, function=99)
+        calls = text(12, function=21)  # EOTC: the current fast flag is already clear.
+        assert sum(event.get("function_call") is True for event in calls) == 1
+        # Delayed tool audio is still filtered and accounts for both frames.
+        assert audio([2, 3]) == []
+        text(1)
+        events = audio([4, 5])
+        assert events[-1]["end_of_turn"] is True
+        assert encoded[-1].tolist() == [4] * 1764 + [5] * 1764
+        state = projector._requests["req-0"]
+        assert state.audio_frames == state.text_frames
+        assert state.pending_speech_end_frames == []
+        assert state.suppressed_audio_frames == set()
+    # A coalesced chunk spanning speech, a call and EOS filters only the call.
+    text(42)
+    text(12, fast=True)
+    text(1)
+    assert audio([6, 7, 8])[-1]["end_of_turn"] is True
+    assert encoded[-1].tolist() == [6] * 1764 + [8] * 1764

@@ -242,6 +242,90 @@ def test_playback_worklet_fades_terminal_drain_to_zero():
     )
 
 
+def test_aura_holds_playback_until_the_second_chunk() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the AudioWorklet regression test")
+    assert node is not None
+    aura = (STATIC_ROOT / "profiles" / "aura_ptt.js").read_text(encoding="utf-8")
+    app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    minicpm = (STATIC_ROOT / "profiles" / "minicpm_native.js").read_text(encoding="utf-8")
+    assert "holdPlaybackUntilSecondChunk: true" in aura
+    assert "holdPlaybackUntilSecondChunk" not in minicpm
+    assert "holdUntilSecondChunk: profile.holdPlaybackUntilSecondChunk === true" in app
+
+    script = textwrap.dedent(
+        """
+        const fs = require('fs');
+        const vm = require('vm');
+
+        global.sampleRate = 1000;
+        global.AudioWorkletProcessor = class {
+          constructor() {
+            this.port = { onmessage: null, postMessage: () => {} };
+          }
+        };
+        let Processor = null;
+        global.registerProcessor = (_name, processor) => { Processor = processor; };
+        vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+
+        const render = (processor) => {
+          const output = new Float32Array(100);
+          processor.process([], [[output]]);
+          return output;
+        };
+        const assert = (condition, message) => {
+          if (!condition) throw new Error(message);
+        };
+        const tone = (value) => {
+          const pcm = new Int16Array(200);
+          pcm.fill(value);
+          return pcm;
+        };
+
+        const held = new Processor();
+        held.handleMessage({
+          type: 'audio',
+          pcm: tone(16384),
+          responseId: 'held',
+          initialBufferMs: 400,
+          holdUntilSecondChunk: true,
+        });
+        for (let index = 0; index < 8; index += 1) {
+          assert(render(held).every((sample) => sample === 0), 'one open chunk must stay silent');
+        }
+        assert(!held.started, 'playback must not start before the second chunk');
+        held.handleMessage({
+          type: 'audio',
+          pcm: tone(8192),
+          responseId: 'held',
+          holdUntilSecondChunk: true,
+        });
+        assert(render(held).some((sample) => sample !== 0), 'the second chunk must start playback');
+
+        const finished = new Processor();
+        finished.handleMessage({
+          type: 'audio',
+          pcm: tone(16384),
+          responseId: 'finished',
+          initialBufferMs: 400,
+          holdUntilSecondChunk: true,
+        });
+        finished.handleMessage({ type: 'drain', responseId: 'finished' });
+        assert(
+          render(finished).some((sample) => sample !== 0),
+          'a finished single chunk must start immediately',
+        );
+        """
+    )
+    subprocess.run(
+        [node, "-e", script, str(STATIC_ROOT / "playback_worklet.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_aura_camera_preview_size_is_not_shared() -> None:
     aura = (STATIC_ROOT / "profiles" / "aura_ptt.js").read_text(encoding="utf-8")
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")

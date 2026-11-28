@@ -86,6 +86,18 @@ def test_serve_parser_accepts_nested_watermark_config() -> None:
     assert args.get_explicit_kwargs_dict()["watermark_config"] == args.watermark_config
 
 
+def test_serve_parser_ulysses_a2a_backend_choices_match_config() -> None:
+    """The CLI keeps its own copy of the backend names so the docs build need not import vllm."""
+    from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    serve_parser = OmniServeCommand().subparser_init(subparsers)
+    action = next(a for a in serve_parser._actions if "--ulysses-a2a-backend" in a.option_strings)
+
+    assert tuple(action.choices) == ULYSSES_A2A_BACKENDS
+
+
 def test_watermark_config_collision_uses_omni_validation(capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure an upstream watermark argument is extended without a duplicate flag."""
     parser = TrackingArgumentParser()
@@ -776,15 +788,14 @@ def test_serve_parser_rejects_negative_robot_openpi_idle_timeout() -> None:
         parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "-1"])
 
 
-def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+@pytest.mark.parametrize("flag", ["--ulysses-a2a-permute", "--no-ulysses-a2a-permute"])
+def test_serve_parser_rejects_removed_ulysses_a2a_permute(flag: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
-
-    assert args.ulysses_a2a_permute is True
-    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", flag])
 
 
 def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
@@ -793,7 +804,7 @@ def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--ulysses-a2a-permute", "--ulysses-overlap-chunks", "4"]
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-backend", "copy_engine", "--ulysses-overlap-chunks", "4"]
     )
 
     assert args.ulysses_overlap_chunks == 4
@@ -1257,6 +1268,18 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
     )
 
 
+_HEADLESS_DEPLOYMENT_ID = "test-deployment-id"
+
+
+def _patch_headless_deployment_id(mocker: MockerFixture, *, module: Any | None = None) -> None:
+    """Headless tests mock registration; also stub the deployment-id prefetch."""
+    target = module if module is not None else "vllm_omni.engine.stage_engine_startup.fetch_deployment_id"
+    if module is None:
+        mocker.patch(target, return_value=_HEADLESS_DEPLOYMENT_ID)
+    else:
+        mocker.patch.object(module, "fetch_deployment_id", return_value=_HEADLESS_DEPLOYMENT_ID)
+
+
 def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
@@ -1280,6 +1303,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1301,6 +1325,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
             output_address="tcp://127.0.0.1:26003",
             replica_id=0,
             coordinator_router_address="tcp://127.0.0.1:26100",
+            deployment_id=_HEADLESS_DEPLOYMENT_ID,
         ),
     )
     mock_manager_cls = mocker.patch(
@@ -1366,6 +1391,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1388,6 +1414,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(
                 output_address=f"tcp://127.0.0.1:2720{idx}",
                 replica_id=idx,
                 coordinator_router_address=None,
+                deployment_id=_HEADLESS_DEPLOYMENT_ID,
             )
             for idx in (0, 1)
         ],
@@ -1429,6 +1456,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1447,6 +1475,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
             output_address="tcp://127.0.0.1:26003",
             replica_id=0,
             coordinator_router_address="tcp://127.0.0.1:26100",
+            deployment_id=_HEADLESS_DEPLOYMENT_ID,
         ),
     )
     fake_manager = SimpleNamespace(
@@ -1504,6 +1533,7 @@ def test_run_headless_generic_diffusion_launches_structured_stage(mocker: Mocker
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch.object(startup_module.stage_init_utils, "load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker, module=startup_module)
     mocker.patch.object(
         startup_module.initialization,
         "resolve_omni_kv_config_for_stage",
@@ -1580,6 +1610,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1598,6 +1629,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
             output_address="tcp://127.0.0.1:26003",
             replica_id=0,
             coordinator_router_address=None,
+            deployment_id=_HEADLESS_DEPLOYMENT_ID,
         ),
     )
     mocker.patch(

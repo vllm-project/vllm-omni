@@ -1,0 +1,22 @@
+{# SPDX-License-Identifier: Apache-2.0
+   SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+   Match Step-Audio-2-mini-Base's plain concatenation format: no roles or turn
+   markers; each input audio keeps one <audio_patch> for the processor.
+   Reference: stepfun-ai/Step-Audio2, revision
+   76e272b56c3917a8d7188f18bbb5a65dfc8a0845, stepaudio2.py (StepAudio2Base).
+#}
+{%- for message in messages -%}
+    {%- if message.content is string -%}
+        {{- message.content -}}
+    {%- elif message.content is not none -%}
+        {%- for part in message.content -%}
+            {%- if part.type == 'text' -%}
+                {{- part.text -}}
+            {%- elif part.type in ['audio', 'audio_url', 'input_audio'] -%}
+                {{- '<audio_patch>' -}}
+            {%- else -%}
+                {{- raise_exception('Unsupported Step-Audio2 Base content type: ' + part.type) -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endfor -%}

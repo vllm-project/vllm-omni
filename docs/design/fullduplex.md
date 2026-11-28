@@ -121,6 +121,11 @@ reserve their history position before continued input, commit emitted text
 on completion or cancellation regardless of playback policy, and release
 playback bookkeeping without ACKs. Whitespace-only output creates no assistant
 history item or snapshot; meaningful emitted text is preserved verbatim.
+On text-only deployments, a response that starts while its user input is
+still being received binds to that input's next commit. History places
+that owning input before the reserved assistant slot, and later input
+after it. A terminal native LISTEN follows normal response completion,
+including when the continuation budget is exhausted.
 The unconditional bypass is deployment-scoped. On audio-capable deployments,
 a reply with zero generated/sent audio and no audio-completion dependency
 commits text without an ACK through the zero-audio fallback. Replies whose
@@ -1751,6 +1756,30 @@ and keep empty slots in mixed batches. The final prefill chunk and decode frames
 can expose function tokens. Model-local postprocess feedback alone does not
 expose a client tool call. Forced feedback remains queued until an eligible
 frame's postprocess consumes it once.
+
+Inside a call, Nemotron decodes back to back. The thinker publishes
+`nvc_function_fast_path` on frames decoded while its function head is inside a
+tool call, using the current frame's function decision before MRv2 sampling
+commits the call state. The session's plugin reports `fast_path_active` only
+for continuation scheduling. When synthetic silence continuation is permitted,
+the session then
+answers each such frame with its own silence unit at once instead of waiting for
+the client's next 80 ms unit. One token per append still holds; only the frame
+that feeds it changes. Client appends that arrive meanwhile are dropped and
+are never buffered, appended or replayed. Disabling
+`silence_continuation`, using the input clock, or failing to schedule the next
+synthetic unit preserves client-paced decoding instead. Session updates invalidate
+queued fast appends, including an off/on update before that append runs.
+Stage-2 suppression follows each originating Stage-0 acoustic frame, not the
+current scheduling flag: delayed call audio remains silent after `EOTC`, while
+earlier speech still plays during a call. Suppressed frames still count toward
+audio coverage and response completion. Coalesced codec chunks filter only the
+call's frames. Fast steps do not
+count against the response continuation limit: the plugin caps them
+(`_FAST_PATH_MAX_STEPS`, like NVIDIA's `MAX_TOOL_TOKENS`) and the frame that
+decodes `EOTC` clears the flag, after which client-paced continuation resumes.
+A finished or failed call request ends the fast path even when its last frame
+still carried the flag, so the session returns to appending client frames.
 
 Turn plugins may bind their stage identities in `configure_pipeline` and select
 an append's entry with `input_stage_id(payload)` (default 0). The request context

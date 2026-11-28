@@ -66,6 +66,13 @@ class DuplexRunState:
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
     #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
     concurrent_turn_requests_released: bool = False
+    #: The plugin wants the next silence append issued immediately instead of on
+    #: the 80 ms pacing clock (for example while a model decodes a tool call).
+    fast_path_active: bool = False
+    #: Invalidate queued fast appends and dropping across session updates.
+    fast_path_config_generation: int | None = None
+    #: Client frames dropped because the model was on the fast path.
+    fast_path_dropped_frames: int = 0
 
 
 class RunnerServices(Protocol):
