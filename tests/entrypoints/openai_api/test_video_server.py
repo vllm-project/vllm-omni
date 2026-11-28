@@ -27,6 +27,7 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import envs
 
+from tests.entrypoints.openai_api.storage_test_utils import build_file_storage
 from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
@@ -39,8 +40,8 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import EncodedVideoResult, OmniOpenAIServingVideo, ReferenceImage
-from vllm_omni.entrypoints.openai.storage import LocalStorageManager, LocalStorageTTLManager
-from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.entrypoints.openai.storage import BackendLease
+from vllm_omni.entrypoints.openai.stores import TaskRegistry, VideoStore
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
@@ -579,10 +580,10 @@ class FakeServerSocket:
 
 @pytest.fixture(autouse=True)
 def isolated_video_backends(tmp_path, monkeypatch):
-    """Use isolated in-memory metadata and local storage for each test."""
-    store: AsyncDictStore[VideoResponse] = AsyncDictStore()
+    """Use isolated on-disk storage and record-backed metadata for each test."""
+    storage = build_file_storage(tmp_path)
+    store = VideoStore(storage)
     tasks = TaskRegistry()
-    storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
     monkeypatch.setattr(api_server, "VIDEO_STORE", store)
     monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
@@ -3464,13 +3465,12 @@ def test_ttl_expiration_removes_video_from_metadata_and_content_endpoints(
     test_client, isolated_video_backends, monkeypatch, mocker: MockerFixture, tmp_path
 ):
     store, _, _ = isolated_video_backends
-    storage = LocalStorageTTLManager(
-        storage_path=str(tmp_path / "ttl-storage"),
-        ttl_seconds=60,
-        sweep_interval_seconds=3600,
-    )
+    storage = build_file_storage(tmp_path / "ttl-storage", default_ttl=60, sweep_interval=3600)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
     monkeypatch.setattr(video_generation_helpers, "STORAGE_MANAGER", storage)
+    # In production the store is bound to the same backend as STORAGE_MANAGER,
+    # so records and artifacts expire together.
+    store._backend = storage
     mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"stored-video")
 
     async def start_storage():
@@ -3497,7 +3497,7 @@ def test_ttl_expiration_removes_video_from_metadata_and_content_endpoints(
         old_mtime = time.time() - 70
         expired_path = storage.get_full_file_path(expired_id)
         os.utime(expired_path, (old_mtime, old_mtime))
-        assert test_client.portal.call(storage._sweep_once, time.time() - 60) == 1
+        assert test_client.portal.call(storage.sweeper.sweep_once) == 1
 
         assert not os.path.exists(expired_path)
         listing = test_client.get("/v1/videos")
@@ -3515,6 +3515,36 @@ def test_ttl_expiration_removes_video_from_metadata_and_content_endpoints(
         test_client.portal.call(storage.stop)
 
 
+def test_create_video_is_rejected_while_another_process_owns_the_prefix(
+    test_client, isolated_video_backends, mocker: MockerFixture
+):
+    _store, _tasks, storage = isolated_video_backends
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"mp4")
+    lease = BackendLease(storage, owner_id="other-process")
+    assert test_client.portal.call(lease.acquire) is True
+    test_client.app.state.storage_lease = BackendLease(storage, owner_id="this-process")
+
+    response = test_client.post("/v1/videos", data={"prompt": "should not be accepted"})
+
+    assert response.status_code == 503
+    assert "does not own the video storage prefix" in response.json()["detail"]
+
+
+def test_create_video_is_allowed_once_this_process_owns_the_prefix(
+    test_client, isolated_video_backends, mocker: MockerFixture
+):
+    _store, _tasks, storage = isolated_video_backends
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"mp4")
+    lease = BackendLease(storage, owner_id="this-process")
+    assert test_client.portal.call(lease.acquire) is True
+    test_client.app.state.storage_lease = lease
+
+    response = test_client.post("/v1/videos", data={"prompt": "accepted"})
+
+    assert response.status_code == 200
+    _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+
+
 def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -3527,7 +3557,7 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     file_name = final["file_name"]
     assert file_name is not None
-    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    file_path = api_server.STORAGE_MANAGER.get_full_file_path(video_id)
     assert os.path.exists(file_path)
 
     delete_resp = test_client.delete(f"/v1/videos/{video_id}")
@@ -3552,7 +3582,7 @@ def test_download_completed_job_uses_storage_open_and_download_name(test_client,
     file_name = final["file_name"]
     assert file_name == f"{video_id}.mp4"
 
-    storage_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    storage_path = api_server.STORAGE_MANAGER.get_full_file_path(video_id)
     assert os.path.exists(storage_path)
 
     response = test_client.get(f"/v1/videos/{video_id}/content")
@@ -3602,8 +3632,8 @@ def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
     assert test_client.get(f"/v1/videos/{video_id}/content?variant=thumbnail").status_code == 422
 
     assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
-    assert not os.path.exists(os.path.join(storage.storage_path, video_id))
-    assert not os.path.exists(os.path.join(storage.storage_path, f"{video_id}.lidar.safetensors"))
+    assert not os.path.exists(storage.get_full_file_path(video_id))
+    assert not os.path.exists(storage.get_full_file_path(f"{video_id}.lidar.safetensors"))
 
 
 def test_download_lidar_variant_requires_lidar_output(test_client, mocker: MockerFixture):
@@ -3690,7 +3720,7 @@ def test_delete_removes_artifact_if_job_completes_during_abort(test_client):
     assert handler.started.wait(timeout=2.0)
 
     assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
-    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    file_path = api_server.STORAGE_MANAGER.get_full_file_path(video_id)
     assert not os.path.exists(file_path)
     assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
@@ -3764,6 +3794,7 @@ def test_delete_failed_job_removes_unpublished_partial_artifact(test_client):
     assert job.file_name is None
     asyncio.run(api_server.VIDEO_STORE.upsert(job.id, job))
     file_path = api_server.STORAGE_MANAGER.get_full_file_path(job.id)
+    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
     Path(file_path).write_bytes(b"partial-video")
 
     delete_resp = test_client.delete(f"/v1/videos/{job.id}")

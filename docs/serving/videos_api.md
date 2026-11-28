@@ -157,6 +157,10 @@ and content endpoints return 404. A record may remain visible between its
 `expires_at` timestamp and the next sweep. If file deletion fails, its metadata
 is retained and deletion is retried on a later sweep.
 
+The sweeper expires an artifact using the object's `last_modified` timestamp when
+the storage backend exposes one, and otherwise falls back to reading `expires_at`
+from the job record.
+
 ## Examples
 
 ### Image-to-Video
@@ -705,6 +709,31 @@ stored:
 ```bash
 export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+Two object families live under that root:
+
+```
+artifacts/{video_id}        # the generated video payload
+meta/{video_id}.json        # the job record (status, created_at, expires_at, ...)
+```
+
+Because the job record is persisted, `GET /v1/videos/{video_id}` and
+`GET /v1/videos` keep returning jobs after a server restart. Jobs that were still
+`queued`/`in_progress` when the previous process exited are reported as `failed`
+on startup, and any partially written artifact for them is removed.
+
+That recovery is destructive, so **one API process owns a storage root at a
+time**. The process keeps an `.owner` lease record in the store and refreshes it
+while serving; a second process pointed at the same root refuses to run the
+destructive recovery (it logs an error and leaves the live jobs untouched). The
+lease is handed back on shutdown, and a lease left behind by a killed process is
+taken over once its heartbeat is 90 seconds old — the second process retries in
+the background, so interrupted jobs are still recovered without another restart.
+While a process does not own the root it rejects `POST /v1/videos` with `503`
+instead of writing jobs that the owner's recovery would later treat as
+interrupted, and recovery never fails a job whose generation is still running in
+the process. Multi-replica deployments must give each replica its own storage
+root.
 
 > `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
 > use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.

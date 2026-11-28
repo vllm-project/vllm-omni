@@ -53,3 +53,5 @@ cosmos-guardrail>=0.3.1
 # these are long-stable APIs with no version-specific need for 1.18.
 scipy>=1.11.0
 s3tokenizer==0.3.0
+# Storage layer for generated video artifacts and job records (OpenDAL fs service).
+opendal>=0.47.5
