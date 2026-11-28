@@ -21,6 +21,12 @@ for name in "${required_vars[@]}"; do
     fi
 done
 
+run_level=${QWEN3_OMNI_RUN_LEVEL:-full_model}
+case "${run_level}" in
+    core_model|advanced_model|full_model) ;;
+    *) echo "Error: unsupported QWEN3_OMNI_RUN_LEVEL=${run_level}." >&2; exit 2 ;;
+esac
+
 if [[ ! "${QWEN3_OMNI_EXPECTED_GPUS}" =~ ^[1-9][0-9]*$ ]] || \
     [[ ! "${QWEN3_OMNI_EXPECTED_RESULTS}" =~ ^[0-9]+$ ]] || \
     [[ ! "${QWEN3_OMNI_EXPECTED_TESTS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -53,6 +59,7 @@ capture_cleanup() {
     if ((baseline_ready)); then
         sleep 5
         ps -eo pid=,ppid=,lstart=,stat=,comm=,args= > "${artifact_dir}/processes-after.txt"
+        inspection_status=$?
         rocm-smi --showpids > "${artifact_dir}/gpu-holders-after.txt" 2>&1 || true
         {
             if ((test_started_epoch)); then
@@ -97,6 +104,10 @@ capture_cleanup() {
                 break
             fi
         done
+        if ((inspection_status != 0)); then
+            echo "status=FAIL process_inspection_failed=1" | tee "${artifact_dir}/process-cleanup.txt"
+            cleanup_status=${inspection_status}
+        fi
     else
         echo "status=SKIP process_baseline_unavailable=1" > "${artifact_dir}/process-cleanup.txt"
     fi
@@ -117,6 +128,7 @@ trap capture_cleanup EXIT
     echo "test_target=${QWEN3_OMNI_TEST_TARGET}"
     echo "config_file=${QWEN3_OMNI_CONFIG_FILE:-none}"
     echo "marks=${QWEN3_OMNI_MARK_EXPRESSION}"
+    echo "run_level=${run_level}"
     echo "expected_gpus=${QWEN3_OMNI_EXPECTED_GPUS}"
     echo "expected_tests=${QWEN3_OMNI_EXPECTED_TESTS}"
     echo "expected_results=${QWEN3_OMNI_EXPECTED_RESULTS}"
@@ -164,7 +176,7 @@ if [[ "${QWEN3_OMNI_REQUIRE_BASELINE:-0}" == 1 ]]; then
 fi
 pytest_args+=(
     -m "${QWEN3_OMNI_MARK_EXPRESSION}"
-    --run-level full_model
+    --run-level "${run_level}"
 )
 
 set +e
@@ -178,6 +190,25 @@ for pipeline_code in "${collection_pipeline_status[@]}"; do
         exit "${pipeline_code}"
     fi
 done
+
+if [[ -n "${QWEN3_OMNI_EXPECTED_NODES:-}" ]]; then
+    python3 - "${QWEN3_OMNI_EXPECTED_NODES}" "${artifact_dir}/collection.txt" \
+        "${QWEN3_OMNI_EXPECTED_TESTS}" <<'PY' 2>&1 | tee "${artifact_dir}/collection-membership.txt"
+import sys
+from pathlib import Path
+
+expected = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+actual = [
+    line for line in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
+    if line.startswith("tests/") and "::" in line
+]
+if len(expected) != int(sys.argv[3]) or len(set(expected)) != len(expected):
+    raise SystemExit("Expected-node manifest must contain exactly the declared number of unique nodes")
+if sorted(actual) != sorted(expected):
+    raise SystemExit(f"Collection membership differs: expected={expected!r}, actual={actual!r}")
+print(f"Verified exact pytest node membership: {len(actual)} tests")
+PY
+fi
 
 set +e
 test_started_epoch=$(date +%s)
