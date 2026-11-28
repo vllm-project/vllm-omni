@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 class OmniVoiceAdapter(DiffusionTTSAdapter):
     model_archs = frozenset({"OmniVoicePipeline"})
     name = "omnivoice"
+    # The pipeline samples with its own position/class temperatures, not
+    # the stage SamplingParams.
+    supports_temperature = False
     supported_output_sample_rates = frozenset({24000})
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:

@@ -829,12 +829,12 @@ steps:
 # TCP/RDMA connector and native NIXL). The CUDA IPC weight-sharing tests in
 # those jobs stay CUDA-only: the feature itself requires NVIDIA CUDA, and its
 # modules skip at import on ROCm, so select omni_connectors/ only.
-# Non-blocking until burn-in.
+# Blocking after five consecutive green READY runs each.
 - label: "ROCm · Distributed Test · 1-GPU"
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   timeout_in_minutes: 30
   env:
     ROCM_DIFFUSION_RUN_LEVEL: core_model
@@ -855,7 +855,7 @@ steps:
   agent_pool: mi300_2
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   timeout_in_minutes: 30
   env:
     ROCM_DIFFUSION_RUN_LEVEL: core_model

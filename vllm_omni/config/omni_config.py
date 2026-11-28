@@ -1083,6 +1083,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = Field(default=64, gt=0, strict=True)
     dlo_resident_layers: int = Field(default=0, ge=0)
@@ -1325,7 +1326,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
-            enable_dlo=self.enable_distributed_layerwise_offload,
+            enable_dlo=(self.enable_distributed_layerwise_offload or self.enable_submodule_offload),
             use_allgather=self.dlo_use_allgather,
             hwr_mode=self.host_weight_runtime_mode,
         )
@@ -1689,6 +1690,48 @@ def _frontend_cli_fields() -> frozenset[str]:
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 
 
+def diffusion_ingress_stage_consumed_fields() -> frozenset[str]:
+    """Raw-ingress field names the diffusion stage config consumes itself.
+
+    Shared by the ingress validator (its return filter) and
+    :func:`diffusion_ingress_allowed_fields`, so the two cannot drift.
+    """
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    return (
+        frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+        | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
+        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
+        | _DIFFUSION_STAGE_METADATA_FIELDS
+        | _DIFFUSION_DEFAULT_FACTORY_FIELDS
+    ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+
+
+def diffusion_ingress_allowed_fields() -> frozenset[str]:
+    """Field names the diffusion ingress validator accepts from raw engine kwargs.
+
+    The stage-consumed fields plus the ones consumed elsewhere (shared engine,
+    serving frontend and orchestrator). Single source of truth for the
+    raw-ingress contract: ``normalize_and_validate_diffusion_engine_ingress_kwargs``
+    validates against it, and external embedders (RL frameworks strip their
+    LLM-only engine args against this set before submitting diffusion
+    requests, instead of mirroring the private per-owner sets).
+    """
+    from vllm_omni.engine.arg_utils import orchestrator_field_names
+
+    externally_consumed_fields = (
+        _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+        | _NON_STAGE_ENGINE_CLI_FIELDS
+        | _frontend_cli_fields()
+        | orchestrator_field_names()
+        # Coordination fields also live on the typed orchestrator config, not
+        # all of them are present on the CLI-only OrchestratorArgs dataclass.
+        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
+    )
+    return diffusion_ingress_stage_consumed_fields() | externally_consumed_fields
+
+
 def normalize_and_validate_diffusion_engine_ingress_kwargs(
     kwargs: Mapping[str, Any],
     *,
@@ -1696,11 +1739,9 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
 ) -> dict[str, Any]:
     """Normalize and validate raw diffusion input without inserting defaults."""
     from vllm_omni.diffusion.data import (
-        OmniDiffusionConfig,
         normalize_omni_diffusion_kwargs,
         validate_omni_diffusion_kwargs,
     )
-    from vllm_omni.engine.arg_utils import orchestrator_field_names
 
     mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
     engine_owned = {
@@ -1713,26 +1754,8 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         raise ValueError("Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided.")
     normalized.update(engine_owned)
 
-    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    stage_consumed_fields = (
-        diffusion_fields
-        | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
-        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
-        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
-        | _DIFFUSION_STAGE_METADATA_FIELDS
-        | _DIFFUSION_DEFAULT_FACTORY_FIELDS
-    ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-    externally_consumed_fields = (
-        _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-        | _NON_STAGE_ENGINE_CLI_FIELDS
-        | _frontend_cli_fields()
-        | orchestrator_field_names()
-        # Coordination fields also live on the typed orchestrator config, not
-        # all of them are present on the CLI-only OrchestratorArgs dataclass.
-        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
-    )
-    allowed_fields = stage_consumed_fields | externally_consumed_fields
-    validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)
+    validate_omni_diffusion_kwargs(normalized, diffusion_ingress_allowed_fields(), stage_id=stage_id)
+    stage_consumed_fields = diffusion_ingress_stage_consumed_fields()
     return {name: value for name, value in normalized.items() if name in stage_consumed_fields}
 
 
