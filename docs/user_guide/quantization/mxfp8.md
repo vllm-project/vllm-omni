@@ -110,6 +110,36 @@ python text_to_video.py --model <your-model> --quantization mxfp8
 vllm serve <your-model> --omni --quantization mxfp8
 ```
 
+### MiniMax H3 video VAE on Ascend A5
+
+On Ascend A5, select the native MiniMax H3 video decoder explicitly to enable
+online MXFP8 with a floating-point checkpoint:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --trust-remote-code --task-type fl2va \
+  --diffusion-quantization-config '{"video_vae":{"method":"mxfp8"}}'
+```
+
+The component setting enables MXFP8 for the decoder Transformer block
+projections (`attn.to_qkv`, `attn.to_out`, `ff.w1`, and `ff.w2`) and for
+eligible dense, unmasked attention calls through MindIE-SD MXFP8 FIA.
+Initialization checks that the installed MindIE-SD build provides
+`mindiesd.quant_attention`. To disable Video VAE MXFP8, omit `video_vae` or
+set it to `null`. Masked or packed attention uses the checkpoint's
+implementation.
+The video encoder, audio VAE, and decoder boundary projections retain their
+original precision. Global MXFP8 and the component map's default do not
+select the Video VAE. An explicit `video_vae` method other than `mxfp8` is
+rejected. Non-null `video_vae.*` child entries raise a configuration error.
+With Video VAE MXFP8 enabled, `null` child entries are also rejected.
+Serialized VAE weights, layer exclusions, and replacement decoders are
+unsupported for this path. Explicit Video VAE MXFP8 selection on other
+devices fails during construction.
+
+The legacy layer-wise offload path stages quantized decoder weights from CPU
+in ND format. NPU-resident decoder weights can use FRACTAL_NZ when enabled by
+the Ascend runtime.
+
 ### Offline Mode (Native)
 
 Native offline mode loads a pre-quantized checkpoint from msModelSlim. A preprocessing

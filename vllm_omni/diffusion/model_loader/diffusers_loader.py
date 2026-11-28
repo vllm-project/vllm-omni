@@ -65,7 +65,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.registry import DiffusionModelRegistry, initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -753,15 +753,24 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False
             )
-            if not is_offline:
-                load_device = device.type
-                offload_after_quant = True
-                logger.info(
-                    "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
-                    load_device,
-                )
-            else:
+            if is_offline:
                 logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
+            else:
+                pipeline_cls = None
+                if load_format == "default":
+                    pipeline_cls = DiffusionModelRegistry._try_load_model_cls(
+                        getattr(self.od_config, "model_class_name", None)
+                    )
+                supports_cpu_load = getattr(pipeline_cls, "supports_cpu_load_with_online_quantization", None)
+                if supports_cpu_load is not None and supports_cpu_load(quant_cfg, device):
+                    logger.info("Pipeline handles online quantization during CPU weight loading")
+                else:
+                    load_device = device.type
+                    offload_after_quant = True
+                    logger.info(
+                        "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
+                        load_device,
+                    )
 
         target_device = torch.device(load_device)
 

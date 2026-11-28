@@ -1159,11 +1159,14 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
     @staticmethod
-    def _load_quant_runtime(method: str) -> Callable[..., torch.Tensor]:
+    def load_quant_runtime(method: str) -> Callable[..., torch.Tensor]:
+        """Load the callable MindIE-SD dense quantized attention entry point."""
         if method not in ("fp8", "mxfp8", "mxfp4"):
             raise ValueError(f"Unsupported NPU attention quantization method {method!r}.")
         from mindiesd import quant_attention
 
+        if not callable(quant_attention):
+            raise ImportError("MindIE-SD requires a callable mindiesd.quant_attention")
         return quant_attention
 
     def _validate_quant_request(
@@ -1205,7 +1208,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         layout = self.qkv_layout or "BSND"
         self._validate_quant_request(method, query, attn_metadata)
         try:
-            runtime = self._load_quant_runtime(method)
+            runtime = self.load_quant_runtime(method)
         except ImportError as exc:
             raise ImportError(
                 f"NPU attention precision {method!r} requires a compatible MindIE-SD "

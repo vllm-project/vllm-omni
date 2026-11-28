@@ -12,6 +12,8 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import offload_streams_blocks
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -27,6 +29,7 @@ from .pipeline_minimax_h3 import (
     get_minimax_h3_post_process_func,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae_mxfp8 import supports_h3_vae_mxfp8_cpu_load
 
 
 def resolve_minimax_h3_decoder_model_path(
@@ -56,6 +59,7 @@ class MiniMaxH3DecoderPipeline(
     nn.Module, DiffusionPipelineProfilerMixin, SupportAudioOutput, SupportsComponentDiscovery
 ):
     supports_step_execution: ClassVar[bool] = False
+    supports_cpu_load_with_online_quantization = staticmethod(supports_h3_vae_mxfp8_cpu_load)
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = []
     _encoder_modules: ClassVar[list[str]] = []
@@ -80,13 +84,25 @@ class MiniMaxH3DecoderPipeline(
         model_path = Path(
             resolve_minimax_h3_decoder_model_path(str(od_config.model), od_config.revision, od_config.task_type)
         )
+        quantization_config = od_config.quantization_config
+        load_device = self.device
+        if (
+            quantization_config is not None
+            and od_config.diffusion_offload_config is None
+            and offload_streams_blocks(od_config)
+            and self.supports_cpu_load_with_online_quantization(quantization_config, self.device)
+        ):
+            load_device = torch.device("cpu")
+            self._offload_plan = OffloadPlan(on_demand_component_paths=frozenset({"video_vae"}))
         self.video_vae = MiniMaxH3VideoVAE(
             str(model_path / "video_vae"),
             device=self.device,
+            load_device=load_device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
             lightvae_decoder_path=resolve_h3_lightvae_decoder_path(od_config.additional_config),
             stack_decode_tiles=od_config.vae_stack_tiles,
+            quantization_config=quantization_config,
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             str(model_path / "audio_vae"),
