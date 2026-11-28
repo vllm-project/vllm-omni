@@ -30,7 +30,7 @@ PUBLISHED = [
     ("minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors", "ref2v", 4, _TURBO_VIDEO_SHIFT_544P),
-    ("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors", "ref2v", 8, _TURBO_VIDEO_SHIFT_768P),
+    ("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors", "ref2v", 8, 12.0),
 ]
 
 

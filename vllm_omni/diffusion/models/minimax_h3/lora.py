@@ -34,10 +34,10 @@ _TURBO_TIME_EMBED_DIM = 2688
 # the only place the sampler contract is recorded.
 _TURBO_NAME_RE = re.compile(
     r"^minimax_h3_(?P<task>fl2v|ref2v)_turbo_(?P<steps>\d+)step"
-    r"_v\d+\.\d+(?P<res>_768p)?(?:_bf16)?\.safetensors$"
+    r"_v(?P<version>\d+\.\d+)(?P<res>_768p)?(?:_bf16)?\.safetensors$"
 )
-# The 768p retrains moved to a shorter video flow shift; the 544p artifacts keep
-# the base model's.
+# FL 768p retrains use a shorter video flow shift; Ref8 v1.0 keeps 12.
+# Other artifacts retain their existing sampling contracts.
 _TURBO_VIDEO_SHIFT_768P = 6.0
 _TURBO_VIDEO_SHIFT_544P = 12.0
 # The name does not record the shift, and ``8step_v1.2`` breaks the rule above:
@@ -94,13 +94,18 @@ def parse_turbo_filename(name: str) -> TurboSpec | None:
     steps = int(match.group("steps"))
     if steps <= 0:
         return None
+    video_shift = _TURBO_VIDEO_SHIFT_BY_NAME.get(
+        name, _TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P
+    )
+    # Ref8 v1.0 differs from the FL 768p family. Publisher's release settings:
+    # https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/51
+    if match.group("task") == "ref2v" and steps == 8 and match.group("version") == "1.0" and match.group("res"):
+        video_shift = 12.0
     return TurboSpec(
         filename=name,
         task_family=match.group("task"),
         denoise_steps=steps,
-        video_shift=_TURBO_VIDEO_SHIFT_BY_NAME.get(
-            name, _TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P
-        ),
+        video_shift=video_shift,
         audio_shift=_TURBO_AUDIO_SHIFT,
         rank=_TURBO_RANK,
         alpha=_TURBO_DEFAULT_ALPHA,
@@ -401,14 +406,12 @@ def load_minimax_h3_turbo_lora(
 
         if partition == "ref2va" and spec.task_family == "fl2v":
             raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
-        # ``combined`` serves ref2va from ``transformers_ref``, but the LoRA
-        # target pattern only injects into ``transformer``: the adapter would
-        # bind to the stack that never runs.
-        if spec.task_family == "ref2v" and partition != "ref2va":
+        if spec.task_family == "ref2v" and partition not in {"ref2va", "combined"}:
             raise ValueError(
-                f"{spec.filename} is a Ref2VA Turbo artifact; start the server with --task-type ref2va "
-                f"(task_type={partition!r} serves ref2va from a DiT the adapter cannot bind to)"
+                f"{spec.filename} is a Ref2VA Turbo artifact; start the server with "
+                f"--task-type ref2va, or use a combined server"
             )
+        dit_component = "transformers_ref" if partition == "combined" and spec.task_family == "ref2v" else "transformer"
         if unsupported_offload_mode is not None:
             raise ValueError(f"MiniMax-H3 Turbo dynamic LoRA does not support {unsupported_offload_mode}")
 
@@ -432,11 +435,15 @@ def load_minimax_h3_turbo_lora(
             spec.alpha / spec.rank,
         )
 
+    # In combined mode qualify both families. Relative FL names would also
+    # match Ref layers after they have been wrapped by an earlier adapter.
     peft_helper = PEFTHelper.from_dict(
         {
             "r": spec.rank,
             "lora_alpha": spec.alpha,
-            "target_modules": _TURBO_ADALN_TARGET_PATTERN if converted.adaln else _TURBO_TARGET_PATTERN,
+            "target_modules": (_TURBO_ADALN_TARGET_PATTERN if converted.adaln else _TURBO_TARGET_PATTERN).replace(
+                "^transformer", "^" + dit_component
+            ),
         }
     )
     lora_model = LoRAModel.from_lora_tensors(
@@ -445,12 +452,22 @@ def load_minimax_h3_turbo_lora(
         peft_helper=peft_helper,
         device="cpu",
         dtype=dtype,
-        weights_mapper=_TURBO_WEIGHTS_MAPPER,
+        weights_mapper=WeightsMapper(
+            orig_to_new_substr=dict(_TURBO_WEIGHTS_MAPPER.orig_to_new_substr),
+            orig_to_new_prefix={
+                "blocks.": f"{dit_component}.blocks.",
+                "token_refiner.": f"{dit_component}.token_refiner.",
+                "final_layer.": f"{dit_component}.final_layer.",
+            },
+        )
+        if partition == "combined"
+        else _TURBO_WEIGHTS_MAPPER,
     )
     # ``from_lora_tensors`` gave every module the rank-128 pairs' rank and
     # scaling. The AdaLN pairs carry their own.
     for module_name, (rank, alpha) in converted.adaln.items():
-        weights = lora_model.loras[module_name]
+        target_name = f"{dit_component}.{module_name}" if partition == "combined" else module_name
+        weights = lora_model.loras[target_name]
         weights.rank = rank
         weights.lora_alpha = alpha
         weights.scaling = alpha / rank
