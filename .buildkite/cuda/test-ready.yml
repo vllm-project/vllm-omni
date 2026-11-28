@@ -144,9 +144,9 @@ steps:
       - label: "Tiny Model Tests · Diffusion (base)"
         timeout_in_minutes: 15
         commands:
-          # All workers share one L4; four concurrent models can exhaust its VRAM.
+          # Workers share one L4; requeue a test once on CUDA OOM instead of lowering -n.
           # Capture worker output so server logs are attached to failed cases.
-          - pytest -v -n 2 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
+          - pytest -v -n 4 -o pythonpath=. -p tests.helpers.fixtures.cuda_oom_queue tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Engine&Model Executor&Work Test"
