@@ -95,10 +95,41 @@ requires the matching `manifest.json`, `config.json` and `sampling.json`.
 Keep the stage dtype at `bfloat16`. By default the worker loads
 `model.safetensors`, including when both checkpoints are present.
 
-The native MXFP8 extra requires FlashInfer 0.7.5. vLLM 0.34.0 pins
-FlashInfer 0.7.3 in its standard CUDA environment. Use a dedicated Motubrain
-worker environment with the 0.7.5 CUTLASS MXFP8 kernels for your GPU.
+The native MXFP8 extra requires FlashInfer 0.7.5. The standard vLLM
+0.34.0 CUDA environment includes FlashInfer 0.7.3 and its dependencies.
+Install the 0.7.5 Python wheel and its additional `portalocker` dependency
+in a private worker directory. Run these commands with the same Python
+environment used for serving and a CUDA toolkit for Blackwell kernel JIT.
 [vLLM CUDA dependency pin](https://github.com/vllm-project/vllm/blob/v0.34.0/requirements/cuda.txt#L13)
+
+```bash
+uv pip install --python "$(command -v python)" --target /opt/motubrain-mxfp8/site --no-deps \
+  flashinfer-python==0.7.5 portalocker==4.4.2
+```
+
+After preparing the Astribot serving directory below, save this deployment
+overlay as `/opt/motubrain-mxfp8/astribot.yaml`. The base deployment supplies
+the encoder sources, robot metadata and BF16 activation dtype.
+
+```yaml
+base_config: /opt/vllm-omni/vllm_omni/deploy/motubrain2-astribot.yaml
+stages:
+  - stage_id: 0
+    engine_extras:
+      model_config:
+        mxfp8: true
+```
+
+Launch the MXFP8 worker in a subshell so only that server and its children
+use the private packages.
+
+```bash
+(
+  export PYTHONPATH="/opt/motubrain-mxfp8/site${PYTHONPATH:+:$PYTHONPATH}"
+  python -c 'from importlib.metadata import version; from flashinfer.gemm import mm_mxfp8; assert version("flashinfer-python") == "0.7.5"'
+  vllm serve /models/astribot-serving --omni --deploy-config /opt/motubrain-mxfp8/astribot.yaml --port 8000
+)
+```
 
 Omitting `dit_cache_enabled` (or setting it to null) enables caching for
 the released Base recipe and leaves it off for Distill. Base is identified
