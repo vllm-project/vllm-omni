@@ -280,8 +280,14 @@ def test_fused_qk_norm_rope_npu_matches_reference(monkeypatch: pytest.MonkeyPatc
     torch.testing.assert_close(actual_k, expected_k, atol=2e-2, rtol=2e-2)
 
 
-@hardware_test(res={"npu": "A3"}, num_cards=1)
+@hardware_test(res={"npu": "A2"}, num_cards=1)
 def test_packed_qkv_eagle_npu_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch_npu = pytest.importorskip("torch_npu")
+    from vllm_ascend.device.hardware import AscendDeviceType, device_type_from_runtime_soc
+
+    if device_type_from_runtime_soc(torch_npu.npu.get_soc_version()) is AscendDeviceType.A3:
+        pytest.skip("MindIE-SD EagleSplitNormRopeConcat is not registered for ascend910_93 (A3)")
+
     ops = pytest.importorskip("mindiesd.fused_ops")
     if not hasattr(ops, "eagle_split_norm_rope_concat"):
         pytest.skip("MindIE-SD Eagle is unavailable")
