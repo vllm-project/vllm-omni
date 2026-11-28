@@ -1132,9 +1132,9 @@ async def test_replacement_open_waits_for_pending_window_release(monkeypatch) ->
                 await asyncio.gather(replacement, return_exceptions=True)
 
 
-@pytest.mark.parametrize("abandon", [False, True])
-async def test_pending_admission_releases_its_wait_position(request: pytest.FixtureRequest, abandon: bool) -> None:
-    if not abandon:
+@pytest.mark.parametrize("outcome", ["timeout", "close_waiting", "close_queued", "close_queued_and_release"])
+async def test_pending_admission_releases_its_wait_position(request: pytest.FixtureRequest, outcome: str) -> None:
+    if outcome == "timeout":
         request.getfixturevalue("short_admission_wait")
     port = PlacementStagePort()
     async with Harness.create(stage_port=port, max_sessions=1) as harness:
@@ -1150,23 +1150,30 @@ async def test_pending_admission_releases_its_wait_position(request: pytest.Fixt
                 output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
             )
         )
-        await asyncio.sleep(0)
-        assert port.rejections == []
-        if abandon:
+        if outcome in {"timeout", "close_waiting"}:
+            await asyncio.sleep(0)
+        if outcome != "timeout":
             harness.manager.dispatch(
                 CloseDuplexSessionMessage(control_id="waiting-close", session_id="sid-waiting", reason="open_abandoned")
             )
+        released = outcome == "close_queued_and_release"
+        if released:
+            await asyncio.sleep(0)
+            assert await harness.manager.reap_expired() == 1
         result = await harness.result()
         assert result.control_id == "waiting-open"
-        assert result.error_code == ("session_closed" if abandon else "resource_exhausted")
-        if abandon:
+        assert result.error_code == ("resource_exhausted" if outcome == "timeout" else "session_closed")
+        if outcome != "timeout":
             closed = await harness.result()
             assert closed.control_id == "waiting-close"
             assert closed.ok
+            assert port.rejections == []
         assert port.reserve_calls == ["sid-closing"]
-        assert port.release_calls == []
+        assert port.release_calls == (["sid-closing"] if released else [])
+        assert not harness.manager._queued_opens
         assert not harness.manager._waiting_admissions
-        assert await harness.manager.reap_expired() == 1
+        if not released:
+            assert await harness.manager.reap_expired() == 1
         assert (await harness.open("sid-replacement")).ok
 
 

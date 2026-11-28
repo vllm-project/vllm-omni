@@ -91,6 +91,11 @@ logger = init_logger(__name__)
 _CLOSING_ADMISSION_WAIT_S = 15.0
 
 
+@dataclass(eq=False)
+class _QueuedOpen:
+    abandoned: bool = False
+
+
 @dataclass(frozen=True)
 class _PendingRequestCleanup:
     session_id: str
@@ -181,12 +186,10 @@ class DuplexSessionManager:
         self._closing: dict[str, _PendingSessionCleanup] = {}
         #: Session ids whose ``open`` passed the capacity check and is still awaiting the plugin.
         self._admitting: set[str] = set()
+        self._queued_opens: dict[str, set[_QueuedOpen]] = {}
         self._waiting_admissions: set[str] = set()
         self._admission_changed = asyncio.Event()
-        #: Opens whose caller gave up (control RPC timeout / cancellation) before
-        #: admission finished. The open completes anyway -- it is already past
-        #: the capacity check -- so it must tear itself down on arrival instead
-        #: of holding a slot and a stage resource until idle expiry.
+        #: Running opens whose caller gave up before admission finished.
         self._abandoned_opens: set[str] = set()
         self._request_index: dict[str, str] = {}
         self._session_control_tails: dict[str, asyncio.Task[None]] = {}
@@ -246,15 +249,40 @@ class DuplexSessionManager:
             return
         if not isinstance(message, self._CONTROL_TYPES):
             raise TypeError(f"Unsupported duplex control message: {type(message).__name__}")
+        if isinstance(message, OpenDuplexSessionMessage):
+            self._dispatch_open(message)
+            return
         session_id = message.session_id
-        if isinstance(message, CloseDuplexSessionMessage) and session_id in self._waiting_admissions:
-            # Keep the close result ordered behind the open while waking the waiter.
-            self._abandon_open(session_id)
+        if isinstance(message, CloseDuplexSessionMessage):
+            for queued in self._queued_opens.get(session_id, ()):
+                queued.abandoned = True
+            if session_id in self._waiting_admissions:
+                # Keep the close result ordered behind the open while waking the waiter.
+                self._abandon_open(session_id)
 
         async def handle_message() -> None:
             await self.handle(message)
 
         self._run_control(session_id, f"duplex-control-{session_id}-{message.control_id}", handle_message)
+
+    def _dispatch_open(self, message: OpenDuplexSessionMessage) -> None:
+        session_id = message.session_id
+        queued = _QueuedOpen()
+        pending = self._queued_opens.setdefault(session_id, set())
+        pending.add(queued)
+
+        def discard(_task: asyncio.Task[None] | None = None) -> None:
+            pending.discard(queued)
+            if not pending and self._queued_opens.get(session_id) is pending:
+                self._queued_opens.pop(session_id)
+
+        async def handle_open() -> None:
+            discard()
+            await self.open(message, queued_abandoned=queued.abandoned)
+
+        task = self._run_control(session_id, f"duplex-control-{session_id}-{message.control_id}", handle_open)
+        # A task cancelled behind its predecessor never reaches handle_open.
+        task.add_done_callback(discard)
 
     def _run_control(
         self,
@@ -680,7 +708,7 @@ class DuplexSessionManager:
             ]
         )
 
-    async def open(self, message: OpenDuplexSessionMessage) -> None:
+    async def open(self, message: OpenDuplexSessionMessage, *, queued_abandoned: bool = False) -> None:
         from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 
         session_id = message.session_id
@@ -700,6 +728,8 @@ class DuplexSessionManager:
             ):
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
             owns_open = True
+            if queued_abandoned:
+                raise DuplexSessionError(f"Duplex session open was abandoned: {session_id}", code="session_closed")
             max_sessions = self.admission_limit
             collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
             capabilities = apply_input_clock_capabilities(
