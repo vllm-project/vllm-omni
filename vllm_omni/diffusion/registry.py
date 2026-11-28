@@ -269,6 +269,11 @@ _DIFFUSION_MODELS = {
         "pipeline_gr00t",
         "Gr00tN1d7Pipeline",
     ),
+    "FastWAMPipeline": (
+        "fastwam",
+        "pipeline_fastwam",
+        "FastWAMPipeline",
+    ),
     "Pi0Pipeline": (
         "pi.pi0",
         "pipeline_pi0",
@@ -567,6 +572,9 @@ _NO_CACHE_ACCELERATION = {
     # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
     # transferred KV prefix, with no DiT block list.
     "Alpamayo2SuperPipeline",
+    # FastWAM integrates its action flow in a self-contained loop over two experts
+    # (no ``.transformer`` block list to cache).
+    "FastWAMPipeline",
     # SAM3 is a single forward pass with no denoising steps to cache.
     "Sam3Model",
     "Sam3VideoModel",
