@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Declarative model capabilities for component layerwise offload.
+"""Declarative model capabilities for diffusion component offload.
 
 Models declare an ``_offload_plan`` class attribute on the pipeline. Both the
 ordinary and distributed layerwise backends consume the same plan instead of
@@ -29,6 +29,12 @@ class OffloadPlan:
     is the only consumer; backends read the resolved artifact it returns.
 
     Attributes:
+        cpu_master_dit_paths: DiT paths whose parameters and buffers stay
+            immutable and can be staged from a CPU master during model-level
+            offload. The device copy is released at each offload.
+        cpu_master_encoder_paths: Encoder paths with immutable parameters.
+            Model-level offload stages the parameters from a CPU master and
+            moves encoder buffers through the regular transfer path.
         block_attrs: Maps DiT path → tuple of block-list attribute names.
             e.g. ``{"transformer": ("gen_layers",),
                     "transformer.language_model": ("layers",)}``
@@ -58,6 +64,8 @@ class OffloadPlan:
     encoder_component_types: dict[str, str] = field(default_factory=dict)
     encoder_block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
     encoder_dlo_weight_replication: frozenset[str] = field(default_factory=frozenset)
+    cpu_master_dit_paths: frozenset[str] = field(default_factory=frozenset)
+    cpu_master_encoder_paths: frozenset[str] = field(default_factory=frozenset)
 
 
 def get_offload_plan(pipeline: nn.Module) -> OffloadPlan | None:

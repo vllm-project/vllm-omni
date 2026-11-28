@@ -181,10 +181,12 @@ def _plan_pinned_slabs(
     )
 
 
-def _unique_module_tensors(modules: tuple[nn.Module, ...]) -> list[torch.Tensor]:
+def _unique_module_tensors(modules: tuple[nn.Module, ...], *, include_buffers: bool = True) -> list[torch.Tensor]:
     targets: list[torch.Tensor] = []
     seen_targets: set[int] = set()
-    for target in chain.from_iterable(chain(module.parameters(), module.buffers()) for module in modules):
+    for target in chain.from_iterable(
+        chain(module.parameters(), module.buffers()) if include_buffers else module.parameters() for module in modules
+    ):
         if id(target) not in seen_targets:
             seen_targets.add(id(target))
             targets.append(target)
@@ -195,9 +197,11 @@ def _local_tensor(target: torch.Tensor) -> torch.Tensor:
     return target.to_local() if is_dtensor(target) else target
 
 
-def _collect_source_groups(modules: tuple[nn.Module, ...]) -> list[_SourceStorageGroup]:
+def _collect_source_groups(
+    modules: tuple[nn.Module, ...], *, include_buffers: bool = True
+) -> list[_SourceStorageGroup]:
     grouped: dict[tuple[object, ...], _SourceStorageGroup] = {}
-    for target in _unique_module_tensors(modules):
+    for target in _unique_module_tensors(modules, include_buffers=include_buffers):
         local = _local_tensor(target)
         if local.is_meta:
             raise ValueError("PinnedModuleStager cannot snapshot a meta tensor")
@@ -433,6 +437,7 @@ class PinnedModuleStager:
     after each forward. In inference the weights are immutable, so retain one
     pinned CPU master instead. ``load`` materializes device storage from that
     master; ``offload`` only rebinds Parameters and buffers to the master.
+    Set ``include_buffers=False`` when the caller manages mutable buffers.
 
     A module iterable is treated as one staging group. It uses one copy stream
     and one reusable completion event. Tensors sharing storage keep their
@@ -443,6 +448,8 @@ class PinnedModuleStager:
     immutable, so no H2D copy repeats). The stable storage addresses keep
     CUDA-graph-captured weight pointers valid across offload/load swaps, at
     the cost of keeping the device storage resident while offloaded.
+    ``resident_weight_bytes`` instead retains a bounded subset of whole storage
+    groups and reloads the rest from the CPU master.
     """
 
     def __init__(
@@ -454,23 +461,44 @@ class PinnedModuleStager:
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
+        include_buffers: bool = True,
+        resident_weight_bytes: int = 0,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
             raise ValueError("PinnedModuleStager requires at least one nn.Module")
+        if resident_weight_bytes and retain_device_storage:
+            raise ValueError("A resident weight budget cannot be combined with fixed device staging")
 
         self.device = device
         self.copy_stream = copy_stream if copy_stream is not None else current_omni_platform.Stream()
         self._ready_event = current_omni_platform.Event()
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
+        self.include_buffers = include_buffers
         self.loaded = False
         self._groups = self._snapshot_groups(
             modules,
             pin_memory=pin_memory,
             pack_pinned=pin_memory and current_omni_platform.is_rocm(),
+            include_buffers=include_buffers,
         )
         self._device_storages: list[torch.Tensor] = []
+        self._resident_indices: list[int] = []
+        self._resident_storages: dict[int, torch.Tensor] = {}
+        if resident_weight_bytes:
+            remaining = resident_weight_bytes
+            # Count the bytes of each master's view, including when it shares a packed slab.
+            sizes_bytes = [group.master.numel() * group.master.element_size() for group in self._groups]
+            for index in sorted(range(len(sizes_bytes)), key=sizes_bytes.__getitem__, reverse=True):
+                if 0 < sizes_bytes[index] <= remaining:
+                    self._resident_indices.append(index)
+                    remaining -= sizes_bytes[index]
+            logger.info(
+                "Model-level offload can retain %d bytes for %s between swaps",
+                resident_weight_bytes - remaining,
+                type(modules[0]).__name__,
+            )
         self._restore_masters()
 
     @staticmethod
@@ -478,9 +506,10 @@ class PinnedModuleStager:
         modules: tuple[nn.Module, ...],
         *,
         pin_memory: bool,
+        include_buffers: bool,
         pack_pinned: bool = False,
     ) -> list[_StorageGroup]:
-        source_groups = _collect_source_groups(modules)
+        source_groups = _collect_source_groups(modules, include_buffers=include_buffers)
         try:
             return _copy_groups_to_cpu(
                 source_groups,
@@ -527,12 +556,17 @@ class PinnedModuleStager:
             self.cache_retention.release_if_needed(force=force)
 
     def _load_once(self) -> None:
-        device_storages = [torch.empty_like(group.master, device=self.device) for group in self._groups]
+        resident = self._resident_storages
+        device_storages = [
+            resident[index] if index in resident else torch.empty_like(group.master, device=self.device)
+            for index, group in enumerate(self._groups)
+        ]
         compute_stream = current_omni_platform.current_stream()
         self.copy_stream.wait_stream(compute_stream)
         with current_omni_platform.stream(self.copy_stream):
-            for device_storage, group in zip(device_storages, self._groups):
-                device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
+            for index, (device_storage, group) in enumerate(zip(device_storages, self._groups)):
+                if index not in resident:
+                    device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
             self._ready_event.record(self.copy_stream)
 
         self._bind(device_storages)
@@ -547,6 +581,7 @@ class PinnedModuleStager:
             logger.debug("Device synchronization failed while cleaning up module staging", exc_info=True)
         self._restore_masters()
         self._device_storages.clear()
+        self._resident_storages.clear()
         self.loaded = False
         self._release_cache(force=True)
 
@@ -565,6 +600,7 @@ class PinnedModuleStager:
             # A retained cache is normally reusable by this process, but an
             # explicit flush gives external memory pressure one bounded retry.
             self._cleanup_failed_load()
+            self._resident_indices.clear()
             try:
                 self._load_once()
             except BaseException:
@@ -585,10 +621,12 @@ class PinnedModuleStager:
             self._restore_masters()
         except BaseException:
             self._device_storages.clear()
+            self._resident_storages.clear()
             self.loaded = False
             self._release_cache(force=True)
             raise
         if not self.retain_device_storage:
+            self._resident_storages = {index: self._device_storages[index] for index in self._resident_indices}
             self._device_storages.clear()
         self.loaded = False
         self._release_cache()

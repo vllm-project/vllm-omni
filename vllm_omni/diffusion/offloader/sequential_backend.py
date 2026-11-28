@@ -3,6 +3,7 @@
 
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from itertools import chain
 
 import torch
 from torch import nn
@@ -63,6 +64,9 @@ class SequentialOffloadHook(ModelHook):
         use_hsdp: bool = False,
         offload_after_context: bool = True,
         persistent_staging: bool = False,
+        cpu_master: bool = False,
+        stage_buffers: bool = True,
+        resident_weight_bytes: int = 0,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
@@ -71,6 +75,9 @@ class SequentialOffloadHook(ModelHook):
         self.use_hsdp = use_hsdp
         self.offload_after_context = offload_after_context
         self.persistent_staging = persistent_staging
+        self.cpu_master = cpu_master and device.type == "cuda" and not use_hsdp
+        self.stage_buffers = stage_buffers
+        self.resident_weight_bytes = resident_weight_bytes
         self._stager: PinnedModuleStager | None = None
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
@@ -84,6 +91,23 @@ class SequentialOffloadHook(ModelHook):
                 pin_memory=self.pin_memory,
                 retain_device_storage=True,
             )
+        elif self.cpu_master and all(
+            tensor.layout == torch.strided
+            and tensor.device.type in ("cpu", "cuda")
+            and not tensor.is_quantized
+            and not tensor.is_conj()
+            and not tensor.is_neg()
+            and type(tensor.data) is torch.Tensor
+            for tensor in chain(module.parameters(), module.buffers() if self.stage_buffers else ())
+        ):
+            self._stager = PinnedModuleStager(
+                module,
+                self.device,
+                pin_memory=self.pin_memory,
+                include_buffers=self.stage_buffers,
+                resident_weight_bytes=self.resident_weight_bytes,
+            )
+            logger.info("Model-level offload uses CPU master staging for %s", type(module).__name__)
         return module
 
     @staticmethod
@@ -93,6 +117,7 @@ class SequentialOffloadHook(ModelHook):
         *,
         non_blocking: bool = False,
         pin_memory: bool = False,
+        buffers_only: bool = False,
     ) -> bool:
         """Move module parameters and buffers to device.
 
@@ -103,13 +128,13 @@ class SequentialOffloadHook(ModelHook):
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
         pin = pin_memory and target_device.type == "cpu" and is_pin_memory_available()
-        if pin and current_omni_platform.is_rocm():
+        if pin and not buffers_only and current_omni_platform.is_rocm():
             moved = _move_module_to_packed_pinned_cpu(module, non_blocking=non_blocking)
             if moved is not None:
                 return moved
 
         moved = False
-        for tensor in (*module.parameters(), *module.buffers()):
+        for tensor in chain(() if buffers_only else module.parameters(), module.buffers()):
             # Modules built on host start pageable; pin them on the first offload
             # so later loads do not stage the whole module through pageable memory.
             unpinned = pin and not isinstance(tensor.data, DTensor) and not tensor.data.is_pinned()
@@ -123,7 +148,7 @@ class SequentialOffloadHook(ModelHook):
 
     @staticmethod
     def _module_stager(module: nn.Module) -> PinnedModuleStager | None:
-        """The persistent stager owned by ``module``'s own sequential hook, if any.
+        """The stager owned by ``module``'s own sequential hook, if any.
 
         Cross-module swaps call ``_to_cpu(target)`` through the *running*
         module's hook, so staging state must be resolved on the target's hook
@@ -137,16 +162,18 @@ class SequentialOffloadHook(ModelHook):
         stager = self._module_stager(module)
         if stager is not None:
             stager.offload()
-            return
+            if stager.include_buffers:
+                return
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
-        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
+        non_blocking = stager is None and not self.use_hsdp and not current_omni_platform.is_xpu()
         moved = self._move_params(
             module,
             torch.device("cpu"),
             non_blocking=non_blocking,
             pin_memory=self.pin_memory,
+            buffers_only=stager is not None,
         )
         if moved:
             current_omni_platform.empty_cache()
@@ -155,8 +182,9 @@ class SequentialOffloadHook(ModelHook):
         stager = self._module_stager(module)
         if stager is not None:
             stager.load()
-            return
-        self._move_params(module, self.device, non_blocking=False)
+            if stager.include_buffers:
+                return
+        self._move_params(module, self.device, buffers_only=stager is not None)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
@@ -188,6 +216,9 @@ def apply_sequential_offload(
     offload_dit_modules: Collection[nn.Module] | None = None,
     offload_encoder_modules: Collection[nn.Module] | None = None,
     persistent_dit_staging: bool = False,
+    cpu_master_dit_modules: Collection[nn.Module] = (),
+    cpu_master_encoder_modules: Collection[nn.Module] = (),
+    resident_weight_bytes: int = 0,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -210,6 +241,12 @@ def apply_sequential_offload(
             storage across swaps, so CUDA-graph-captured weight pointers stay
             valid. Encoders keep plain move semantics so their memory is
             actually freed while the DiT runs.
+        cpu_master_dit_modules: Selected DiTs eligible for CUDA staging from
+            immutable CPU masters, with device storage released on offload.
+        cpu_master_encoder_modules: Selected encoders eligible for parameter-only
+            CPU staging. Their buffers keep the ordinary move semantics.
+        resident_weight_bytes: Maximum retained device weight bytes per
+            CPU-master-staged module after an offload.
 
     Example:
         >>> apply_sequential_offload(
@@ -225,7 +262,13 @@ def apply_sequential_offload(
     }
 
     all_modules = [*dit_modules, *encoder_modules]
-    initial_devices = _capture_tensor_devices(dit_modules) if offload_initial_dits else []
+    cpu_master_dit_ids = selected_dit_ids.intersection(id(module) for module in cpu_master_dit_modules)
+    cpu_master_encoder_ids = selected_encoder_ids.intersection(id(module) for module in cpu_master_encoder_modules)
+    # Stager registration can move a DiT to CPU before the next hook is installed.
+    initial_devices = _capture_tensor_devices(
+        [dit for dit in dit_modules if persistent_dit_staging or id(dit) in cpu_master_dit_ids or offload_initial_dits]
+        + [encoder for encoder in encoder_modules if id(encoder) in cpu_master_encoder_ids]
+    )
     try:
         selected_encoders = [encoder for encoder in encoder_modules if id(encoder) in selected_encoder_ids]
         # Register hooks on DiT modules (offload selected encoders and other selected DiTs).
@@ -239,6 +282,8 @@ def apply_sequential_offload(
                 use_hsdp=use_hsdp,
                 offload_after_context=id(dit_mod) in selected_dit_ids,
                 persistent_staging=persistent_dit_staging,
+                cpu_master=id(dit_mod) in cpu_master_dit_ids,
+                resident_weight_bytes=resident_weight_bytes,
             )
             registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
             logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
@@ -254,6 +299,9 @@ def apply_sequential_offload(
                 pin_memory=pin_memory,
                 use_hsdp=use_hsdp,
                 offload_after_context=id(enc) in selected_encoder_ids,
+                cpu_master=id(enc) in cpu_master_encoder_ids,
+                stage_buffers=False,
+                resident_weight_bytes=resident_weight_bytes,
             )
             registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
             logger.debug("Registered offload hook for %s", enc.__class__.__name__)
@@ -313,7 +361,8 @@ def sequential_offload_staging_active(module: nn.Module) -> bool:
     Fixed staging storage keeps CUDA-graph-captured weight pointers valid
     across offload/load swaps.
     """
-    return SequentialOffloadHook._module_stager(module) is not None
+    stager = SequentialOffloadHook._module_stager(module)
+    return stager is not None and stager.retain_device_storage
 
 
 @contextmanager
@@ -350,6 +399,15 @@ class ModelLevelOffloadBackend(OffloadBackend):
         if self.enabled:
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
+
+        resident_weight_bytes = self.config.resident_mib_per_module * 1024**2
+        if resident_weight_bytes and (
+            not current_omni_platform.is_cuda()
+            or self.device.type != "cuda"
+            or self.config.use_hsdp
+            or isinstance(pipeline, SupportsModelCpuOffload)
+        ):
+            raise ValueError("resident_mib_per_module requires CUDA model-level hooks without HSDP")
 
         # Pipelines with non-forward component entry points own their complete
         # mutual-exclusion lifecycle. Delegate through the explicit protocol.
@@ -389,6 +447,14 @@ class ModelLevelOffloadBackend(OffloadBackend):
         residents = [component.module for component in resolved.residents]
         selected_dits = [component.module for component in resolved.dits if component.selected]
         selected_encoders = [component.module for component in resolved.encoders if component.selected]
+        cpu_master_dits = [component.module for component in resolved.dits if component.cpu_master]
+        cpu_master_encoders = [component.module for component in resolved.encoders if component.cpu_master]
+        # Decode graphs keep fixed device storage so captured pointers stay valid.
+        persistent_dit_staging = self.device.type == "cuda" and any(
+            getattr(dit, "enable_cuda_graph_decode", False) for dit in dits
+        )
+        if resident_weight_bytes and (persistent_dit_staging or not (cpu_master_dits or cpu_master_encoders)):
+            raise ValueError("resident_mib_per_module requires CPU-master staging without fixed decode graphs")
 
         all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
@@ -422,14 +488,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 use_hsdp=self.config.use_hsdp,
                 offload_dit_modules=selected_dits,
                 offload_encoder_modules=selected_encoders,
-                # Fixed DiT staging keeps decode-graph weight pointers valid;
-                # only models that capture weight pointers (Qwen-Image-2.1's
-                # CUDA-graph decode) pay for it — every other model keeps
-                # plain move semantics so offloading actually frees DiT VRAM
-                # while the encoders run.
-                persistent_dit_staging=(
-                    self.device.type == "cuda" and any(getattr(dit, "enable_cuda_graph_decode", False) for dit in dits)
-                ),
+                cpu_master_dit_modules=cpu_master_dits,
+                cpu_master_encoder_modules=cpu_master_encoders,
+                persistent_dit_staging=persistent_dit_staging,
+                resident_weight_bytes=resident_weight_bytes,
             )
         except BaseException:
             try:

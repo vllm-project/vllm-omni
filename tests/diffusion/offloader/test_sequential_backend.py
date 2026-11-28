@@ -7,7 +7,9 @@ import pytest
 import torch
 from torch import nn
 
+from tests.diffusion.offloader.helpers import patch_offload_runtime
 from vllm_omni.diffusion.hooks import HookRegistry
+from vllm_omni.diffusion.offloader import sequential_backend
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.offloader.sequential_backend import (
@@ -16,6 +18,7 @@ from vllm_omni.diffusion.offloader.sequential_backend import (
     apply_sequential_offload,
     remove_sequential_offload,
     sequential_offload_component,
+    sequential_offload_staging_active,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -300,6 +303,7 @@ def test_persistent_dit_staging_reuses_fixed_device_storage(accelerator_device) 
     dit_hook = dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
     encoder_hook = encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
     assert dit_hook._stager is not None
+    assert sequential_offload_staging_active(dit)
     assert encoder_hook._stager is None  # encoders keep plain move semantics
 
     # Registration snapshots the CPU master and rebinds to it.
@@ -353,6 +357,151 @@ def test_default_sequential_offload_releases_device_storage(accelerator_device) 
     assert all(parameter.device.type == "cpu" for parameter in dit.parameters())
 
     remove_sequential_offload([dit, encoder])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_model_level_cpu_master_reuses_host_storage(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, device_type: str
+) -> None:
+    """Exercise plan resolution and cross-module swaps across repeated forwards."""
+    use_cuda = device_type == "cuda"
+    if use_cuda and (current_omni_platform.get_device_count() == 0 or not current_omni_platform.is_cuda()):
+        pytest.skip("CUDA required for real device staging")
+
+    class DiT(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.eye(2).to(dtype), requires_grad=False)
+            self.register_buffer("scale", torch.tensor(0.5))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return (x @ self.weight.to(x.dtype)) * self.scale
+
+    pipeline = nn.Module()
+    pipeline.transformer = dit = DiT()
+    pipeline.text_encoder = encoder = nn.Identity()
+    pipeline._offload_plan = OffloadPlan(cpu_master_dit_paths=frozenset({"transformer"}))
+    cpu = torch.device("cpu")
+    cuda = torch.device("cuda:0")
+    compute_device = cuda if use_cuda else cpu
+    x = torch.ones(1, 2, device=compute_device)
+    expected = dit(x.cpu()).to(compute_device)
+    if not use_cuda:
+        stager_type = sequential_backend.PinnedModuleStager
+
+        def stage_on_cpu(
+            module: nn.Module,
+            device: torch.device,
+            *,
+            pin_memory: bool,
+            include_buffers: bool,
+            resident_weight_bytes: int,
+        ) -> sequential_backend.PinnedModuleStager:
+            assert device == cuda
+            return stager_type(
+                module,
+                cpu,
+                pin_memory=pin_memory,
+                include_buffers=include_buffers,
+                resident_weight_bytes=resident_weight_bytes,
+            )
+
+        patch_offload_runtime(monkeypatch, current_omni_platform, synchronize=True)
+        monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda: 0)
+        monkeypatch.setattr(sequential_backend, "PinnedModuleStager", stage_on_cpu)
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=use_cuda), cuda
+    )
+    backend.enable(pipeline)
+
+    hook = dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    stager = hook._stager
+    assert stager is not None
+    assert not sequential_offload_staging_active(dit)
+    weight = dit.weight
+    master_ptr = weight.data_ptr()
+    scale_ptr = dit.scale.data_ptr()
+
+    for _ in range(2):
+        torch.testing.assert_close(dit(x), expected, rtol=0, atol=0)
+        assert stager.loaded
+        assert weight.device == dit.scale.device == compute_device
+        if not use_cuda:
+            assert weight.data_ptr() != master_ptr
+            assert dit.scale.data_ptr() != scale_ptr
+        # A change to the staged copy must not be copied back into the CPU master.
+        dit.scale.fill_(2.0)
+        encoder(x)
+        assert not stager.loaded
+        assert not stager._device_storages
+        assert dit.weight is weight
+        assert weight.device == dit.scale.device == cpu
+        assert weight.is_pinned() == use_cuda
+        assert weight.data_ptr() == master_ptr
+        assert dit.scale.data_ptr() == scale_ptr
+        assert dit.scale.item() == 0.5
+
+    backend.disable()
+    assert dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME) is None
+
+
+@pytest.mark.parametrize("resident_mib", [0, 1])
+def test_model_level_encoder_cpu_master_preserves_mutable_buffers(
+    accelerator_device: torch.device, resident_mib: int
+) -> None:
+    if not current_omni_platform.is_cuda():
+        pytest.skip("CUDA required for encoder CPU master staging")
+
+    class Encoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(2.0), requires_grad=False)
+            self.register_buffer("counter", torch.tensor(0.0), persistent=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.counter.add_(1)
+            return x * self.weight + self.counter
+
+    pipeline = nn.Module()
+    pipeline.text_encoder = encoder = Encoder()
+    pipeline.transformer = nn.Identity()
+    pipeline._offload_plan = OffloadPlan(cpu_master_encoder_paths=frozenset({"text_encoder"}))
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, resident_mib_per_module=resident_mib), accelerator_device
+    )
+    backend.enable(pipeline)
+
+    hook = encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert hook._stager is not None
+    master_ptr = encoder.weight.data_ptr()
+    x = torch.ones((), device=accelerator_device)
+    for counter in (1, 2):
+        assert encoder(x).item() == 2 + counter
+        pipeline.transformer(x)
+        assert encoder.weight.device.type == encoder.counter.device.type == "cpu"
+        assert encoder.counter.item() == counter
+        assert encoder.weight.data_ptr() == master_ptr
+        assert not hook._stager._device_storages
+        assert len(hook._stager._resident_storages) == bool(resident_mib)
+
+    backend.disable()
+
+
+@pytest.mark.parametrize(
+    ("device", "use_hsdp", "sparse_buffer"), [("cpu", False, False), ("cuda", True, False), ("cuda", False, True)]
+)
+def test_cpu_master_staging_falls_back_for_unsupported_modules(
+    device: str, use_hsdp: bool, sparse_buffer: bool
+) -> None:
+    dit = _create_simple_module()
+    if sparse_buffer:
+        dit.register_buffer("state", torch.ones(2).to_sparse())
+    hook = SequentialOffloadHook([], torch.device(device), use_hsdp=use_hsdp, cpu_master=True)
+
+    hook.initialize_hook(dit)
+
+    assert hook._stager is None
 
 
 @pytest.mark.parametrize(

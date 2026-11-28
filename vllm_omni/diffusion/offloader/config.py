@@ -80,6 +80,7 @@ class ParsedDiffusionOffloadConfig:
     components: frozenset[str]
     layer_options: Mapping[str, LayerOffloadOptions]
     pin_memory: bool | None = None
+    resident_mib_per_module: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "layer_options", _FrozenMapping(self.layer_options))
@@ -185,11 +186,11 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
         raise TypeError(f"diffusion_offload_config must be a mapping, got {type(value).__name__}")
 
     _validate_string_keys(value, "diffusion_offload_config")
-    unknown = sorted(set(value) - {"mode", "components", "layer_options", "pin_memory"})
+    unknown = sorted(set(value) - {"mode", "components", "layer_options", "pin_memory", "resident_mib_per_module"})
     if unknown:
         raise ValueError(
             f"Unknown diffusion_offload_config field(s): {', '.join(unknown)}; "
-            "choose from: mode, components, layer_options, pin_memory"
+            "choose from: mode, components, layer_options, pin_memory, resident_mib_per_module"
         )
     if "mode" not in value:
         raise ValueError("diffusion_offload_config requires 'mode'")
@@ -217,6 +218,12 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
     if pin_memory is not None and type(pin_memory) is not bool:
         raise TypeError("diffusion_offload_config.pin_memory must be a bool")
 
+    resident_mib_per_module = value.get("resident_mib_per_module", 0)
+    if type(resident_mib_per_module) is not int or resident_mib_per_module < 0:
+        raise ValueError("diffusion_offload_config.resident_mib_per_module must be a non-negative integer")
+    if resident_mib_per_module and mode is not OffloadMode.MODULE:
+        raise ValueError("diffusion_offload_config.resident_mib_per_module requires mode='module'")
+
     if mode is OffloadMode.MODULE and raw_layer_options:
         raise ValueError(
             "diffusion_offload_config.layer_options requires mode='layer'; "
@@ -231,6 +238,7 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
         components=components,
         layer_options=layer_options,
         pin_memory=pin_memory,
+        resident_mib_per_module=resident_mib_per_module,
     )
 
 

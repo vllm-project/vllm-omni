@@ -14,8 +14,13 @@ Server rows:
 - ``vae_slicing_tiling`` — ``--vae-use-slicing --vae-use-tiling`` (the recipe's
   OOM mitigation; applied generically in ``registry.initialize_model``).
 - ``cfg_parallel_2`` — two-card CFG branch parallelism.
+- ``cpu_offload`` — ``--enable-cpu-offload`` (model-level: DiT <-> mllm mutual
+  exclusion; runs the 34.6 GiB checkpoint on ~24 GiB cards, validated on RTX
+  4090).
+- ``layerwise_offload`` — ``--enable-layerwise-offload`` (DiT blocks stream
+  per layer; 40 layers discovered from ``_layerwise_offload_blocks_attrs``).
 
-Cases (one per test, each parametrized over all server rows):
+Cases (one per test, each parametrized over every server row):
 - ``test_non_square_resolution`` — 768x1024, exercises the patchify / RoPE path
   at a non-square aspect ratio.
 - ``test_cfg_off`` — ``guidance_scale=1.0``, exercises the no-CFG denoise branch
@@ -24,8 +29,8 @@ Cases (one per test, each parametrized over all server rows):
 
 Boogu-Image reads ``sp.guidance_scale`` (not ``true_cfg_scale``). These stay
 smoke-depth (``num_inference_steps=2``); numeric parity vs. Diffusers is covered
-by the local parity harness (support plan, step 14). CPU offload, Cache-DiT, and
-non-CFG multi-GPU parallelism remain unsupported.
+by the local parity harness (support plan, step 14). Cache-DiT and non-CFG
+multi-GPU parallelism remain unsupported.
 
 From ``tests/``::
 
@@ -72,6 +77,22 @@ def _get_diffusion_feature_cases(model: str):
             OmniServerParams(model=model, server_args=["--cfg-parallel-size", "2"]),
             id="cfg_parallel_2",
             marks=PARALLEL_2_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--enable-cpu-offload"],
+            ),
+            id="cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--enable-layerwise-offload"],
+            ),
+            id="layerwise_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
 
