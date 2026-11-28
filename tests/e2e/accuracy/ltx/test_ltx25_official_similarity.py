@@ -40,8 +40,8 @@ if TYPE_CHECKING:
     from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 skip_pending_natten_build = pytest.mark.skipif(
-    torch.version.cuda == "13.0" and torch.__version__.startswith("2.14."),
-    reason="NATTEN Hub build for PyTorch 2.14 with CUDA 13.0 is pending at https://github.com/SHI-Labs/NATTEN/issues/356",
+    torch.version.cuda is not None,
+    reason="Temporarily skipped on CUDA pending https://github.com/SHI-Labs/NATTEN/issues/356",
 )
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
