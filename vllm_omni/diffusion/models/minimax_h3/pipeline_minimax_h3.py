@@ -651,20 +651,7 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
         if exc is not None:
             raise exc
         return
-    if rank == 0:
-        if exc is None:
-            payload: list[Any] = [None]
-        else:
-            payload = [
-                {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "status_code": getattr(exc, "status_code", None),
-                    "error_type": getattr(exc, "error_type", None),
-                }
-            ]
-    else:
-        payload = [None]
+    payload: list[Any] = [_exception_metadata(exc) if rank == 0 else None]
     dist.broadcast_object_list(payload, src=0, group=group)
     info = payload[0]
     if info is None:
@@ -672,12 +659,32 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
     if rank == 0:
         assert exc is not None
         raise exc
-    # Rebuild a matching client-facing error on non-zero ranks so the runner's
-    # per-request try/except records the same 4xx status as rank 0. The exact
-    # subclass need not survive the wire; the message and status suffice.
+    _raise_published_exception(info, source_rank=0)
+
+
+def _exception_metadata(exc: Exception | None) -> dict[str, Any] | None:
+    """Serialize an exception into a payload that can cross a process group."""
+    if exc is None:
+        return None
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "status_code": getattr(exc, "status_code", None),
+        "error_type": getattr(exc, "error_type", None),
+    }
+
+
+def _raise_published_exception(info: dict[str, Any], source_rank: int) -> None:
+    """Raise a failure that ``source_rank`` published to the other ranks.
+
+    The failing rank raises its own exception, so the original traceback is
+    kept there. The other ranks rebuild a matching client-facing error so the
+    runner's per-request try/except records the same 4xx status. The exact
+    subclass need not survive the wire; the message and status suffice.
+    """
     status_code = info.get("status_code")
     error_type = info.get("error_type")
-    message = f"[rank 0] {info['type']}: {info['message']}"
+    message = f"[rank {source_rank}] {info['type']}: {info['message']}"
     if status_code is not None:
         raise client_error_from_metadata(
             message,
@@ -685,6 +692,52 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
             error_type=error_type,
         )
     raise RuntimeError(message)
+
+
+def _publish_any_rank_exception(exc: Exception | None) -> None:
+    """Synchronize an exception raised by *any* DiT rank across every DiT rank.
+
+    ``_broadcast_rank0_exception`` can only carry rank 0's failure: the
+    broadcast source is fixed at rank 0 and every other rank's payload is
+    ignored. That is enough for the preparation step, which only runs on
+    rank 0, but not for the text encoder forward, which runs on the first
+    ``text_encoder_tp_size`` ranks. With more than one encoder rank a
+    non-zero encoder rank can fail while rank 0 succeeds, and the rank-0
+    broadcast drops that failure: the surviving ranks then enter the output
+    broadcast, which every DiT rank has to join, without the failure - the
+    same divergence as the rank-0 case.
+
+    This helper all-gathers the per-rank failure status instead, so the
+    lowest failing rank owns the error and every other rank raises the same
+    failure. It is a collective like its rank-0 counterpart, so every rank
+    has to call it before any subsequent collective.
+    """
+    # The payload is a Python object, so it has to travel host-side over the
+    # gloo group instead of the device group: a device-group object collective
+    # allocates device buffers and drives the device backend, which is the
+    # ``EI0006`` failure on ``HcclBroadcast`` that #10645 is about. Every
+    # object collective of this file uses the CPU group view.
+    group, rank, world_size = _dit_cpu_rank_world()
+    if world_size == 1:
+        if exc is not None:
+            raise exc
+        return
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(
+        gathered,
+        {"rank": rank, "error": _exception_metadata(exc)},
+        group=group,
+    )
+    failures = [item for item in gathered if item is not None and item["error"] is not None]
+    if not failures:
+        return
+    failure = min(failures, key=lambda item: item["rank"])
+    source_rank = int(failure["rank"])
+    info = failure["error"]
+    if source_rank == rank:
+        assert exc is not None
+        raise exc
+    _raise_published_exception(info, source_rank=source_rank)
 
 
 def _broadcast_tensor(
@@ -3173,9 +3226,40 @@ class MiniMaxH3Pipeline(
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
+        encode_error = None
         if rank < self.text_encoder_tp_size:
-            ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            hidden = self._encode_text_hidden(ids, vision_kwargs)
+            # The encoder inputs and the encoder forward are rank-local work
+            # that the other DiT ranks wait for through the broadcasts below.
+            # An operator failure here (an Ascend tiling error, an OOM, a
+            # shape mismatch) must reach every rank the same way a
+            # preparation failure does: otherwise this rank leaves the
+            # function while the peers block in ``_broadcast_tensor`` on a
+            # collective nobody will join, and the whole worker wedges until
+            # the collective times out.
+            #
+            # The input distribution is inside the guard because it can fail
+            # before its own collective. A failure *inside* one of its
+            # encoder-group broadcasts leaves the DiT group intact but strands
+            # the peers of that broadcast, so they never reach the
+            # publication below and the request still times out - that is the
+            # known in-collective limitation, not something this guard can
+            # repair.
+            try:
+                ids = self._distribute_encode_inputs(ids, vision_kwargs)
+                hidden = self._encode_text_hidden(ids, vision_kwargs)
+            except Exception as exc:
+                encode_error = exc
+        # Every rank calls this helper, including the ranks that did not run
+        # the encoder: it is a collective, and the ranks that skipped the
+        # encoder are exactly the ones that would otherwise wait in the
+        # broadcast below for a rank that failed.
+        if self.text_encoder_tp_size > 1:
+            # More than one rank runs the encoder, so the failure can come
+            # from any of them and the rank-0-only broadcast would drop the
+            # failure of a non-zero encoder rank.
+            _publish_any_rank_exception(encode_error)
+        else:
+            _broadcast_rank0_exception(encode_error)
         return (
             _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
             _broadcast_tensor(tags, dtype=torch.long, device=self.device),

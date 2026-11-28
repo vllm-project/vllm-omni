@@ -62,6 +62,44 @@ cross-stage routing.
 
 **Rule:** Model directories SHOULD contain only genuine model differences.
 
+### DIFF-MODEL-INV-005: Rank-local work stays in step
+
+**Rule:** A pipeline that runs work on a subset of ranks MUST publish that
+work's failure to every rank before the next collective, so that no rank
+waits on a collective whose peer has already left.
+
+**Why:** The failure is not reported, it is only felt by the peers. The rank
+that failed returns to its caller, while its peers block in the next
+collective until the collective timeout expires, or - when the failed rank's
+process has already died - continue with an empty payload and report
+success. The process stays alive and keeps answering health checks, so the
+server keeps dispatching work that cannot finish, and every later request
+fails for the same reason.
+
+**How to apply:** Wrap rank-local work in a try, publish the exception through
+the pipeline's rank-failure helper, and call that helper on every rank
+immediately after the rank-local work and before the next collective. The
+helper is itself a collective, so every rank must call it even when it did no
+rank-local work; a rank that skips it desynchronizes the group.
+
+MiniMax-H3's `encode_prompt` runs the text encoder on the first
+`text_encoder_tp_size` DiT ranks and broadcasts the result to the others. The
+preparation step already published its failures this way, but the encoder
+forward did not, so an encoder operator failure on rank 0 left the other
+ranks in the broadcast without the failure.
+
+The publishing helper has to match the set of ranks that ran the work. A
+rank-0-only broadcast carries rank 0's failure and ignores every other rank's
+payload, so it is the wrong helper as soon as more than one rank runs the
+work: with `text_encoder_tp_size > 1` a non-zero encoder rank can fail while
+rank 0 succeeds, and the rank-0 broadcast drops that failure. The surviving
+ranks then enter the output broadcast, which every DiT rank has to join,
+without the failure: they either wait there until the collective times out
+or, when the failed rank's process has already died, continue with an empty
+payload. That is the same divergence as the rank-0 case, not a smaller one.
+When the failing rank is not fixed, the helper has to collect the per-rank
+failure status and let every rank raise the same failure.
+
 ## Safe-change guide
 
 Test registry selection, checkpoint loading, minimal inference, input and output
