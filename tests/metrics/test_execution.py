@@ -287,3 +287,14 @@ def test_component_weight_dtypes_count_loaded_weights_per_component():
         # Packed quantized weights are persistent buffers; the cache is not a weight.
         "video_vae": {"float32": 6, "uint8": 8},
     }
+
+
+def test_diffusion_facts_read_frames_from_encoded_video_without_counts(monkeypatch):
+    from vllm_omni.diffusion.utils import media_utils
+
+    monkeypatch.setattr(media_utils, "count_mp4_frames", lambda data: 209 if data == b"mp4" else None)
+    formatted = [SimpleNamespace(images=[b"mp4"], multimodal_output={})]
+
+    facts = execution.diffusion_facts(_request(), DiffusionOutput(), formatted)
+
+    assert (facts["num_frames"], facts["frames_source"]) == (209, "container")

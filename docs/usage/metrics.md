@@ -187,7 +187,7 @@ defaults report what the pipeline resolved where the pipeline reports it
 | Field | Meaning |
 | --- | --- |
 | `width`, `height`, `size_source` | Output size and its source: `tensor` (typed video tensor), `image`, `pipeline` (reported by the pipeline, e.g. for video it encoded in the worker) or `request` (resolved sampling parameters). |
-| `num_frames`, `frames_source` | Frame count before optional frame interpolation and its source: `tensor`, `encoder` (frame counts the encoder reported for video the worker encoded), `stream` (sum of streamed chunks) or `request`. |
+| `num_frames`, `frames_source` | Frame count before optional frame interpolation and its source: `tensor`, `encoder` (frame counts the encoder reported for video the worker encoded), `container` (frame count read from the encoded MP4), `stream` (sum of streamed chunks) or `request`. |
 | `fps`, `seed` | Output rate; resolved seed, including a server-assigned random seed. |
 | `num_inference_steps` | Requested denoising steps (`null` when the model default applied). |
 | `completed_steps` | Denoising steps the pipeline completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
@@ -209,7 +209,7 @@ worker once after the model loads:
 | `parallel_config`, `max_num_seqs` | Parallel degrees; maximum requests batched together. |
 | `device`, `world_size` | Accelerator name and number of ranks. |
 | `attention` | The backend each attention layer resolved, counted per role. |
-| `weight_dtypes` | Weight elements per dtype of each pipeline component as loaded (parameters and persistent buffers, so packed quantized weights such as NVFP4 show), e.g. `{"transformer": {"bfloat16": …}, "video_vae": {"float32": …, "float16": …}}`. |
+| `weight_dtypes` | Weight elements per dtype of each pipeline component as loaded on the reporting rank (rank 0; a component sharded with tensor parallelism shows its shard) (parameters and persistent buffers, so packed quantized weights such as NVFP4 show), e.g. `{"transformer": {"bfloat16": …}, "video_vae": {"float32": …, "float16": …}}`. |
 | other keys | Facts the pipeline reports through `execution_runtime_facts()`, e.g. MiniMax-H3's `compute_dtypes` (`video_vae_decode: float16`) and `video_vae_decoder: nvfp4` when the NVFP4 decoder is installed. |
 
 MiniMax-H3 on one B300; the request set `prompt`, `aspect_ratio`, `seed` and `num_inference_steps=49`:

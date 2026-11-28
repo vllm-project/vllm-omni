@@ -99,6 +99,13 @@ def _output_size(formatted_outputs: Sequence[Any] | None) -> tuple[int | None, i
         frame_counts = _video_metadata(request_output).get("frame_counts")
         if valid_frame_counts(frame_counts, len(images)):
             return None, None, frame_counts[0], "encoder"
+        if images and isinstance(images[0], (bytes, bytearray)):
+            # Encoded video without reported counts: read the MP4's sample table.
+            from vllm_omni.diffusion.utils.media_utils import count_mp4_frames
+
+            num_frames = count_mp4_frames(bytes(images[0]))
+            if num_frames is not None:
+                return None, None, num_frames, "container"
     return None
 
 
@@ -140,7 +147,8 @@ def diffusion_facts(
     from: ``tensor`` (typed video tensor), ``image``, ``pipeline`` (the size
     the pipeline reported, e.g. for video it encoded in the worker) or
     ``request``; ``frames_source`` does the same for ``num_frames`` (``tensor``,
-    ``encoder`` for the frame counts of video the worker encoded, ``stream``
+    ``encoder`` for the frame counts of video the worker encoded,
+    ``container`` for the frame count in the encoded MP4 itself, ``stream``
     or ``request``).
     ``num_inference_steps`` is the requested step count; ``completed_steps``
     is the denoising steps the model runner counted (``None`` without a
