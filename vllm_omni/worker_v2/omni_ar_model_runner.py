@@ -13,6 +13,7 @@ Extends ``OmniGPUModelRunner`` with:
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -504,6 +505,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             finalize_output=finalize_output,
             finalize_multimodal=finalize_multimodal,
             finalize_pooler_payload=finalize_pooler_payload,
+            client_mm_keys=tuple(getattr(self.model, "omni_client_multimodal_output_keys", ()) or ()),
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
@@ -826,6 +828,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         req_ids: list[str] | None = None,
         engine_output_type: str = "audio",
         finalize_pooler_payload: Any | None = None,
+        client_mm_keys: Collection[str] = (),
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
         """Build async-chunk payloads without materializing hidden on CPU."""
         if not mm_outputs:
@@ -863,7 +866,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
             flat = flatten_payload(payload)
             if finalize_pooler_payload is not None:
                 flat = flatten_payload(finalize_pooler_payload(flat, multimodal_outputs=mm_outputs, idx=i))
-            inter_stage, client_mm = partition_flat_payload(flat)
+            # Models publish client-facing keys explicitly; the partitioner
+            # must honour that or the key dies in the inter-stage partition
+            # (Nemotron tool calls did exactly that).
+            inter_stage, client_mm = partition_flat_payload(flat, extra_client_keys=client_mm_keys)
             inter_stage_list.append(inter_stage or None)
             client_mm_list.append(client_mm or None)
 
@@ -1197,8 +1203,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         request_errors: tuple[torch.Tensor, str] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
         hidden_state_slices: dict[str, torch.Tensor] | None = None,
+        client_mm_keys: Collection[str] = (),
     ):
         self.model_runner_output = model_runner_output
+        self._client_mm_keys = tuple(client_mm_keys)
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
@@ -1469,6 +1477,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._req_ids,
                     self._engine_output_type,
                     self._finalize_pooler_payload,
+                    # The model declares which multimodal keys belong to the
+                    # client; the partitioner must carry them or a tool call is
+                    # projected to nothing.
+                    self._client_mm_keys,
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()

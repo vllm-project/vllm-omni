@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -36,6 +39,30 @@ def test_partition_code2wav_client_audio():
     inter, client = partition_flat_payload(payload)
     assert inter == {}
     assert client == payload
+
+
+def test_declared_client_keys_reach_the_client_partition():
+    """A model's declared client keys must not die in the inter-stage dict.
+
+    ``nemotron_voicechat_thinker`` declares ``nvc_function_token`` through
+    ``omni_client_multimodal_output_keys``; without this the token never
+    reaches the data plane, no ``response.function_call_arguments.done`` is
+    emitted, and the model's tool call is silently dropped.
+    """
+    token = torch.tensor([12])
+    payload = {"nvc_function_token": token, "hidden": torch.zeros(1, 4)}
+    inter, client = partition_flat_payload(payload, extra_client_keys=("nvc_function_token",))
+    assert client["nvc_function_token"] is token
+    # Downstream stages keep seeing it, like the meta.* client keys.
+    assert inter["nvc_function_token"] is token
+    assert "hidden" not in client
+
+
+def test_undeclared_function_token_stays_inter_stage_only():
+    payload = {"nvc_function_token": torch.tensor([12])}
+    inter, client = partition_flat_payload(payload)
+    assert "nvc_function_token" in inter
+    assert "nvc_function_token" not in client
 
 
 def test_partition_payload_list_preserves_request_alignment():
