@@ -14,8 +14,6 @@ at commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` (tagged `v0.34.0`).
 The combined Python metadata range for this checkout and vLLM is
 `>=3.11,<3.14`. The release CUDA wheel uses PyTorch 2.14.0 and CUDA 13.0
 (`cu130`); the current validation environment uses Python 3.12.
-The pre-built Omni wheel instructions below install
-the published 0.32.0 release with its matching vLLM dependency.
 
 !!! note
     PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
@@ -28,24 +26,31 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 #### Installation of vLLM
 
-These pre-built wheel instructions install the published vLLM-Omni 0.32.0 release.
+These pre-built wheel instructions install the published vLLM-Omni 0.34.0 release.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 
 ```bash
-uv pip install vllm==0.32.0 --torch-backend=cu130
+uv pip install vllm==0.34.0 --torch-backend=cu130
 ```
 
 #### Installation of vLLM-Omni
 
 ```bash
-uv pip install vllm-omni==0.32.0
+uv pip install vllm-omni==0.34.0
+uv pip check
 ```
 
-To run Gradio demos, also install the optional extras:
+For Gradio demos, build the Pillow 13 compatible Gradio wheel from the
+matching Omni tag, then install it together with the pinned demo extra:
 
 ```bash
-uv pip install 'vllm-omni[demo]==0.32.0'
+git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install 'vllm-omni[demo]==0.34.0' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 ```
 
 # --8<-- [end:pre-built-wheels]
@@ -173,7 +178,7 @@ Nightly CUDA images built from the latest `main` are also available:
 
 Use a commit-pinned tag when you need a reproducible nightly environment.
 
-The [v0.32.0 release](https://github.com/vllm-project/vllm-omni/releases/tag/v0.32.0)
+The [v0.34.0 release](https://github.com/vllm-project/vllm-omni/releases/tag/v0.34.0)
 provides CUDA images for `linux/amd64` and `linux/arm64`. Use the versioned
 tag for a reproducible release environment rather than the rolling `latest` tag.
 
@@ -186,7 +191,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.32.0 \
+    vllm/vllm-omni:v0.34.0 \
     vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 

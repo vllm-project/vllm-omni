@@ -26,7 +26,9 @@ installing vLLM-Omni, as shown below.
 
 #### Installation of vLLM
 
-These pre-built wheel instructions install the published vLLM-Omni 0.30.0 release.
+Legacy v0.30.0 only. For v0.34.0, use the tagged Docker source build below;
+[upstream vLLM v0.34.0](https://github.com/vllm-project/vllm/releases/tag/v0.34.0#before-you-upgrade)
+no longer publishes ROCm 7.2 artifacts.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 
@@ -109,6 +111,8 @@ source backport and installs the resulting local wheel with the normal resolver.
 ROCm model validation remains pending.
 
 ```bash
+git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
 ```
 
@@ -164,7 +168,9 @@ vllm-omni-rocm
 
 vLLM-Omni offers an official docker image for deployment. These images are built on top of vLLM docker images and available on Docker Hub as [vllm/vllm-omni-rocm](https://hub.docker.com/r/vllm/vllm-omni-rocm/tags). The version of vLLM-Omni indicates which release of vLLM it is based on.
 
-The prebuilt ROCm image is published separately from the release pipeline: `v0.28.0` is the latest tag currently available on Docker Hub, and newer-tag availability is tracked in [#7405](https://github.com/vllm-project/vllm-omni/issues/7405).
+These prebuilt examples are for v0.28.0 only. For v0.34.0, build from the
+release tag as shown above. See [#7405](https://github.com/vllm-project/vllm-omni/issues/7405)
+for prebuilt image availability.
 
 #### Launch vLLM-Omni Server
 
