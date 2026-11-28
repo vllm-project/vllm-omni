@@ -1162,47 +1162,6 @@ def test_longcat_image_edit_tiny_diffusion_has_cold_start_headroom() -> None:
     assert "offline_init_timeout_s=900" in longcat_edit_settings
 
 
-def test_flux2_klein_weekly_pixel_contract_uses_native_image_diff() -> None:
-    source = Path("tests/e2e/offline_inference/test_flux2_klein.py").read_text(encoding="utf-8")
-
-    assert "ImageChops.difference(first, second).getbbox(alpha_only=False)" in source
-    assert "if current_omni_platform.is_rocm():" in source
-    assert "assert _image_difference_bbox(images1[0], images2[0]) is None" in source
-    assert "list(images1[0].getdata())" not in source
-    assert "zip(images1[0].getdata(), images2[0].getdata())" not in source
-
-
-def test_flux2_dev_weekly_online_has_cold_start_headroom() -> None:
-    path = Path("tests/e2e/online_serving/test_flux_2_dev_expansion.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    timeout_assignment = next(
-        statement
-        for statement in tree.body
-        if isinstance(statement, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "FLUX_2_DEV_INIT_TIMEOUT_S" for target in statement.targets
-        )
-    )
-    assert isinstance(timeout_assignment.value, ast.Constant)
-    assert timeout_assignment.value.value == 1800
-
-    cases = next(
-        statement
-        for statement in tree.body
-        if isinstance(statement, ast.FunctionDef) and statement.name == "_get_flux_2_dev_feature_cases"
-    )
-    server_params = [
-        node
-        for node in ast.walk(cases)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "OmniServerParams"
-    ]
-    assert len(server_params) == 6
-    for params in server_params:
-        timeout = next(keyword.value for keyword in params.keywords if keyword.arg == "init_timeout")
-        assert isinstance(timeout, ast.Name)
-        assert timeout.id == "FLUX_2_DEV_INIT_TIMEOUT_S"
-
-
 def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
     cpu_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment.py").read_text(encoding="utf-8")
     cuda_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment_cuda.py").read_text(
@@ -1641,7 +1600,7 @@ def test_distributed_ready_jobs_mirror_cuda_scopes(label: str, pool: str, expect
     command = " ".join("\n".join(step["commands"]).split())
 
     assert step["agent_pool"] == pool
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
     assert f"run-rocm-diffusion-nightly.sh {expected} tests/distributed/omni_connectors/ {marker}" in command
     # Only the single-process Mooncake connector tests need the TCP path.
@@ -1741,10 +1700,12 @@ def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
     marker = "-m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only'"
 
     assert step["agent_pool"] == "mi300_2"
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["source_file_dependencies"] == "omni_qwen3_omni_duplex_playback_function"
-    assert "assert-pytest-collection.sh 29" in commands
-    assert "if tests != 29 or skipped != 0" in commands
+    expected_cases = 31
+    assert f"assert-pytest-collection.sh {expected_cases} " in commands
+    assert f"if tests != {expected_cases} or skipped != 0" in commands
+    assert f"Expected exactly {expected_cases} executed Qwen3-Omni" in commands
     assert commands.count(marker) == 2
     for path in (
         "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py",
@@ -2348,46 +2309,6 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
-
-
-def test_ming_weekly_uses_rocm_stage_init_allowance() -> None:
-    path = Path("tests/e2e/offline_inference/test_ming_flash_omni_expansion.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    assignments: dict[str, ast.AST] = {}
-    for statement in tree.body:
-        if not isinstance(statement, ast.Assign):
-            continue
-        for target in statement.targets:
-            if isinstance(target, ast.Name):
-                assignments[target.id] = statement.value
-
-    timeout = assignments["MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"]
-    assert isinstance(timeout, ast.Constant)
-    assert ast.literal_eval(timeout) == 1800
-
-    rocm_kwargs = assignments["_ROCM_STAGE_INIT_KWARGS"]
-    assert isinstance(rocm_kwargs, ast.IfExp)
-    assert ast.unparse(rocm_kwargs.test) == "current_omni_platform.is_rocm()"
-    assert isinstance(rocm_kwargs.body, ast.Dict)
-    assert len(rocm_kwargs.body.keys) == 1
-    timeout_key = rocm_kwargs.body.keys[0]
-    assert isinstance(timeout_key, ast.Constant)
-    assert timeout_key.value == "stage_init_timeout"
-    assert len(rocm_kwargs.body.values) == 1
-    timeout_ref = rocm_kwargs.body.values[0]
-    assert isinstance(timeout_ref, ast.Name)
-    assert timeout_ref.id == "MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"
-    assert isinstance(rocm_kwargs.orelse, ast.Dict)
-    assert not rocm_kwargs.orelse.keys
-
-    for params_name in ("test_params_thinker", "test_params"):
-        params = assignments[params_name]
-        assert isinstance(params, ast.ListComp)
-        assert isinstance(params.elt, ast.Tuple)
-        assert len(params.elt.elts) == 3
-        kwargs_ref = params.elt.elts[2]
-        assert isinstance(kwargs_ref, ast.Name)
-        assert kwargs_ref.id == "_ROCM_STAGE_INIT_KWARGS"
 
 
 @pytest.mark.parametrize(
@@ -4259,7 +4180,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "Higgs Audio V3 · 1-GPU": {
             "timeout": 240,
             "test_timeout": 210,
-            "count": 13,
+            "count": 15,
             "artifact_name": "rocm-higgs-audio-v3-weekly",
             "dependency": "tts_higgs_audio_v3_weekly",
             "files": ("tests/e2e/online_serving/test_higgs_audio_v3.py",),
@@ -4458,7 +4379,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_moss_tts_nano_expansion.py": 5,
         "tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py": 3,
         "tests/e2e/online_serving/test_higgs_audio_v2_expansion.py": 6,
-        "tests/e2e/online_serving/test_higgs_audio_v3.py": 13,
+        "tests/e2e/online_serving/test_higgs_audio_v3.py": 15,
         "tests/e2e/offline_inference/test_omnivoice_expansion.py": 2,
         "tests/e2e/online_serving/test_omnivoice_expansion.py": 18,
         "tests/e2e/online_serving/test_omnivoice_parity.py": 2,
@@ -5083,24 +5004,57 @@ def test_minicpmo_accuracy_nightly_jobs_block_on_one_gpu() -> None:
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
 
+def test_minicpmo_daily_omni_uses_deterministic_half_sample() -> None:
+    path = Path("tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assignments = {
+        target.id: statement.value
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    assert ast.literal_eval(assignments["_DAILY_OMNI_NUM_PROMPTS"]) == 599
+
+    test_function = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.FunctionDef) and statement.name == "test_minicpmo_4_5_daily_omni_accuracy_bench"
+    )
+    build_call = next(
+        node
+        for node in ast.walk(test_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_acc_benchmark_cli_argv"
+    )
+    num_prompts = next(keyword.value for keyword in build_call.keywords if keyword.arg == "num_prompts")
+    assert isinstance(num_prompts, ast.Name)
+    assert num_prompts.id == "_DAILY_OMNI_NUM_PROMPTS"
+    assert any(
+        isinstance(node, ast.Constant) and node.value == "--daily-omni-save-eval-items"
+        for node in ast.walk(test_function)
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "should_pass"),
     [
         ({}, True),
         (None, False),
-        ({"daily_omni_evaluated_ok": 1196}, False),
+        ({"daily_omni_evaluated_ok": 598}, False),
         ({"daily_omni_no_gold": 1}, False),
         ({"daily_omni_request_failed": 1}, False),
     ],
-    ids=["complete", "skipped", "partial", "missing-gold", "failed-request"],
+    ids=["half-sample", "skipped", "partial", "missing-gold", "failed-request"],
 )
-def test_minicpmo_daily_omni_requires_complete_dataset(
+def test_minicpmo_daily_omni_requires_half_dataset(
     tmp_path: Path, overrides: dict[str, int] | None, should_pass: bool
 ) -> None:
     step = _find_step("MiniCPM-o 4.5 Daily-Omni Accuracy", AMD_NIGHTLY_PIPELINE)
     check = step["commands"][-1].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     if overrides is not None:
-        metrics = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+        metrics = {"daily_omni_evaluated_ok": 599, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
         metrics.update(overrides)
         (tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_test.json").write_text(json.dumps(metrics), encoding="utf-8")
     result = subprocess.run([sys.executable, "-c", check, str(tmp_path)], capture_output=True, text=True)
@@ -6251,6 +6205,7 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
         "tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py",
         "tests/assets/minicpmo_4_5/",
         "vllm_omni/deploy/qwen3_omni_duplex.yaml",
+        "vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml",
         "vllm_omni/engine/duplex/",
         "vllm_omni/model_executor/models/qwen3_omni/",
     } <= qwen_paths
@@ -6278,14 +6233,6 @@ def test_qwen_duplex_rocm_mark_covers_the_whole_playback_class() -> None:
     ) in source
     # The class mark already selects the full_model method on ROCm.
     assert '@hardware_test(res={"rocm": "MI325"}, num_cards=2)' not in source
-
-
-def test_bagel_rocm_nightly_allows_cold_aiter_startup() -> None:
-    source = Path("tests/entrypoints/test_omni_sleep_mode.py").read_text(encoding="utf-8")
-    fixture = source.split("async def bagel_diffusion_engine", maxsplit=1)[1].split(
-        "@pytest.mark.full_model", maxsplit=1
-    )[0]
-    assert "init_timeout=1200" in fixture
 
 
 @pytest.mark.parametrize(

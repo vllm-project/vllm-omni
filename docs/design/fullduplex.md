@@ -19,6 +19,13 @@ The public wire contract lives in
 [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md);
 this page describes how it is produced.
 
+Client-side camera-frame tiling lives in `vllm_omni.clients.video_stacking`.
+The benchmark wire probe in `vllm_omni.clients.realtime` reuses the public
+`EventCollector`; application sessions use `DuplexClient`. JoyAI's shared action
+parser and prompts live under its model's `duplex` package. Standalone JoyVL and
+Mage-VL services are owned by `entrypoints/joyvl` and `entrypoints/mage_vl`; see
+the [standalone serving guide](../serving/standalone_servers.md).
+
 ## Purpose
 
 A full-duplex model listens and speaks at the same time: audio streams into
@@ -121,6 +128,11 @@ reserve their history position before continued input, commit emitted text
 on completion or cancellation regardless of playback policy, and release
 playback bookkeeping without ACKs. Whitespace-only output creates no assistant
 history item or snapshot; meaningful emitted text is preserved verbatim.
+On text-only deployments, a response that starts while its user input is
+still being received binds to that input's next commit. History places
+that owning input before the reserved assistant slot, and later input
+after it. A terminal native LISTEN follows normal response completion,
+including when the continuation budget is exhausted.
 The unconditional bypass is deployment-scoped. On audio-capable deployments,
 a reply with zero generated/sent audio and no audio-completion dependency
 commits text without an ACK through the zero-audio fallback. Replies whose
@@ -233,6 +245,11 @@ playback calibration still determine the effective Session records.
 | `bounded_recent` | Recent complete turns under the configured context/media budget. | Remove older turns until the request fits. |
 | `incremental` | Published memory plus selected uncompressed turns. | Compress older sources and fit the foreground request to budget. |
 
+Only `recent` applies the legacy four-audio/eight-image window. The budgeted
+policies use the deployment's media counts, with audio additionally bounded by
+`history_limits.max_audio_items`. Their retained-media byte budgets and
+compression triggers remain separate from these per-request counts.
+
 The default now changes from `recent` to `full_history`. Deployments that need the
 previous bounded window must explicitly set `history_policy: recent`. Full-history
 requests preserve system-message order and the existing tool-call protocol. They
@@ -249,8 +266,10 @@ limit includes `max_context_tokens` when configured. Overflow
 raises a recoverable `input_capacity_exceeded` error without submitting a partial
 request or deleting history. Clients can delete source items and retry. Session
 input-admission limits still reject additional material before it is accepted.
-The base deployment permits four audio inputs and eight images per request;
-full history does not raise these deployment limits automatically. Direct plugin
+The MRv2 duplex deployment leaves per-request media counts at vLLM defaults
+(currently 999 per modality). Deployments can set `limit_mm_per_prompt` explicitly;
+full history does not raise those limits automatically. Session image admission
+remains bounded separately, as described below. Direct plugin
 calls without a resolved model configuration leave validation to the downstream
 engine.
 
@@ -283,8 +302,9 @@ Existing custom bounded/compression strategies retain the four required hooks.
 
 Audio retention is selected explicitly with `audio_retention`. `original` keeps
 PCM until source deletion and requires both audio cache limits to be `None`.
-`bounded` requires a positive `audio_cache_items` limit and accepts an optional
-`audio_cache_bytes` target; it keeps at least the newest binding, including when
+`bounded` inherits `history_limits.max_audio_items` and `max_audio_bytes` when its
+cache limits are `None`. A policy can set positive `audio_cache_items` and
+`audio_cache_bytes` overrides; it keeps at least the newest binding, including when
 that binding exceeds the byte target. Unsupported combinations fail at policy
 construction. With original-message rendering, `original` also rejects selected
 sources whose PCM is unavailable, independently of the context overflow action.
@@ -420,7 +440,7 @@ and combines repeated observations across frames into one memory.
 Configure the policy in a deployment overlay:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   model_custom_options:
     history_policy: incremental
@@ -445,7 +465,7 @@ selection/compression interface. They independently replace message-count
 triggering and batching:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   model_custom_options:
     history_policy: incremental
@@ -932,7 +952,7 @@ audio-slot limits and the no-empty-run fallback are unchanged.
 ```text
 open   DuplexOmni.open_session(config)
          -> engine.open_session_async(session_id, DuplexSessionConfig)      [RPC]
-         -> DuplexSessionManager.open: admission (max_sessions, closing sessions keep their slot),
+         -> DuplexSessionManager.open: admission (max_sessions, bounded wait for closing slots),
             plugin.validate_client_extra_body / prepare_runtime_config, DuplexEngineSession,
             Stage0 request id reserved (ensure_stage_request), DuplexSessionRunner.start()
          -> first event: SessionCreated (announces the allocated id)
@@ -953,8 +973,9 @@ close    DuplexOmni.close_session -> close RPC; the manager tears the runner dow
          (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result.
          SessionClosed is emitted after the cleanup attempt (in a finally), so it is also sent when the
          stage cleanup failed; in that case the admission slot is intentionally retained and the cleanup
-         is retried by the reaper, and opening a replacement session can still be refused with
-         resource_exhausted. Seeing the event therefore does not by itself guarantee a free slot.
+         is retried by the reaper. When the frontend is full, up to one open per closing slot
+         can wait up to 15 seconds for actual release. An open that finds no available slot
+         after that wait can still be refused with resource_exhausted.
 reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
 ```
 
@@ -1743,6 +1764,30 @@ and keep empty slots in mixed batches. The final prefill chunk and decode frames
 can expose function tokens. Model-local postprocess feedback alone does not
 expose a client tool call. Forced feedback remains queued until an eligible
 frame's postprocess consumes it once.
+
+Inside a call, Nemotron decodes back to back. The thinker publishes
+`nvc_function_fast_path` on frames decoded while its function head is inside a
+tool call, using the current frame's function decision before MRv2 sampling
+commits the call state. The session's plugin reports `fast_path_active` only
+for continuation scheduling. When synthetic silence continuation is permitted,
+the session then
+answers each such frame with its own silence unit at once instead of waiting for
+the client's next 80 ms unit. One token per append still holds; only the frame
+that feeds it changes. Client appends that arrive meanwhile are dropped and
+are never buffered, appended or replayed. Disabling
+`silence_continuation`, using the input clock, or failing to schedule the next
+synthetic unit preserves client-paced decoding instead. Session updates invalidate
+queued fast appends, including an off/on update before that append runs.
+Stage-2 suppression follows each originating Stage-0 acoustic frame, not the
+current scheduling flag: delayed call audio remains silent after `EOTC`, while
+earlier speech still plays during a call. Suppressed frames still count toward
+audio coverage and response completion. Coalesced codec chunks filter only the
+call's frames. Fast steps do not
+count against the response continuation limit: the plugin caps them
+(`_FAST_PATH_MAX_STEPS`, like NVIDIA's `MAX_TOOL_TOKENS`) and the frame that
+decodes `EOTC` clears the flag, after which client-paced continuation resumes.
+A finished or failed call request ends the fast path even when its last frame
+still carried the flag, so the session returns to appending client frames.
 
 Turn plugins may bind their stage identities in `configure_pipeline` and select
 an append's entry with `input_stage_id(payload)` (default 0). The request context

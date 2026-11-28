@@ -120,15 +120,14 @@ steps:
           RUN_ADVANCED
 
     # Mirrors the CUDA MERGE "Entrypoint Test with H100" selection: the advanced
-    # Qwen3-Omni duplex-playback and /v1/realtime cases (21 + 8). CUDA runs them
+    # Qwen3-Omni duplex-playback and /v1/realtime cases (22 + 9). CUDA runs them
     # in about 31 minutes on H100; MI300 also pays cold AITER compilation.
-    # test_livekit_client_vad_replay_without_runtime_jit stays CUDA-only: on MI300
-    # the Triton kernel_unified_attention JIT-compiles mid-request (AMD #17564).
+    # Blocking after 23 consecutive green main runs.
     - label: "MERGE · Qwen3-Omni Realtime and Duplex Entrypoints · 2-GPU"
       agent_pool: mi300_2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 90
       source_file_dependencies: omni_qwen3_omni_duplex_playback_function
       artifact_paths:
@@ -139,7 +138,7 @@ steps:
         - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
         - |
           set -euo pipefail
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 29 \
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 31 \
             tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py \
             tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py \
             -m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
@@ -169,8 +168,8 @@ steps:
           skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
           failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
           errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
-          if tests != 29 or skipped != 0 or failures != 0 or errors != 0:
-              print("Expected exactly 29 executed Qwen3-Omni realtime and duplex entrypoint tests; "
+          if tests != 31 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 31 executed Qwen3-Omni realtime and duplex entrypoint tests; "
                     f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
               raise SystemExit(5)
           ' "$$ROCM_MERGE_ARTIFACT_DIR/pytest.xml"; then

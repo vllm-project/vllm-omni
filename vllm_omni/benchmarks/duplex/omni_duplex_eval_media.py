@@ -28,8 +28,6 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
-from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
-
 logger = logging.getLogger(__name__)
 
 # libavcodec frame threads deadlock under concurrent seek/decode (see #7364 for
@@ -251,6 +249,8 @@ def iter_jpegs(
 
 
 def read_audio_pcm16(path: str | Path) -> bytes:
+    from vllm_omni.clients.duplex import PCM16_SAMPLE_RATE
+
     source = Path(path)
     if source.suffix.lower() == ".wav":
         try:
@@ -308,6 +308,8 @@ def _presentation_origin(container: Any) -> Fraction:
 
 def _pcm_sample_index(frame: Any, origin: Fraction) -> int | None:
     """Map a decoded frame onto the 16 kHz timeline, or None when it has no PTS."""
+    from vllm_omni.clients.duplex import PCM16_SAMPLE_RATE
+
     if frame.pts is None or frame.time_base is None:
         return None
     delta = Fraction(int(frame.pts)) * Fraction(frame.time_base) - origin
@@ -326,6 +328,8 @@ def read_soundtrack_pcm16(path: str | Path) -> bytes:
     """
     import av
     import numpy as np
+
+    from vllm_omni.clients.duplex import PCM16_SAMPLE_RATE
 
     try:
         with _PYAV_LOCK, av.open(str(path)) as container:
@@ -390,6 +394,8 @@ def iter_av_units(
     Audio must cover the video timeline. Frames that cannot fit the interval or
     the wire's two-image limit fail explicitly instead of being lost or delayed.
     """
+    from vllm_omni.clients.duplex import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
+
     if unit_ms <= 0 or len(audio_pcm16) % PCM16_BYTES_PER_SAMPLE:
         raise ValueError("unit_ms must be positive and PCM16 must contain whole samples")
     unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * unit_ms // 1000

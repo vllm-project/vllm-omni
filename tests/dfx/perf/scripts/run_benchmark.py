@@ -1165,6 +1165,104 @@ def _persist_confirmation_result(
     )
 
 
+def _assert_sweep_with_confirmation(
+    result: dict[str, Any],
+    assert_params: dict[str, Any],
+    num_prompt: int,
+    pytestconfig: pytest.Config,
+    *,
+    context: str,
+    baseline_regressions: list[str],
+    sweep_index: int,
+    sweep_size: int,
+    run_confirmation_attempt: Callable[[int], dict[str, Any]],
+) -> None:
+    """Apply the baseline gate and, when configured, confirm a noisy threshold regression."""
+    initial_regressions: list[str] = []
+    regression = _assert_sweep_result(
+        result,
+        assert_params,
+        num_prompt,
+        pytestconfig,
+        context=context,
+        baseline_regressions=initial_regressions,
+    )
+    if regression is None:
+        return
+    policy = _baseline_confirmation_policy(
+        assert_params,
+        result,
+        regression,
+        sweep_index=sweep_index,
+        sweep_size=sweep_size,
+    )
+    if policy is None:
+        baseline_regressions.extend(initial_regressions)
+        return
+
+    confirmation_metrics, attempts, confirmation_tolerance = policy
+    confirmation_results = [result]
+    last_result = result
+    for attempt in range(2, attempts + 1):
+        print(
+            f"[baseline-check] RETRY confirmation attempt {attempt}/{attempts} for {context}",
+            flush=True,
+        )
+        retry_result = run_confirmation_attempt(attempt)
+        confirmation_results.append(retry_result)
+        last_result = retry_result
+        retry_regressions: list[str] = []
+        retry_regression = _assert_sweep_result(
+            _without_confirmed_baseline_metrics(retry_result, confirmation_metrics),
+            assert_params,
+            num_prompt,
+            pytestconfig,
+            context=f"{context} confirmation_attempt={attempt}",
+            baseline_regressions=retry_regressions,
+        )
+        if retry_regression is not None:
+            baseline_regressions.extend(retry_regressions)
+            _persist_confirmation_result(
+                confirmation_results,
+                last_result,
+                confirmation_metrics,
+                configured_attempts=attempts,
+                tolerance=confirmation_tolerance,
+                status="aborted_hard_regression",
+            )
+            return
+
+    confirmed_regressions: list[str] = []
+    confirmed_result = _median_confirmation_result(confirmation_results, confirmation_metrics)
+    confirmed_regression = _assert_sweep_result(
+        _with_only_confirmed_baseline_metrics(confirmed_result, confirmation_metrics),
+        assert_params,
+        num_prompt,
+        pytestconfig,
+        context=f"{context} confirmed_median_of={attempts}",
+        baseline_regressions=confirmed_regressions,
+        baseline_tolerance=confirmation_tolerance,
+    )
+    if confirmed_regression is not None:
+        baseline_regressions.extend(confirmed_regressions)
+        confirmation_status = "failed"
+    else:
+        confirmation_status = "passed"
+        print(
+            f"[baseline-check] PASS confirmed median across {attempts} runs "
+            f"at tolerance={confirmation_tolerance:.0%} for {context}",
+            flush=True,
+        )
+    _persist_confirmation_result(
+        confirmation_results,
+        confirmed_result,
+        confirmation_metrics,
+        configured_attempts=attempts,
+        tolerance=confirmation_tolerance,
+        status=confirmation_status,
+    )
+
+
 @pytest.mark.benchmark
 @pytest.mark.parametrize(
     "omni_server,benchmark_params",
@@ -1352,13 +1450,38 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                _assert_sweep_result(
+                _assert_sweep_with_confirmation(
                     result,
                     assert_params,
                     num_prompt,
                     pytestconfig,
                     context=f"request_rate={qps!r} num_prompts={num_prompt}",
                     baseline_regressions=baseline_regressions,
+                    sweep_index=sweep_index,
+                    sweep_size=len(qps_list),
+                    run_confirmation_attempt=lambda attempt: run_benchmark(
+                        args=args,
+                        test_name=test_name,
+                        flow=qps,
+                        dataset_name=dataset_name,
+                        num_prompt=num_prompt,
+                        baseline_config=params.get("baseline"),
+                        sweep_index=sweep_index,
+                        random_input_len=params.get("random_input_len"),
+                        random_output_len=params.get("random_output_len"),
+                        resource_label=resource_label,
+                        num_warmups=_resolve_num_warmups(
+                            params,
+                            default=2,
+                            sweep_index=sweep_index,
+                            sweep_size=len(qps_list),
+                        ),
+                        benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                        result_filename_suffix=f"confirmation-{attempt}",
+                        accuracy_baseline=accuracy_baseline,
+                        check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                        result_transform=result_transform,
+                    ),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
@@ -1397,38 +1520,16 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                initial_regressions: list[str] = []
-                regression = _assert_sweep_result(
+                _assert_sweep_with_confirmation(
                     result,
                     assert_params,
                     num_prompt,
                     pytestconfig,
                     context=f"max_concurrency={concurrency!r} num_prompts={num_prompt}",
-                    baseline_regressions=initial_regressions,
-                )
-                if regression is None:
-                    continue
-                policy = _baseline_confirmation_policy(
-                    assert_params,
-                    result,
-                    regression,
+                    baseline_regressions=baseline_regressions,
                     sweep_index=sweep_index,
                     sweep_size=len(max_concurrency_list),
-                )
-                if policy is None:
-                    baseline_regressions.extend(initial_regressions)
-                    continue
-                confirmation_metrics, attempts, confirmation_tolerance = policy
-                confirmation_results = [result]
-                hard_regression = False
-                last_result = result
-                for attempt in range(2, attempts + 1):
-                    print(
-                        f"[baseline-check] RETRY confirmation attempt {attempt}/{attempts} "
-                        f"for max_concurrency={concurrency!r}",
-                        flush=True,
-                    )
-                    retry_result = run_benchmark(
+                    run_confirmation_attempt=lambda attempt: run_benchmark(
                         args=args,
                         test_name=test_name,
                         flow=concurrency,
@@ -1450,64 +1551,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                         accuracy_baseline=accuracy_baseline,
                         check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
                         result_transform=result_transform,
-                    )
-                    confirmation_results.append(retry_result)
-                    last_result = retry_result
-                    retry_regressions: list[str] = []
-                    retry_regression = _assert_sweep_result(
-                        _without_confirmed_baseline_metrics(retry_result, confirmation_metrics),
-                        assert_params,
-                        num_prompt,
-                        pytestconfig,
-                        context=(
-                            f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmation_attempt={attempt}"
-                        ),
-                        baseline_regressions=retry_regressions,
-                    )
-                    if retry_regression is not None:
-                        baseline_regressions.extend(retry_regressions)
-                        hard_regression = True
-                        break
-                if hard_regression:
-                    _persist_confirmation_result(
-                        confirmation_results,
-                        last_result,
-                        confirmation_metrics,
-                        configured_attempts=attempts,
-                        tolerance=confirmation_tolerance,
-                        status="aborted_hard_regression",
-                    )
-                    continue
-                confirmed_regressions: list[str] = []
-                confirmed_result = _median_confirmation_result(confirmation_results, confirmation_metrics)
-                confirmed_regression = _assert_sweep_result(
-                    _with_only_confirmed_baseline_metrics(confirmed_result, confirmation_metrics),
-                    assert_params,
-                    num_prompt,
-                    pytestconfig,
-                    context=(
-                        f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmed_median_of={attempts}"
                     ),
-                    baseline_regressions=confirmed_regressions,
-                    baseline_tolerance=confirmation_tolerance,
-                )
-                if confirmed_regression is not None:
-                    baseline_regressions.extend(confirmed_regressions)
-                    confirmation_status = "failed"
-                else:
-                    confirmation_status = "passed"
-                    print(
-                        f"[baseline-check] PASS confirmed median across {attempts} runs "
-                        f"at tolerance={confirmation_tolerance:.0%} for max_concurrency={concurrency!r}",
-                        flush=True,
-                    )
-                _persist_confirmation_result(
-                    confirmation_results,
-                    confirmed_result,
-                    confirmation_metrics,
-                    configured_attempts=attempts,
-                    tolerance=confirmation_tolerance,
-                    status=confirmation_status,
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)

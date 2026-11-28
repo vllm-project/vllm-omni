@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
-from vllm_omni.experimental.fullduplex.mage_vl import (
+from vllm_omni.entrypoints.mage_vl import (
     MageVLCodecWindow,
     MageVLDuplexAdapter,
     MageVLDuplexRuntime,
     MageVLGateDecision,
 )
+from vllm_omni.entrypoints.mage_vl.core import protocol as ev
+from vllm_omni.entrypoints.mage_vl.core.session import DuplexSession, DuplexSessionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

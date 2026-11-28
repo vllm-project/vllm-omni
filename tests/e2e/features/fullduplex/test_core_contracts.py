@@ -15,14 +15,14 @@ import dataclasses
 import pytest
 
 from vllm_omni.engine.duplex.contracts import DuplexFence
-from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.adapter import (
+from vllm_omni.entrypoints.mage_vl.core import protocol as ev
+from vllm_omni.entrypoints.mage_vl.core.adapter import (
     DuplexAdapter,
     DuplexCapability,
     OutputChunk,
 )
-from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
-from vllm_omni.experimental.fullduplex.core.session import (
+from vllm_omni.entrypoints.mage_vl.core.runtime import DuplexRuntime
+from vllm_omni.entrypoints.mage_vl.core.session import (
     DuplexSession,
     DuplexSessionConfig,
     DuplexState,

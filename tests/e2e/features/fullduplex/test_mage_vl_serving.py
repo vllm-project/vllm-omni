@@ -10,9 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter
-from vllm_omni.experimental.fullduplex.mage_vl.serving import backend as backend_module
-from vllm_omni.experimental.fullduplex.mage_vl.serving.server import (
+from vllm_omni.entrypoints.mage_vl import MageVLDuplexAdapter
+from vllm_omni.entrypoints.mage_vl.serving import backend as backend_module
+from vllm_omni.entrypoints.mage_vl.serving.server import (
     MageVLServingConfig,
     create_app,
 )

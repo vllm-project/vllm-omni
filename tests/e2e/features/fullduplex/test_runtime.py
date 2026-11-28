@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.adapter import DuplexCapability, OutputChunk
-from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
-from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
-from vllm_omni.experimental.fullduplex.joyvl.adapter import JoyVLDuplexAdapter
+from vllm_omni.entrypoints.mage_vl.core import protocol as ev
+from vllm_omni.entrypoints.mage_vl.core.adapter import DuplexCapability, OutputChunk
+from vllm_omni.entrypoints.mage_vl.core.runtime import DuplexRuntime
+from vllm_omni.entrypoints.mage_vl.core.session import DuplexSession, DuplexSessionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -142,31 +141,3 @@ async def test_runtime_new_response_supersedes_inflight_without_blocking():
     assert len(created) == 2
     assert len(done) == 1
     assert done[0]["response_index"] == created[-1]["response_index"]
-
-
-@pytest.mark.asyncio
-async def test_joyvl_adapter_speaks_then_silences():
-    replies = iter(["</response> a fire is breaking out", "</silence>"])
-
-    async def fake_generate(messages):
-        return next(replies)
-
-    adapter = JoyVLDuplexAdapter(fake_generate, num_frames=4)
-    cfg = DuplexSessionConfig(input_modalities=("video", "text"), output_modalities=("text",), proactive=True)
-    rt = DuplexRuntime(DuplexSession("s", cfg), adapter)
-    out, emit = _collector()
-    await rt.run(
-        _feed(
-            [
-                {"type": ev.INPUT_APPEND, "modality": "text", "data": "alert me if a fire breaks out"},
-                {"type": ev.INPUT_APPEND, "modality": "video", "data": "data:image/jpeg;base64,AAA"},
-                {"type": ev.INPUT_APPEND, "modality": "video", "data": "data:image/jpeg;base64,BBB"},
-                {"type": ev.CLOSE},
-            ]
-        ),
-        emit,
-    )
-    deltas = [e["data"] for e in out if e["type"] == ev.RESPONSE_DELTA]
-    assert "a fire is breaking out" in deltas
-
-    assert deltas.count("a fire is breaking out") == 1
