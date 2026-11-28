@@ -179,7 +179,15 @@ def _local_compact_positions(
     local_start: int,
     local_len: int,
 ) -> torch.Tensor | None:
-    """Select this SP rank's equal shard from the compact global row order."""
+    """Select this SP rank's equal shard from the compact global row order.
+
+    This is the strict-mode layout: the split hook validates divisibility for
+    every tensor it shards, so a compact row count that does not divide the SP
+    size is rejected before the gather rather than split unevenly.  Return
+    ``None`` in that case and let the caller fail with a clear message; the
+    ``advanced_uaa`` layout never reaches here (it keeps the full row set and
+    is trimmed by the padded gather).
+    """
     if local_len == seq_len:
         return active_positions
     if local_len <= 0 or seq_len % local_len:
@@ -698,10 +706,62 @@ class MiniMaxH3SPPrepare(nn.Module):
 
 
 class MiniMaxH3SPGather(nn.Module):
-    """Explicit boundary for restoring packed rows after the block stack."""
+    """Explicit boundary for restoring packed rows after the block stack.
+
+    ``sp_gather_global_rows`` is the exact packed-row count before the split
+    boundary. The SP gather hook reads it so it can pad unequal shards to a
+    common length and drop the padding again: under ``advanced_uaa`` the rows
+    are sharded with ``torch.chunk`` (uneven when the length is not divisible
+    by the SP size), and reference-KV reuse compacts rows between the split
+    and this gather (the compact count may be uneven even when the original
+    packed length was not).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sp_gather_global_rows: int | None = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states
+
+
+def _validate_ulysses_head_divisibility(
+    num_attention_heads: int,
+    *,
+    tp_size: int,
+    ulysses_degree: int,
+    ulysses_mode: str,
+) -> None:
+    """Reject a Ulysses degree the DiT attention heads cannot support.
+
+    MiniMax-H3 has 56 attention heads, so a strict Ulysses degree must divide
+    56 (1/2/4/7/8/14/28/56).  ``advanced_uaa`` pads the head count up to the
+    next multiple of the degree before the all-to-all and drops the padding on
+    the reverse transform (``_ulysses_all_to_all_any_o(orig_head_cnt=...)``),
+    so a non-divisible count is legal there: degree 16 pads 56 heads to 64, a
+    1.14x attention cost whose padding heads are exact zeros that are sliced
+    away again.  Strict mode keeps the divisibility requirement.
+
+    UAA also shards the packed rows unevenly when the sequence length is not
+    divisible by the SP size.  The final gather pads every rank's shard to a
+    common length and trims the padding again (``sp_gather_padded``), so the
+    final layer always sees ``seq_len`` rows that match ``inverse_indices`` --
+    the uneven-row fault from the 2026-11-10 CUDA trace.  No platform gate is
+    needed for that any more, on CUDA or on Ascend.
+    """
+    local_heads = num_attention_heads // tp_size
+    if not local_heads % ulysses_degree:
+        return
+    if ulysses_mode != "advanced_uaa":
+        supported = [degree for degree in range(1, local_heads + 1) if local_heads % degree == 0]
+        raise ValueError(
+            "MiniMax H3 local attention heads must be divisible by "
+            "ulysses_degree: "
+            f"({num_attention_heads} / {tp_size}) % {ulysses_degree} != 0. "
+            f"Supported ulysses_degree values are {supported}, or set "
+            "ulysses_mode='advanced_uaa' to pad the head count."
+        )
+    # advanced_uaa pads the heads and the gather pads the rows: any degree works.
 
 
 class MiniMaxH3DiTModel(nn.Module):
@@ -891,16 +951,12 @@ class MiniMaxH3DiTModel(nn.Module):
             arch=arch,
             tp_size=get_tensor_model_parallel_world_size(),
         )
-        local_heads = arch.num_attention_heads // get_tensor_model_parallel_world_size()
-        ulysses_degree = int(self.parallel_config.ulysses_degree)
-        if local_heads % ulysses_degree:
-            raise ValueError(
-                "MiniMax H3 local attention heads must be divisible by "
-                "ulysses_degree: "
-                f"({arch.num_attention_heads} / "
-                f"{get_tensor_model_parallel_world_size()}) % "
-                f"{ulysses_degree} != 0"
-            )
+        _validate_ulysses_head_divisibility(
+            arch.num_attention_heads,
+            tp_size=get_tensor_model_parallel_world_size(),
+            ulysses_degree=self.parallel_config.ulysses_degree,
+            ulysses_mode=self.parallel_config.ulysses_mode,
+        )
 
         self.video_patch_proj = ColumnParallelLinear(
             arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2],
@@ -1533,7 +1589,12 @@ class MiniMaxH3DiTModel(nn.Module):
                     local_len=local_len,
                 )
                 if compact_local_positions is None:
-                    raise ValueError("MiniMax H3 reference-KV target rows cannot form an equal SP shard")
+                    raise ValueError(
+                        "MiniMax H3 reference-KV target rows cannot form an equal SP shard: "
+                        f"{int(active_positions.numel())} compact rows do not divide the SP size "
+                        f"{seq_len // local_len}. Use advanced_uaa (which keeps the full row set and "
+                        "trims the padded gather) or disable kv_offload_config."
+                    )
 
         rope_table = kwargs.get("rope_table")
         if compact_reference and local_len != seq_len:
@@ -1711,6 +1772,13 @@ class MiniMaxH3DiTModel(nn.Module):
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:
+            # Rows are sharded with torch.chunk (uneven under advanced_uaa when
+            # seq_len is not divisible by the SP size) and reference-KV reuse
+            # compacts them between the split and this gather; tell the hook the
+            # exact global row count so it can pad, gather and trim.
+            self.sp_gather.sp_gather_global_rows = (
+                int(active_positions.numel()) if active_positions is not None else seq_len
+            )
             hidden = self.sp_gather(hidden)
             final_inverse_indices = (
                 inverse_indices.index_select(0, active_positions) if active_positions is not None else inverse_indices
@@ -1739,6 +1807,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 pdd_step=pdd_step,
             )
             compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            self.sp_gather.sp_gather_global_rows = int(active_positions.numel())
             compact_logits = self.sp_gather(compact_logits)
             video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
             compact_video = compact_logits[..., :video_width]
@@ -1760,6 +1829,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 pdd_step=pdd_step,
             )
             compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            self.sp_gather.sp_gather_global_rows = seq_len
             compact_logits = self.sp_gather(compact_logits)
             video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
             video_logits = compact_logits[..., :video_width]

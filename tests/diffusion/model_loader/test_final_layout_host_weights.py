@@ -409,7 +409,7 @@ def _small_h3_config() -> SimpleNamespace:
             "final_adaln_out_features": 2 * 8,
             "rope_inv_freq_len": 2,
         },
-        parallel_config=SimpleNamespace(ulysses_degree=1),
+        parallel_config=SimpleNamespace(ulysses_degree=1, ulysses_mode="strict"),
     )
 
 

@@ -54,7 +54,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutputType,
     SequenceParallelPartialInput,
 )
-from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
+from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_gather_padded, sp_shard
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 
 logger = init_logger(__name__)
@@ -598,10 +598,12 @@ class SequenceParallelGatherHook(ModelHook):
                 )
                 continue
 
-            # Gather from all ranks
-            gathered = sp_gather(x, spm.gather_dim, validate=False)
+            # The module may know the exact global row count of the boundary.
+            # That is required when the shards are not equally long: advanced_uaa
+            # shards without auto_pad, and models that compact rows between the
+            # split and the gather (e.g. reference-KV reuse).
+            global_rows = getattr(module, "sp_gather_global_rows", None)
 
-            # Remove padding if it was applied
             original_seq_len = None
             if is_forward_context_available():
                 ctx = get_forward_context()
@@ -611,9 +613,20 @@ class SequenceParallelGatherHook(ModelHook):
                     original_seq_len = ctx.sp_shard_metadata.get(spm.shard_group)
                     if original_seq_len is None:
                         raise RuntimeError(f"No SP shard metadata was registered for shard_group={spm.shard_group!r}.")
-            if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
-                gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
-                logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
+            if global_rows is not None:
+                # Uneven shards are allowed: pad to the largest chunk, gather,
+                # then drop the padding again. The module's exact row count is
+                # authoritative, so no further trimming applies.
+                gathered = sp_gather_padded(x, spm.gather_dim, int(global_rows))
+            else:
+                # auto_pad boundaries are already equally long; gather and
+                # remove the padding below.
+                gathered = sp_gather(x, spm.gather_dim, validate=False)
+                if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
+                    gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
+                    logger.debug(
+                        f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})"
+                    )
 
             output[i] = gathered
             actually_gathered = True

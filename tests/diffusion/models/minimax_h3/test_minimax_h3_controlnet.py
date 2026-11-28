@@ -356,7 +356,7 @@ def test_transformer_baseline_zero_strength_and_request_isolation(cpu_layers):
     arch = tiny_arch()
     config = SimpleNamespace(
         tf_model_config=vars(arch),
-        parallel_config=SimpleNamespace(ulysses_degree=1, ring_degree=1),
+        parallel_config=SimpleNamespace(ulysses_degree=1, ulysses_mode="strict", ring_degree=1),
         controlnet_model_path=None,
     )
     model = h3.MiniMaxH3DiTModel(config)
