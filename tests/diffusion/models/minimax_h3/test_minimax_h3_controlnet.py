@@ -358,6 +358,9 @@ def test_transformer_baseline_zero_strength_and_request_isolation(cpu_layers):
         tf_model_config=vars(arch),
         parallel_config=SimpleNamespace(ulysses_degree=1, ring_degree=1),
         controlnet_model_path=None,
+        # The model enables AdaLN offload by default when the host GPU is SM120,
+        # but offload needs CUDA and this test runs the model on CPU.
+        cache_config={"minimax_h3_adaln_offload": False},
     )
     model = h3.MiniMaxH3DiTModel(config)
     with torch.no_grad():
