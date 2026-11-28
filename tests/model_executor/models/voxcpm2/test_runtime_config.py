@@ -153,7 +153,7 @@ def test_v2_overlay_on_base_yaml_preserves_explicit_audio_cadence(monkeypatch, t
     monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
     overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
-    overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
+    overlay.write_text(f"base_config: {deploy_yaml}\n")
 
     config = _runtime_config_from_deploy_yaml(overlay, use_v2_model_runner=True)
     assert (config.vae_decode_every, config.audio_emit_every) == expected

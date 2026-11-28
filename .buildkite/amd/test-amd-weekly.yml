@@ -2274,7 +2274,6 @@ steps:
         env:
           # Match CUDA weekly's runner. The test-only deploy overlay selects the
           # native ROCm attention profile without changing production defaults.
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
           OPENBLAS_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
           MKL_NUM_THREADS: "1"
@@ -2303,7 +2302,6 @@ steps:
         source_file_dependencies: tts_voxtral_weekly
         env:
           # Preserve the existing CUDA weekly runner contract on ROCm.
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
           OPENBLAS_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
           MKL_NUM_THREADS: "1"

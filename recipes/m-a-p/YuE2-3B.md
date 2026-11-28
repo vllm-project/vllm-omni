@@ -111,7 +111,7 @@ chunked prefill disabled. Existing two-call ABC/semantic clients and external
 scores remain supported; pipeline, architecture and HTTP endpoint names stay
 `yue2`, `Yue2ForCausalLM` and `/v1/audio/speech`.
 
-The deploy YAML selects `model_runner: v2` and uses the standard AR worker and
+The deployment uses the standard AR worker and
 `OmniARModelRunner`. `Yue2ModelState` supplies request transitions and acoustic
 completion through the shared runner's lifecycle hooks, including idle steps.
 

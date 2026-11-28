@@ -108,8 +108,8 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
   and reference code row count without logging text or audio content. They do not
   change the existing fallback behavior; legacy counts describe the current span.
 - Deploy config: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml` (auto-discovered from `model_type`).
-    - Uses `model_runner: v2`; vLLM 0.34 no longer supports V1.
-    - MRV2 switches self-enable from the runner selection; no enabling `hf_overrides` block is needed on CUDA.
+    - Uses Model Runner V2.
+    - MRV2 switches are enabled by default; no enabling `hf_overrides` block is needed on CUDA.
     - Both stages use `max_num_seqs=16` and device `0` by default.
     - CUDA Stage 0 uses FLASH_ATTN, `FULL` CUDA graph capture and `async_scheduling: true`; Stage 1 stays eager with codec graph windows `[8, 33]`.
     - CUDA streaming uses 25-frame chunks with 8-frame left context and an 8-frame first chunk (~320 ms of audio).
@@ -123,7 +123,7 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
 - Deploy profiles:
     - Default: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml`.
     - H200 tuning: `vllm_omni/deploy/higgs_multimodal_qwen3_h200.yaml` (64-sequence capacities, larger capture sizes, MPS).
-    - The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for compatibility, but both files are V2 profiles on vLLM 0.34: the former keeps the eager local MLP graph and the latter uses the external `FULL_DECODE_ONLY` graph. Neither is a V1 opt-out.
+    - The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for compatibility, but both files are V2 profiles on vLLM 0.34: the former keeps the eager local MLP graph and the latter uses the external `FULL_DECODE_ONLY` graph.
     - Profile details: `vllm_omni/deploy/README_higgs_audio_v3.md`.
 - Validation notes:
     - Earlier V1/V2 quality and performance comparisons predate the vLLM 0.34 rebase. They do not qualify the current runtime; repeat matched hardware measurements before making new parity or speedup claims.

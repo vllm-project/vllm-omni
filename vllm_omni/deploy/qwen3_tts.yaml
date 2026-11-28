@@ -1,10 +1,7 @@
 # Qwen3-TTS deploy: talker → code2wav via shared-memory chunk streaming.
 # Verified on 1x H100.
 #
-# Runner selection:
-#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default on CUDA, ROCm,
-#   NPU and XPU. V1 overrides are unsupported with vLLM 0.34; MUSA still
-#   requests V1 and is rejected.
+# All LLM stages use Model Runner V2.
 #   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
@@ -17,7 +14,6 @@
 #   * Stage 0 uses the existing platform graph defaults.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
-model_runner: v2
 async_chunk: true
 
 connectors:
@@ -154,7 +150,6 @@ stages:
 platforms:
   rocm:
     # vLLM 0.34 supports only MRV2. Keep Code2Wav eager on ROCm below.
-    model_runner: v2
     stages:
       - stage_id: 1
         # MIOpen Conv1d cannot be invoked while vLLM captures the outer
@@ -162,7 +157,6 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
-    model_runner: v2
     stages:
       - stage_id: 0
         enforce_eager: false
@@ -180,5 +174,3 @@ platforms:
       - stage_id: 1
         # Level Zero cannot capture the Code2Wav graph.
         enforce_eager: true
-  musa:
-    model_runner: v1

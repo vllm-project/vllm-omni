@@ -64,7 +64,6 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
     resolve_stage_async_chunk,
-    resolve_stage_model_runner,
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
 )
@@ -2376,12 +2375,8 @@ def _build_model_config(
         kwargs["recompute_preemption"] = topology.recompute_preemption
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
-    stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
-    validate_native_mrv2_session(deploy, topology, stage_runner)
-    kwargs.setdefault(
-        "use_v2_model_runner",
-        stage_runner == "v2" and topology.execution_type is not StageExecutionType.DIFFUSION,
-    )
+    validate_native_mrv2_session(deploy, topology)
+    kwargs["use_v2_model_runner"] = topology.execution_type is not StageExecutionType.DIFFUSION
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,

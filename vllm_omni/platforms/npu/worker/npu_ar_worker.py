@@ -5,6 +5,7 @@ from vllm.logger import init_logger
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
+from vllm_omni.platforms.npu.minicpmo_shared_kv import install_minicpmo_shared_kv
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
@@ -26,10 +27,7 @@ class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
 
     def init_device(self):
         self.device = self._init_device()
-        if self.use_v2_model_runner:
-            from vllm_omni.platforms.npu.minicpmo_shared_kv import install_minicpmo_shared_kv
-
-            install_minicpmo_shared_kv(self.vllm_config)
+        install_minicpmo_shared_kv(self.vllm_config)
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 

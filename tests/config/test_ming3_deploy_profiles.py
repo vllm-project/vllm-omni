@@ -125,7 +125,6 @@ def test_flash_default_profile_batches_both_stages_without_deploy_override():
     for key in ("max_model_len", "limit_mm_per_prompt", "default_sampling_params"):
         assert thinker[key] == reference_thinker[key]
     assert thinker["max_num_seqs"] == talker["max_num_seqs"] == 32
-    assert thinker["model_runner"] == talker["model_runner"] == "v2"
     assert thinker["async_scheduling"] is True
     # Audio prefills reach hundreds of tokens; they must stay within the graphs.
     assert max(thinker["compilation_config"]["cudagraph_capture_sizes"]) >= 1024

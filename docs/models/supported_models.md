@@ -13,7 +13,7 @@ For deployment recipes (TTS and multimodal), see [recipes.vllm.ai](https://recip
 With vLLM 0.34.0, profiles that require Model Runner V1 are unavailable,
 including Drama 3 / Fish-Omni serving and the LFM3-Omni profiles. Their
 implementation entries below do not imply runnable V2 deployments. See
-[stage-level runner selection](../configuration/stage_configs.md#stage-level-runner-selection)
+[Model Runner V2](../configuration/stage_configs.md#model-runner-v2)
 for the unavailable workflows and CI coverage limits.
 
 <style>

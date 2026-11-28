@@ -36,8 +36,7 @@ Asynchronous chunk streaming is **enabled by default** within the bundled config
 On CUDA and NPU the same file selects model runner v2 for all three stages. Prefix caching is disabled on all three stages; set `enable_prefix_caching: true` on stage 0 to opt into Thinker caching.
 The default includes a `[1, 2, 4, 8, 16, 25]` codec chunk ramp, grouped codec graph buckets and CUDA fused Snake blocks. Eligible CUDA Talkers deliver the first audio frame directly. See the [codec tuning and opt-out settings](../../../design/qwen3_omni_mrv2_performance.md) for platform conditions and overrides.
 The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
-All AR and generation stages use Model Runner V2. `model_runner: v1` is rejected;
-backend and model-state support must be validated for the selected hardware.
+All AR and generation stages use Model Runner V2.
 
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to

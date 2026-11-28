@@ -29,7 +29,6 @@ PREDICTOR_OPTIONS = tuple(PREDICTOR_DEFAULTS)
 def test_resolved_optimization_defaults_are_npu_only(monkeypatch, platform):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path("qwen3_tts.yaml")), platform=platform)
-    assert deploy.model_runner == ("v2" if platform in ("cuda", "rocm", "npu", "xpu") else "v1")
     if platform == "npu":
         for stage in deploy.stages:
             assert stage.compilation_config is not None
@@ -90,20 +89,18 @@ def test_frame_graph_opt_in_controls_implicit_npu_kv(monkeypatch, frame_graph):
     assert options["code_predictor_kv_cache"] is frame_graph
 
 
-def test_custom_npu_v1_overlay_overrides_default_runner_and_full_graphs(tmp_path):
-    overlay = tmp_path / "qwen3_tts_npu_v1.yaml"
+def test_custom_npu_overlay_overrides_full_graphs(tmp_path):
+    overlay = tmp_path / "qwen3_tts_npu.yaml"
     overlay.write_text(
         f"base_config: {get_deploy_config_path('qwen3_tts.yaml')}\n"
         "platforms:\n"
         "  npu:\n"
-        "    model_runner: v1\n"
         "    stages:\n"
         "      - stage_id: 0\n"
         "        compilation_config:\n"
         "          cudagraph_mode: PIECEWISE\n"
     )
     deploy = _apply_platform_overrides(load_deploy_config(overlay), platform="npu")
-    assert deploy.model_runner == "v1"
     talker = next(stage for stage in deploy.stages if stage.stage_id == 0)
     assert talker.enforce_eager is False
     assert talker.compilation_config is not None

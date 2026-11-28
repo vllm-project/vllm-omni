@@ -72,8 +72,7 @@ Alternatively, use the convenience script:
 
 The bundled deploy config (`vllm_omni/deploy/qwen3_tts.yaml`) enables async
 chunking for low first-audio latency and selects Model Runner V2 on CUDA, ROCm,
-NPU and XPU. V1 is unavailable with vLLM 0.34; the retained MUSA V1 override is
-rejected. ROCm keeps Code2Wav eager. XPU selection does not establish
+NPU and XPU. ROCm keeps Code2Wav eager. XPU selection does not establish
 final-release hardware validation.
 For advanced deployment tuning, pass a custom deploy config:
 

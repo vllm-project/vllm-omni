@@ -27,12 +27,12 @@ def test_run_level_selects_weights_for_all_inherited_stages(tmp_path, run_level)
         "      cudagraph_capture_sizes: [1, 2, 4]\n"
     )
     overlay = tmp_path / "profile.yaml"
-    overlay.write_text("base_config: base.yaml\nplatforms:\n  npu:\n    model_runner: v2\n")
+    overlay.write_text("base_config: base.yaml\nplatforms:\n  npu:\n    cuda_mps: false\n")
     generated = stage_config_path_for_run_level(str(overlay), run_level)
     assert generated is not None
     resolved = resolve_deploy_yaml(generated)
     assert [stage["stage_id"] for stage in resolved["stages"]] == [0, 1]
-    assert resolved["platforms"]["npu"]["model_runner"] == "v2"
+    assert resolved["platforms"]["npu"]["cuda_mps"] is False
     assert resolved["stages"][1]["enforce_eager"] is False
     assert resolved["stages"][1]["compilation_config"]["cudagraph_capture_sizes"] == [1, 2, 4]
     if run_level == "core_model":

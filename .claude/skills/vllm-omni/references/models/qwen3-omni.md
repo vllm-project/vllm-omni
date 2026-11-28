@@ -21,7 +21,7 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 
 | YAML | Use |
 |------|-----|
-| `qwen3_omni_moe.yaml` | Default MRv2 on CUDA/ROCm/NPU/XPU; MUSA retains an unsupported V1 pin. Thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). Prefix caching off, `async_chunk: true`, `talker_first_audio`, `[1, 2, 4, 8, 16, 25]` codec chunk ramp, grouped graph buckets and CUDA fused Snake |
+| `qwen3_omni_moe.yaml` | Default MRv2. Thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). Prefix caching off, `async_chunk: true`, `talker_first_audio`, `[1, 2, 4, 8, 16, 25]` codec chunk ramp, grouped graph buckets and CUDA fused Snake |
 | `qwen3_omni_moe_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10) plus code-predictor KV and sampling optimizations |
 | `qwen3_omni_moe_thinking.yaml` | Thinker-only pipeline, TP=2, prefix caching on |
 | `qwen3_omni_duplex.yaml` | `session_mode: duplex` |

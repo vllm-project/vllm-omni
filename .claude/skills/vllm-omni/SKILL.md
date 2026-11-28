@@ -21,8 +21,7 @@ stage 0 thinker (LLM_AR)  ->  stage 1 talker (LLM_AR)  ->  stage 2 code2wav (LLM
 - **Pipeline** (code, `models/<model>/pipeline.py`) fixes the topology and the
   stage hand-off functions (`model_executor/stage_input_processors/`).
 - **Deploy YAML** (`vllm_omni/deploy/*.yaml`) sets runtime: devices, memory,
-  batch limits, CUDA graphs, connectors, `async_chunk`, `session_mode`,
-  `model_runner` (v1 / MRv2).
+  batch limits, CUDA graphs, connectors, `async_chunk`, and `session_mode`.
 - **Orchestrator** (`vllm_omni/engine/orchestrator.py`) routes each stage output to
   the next stage or the client; **connectors** move the data.
 - **`async_chunk`** streams partial outputs between stages; it determines first

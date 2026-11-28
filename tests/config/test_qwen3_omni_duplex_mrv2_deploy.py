@@ -39,7 +39,6 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
 
 def test_duplex_mrv2_rocm_profile_runs_v2(monkeypatch) -> None:
     config, stages = _resolve_stages(monkeypatch, "rocm")
-    assert config.model_runner == "v2"
     assert config.session_mode == "duplex"
     assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True, True]
     assert [stage.yaml_engine_args["session_mode"] for stage in stages] == ["duplex", "duplex", "duplex"]
@@ -53,17 +52,9 @@ def test_duplex_mrv2_rocm_profile_runs_v2(monkeypatch) -> None:
     assert structured.stage_by_id(2).model_config.enforce_eager is True
 
 
-def test_duplex_mrv2_profile_runs_v2_on_xpu(monkeypatch) -> None:
-    # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-    config, stages = _resolve_stages(monkeypatch, "xpu")
-    assert config.model_runner == "v2"
-    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True, True]
-
-
-@pytest.mark.parametrize("platform", ["npu", "musa"])
-def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
-    monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
-    assert config.model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(QWEN3_OMNI_PIPELINE, config)
+@pytest.mark.parametrize("platform", ["xpu", "npu", "musa"])
+def test_duplex_profile_uses_v2(monkeypatch, platform) -> None:
+    config, stages = _resolve_stages(monkeypatch, platform)
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    structured = VllmOmniConfig.from_pipeline_config(QWEN3_OMNI_PIPELINE, user_deploy_config=config)
+    assert all(stage.model_config.use_v2_model_runner for stage in structured.stage_configs)

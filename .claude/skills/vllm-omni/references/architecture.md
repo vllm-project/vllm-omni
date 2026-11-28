@@ -17,7 +17,7 @@ before citing them.
 | Layer | Defines | Where |
 |-------|---------|-------|
 | **Pipeline** (code, frozen) | Topology: stages, `model_stage`, `execution_type` (`LLM_AR` / `LLM_GENERATION`), input sources, stage input processor functions, final outputs | `vllm_omni/model_executor/models/<model>/pipeline.py`, registered in `OMNI_PIPELINES` (`vllm_omni/config/pipeline_registry.py`) |
-| **Deploy** (YAML, tunable) | Runtime: devices, memory, batch limits, eager vs graph, connectors, `async_chunk`, `session_mode`, `model_runner`, platform overrides | `vllm_omni/deploy/<name>.yaml`, schema in `vllm_omni/config/stage_config.py` |
+| **Deploy** (YAML, tunable) | Runtime: devices, memory, batch limits, eager vs graph, connectors, `async_chunk`, `session_mode`, platform overrides | `vllm_omni/deploy/<name>.yaml`, schema in `vllm_omni/config/stage_config.py` |
 
 The pipeline is auto-selected from the HF config (`config_factory.py`); its
 `default_deploy_config_name` picks the deploy YAML unless `--deploy-config` is
@@ -37,8 +37,7 @@ given. Deploy YAML must not redefine topology.
 4. **Orchestration**: `engine/orchestrator.py` admits requests to stage 0, drains
    outputs, and routes each output either to the frontend or to the next stage.
 5. **Workers / runners**: `execution_type` maps to worker type (`LLM_AR` → AR worker,
-   `LLM_GENERATION` → generation worker). V1 runners: `vllm_omni/worker/`; MRv2
-   (`model_runner: v2`) runners: `vllm_omni/worker_v2/`. Schedulers: `vllm_omni/core/sched/`.
+   `LLM_GENERATION` → generation worker). MRv2 runners: `vllm_omni/worker_v2/`. Schedulers: `vllm_omni/core/sched/`.
 6. **Output shaping**: `vllm_omni/outputs/output_processor.py` builds text, audio,
    and multimodal client outputs. Model forward returns `OmniOutput`
    (`model_executor/models/output_templates.py`).

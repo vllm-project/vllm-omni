@@ -149,7 +149,6 @@ settings. Set this on the Thinker stage:
 ```yaml
 stages:
   - stage_id: 0
-    model_runner: v2
     enable_prefix_caching: false
     omni_kv_config:
       kv_store_config:

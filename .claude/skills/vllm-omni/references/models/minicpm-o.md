@@ -47,9 +47,7 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
   capture (`code2wav/token2wav.py`); replay outside it changed numerics. Regression
   test: `test_decode_replays_encoder_graph_in_capture_autocast` in
   `tests/model_executor/models/minicpmo_4_5/test_code2wav_batching.py`.
-- CUDA duplex runs llm and code2wav on MRv2 through the default
-  `minicpmo_4_5.yaml`; tts stays on v1 because multi-frame decode is V1-only.
-  Set `platforms.cuda.model_runner: v1` in an overlay for all-V1. MiniCPM-o stages declare
+- CUDA duplex runs all three stages on MRv2 with `minicpmo_4_5.yaml`. MiniCPM-o stages declare
   `supports_duplex_mrv2=True`; downstream native-data-plane stages without this
   capability fail duplex MRv2 config validation. Earlier MRv2 performance
   numbers were invalidated; re-measure each mode. TF32 for CFM is opt-in

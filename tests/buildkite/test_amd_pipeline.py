@@ -4200,9 +4200,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 9,
             "artifact_name": "rocm-voxcpm2-tts-weekly",
             "dependency": "tts_voxcpm2_weekly",
-            "env": {
-                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
-            },
+            "env": {},
             "files": (
                 "tests/e2e/offline_inference/test_voxcpm2_tts.py",
                 "tests/e2e/online_serving/test_voxcpm2_tts.py",
@@ -4216,9 +4214,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 10,
             "artifact_name": "rocm-voxtral-tts-weekly",
             "dependency": "tts_voxtral_weekly",
-            "env": {
-                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
-            },
+            "env": {},
             "files": (
                 "tests/e2e/offline_inference/test_voxtral_tts_expansion.py",
                 "tests/e2e/online_serving/test_voxtral_tts_expansion.py",

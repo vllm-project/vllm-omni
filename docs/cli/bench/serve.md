@@ -872,7 +872,7 @@ IA-QTF1 floor; skipped sessions from the official eligibility policy do not fail
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
 using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via
 `server_params.extra_cli_args`. Inline `server_params.update` values select
-`model_runner: v2`, `async_chunk: true`, Thinker prefix caching,
+Model Runner V2, `async_chunk: true`, Thinker prefix caching,
 `duplex_session.max_sessions: 8`, and `duplex_session.collect_stats: true`.
 The harness applies these settings to a temporary deploy copy, preserving base
 inheritance and removing the copy when pytest exits. No test-specific deploy

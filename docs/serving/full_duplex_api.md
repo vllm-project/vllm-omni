@@ -157,7 +157,7 @@ WebSocket query parameters cannot switch engines.
 (`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
 (`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
 over this endpoint today. Qwen3-Omni's duplex profile selects Model Runner V2
-on CUDA, ROCm and XPU; NPU and MUSA retain unsupported V1 overrides.
+on every platform.
 **PersonaPlex** uses `vllm_omni/deploy/personaplex.yaml` and its
 `PersonaPlexDuplexPlugin` on CUDA, with duplex mode and `async_chunk` enabled.
 

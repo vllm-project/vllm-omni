@@ -1,4 +1,3 @@
-model_runner: v2
 async_chunk: false
 trust_remote_code: true
 connectors:

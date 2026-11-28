@@ -102,7 +102,7 @@ Talker uses FlashAttention and decodes up to sixteen codec frames per K-step.
 CUDA turn serving inherits Thinker ngram speculation and disabled prefix
 caching, and passes the completed Thinker payload to the Talker. The Talker
 streams codec chunks to Code2Wav. Model Runner V2 is the only supported runner
-with vLLM 0.34; a custom overlay that selects V1 is rejected.
+with vLLM 0.34.
 
 Stage-0 speculative decoding (including n-gram) cannot be combined with the
 stage-output prefix cache. Existing CUDA turn overlays that enable speculation
@@ -395,8 +395,7 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 
 ## Intel XPU
 
-`minicpmo_4_5.yaml` sets `platforms.xpu.model_runner: v2`, so on XPU all three
-stages build on Model Runner V2, as on CUDA. Thinker and Talker capture XPU
+All three stages in `minicpmo_4_5.yaml` use Model Runner V2 on XPU. Thinker and Talker capture XPU
 graphs (`PIECEWISE` + `FULL`). Code2Wav keeps its HiFT/CFM device graphs
 disabled on XPU and runs them eagerly.
 

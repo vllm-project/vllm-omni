@@ -68,8 +68,11 @@ def on_streaming_updates(
     return mark
 
 
-def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
-    """Normalize promoted backends and enforce their precedence over extras."""
+def _normalize_stage_engine_fields(stage: StageDeployConfig) -> None:
+    """Normalize stage engine arguments after parsing YAML or platform overrides."""
+    # Older deploy files may put the retired selector among flat or nested
+    # stage arguments. Never forward it to the engine.
+    stage.engine_extras.pop("model_runner", None)
     kernels = {
         name: getattr(stage, name) for name in ("moe_backend", "linear_backend") if getattr(stage, name) is not None
     }
@@ -434,10 +437,10 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
-    # Sampling keys this stage's model_runner: v2 implementation does not
+    # Sampling keys this stage's V2 runner does not
     # support. Checked against ``default_sampling_params`` at deploy-merge time
     # and request sampling at the frontend admission boundary. An unsupported
-    # default fails at startup (with the v1 opt-out named), while an unsupported
+    # default fails at startup, while an unsupported
     # request fails before it can enter the engine queue. Keys whose
     # engine-default value is neutral (e.g. repetition_penalty=1.0) pass; any
     # non-neutral value fails.
@@ -614,9 +617,6 @@ class StageDeployConfig:
 
     # False opts this stage out of pipeline-wide async chunking.
     async_chunk: bool | None = None
-    # Overrides the deploy-level ``model_runner`` for this stage, so a pipeline
-    # can run e.g. its LLM stage on v1 and its codec stages on MRv2.
-    model_runner: Literal["v1", "v2"] | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -759,7 +759,7 @@ class StageDeployConfig:
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _normalize_stage_backend_fields(self)
+        _normalize_stage_engine_fields(self)
 
 
 @dataclass(frozen=True)
@@ -945,7 +945,6 @@ class DeployConfig:
     async_chunk: bool | None = None
     weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
-    model_runner: Literal["v1", "v2"] = "v2"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
@@ -975,7 +974,6 @@ class DeployConfig:
 _STAGE_RESERVED_KEYS = frozenset(
     {
         "async_chunk",
-        "model_runner",
         "stage_id",
         "devices",
         "num_replicas",
@@ -1056,9 +1054,6 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
             else:
                 flat_args[k] = v
 
-    stage_runner = stage_data.get("model_runner")
-    if stage_runner is not None and stage_runner not in ("v1", "v2"):
-        raise ValueError(f"stage {stage_data['stage_id']}: model_runner must be 'v1' or 'v2', got {stage_runner!r}")
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
         "devices": devices,
@@ -1070,7 +1065,6 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
             kwargs[name] = flat_args.pop(name)
 
     kwargs["async_chunk"] = stage_data.get("async_chunk")
-    kwargs["model_runner"] = stage_runner
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
@@ -1220,10 +1214,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
-    model_runner = raw_dict.get("model_runner", "v2")
-    if model_runner not in ("v1", "v2"):
-        raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
-
     if not isinstance(raw_dict.get("cuda_mps", False), bool):
         raise ValueError("cuda_mps must be a boolean")
 
@@ -1234,7 +1224,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),
-        "model_runner": model_runner,
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
@@ -1275,13 +1264,6 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
         return PlatformOverrides(overrides, runtime_cfg.get("devices"), runtime_cfg.get("env"))
     overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
     return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
-
-
-# Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
-# adapt a platform worker, so an entry is removed only with the real integration.
-# NPU AR stages use the Ascend V2 runner (attention metadata and input state).
-# Platforms whose workers still force the V1 runner; XPU and NPU build the omni V2 runners.
-_MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
 # Engine-default (neutral) values for sampling params a v2 stage may list as
@@ -1326,18 +1308,16 @@ def get_unsupported_mrv2_sampling_params(
     return tuple(sorted(set(bad)))
 
 
-def _validate_mrv2_default_sampling_params(
-    ps: StagePipelineConfig, ds: StageDeployConfig | None, stage_runner: str
-) -> None:
+def _validate_mrv2_default_sampling_params(ps: StagePipelineConfig, ds: StageDeployConfig | None) -> None:
     """Reject non-neutral unsupported ``default_sampling_params`` under v2 at startup."""
-    if stage_runner != "v2" or not ps.mrv2_unsupported_sampling_params:
+    if not ps.mrv2_unsupported_sampling_params:
         return
     params = (ds.default_sampling_params if ds is not None else None) or {}
     bad = get_unsupported_mrv2_sampling_params(params, ps.mrv2_unsupported_sampling_params)
     if bad:
         raise ValueError(
             f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
-            "model_runner: v2 path; remove the unsupported parameters"
+            "Model Runner V2 path; remove the unsupported parameters"
         )
 
 
@@ -1345,7 +1325,7 @@ def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
 ) -> DeployConfig:
-    """Merge platform-specific runner and stage overrides into deploy config."""
+    """Merge platform-specific overrides into deploy config."""
     if platform is None:
         from vllm_omni.platforms import current_omni_platform
 
@@ -1367,16 +1347,6 @@ def _apply_platform_overrides(
         if not isinstance(cuda_mps, bool):
             raise ValueError("platform cuda_mps must be a boolean")
         deploy.cuda_mps = cuda_mps
-    if platform_section is not None and "model_runner" in platform_section:
-        model_runner = platform_section["model_runner"]
-        if model_runner not in ("v1", "v2"):
-            raise ValueError(f"platform model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
-        deploy.model_runner = model_runner
-        if model_runner == "v1":
-            # A platform's V1 fallback also covers stages that opt into V2.
-            for stage in deploy.stages:
-                if stage.model_runner == "v2":
-                    stage.model_runner = None
     platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
@@ -1419,18 +1389,7 @@ def _apply_platform_overrides(
                 base.engine_extras[key] = val
         # Platform overlays run after construction and can reintroduce nested
         # backend extras. Reapply normalization and first-class precedence.
-        _normalize_stage_backend_fields(base)
-
-    # Validate the final values, including stage entries from the platform
-    # overlay. A global V2 default may still apply to omitted pipeline stages.
-    for stage in deploy.stages:
-        if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
-            raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
-    uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
-    if uses_v2 and platform is not None:
-        reason = _MRV2_UNSUPPORTED_PLATFORMS.get(platform)
-        if reason is not None:
-            raise NotImplementedError(f"Model Runner V2 is not supported on {platform.upper()}: {reason}.")
+        _normalize_stage_engine_fields(base)
 
     return deploy
 
@@ -1449,23 +1408,13 @@ def _resolve_execution_mode(
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
 
 
-def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
-    """The stage's own ``model_runner`` if set, else the deploy-level one."""
-    runner = getattr(stage, "model_runner", None) if stage is not None else None
-    selected = runner or deploy.model_runner
-    if selected != "v2":
-        raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
-    return selected
-
-
-def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
+def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig) -> None:
     """Reject session modes a downstream MRv2 native-data-plane stage lacks.
 
-    Streaming-session prompt replacement exists only in the V1 chunk adapter,
-    so a stage that receives from an upstream stage on MRv2 supports
-    turn-based sessions only unless it explicitly declares supports_duplex_mrv2.
+    Native downstream stages accept turn-based sessions. Duplex sessions
+    require a model-owned handoff declared by supports_duplex_mrv2.
     """
-    if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+    if not ps.supports_native_mrv2_data_plane or not ps.input_sources:
         return
     if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:
         return
@@ -1557,26 +1506,21 @@ def _build_engine_args(
         # Session placement caps model-owned state per replica. Legacy deploys
         # retain the global admission limit as their worker capacity.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.worker_max_sessions
-    # The runner selection is a deploy-topology decision owned by the
-    # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
-    # silently veto or force it per stage.
     if ds is not None:
         for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
             if reserved in ds.engine_extras:
                 raise ValueError(
                     f"stage {ds.stage_id}: {reserved!r} must not be set via engine_extras; "
-                    "it is derived from the deploy-level `model_runner` field and the "
-                    "pipeline's `supports_native_mrv2_data_plane` declaration."
+                    "the pipeline defines its runner and transport capabilities."
                 )
-    stage_runner = resolve_stage_model_runner(deploy, ds)
-    validate_native_mrv2_session(deploy, ps, stage_runner)
-    _validate_mrv2_default_sampling_params(ps, ds, stage_runner)
+    validate_native_mrv2_session(deploy, ps)
+    _validate_mrv2_default_sampling_params(ps, ds)
     # This flag selects the LLM runner; diffusion stages own their runner.
-    engine_args["use_v2_model_runner"] = stage_runner == "v2" and ps.execution_type is not StageExecutionType.DIFFUSION
+    engine_args["use_v2_model_runner"] = ps.execution_type is not StageExecutionType.DIFFUSION
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
     if engine_args["use_v2_model_runner"] and not ps.supports_native_mrv2_data_plane:
         logger.warning(
-            "Stage %s (%s) selects model_runner=v2 without declaring "
+            "Stage %s (%s) uses Model Runner V2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "
             "MRV2 support for this pipeline has not been validated. "
             "Validate its V2 hooks before deployment.",

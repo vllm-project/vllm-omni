@@ -27,7 +27,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -242,7 +241,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {
@@ -251,7 +249,6 @@
         },
         "duplex_session.max_sessions": 8,
         "duplex_session.collect_stats": true,
-        "platforms.npu.model_runner": "v2",
         "platforms.npu.stages.0.enable_prefix_caching": true
       }
     },

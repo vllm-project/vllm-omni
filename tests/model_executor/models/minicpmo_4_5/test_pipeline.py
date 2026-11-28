@@ -192,10 +192,6 @@ class TestDeployTopology:
         monkeypatch.setattr(current_omni_platform, "device_name", platform)
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         pipeline = OMNI_PIPELINES[deploy.pipeline]
-        if platform == "cpu" and deploy.model_runner == "v1":
-            with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-                merge_pipeline_deploy(pipeline, deploy)
-            return
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         cuda_replicas = platform == "cuda" and filename == "minicpmo_4_5.yaml"

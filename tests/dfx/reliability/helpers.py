@@ -1283,14 +1283,12 @@ def start_server_from_params(
     params: Any, *, startup_timeout: int | None = None, wait_for_device_memory: bool = True
 ) -> Any:
     """Build an ``OmniServer`` the same way the reliability fixture does, without entering it."""
-    from tests.helpers.runtime import OmniServer, _resolve_server_deploy_args, get_model_prefix
+    from tests.helpers.runtime import OmniServer, get_model_prefix
+    from tests.helpers.stage_config import stage_config_path_for_run_level
 
     original_model = get_model_prefix() + params.model
-    server_args, stage_config_path, replaced = _resolve_server_deploy_args(
-        list(params.server_args or []),
-        params.stage_config_path,
-        "advanced_model",
-    )
+    server_args = list(params.server_args or [])
+    stage_config_path = stage_config_path_for_run_level(params.stage_config_path, "advanced_model")
     if params.use_omni:
         if "--stage-init-timeout" not in server_args:
             server_args += ["--stage-init-timeout", "600"]
@@ -1298,7 +1296,7 @@ def start_server_from_params(
             server_args += ["--init-timeout", "900"]
         if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
             server_args += ["--log-stats"]
-    if stage_config_path is not None and not replaced:
+    if stage_config_path is not None:
         server_args += ["--deploy-config", stage_config_path]
     if original_model != params.model and "--served-model-name" not in server_args:
         server_args += ["--served-model-name", params.model]

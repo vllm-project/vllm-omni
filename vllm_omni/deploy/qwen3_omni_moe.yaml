@@ -1,11 +1,9 @@
 # Qwen3-Omni-MoE default deploy with streaming codec tuning.
 # Two-GPU placement: stage 0 on cuda:0, stages 1+2 on cuda:1.
 #
-# Runner selection:
-#   Model Runner V2 is the default on CUDA, ROCm, NPU and XPU. V1 overrides
-#   are unsupported with vLLM 0.34; MUSA still requests V1.
+# All LLM stages use Model Runner V2.
 #   Prefix caching is disabled on all three stages.
-#   qwen3_omni_duplex.yaml selects V2 on CUDA, ROCm and XPU.
+#   qwen3_omni_duplex.yaml selects duplex sessions.
 #   When colocating all stages on one CUDA GPU, run under NVIDIA MPS;
 #   qwen3_omni_moe_h200.yaml provides the single-H200 tuning.
 #
@@ -20,7 +18,6 @@
 #     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
-model_runner: v2
 async_chunk: true
 
 connectors:
@@ -113,7 +110,6 @@ platforms:
   # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
   # profile before vLLM performs its normal quantization auto-detection.
   musa:
-    model_runner: v1
     stages:
       - stage_id: 1
         hf_overrides:
@@ -148,7 +144,6 @@ platforms:
   # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
   # graph-capture failures.
   rocm:
-    model_runner: v2
     stages:
       - stage_id: 2
         enforce_eager: true

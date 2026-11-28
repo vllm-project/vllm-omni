@@ -171,7 +171,6 @@ def make_backend(args):
         {} if args.variant == "turbo" else {name: settings["stages"][0]["additional_config"][name] for name in CONTROLS}
     )
     settings["async_chunk"] = False
-    settings["model_runner"] = "v2"
     for stage in settings["stages"]:
         stage["dtype"] = "float32"
         stage["enforce_eager"] = not (args.cuda_graphs and stage["stage_id"] == 0)

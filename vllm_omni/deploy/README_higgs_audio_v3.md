@@ -1,18 +1,18 @@
 # Higgs-Audio V3 Deploy Profiles
 
 With vLLM 0.34, Model Runner V2 is the only supported runner. The default
-profile is `higgs_multimodal_qwen3.yaml`; `model_runner: v1` is rejected.
+profile is `higgs_multimodal_qwen3.yaml`.
 
 ## Legacy profile names
 
 The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for
 compatibility, but both files are V2 profiles after #10800. The former keeps
 the eager local MLP graph for throughput; the latter uses the external
-`FULL_DECODE_ONLY` graph for low latency. Neither file is a V1 opt-out.
+`FULL_DECODE_ONLY` graph for low latency.
 
 ## Model Runner V2 (default)
 
-The default profile uses Stage 0 `model_runner: v2`, `FULL` CUDA graph capture,
+The default profile uses Model Runner V2 for Stage 0, `FULL` CUDA graph capture,
 `FLASH_ATTN`, and `async_scheduling: true`; Stage 1 stays eager with codec
 graph windows `[8, 33]`. The connector emits 25 steady frames with 8 frames
 of left context; its first 8-frame chunk holds about 320 ms of audio.

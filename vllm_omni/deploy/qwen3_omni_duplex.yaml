@@ -1,7 +1,6 @@
 # Model Runner V2 profile for Qwen3-Omni duplex.
 # Qwen duplex commits each utterance as a fresh request, so Thinker, Talker,
-# and Code2Wav use the same native MRv2 data plane as turn mode. CUDA, ROCm,
-# and XPU run V2. NPU and MUSA retain unsupported V1 overrides.
+# and Code2Wav use the same native MRv2 data plane as turn mode.
 # Unconfigured history_policy preserves full history. Per-request media counts
 # use vLLM defaults; configure smaller counts explicitly when needed. Context
 # capacity and Session input-admission budgets still apply.
@@ -9,8 +8,3 @@
 base_config: qwen3_omni_moe.yaml
 
 session_mode: duplex
-
-platforms:
-  # Preserve the duplex profile's NPU restriction; turn mode uses V2 on NPU.
-  npu:
-    model_runner: v1

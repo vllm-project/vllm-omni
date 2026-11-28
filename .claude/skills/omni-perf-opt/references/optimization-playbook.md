@@ -98,18 +98,18 @@ Validate smoothness with `audio_continuity_ok_rate`, not mean RTF.
 
 ## Model runner V2
 
-`model_runner: v2` is the default and only supported runner with vLLM 0.34.
+Model Runner V2 is the only LLM runner with vLLM 0.34.
 Qwen3-Omni's default `qwen3_omni_moe.yaml` includes streaming codec tuning.
 Workload-specific profiles include `qwen3_omni_moe_h200.yaml`
 and `minicpmo_4_5_turn.yaml`. MiniCPM-o duplex uses MRv2 for all stages
 through the default `minicpmo_4_5.yaml`.
 
-- Platform support is profile-specific; retained V1 pins reject startup rather than providing a fallback.
+- Validate model support on the target platform.
 - Gains come from keeping sampler and EOS state on device (no per-step D2H
   wait), native data plane hand-off, and FULL decode graphs.
 - Output is not bitwise identical to V1. MRv2 downstream stages support turn
   mode; duplex needs the dedicated overlay and separate measurement.
-- Enabling MRv2 for a new model is P2: it needs
+- Enabling native MRv2 transport for a new model is P2: it needs
   `supports_native_mrv2_data_plane=True` in the pipeline and a full parity
   pass. Duplex additionally needs `supports_duplex_mrv2=True` on downstream
   native-data-plane stages and separate duplex validation; declaring the flag

@@ -385,12 +385,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
-        # The scheduler must agree with the stage's worker about which runner
-        # consumes its SchedulerOutput: vLLM's own default (v2 since 0.29) would
-        # take the v2 fast path, which omits resumed-request token ids, while a
-        # v1 omni runner still reads them (``KeyError: <req_id>`` in
-        # ``_update_states``). The stage's model config carries the choice
-        # (deploy ``model_runner``, optionally per stage).
+        # Use the same SchedulerOutput layout as the stage worker.
         model_config = self.vllm_config.model_config
         self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
         # Native-AR stages whose decode step feeds more than the sampled token

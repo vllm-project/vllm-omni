@@ -39,7 +39,6 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             engine_output_type="text",
             model_arch="Qwen3ASRForConditionalGeneration",
-            # Takes effect only when the deploy selects model_runner v2.
             supports_native_mrv2_data_plane=True,
             sampling_constraints={"detokenize": True},
         ),

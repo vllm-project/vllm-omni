@@ -1,8 +1,5 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
-# Keep MRv1 as the global default for deferred platforms; CUDA, ROCm, NPU and
-# XPU select MRv2 below.
-model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
@@ -177,7 +174,6 @@ stages:
 
 platforms:
   cuda:
-    model_runner: v2
     connectors:
       connector_of_shared_memory:
         extra:
@@ -245,13 +241,7 @@ platforms:
         gpu_memory_utilization: 0.15
         max_num_seqs: 8
 
-  rocm:
-    # vLLM 0.34 removed Model Runner V1; preserve the shared duplex topology
-    # and connector options while selecting the supported runner on ROCm.
-    model_runner: v2
-
   npu:
-    model_runner: v2
     stages:
       - stage_id: 0
         # Keep the three stages' concurrency caps aligned so the top tier is
@@ -375,7 +365,3 @@ platforms:
           # Fit singleton, batch and tail captures in the 32-entry pool.
           cfm_graph_capture_frames: [64, 80]
           token2wav_ref_prefetch_setup: true
-
-  xpu:
-    # Intel XPU builds the omni V2 runners; all three stages run on MRv2.
-    model_runner: v2

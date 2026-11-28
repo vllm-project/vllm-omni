@@ -85,11 +85,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
             self._model_path = None
             self.vllm_config = None
 
-        _, self._codec_graph_enabled = self.config.resolve_graph_defaults(
-            use_v2_model_runner=bool(
-                getattr(getattr(self.vllm_config, "model_config", None), "use_v2_model_runner", False)
-            )
-        )
+        _, self._codec_graph_enabled = self.config.resolve_graph_defaults()
         self.sample_rate: int = int(self.config.sample_rate)
         self.num_codebooks: int = int(self.config.num_codebooks)
         self.num_real_codes: int = int(self.config.num_real_codes)

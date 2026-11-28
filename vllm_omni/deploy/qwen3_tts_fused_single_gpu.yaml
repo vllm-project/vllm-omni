@@ -3,7 +3,6 @@
 # reset_prefix_cache(reset_running_requests=True) returns False while requests
 # are running; wait for completion or abort them before resetting the cache.
 pipeline: qwen3_tts_fused
-model_runner: v2
 async_chunk: true
 
 stages:

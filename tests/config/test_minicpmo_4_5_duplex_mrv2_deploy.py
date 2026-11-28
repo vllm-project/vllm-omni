@@ -51,7 +51,6 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
 
 def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None:
     config, stages = _resolve_stages(monkeypatch, "rocm")
-    assert config.model_runner == "v2"
     assert config.session_mode == "duplex"
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
@@ -65,12 +64,11 @@ def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None
 
 
 @pytest.mark.parametrize("platform", ["musa"])
-def test_duplex_mrv2_profile_keeps_deferred_platforms_on_v1(monkeypatch, platform) -> None:
+def test_duplex_mrv2_profile_uses_v2_on_other_platforms(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
-    assert config.model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
 
 def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
@@ -176,7 +174,6 @@ def test_two_card_deploy_accepts_single_vocoder_stage_override(monkeypatch) -> N
 def test_duplex_mrv2_profile_xpu_full_mrv2(monkeypatch) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", "xpu")
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="xpu")
-    assert config.model_runner == "v2"
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
 

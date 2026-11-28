@@ -16,7 +16,7 @@ DEPLOY = Path(__file__).resolve().parents[2] / "vllm_omni/deploy/hunyuan-image-3
 
 def test_shared_deploy_reaches_structured_resolver_without_losing_kv_config():
     deploy = load_deploy_config(DEPLOY)
-    assert deploy.weight_sharing is not None and deploy.model_runner == "v2"
+    assert deploy.weight_sharing is not None
     assert deploy.weight_sharing.gpu_memory_utilization == 0.95
     assert deploy.weight_sharing.timeout == 120.0
     stages = {stage.stage_id: stage for stage in deploy.stages}
@@ -42,4 +42,3 @@ def test_yaml_null_disables_sharing_without_changing_inherited_stages(tmp_path):
     config = load_deploy_config(overlay)
     assert config.weight_sharing is None
     assert len(config.stages) == 2
-    assert config.model_runner == "v2"

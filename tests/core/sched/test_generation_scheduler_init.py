@@ -98,10 +98,6 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
-    if platform not in {"cuda", "npu"}:
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-            merge_pipeline_deploy(pipeline, deploy)
-        return
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     extras = deploy.connectors["shm"]["extra"]
     config = _config(
@@ -112,7 +108,7 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     )
     warning = mocker.patch("vllm_omni.core.sched.omni_generation_scheduler.logger.warning")
     scheduler = construct_scheduler(config)
-    # The raw extras persist through fallback; the live constructor must cope.
+    # The codec scheduler receives the shared batching settings on every platform.
     assert extras["generation_min_batch_size"] == 16
     assert extras["generation_max_wait_ms"] == 6
     assert scheduler._native_data_plane is True

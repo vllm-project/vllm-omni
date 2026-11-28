@@ -25,8 +25,3 @@ stages:
   - stage_id: 2
     devices: "0"
     gpu_memory_utilization: 0.10
-
-platforms:
-  # Preserve this CUDA tuning profile's NPU restriction.
-  npu:
-    model_runner: v1

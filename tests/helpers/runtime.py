@@ -36,7 +36,7 @@ from tests.helpers.clean import (
 from tests.helpers.media import (
     release_audio_transcriber,
 )
-from tests.helpers.stage_config import load_stage_ids, load_stage_replica_counts
+from tests.helpers.stage_config import load_stage_ids, load_stage_replica_counts, stage_config_path_for_run_level
 from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.outputs import OmniRequestOutput
@@ -1466,53 +1466,6 @@ def get_model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
-def _deploy_config_arg_index(server_args: list[str]) -> int | None:
-    for index, arg in enumerate(server_args):
-        if arg == "--deploy-config" or arg.startswith("--deploy-config="):
-            return index
-    return None
-
-
-def _deploy_config_value(server_args: list[str], index: int) -> str:
-    arg = server_args[index]
-    if arg.startswith("--deploy-config="):
-        return arg.split("=", 1)[1]
-    if index + 1 >= len(server_args):
-        raise ValueError("--deploy-config requires a path")
-    return server_args[index + 1]
-
-
-def _resolve_server_deploy_args(
-    server_args: list[str] | None,
-    stage_config_path: str | None,
-    run_level: str,
-) -> tuple[list[str], str | None, bool]:
-    """Return launch args, the deploy path, and whether args already carry it.
-
-    A ``--deploy-config`` that exists only in ``server_args`` is rewritten when
-    the weekly runner override is set. Otherwise that argument, including its
-    ``load_format``, is left as the test wrote it.
-    """
-    from tests.helpers.stage_config import _ci_model_runner_override, stage_config_path_for_run_level
-
-    args = list(server_args or [])
-    deploy_arg_index = None
-    deploy_path = stage_config_path
-    if deploy_path is None and _ci_model_runner_override() is not None:
-        deploy_arg_index = _deploy_config_arg_index(args)
-        if deploy_arg_index is not None:
-            deploy_path = _deploy_config_value(args, deploy_arg_index)
-    resolved = stage_config_path_for_run_level(deploy_path, run_level)
-    replaced = False
-    if deploy_arg_index is not None and resolved is not None:
-        if args[deploy_arg_index].startswith("--deploy-config="):
-            args[deploy_arg_index] = f"--deploy-config={resolved}"
-        else:
-            args[deploy_arg_index + 1] = resolved
-        replaced = True
-    return args, resolved, replaced
-
-
 def iter_omni_server(
     request: Any,
     run_level: str,
@@ -1535,9 +1488,8 @@ def iter_omni_server(
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         port = params.port
-        server_args, stage_config_path, deploy_arg_replaced = _resolve_server_deploy_args(
-            params.server_args, params.stage_config_path, run_level
-        )
+        server_args = list(params.server_args or [])
+        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
         if model != original_model:
             server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni:
@@ -1572,7 +1524,7 @@ def iter_omni_server(
                 yield server
                 print("OmniServer stopping...")
         else:
-            if stage_config_path is not None and not deploy_arg_replaced:
+            if stage_config_path is not None:
                 server_args += ["--deploy-config", stage_config_path]
 
             with (
@@ -1608,7 +1560,6 @@ def iter_omni_runner(
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, None, None]:
     """Yield an :class:`OmniRunner`; used by ``omni_runner`` / ``omni_runner_function`` fixtures."""
-    from tests.helpers.stage_config import stage_config_path_for_run_level
 
     model_prefix = get_model_prefix()
     with omni_fixture_lock, _whisper_device_free_around():
@@ -1647,7 +1598,6 @@ def iter_async_omni(
     ``core_model`` tiny-model rewrite (``diffusion``-marked tests) as
     :func:`iter_omni_runner`.
     """
-    from tests.helpers.stage_config import stage_config_path_for_run_level
 
     params = getattr(request, "param", None)
     if not isinstance(params, AsyncOmniParams):

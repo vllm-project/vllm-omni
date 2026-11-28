@@ -27,7 +27,6 @@
         "1800"
       ],
       "update": {
-        "model_runner": "v2",
         "async_chunk": true,
         "stages": {
           "0": {

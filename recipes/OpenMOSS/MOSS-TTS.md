@@ -47,9 +47,9 @@ cached across requests.
 With `async_chunk: false`, codec v2 uses eager whole-sequence decoding; the
 legacy offline CUDA Graph wrapper supports codec v1 only.
 
-For the CUDA MRV2 runner and platform fallbacks, see the
+For the supported deployment platforms, see the
 [Local 1.5 deployment profile](../../docs/configuration/stage_configs.md#moss-tts-local-15-with-model-runner-v2).
-Local 1.5 defaults to MRV2 on CUDA and retains V1 on other platforms.
+Local 1.5 uses MRV2 on CUDA and NPU.
 
 ## References
 
@@ -207,9 +207,7 @@ file, `moss_tts_local.yaml`. The CUDA settings use MRV2, 128 stream slots per
 stage, full-quota private MPS, prefix caching and Triton backbone attention.
 These settings replace the former C64, high-concurrency, low-latency and
 optimized presets. Pipeline selection no longer probes GPU memory or MPS.
-Non-CUDA platforms retain V1 through the same file's platform overrides, and
-NPU has an opt-in MRV2 profile (see the NPU section above); the separate 2/3-NPU
-files describe different device placements.
+NPU uses the same profile. The separate 2/3-NPU files describe different device placements.
 
 Both stages share one GPU, with a 32 GiB Talker KV budget. The CUDA settings
 are validated on H200 and require room for codec state and graphs, plus

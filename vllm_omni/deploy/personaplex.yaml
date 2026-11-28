@@ -1,5 +1,4 @@
 # CUDA Model Runner V2 profile; requires duplex mode and async_chunk.
-# Non-CUDA platforms retain V1 pins and are unavailable with vLLM 0.34.
 # PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.
 #
 # PersonaPlex is a Moshi finetune (full-duplex S2S), served offline as a 2-stage
@@ -126,13 +125,6 @@ stages:
 
 platforms:
   npu:
-    model_runner: v1
     stages:
       - stage_id: 0
         enforce_eager: false
-  xpu:
-    model_runner: v1
-  rocm:
-    model_runner: v1
-  musa:
-    model_runner: v1

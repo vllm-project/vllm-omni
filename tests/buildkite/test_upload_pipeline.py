@@ -837,10 +837,6 @@ def test_voxcpm2_voxtral_weekly_pr_validation_is_focused(monkeypatch: pytest.Mon
         "tts_voxcpm2_weekly",
         "tts_voxtral_weekly",
     ]
-    assert step["env"]["VLLM_OMNI_CI_MODEL_RUNNER"] == "v2"
-    command = "\n".join(step["commands"])
-    assert "env VLLM_OMNI_CI_MODEL_RUNNER" not in command
-    assert "env -u VLLM_OMNI_CI_MODEL_RUNNER" not in command
 
     group = next(step for step in doc["steps"] if "VoxCPM2 and Voxtral Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
@@ -866,7 +862,6 @@ def test_moss_higgs_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPa
     }
     expected_env = {
         "TTS · Moss · L4": {
-            "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
             "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE": "cpu",
         },
     }
@@ -939,7 +934,7 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
             "dependency": "tts_breeze_tts2_weekly",
             "extra_dependencies": ("tts_breeze_tts2_mrv2_weekly",),
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
-            "env": {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
+            "env": {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
     }
     retired = {
@@ -995,9 +990,8 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert step["source_file_dependencies"] == [
         "tts_qwen3_tts_function",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
+    assert step["env"] == {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
-    assert "VLLM_OMNI_CI_MODEL_RUNNER" not in command
     assert "failed=0" in command
     assert "exit $$failed" in command
     assert 'pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1' in command
@@ -1081,7 +1075,7 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tts_minimax_music3_weekly",
         "tts_yue2_weekly",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
+    assert step["env"] == {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
     explicit_files = (
         "tests/e2e/offline_inference/test_audex_s2s.py",
@@ -1091,8 +1085,6 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tests/e2e/online_serving/test_higgs_audio_v3.py",
         "tests/e2e/online_serving/test_minimax_music3.py",
     )
-    assert "VLLM_OMNI_CI_MODEL_RUNNER=v1" not in command
-    assert "VLLM_OMNI_CI_MODEL_RUNNER=v2 pytest" in command
     for path in explicit_files:
         assert command.count(path) == 2
         assert f"--ignore={path}" in command

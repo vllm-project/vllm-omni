@@ -9,7 +9,6 @@
 # a smaller or slower card lower max_num_seqs and recompute the fractions
 # from that card's memory with the same arithmetic.
 pipeline: chatterbox
-model_runner: v2
 async_chunk: true
 connectors:
   connector_of_shared_memory:
@@ -87,7 +86,6 @@ stages:
 # controls are restated.
 platforms:
   npu:
-    model_runner: v1
     stages:
       - stage_id: 0
         additional_config:
@@ -102,7 +100,6 @@ platforms:
           exaggeration: 0.5
           cfg_weight: 0.5
   musa:
-    model_runner: v1
     stages:
       - stage_id: 0
         additional_config:

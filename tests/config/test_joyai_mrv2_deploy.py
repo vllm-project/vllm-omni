@@ -43,15 +43,3 @@ def test_joyai_runner_and_transport_contract(monkeypatch, platform, asr, duplex)
     if asr:
         assert pipeline.stages[0].bypass_without_modalities == ("audio",)
         assert stages[1].custom_process_input_func.endswith(".asr_to_joyai")
-
-
-@pytest.mark.parametrize("v1_stages", [(0,), (1,), (2,), (0, 1, 2)])
-def test_joyai_stage_runner_override(monkeypatch, v1_stages):
-    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    deploy = _apply_platform_overrides(
-        load_deploy_config(get_deploy_config_path("joyai_vl_interaction_duplex.yaml")), platform="cuda"
-    )
-    for stage_id in v1_stages:
-        deploy.stages[stage_id].model_runner = "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, deploy)

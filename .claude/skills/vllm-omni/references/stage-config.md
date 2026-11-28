@@ -33,7 +33,6 @@ rejected. Do not write new configs in that shape.
 | `pipeline` | – | Override the pipeline registry key (e.g. a thinker-only variant) |
 | `async_chunk` | resolved from pipeline | Streaming hand-off between stages |
 | `session_mode` | `turn` | `turn` (HTTP request/response) or `duplex` |
-| `model_runner` | `v1` | `v2` enables MRv2 runners (`vllm_omni/worker_v2/`) |
 | `connectors` | – | Named connector specs: `{name: ConnectorClass, extra: {...}}` |
 | `stages` | `[]` | Per-stage settings, matched by `stage_id` |
 | `platforms` | – | `cuda` / `rocm` / `npu` / `xpu` / `musa` → nested `stages:` overrides |
@@ -51,7 +50,6 @@ rejected. Do not write new configs in that shape.
 | `max_num_seqs`, `max_num_batched_tokens`, `max_model_len` | Usual vLLM limits |
 | `enforce_eager` | Disable CUDA graphs for this stage |
 | `tensor_parallel_size` | TP within the stage |
-| `model_runner` | Per-stage v1/v2 override |
 | `async_chunk` | `false` opts a stage out |
 | `input_connectors` / `output_connectors` | Connector names |
 | `default_sampling_params` | Stage sampling defaults |

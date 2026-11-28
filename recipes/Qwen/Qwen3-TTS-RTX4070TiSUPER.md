@@ -59,7 +59,7 @@ Both stages (talker and code2wav) shared GPU 0 at `gpu_memory_utilization: 0.3`
 each, so the `0.15` profile documented for the RTX 4090 was not needed here.
 
 Since that commit, [#7930](https://github.com/vllm-project/vllm-omni/pull/7930)
-made the experimental Model Runner V2 (`model_runner: v2`) the default for
+made the experimental Model Runner V2 the default for
 Qwen3-TTS on CUDA and lowered stage 0 `max_num_batched_tokens` from 32768 to
 512. The memory and startup figures below were measured on the V1 runner and
 have not been re-checked on current main, so they may differ there.

@@ -101,7 +101,6 @@ def test_npu_matrix_preserves_platform_runtime_guards(config_file, test_name, pr
     actual = _apply_platform_overrides(load_deploy_config(modified), "npu")
     stages = {stage.stage_id: stage for stage in actual.stages}
 
-    assert actual.model_runner == "v2"
     assert {stage_id: stage.devices for stage_id, stage in stages.items()} == {0: "0,1", 1: "2", 2: "2"}
     assert stages[0].tensor_parallel_size == 2
     assert config["mark"][0]["hardware_marks"]["num_cards"] == 4
@@ -113,7 +112,7 @@ def test_npu_matrix_preserves_platform_runtime_guards(config_file, test_name, pr
         if "result_metadata" in benchmark:
             metadata = benchmark["result_metadata"]
             assert metadata["inference_devices"] == len(devices)
-            assert metadata["model_runner"] == actual.model_runner
+            assert metadata["model_runner"] == "v2"
             assert metadata["thinker_prefix_caching"] is prefix
     for stage in original.stages:
         expected = asdict(stage)
