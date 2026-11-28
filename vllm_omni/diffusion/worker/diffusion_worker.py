@@ -430,9 +430,48 @@ def _flashinfer_tune_signature(request: Any) -> str:
 
 
 def _get_mem_allocator_instance() -> Any:
+    if current_omni_platform.device_type == "npu":
+        from vllm_ascend.device_allocator.camem import CaMemAllocator
+
+        return CaMemAllocator.get_instance()
+
     from vllm.device_allocator import get_mem_allocator_instance
 
     return get_mem_allocator_instance()
+
+
+@contextmanager
+def _use_diffusion_memory_pool(allocator: Any, tag: str):
+    """Keep framework cache-release helpers out of an active NPU pool."""
+    if current_omni_platform.device_type != "npu":
+        with allocator.use_memory_pool(tag=tag):
+            yield
+        return
+
+    try:
+        from diffusers.models import modeling_utils
+        from diffusers.utils import torch_utils
+    except ImportError:
+        with allocator.use_memory_pool(tag=tag):
+            yield
+        return
+
+    original_modeling_empty_cache = modeling_utils.empty_device_cache
+    original_torch_empty_cache = torch_utils.empty_device_cache
+
+    def empty_device_cache(device_type: str | None = None):
+        if device_type is None or device_type == "npu":
+            return
+        return original_torch_empty_cache(device_type)
+
+    modeling_utils.empty_device_cache = empty_device_cache
+    torch_utils.empty_device_cache = empty_device_cache
+    try:
+        with allocator.use_memory_pool(tag=tag):
+            yield
+    finally:
+        modeling_utils.empty_device_cache = original_modeling_empty_cache
+        torch_utils.empty_device_cache = original_torch_empty_cache
 
 
 def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
@@ -1677,7 +1716,7 @@ class DiffusionWorker:
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
                 self._owns_sleep_pool = True
             logger.info(f"[Worker {self.rank}] Activating Diffusion CuMem pool for tag: {tag}")
-            return allocator.use_memory_pool(tag=tag)
+            return _use_diffusion_memory_pool(allocator, tag)
         return nullcontext()
 
     def shutdown(self) -> None:

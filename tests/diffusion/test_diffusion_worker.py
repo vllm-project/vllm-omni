@@ -10,6 +10,9 @@ This module tests the DiffusionWorker implementation:
 - shutdown: Releasing collective resources before process groups
 """
 
+import sys
+import types
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -56,6 +59,56 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     worker.device = torch.device("cuda", 0)
     worker._sleep_saved_buffers = {}
     return worker
+
+
+def test_npu_pool_suppresses_diffusers_empty_cache(mocker: MockerFixture, mock_gpu_worker):
+    """Framework NPU cache releases must not run inside a CaMem pool."""
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.device_type",
+        "npu",
+    )
+    allocator = patch_cumem_allocator(mocker)
+    mock_gpu_worker.od_config.enable_sleep_mode = True
+    mock_gpu_worker._owns_sleep_pool = False
+
+    modeling_utils = types.ModuleType("diffusers.models.modeling_utils")
+    torch_utils = types.ModuleType("diffusers.utils.torch_utils")
+    modeling_utils.empty_device_cache = mocker.Mock()
+    torch_utils.empty_device_cache = mocker.Mock()
+    mocker.patch.dict(
+        sys.modules,
+        {
+            "diffusers.models": types.SimpleNamespace(modeling_utils=modeling_utils),
+            "diffusers.utils": types.SimpleNamespace(torch_utils=torch_utils),
+        },
+    )
+
+    with mock_gpu_worker._maybe_get_memory_pool_context("weights"):
+        modeling_utils.empty_device_cache()
+        torch_utils.empty_device_cache("npu")
+        torch_utils.empty_device_cache("cuda")
+
+    allocator.use_memory_pool.assert_called_once_with(tag="weights")
+    modeling_utils.empty_device_cache.assert_not_called()
+    torch_utils.empty_device_cache.assert_called_once_with("cuda")
+    assert mock_gpu_worker._owns_sleep_pool is True
+
+
+def test_npu_pool_uses_camem_allocator(mocker: MockerFixture, mock_gpu_worker):
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.device_type",
+        "npu",
+    )
+    mock_gpu_worker.od_config.enable_sleep_mode = True
+    mock_gpu_worker._owns_sleep_pool = False
+    allocator = mocker.Mock()
+    camem = types.ModuleType("vllm_ascend.device_allocator.camem")
+    camem.CaMemAllocator = types.SimpleNamespace(get_instance=lambda: allocator)
+    mocker.patch.dict(sys.modules, {"vllm_ascend.device_allocator.camem": camem})
+
+    mock_gpu_worker._maybe_get_memory_pool_context("weights")
+
+    allocator.get_current_usage.assert_called_once_with()
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
