@@ -1742,7 +1742,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
-                    fused_sources=self._mmap_fused_by_tensor_id if use_mmap else None,
+                    fused_sources=self._mmap_fused_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
                     chunk_size_bytes=self.config.chunk_size_bytes,
                 )
