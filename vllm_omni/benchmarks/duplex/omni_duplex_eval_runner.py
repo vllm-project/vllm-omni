@@ -16,6 +16,8 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -75,6 +77,9 @@ _FINAL_ACK_TIMEOUT_S = 20.0
 _FINAL_CLOSE_TIMEOUT_S = 20.0
 # Optional session.stats fetch: the deadline covers the send as well as the reply.
 _SESSION_STATS_TIMEOUT_S = 5.0
+# A closed session can retain its slot until asynchronous stage cleanup ends.
+# Bound admission retries separately from the sample's generation deadline.
+_SESSION_ADMISSION_TIMEOUT_S = 120.0
 # How long a cancelled close may take to unwind before the transport goes down.
 _FORCE_CLOSE_GRACE_S = 5.0
 # Bound the commit write: it rides the session socket like the close, so a
@@ -725,6 +730,71 @@ async def _commit_clip_then_pad(client, period_ms: int, stop: asyncio.Event) -> 
     return asyncio.create_task(_pad_silence_until_stopped(client, period_ms, stop)), commit_timeout
 
 
+@asynccontextmanager
+async def _open_duplex_session(
+    *,
+    url: str,
+    model: str,
+    additional_headers: dict[str, str] | None,
+    ref_audio: str | None,
+    instructions: str | None,
+    extra_body: dict[str, object] | None,
+    turn_detection: str,
+) -> AsyncIterator[tuple[RealtimeDuplexClient, int, float]]:
+    """Wait for admission without replaying any already-started sample."""
+    from vllm_omni.clients.duplex import DuplexProtocolError
+    from vllm_omni.clients.realtime import RealtimeDuplexClient, build_realtime_url
+
+    started = time.monotonic()
+    async with AsyncExitStack() as stack:
+
+        async def admit() -> tuple[RealtimeDuplexClient, int]:
+            rejections = 0
+            delay_s = 0.25
+            while True:
+                client = RealtimeDuplexClient(
+                    build_realtime_url(url, model, autostart=False), additional_headers=additional_headers
+                )
+                await stack.enter_async_context(client)
+                try:
+                    await client.configure(
+                        model,
+                        ref_audio=ref_audio,
+                        instructions=instructions,
+                        extra_body=extra_body,
+                        auto_response=turn_detection != TURN_DETECTION_SERVER_VAD,
+                        turn_detection=session_turn_detection(turn_detection),
+                        # Use the deployment default, including text-only outputs.
+                        modalities=None,
+                    )
+                except DuplexProtocolError as exc:
+                    error = exc.raw.get("error")
+                    if (
+                        exc.code != "resource_exhausted"
+                        or not isinstance(error, dict)
+                        or error.get("retryable") is not True
+                        or client.events.count("session.created")
+                    ):
+                        raise
+                    rejections += 1
+                    await stack.aclose()
+                    logger.warning(
+                        "Omni-DuplexEval session admission rejected %d time(s); retrying in %.2fs: %s",
+                        rejections,
+                        delay_s,
+                        exc,
+                    )
+                    await asyncio.sleep(delay_s)
+                    delay_s = min(delay_s * 2, 2.0)
+                else:
+                    return client, rejections
+
+        client, rejections = await asyncio.wait_for(admit(), timeout=_SESSION_ADMISSION_TIMEOUT_S)
+        # Neither the admission deadline nor its retry handler covers sample
+        # generation: a failure after admission must not replay model inputs.
+        yield client, rejections, time.monotonic() - started
+
+
 async def generate_sample(
     sample: DuplexSample,
     *,
@@ -761,7 +831,6 @@ async def generate_sample(
     # The CLI imports this module while composing the server. Load client
     # libraries only when a benchmark session actually runs.
     from vllm_omni.clients.duplex import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE, wait_for_condition
-    from vllm_omni.clients.realtime import RealtimeDuplexClient, build_realtime_url
 
     if pace not in {"realtime", "as-fast-as-possible"}:
         raise ValueError("pace must be realtime or as-fast-as-possible")
@@ -805,9 +874,6 @@ async def generate_sample(
         # No final commit: trailing silence lets the VAD close the last turn.
         pcm += bytes(round(SERVER_VAD_TAIL_S * PCM16_SAMPLE_RATE) * PCM16_BYTES_PER_SAMPLE)
     realtime = pace == "realtime"
-    client = RealtimeDuplexClient(
-        build_realtime_url(url, model, autostart=False), additional_headers=additional_headers
-    )
     response_done = False
     drain_timeout = None
     drain_timeout_state: dict[str, object] | None = None
@@ -824,17 +890,15 @@ async def generate_sample(
     stream_start: float | None = None
     if collect_stage_metrics:
         extra_body = {**(extra_body or {}), "return_stage_metrics": True}
-    async with client:
-        await client.configure(
-            model,
-            ref_audio=prepared.ref_audio,
-            instructions=instructions,
-            extra_body=extra_body,
-            auto_response=not server_turns,
-            turn_detection=session_turn_detection(turn_detection),
-            # Use the deployment default; a text-only deployment rejects audio.
-            modalities=None,
-        )
+    async with _open_duplex_session(
+        url=url,
+        model=model,
+        additional_headers=additional_headers,
+        ref_audio=prepared.ref_audio,
+        instructions=instructions,
+        extra_body=extra_body,
+        turn_detection=turn_detection,
+    ) as (client, admission_rejections, admission_s):
         frame_transport = select_frame_transport(_session_capabilities(client))
         if not server_turns:
             from vllm_omni.clients.duplex import chunk_period_ms, has_residual_model_unit
@@ -1009,6 +1073,8 @@ async def generate_sample(
         "fps": fps,
         "unit_ms": unit_ms,
         "model": model,
+        "session_admission_rejections": admission_rejections,
+        "session_admission_s": admission_s,
         "turn_detection": turn_detection,
         "frame_transport": frame_transport,
         "instructions": instructions,
