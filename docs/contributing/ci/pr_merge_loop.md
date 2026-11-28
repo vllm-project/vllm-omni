@@ -267,3 +267,27 @@ Acceptance (product):
 Verifier: say what was run at **this tip SHA** — a check not run is listed “not run” / “not tried on <GPU/model>”, never omitted. Merge only the reviewed tip; rebase → re-review.
 
 Perf/model claims need matched A/B on the **named** model path; fix the class, not only the sample.
+
+## Worked example: boundary-change handoff
+
+This example shows one boundary-changing PR carried from author to reviewer to maintainer. The values below are placeholders; replace each with verified facts for the actual PR.
+
+| Field | Example entry |
+| --- | --- |
+| Trigger | Caller passes an empty `prompt_embeds` list to the stage input adapter. |
+| Before | The adapter raises `IndexError` inside the stage worker. |
+| After | The adapter returns an empty result and the stage reports a validation error. |
+| Affected contract | Stage input adapter return type and error surface. |
+| Actual caller | The stage scheduler call site, traced from the entry point to the adapter (file and line). |
+| Named test | The regression test that fails before the change and passes after it. |
+| Revision | Exact PR head SHA the evidence was run against. |
+| Backend | Hardware and backend used for the run, or `not run` with the reason. |
+| Substitutes / unrun checks | Any local substitute used in place of a GPU run, and each check still unrun. |
+
+Handoff steps:
+
+1. **Author** fills the table for the head SHA, links the named test, and records the exact local command and result.
+2. **Reviewer** follows the call path from the actual caller to the changed boundary, confirms the named test exercises that path, and checks that the before/after behavior matches the table. Unresolved findings go in the TODO checklist.
+3. **Maintainer** checks that every evidence row refers to the current head. Evidence for an older SHA does not count. Current-tip CUDA L2 (or the recorded docs-only skip) and applicable GitHub checks decide merge eligibility, as in the rules above.
+
+Lessons from this format: list unrun checks explicitly rather than omitting them, and keep the table to the fields above so reviewers do not need a second template.
