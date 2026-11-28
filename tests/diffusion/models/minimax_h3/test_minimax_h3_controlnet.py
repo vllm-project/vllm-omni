@@ -74,10 +74,18 @@ def control_startup(tmp_path, monkeypatch):
         model="/unused/FL2VA",
         task_type="fl2va",
         model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
+        parallel_config=SimpleNamespace(
+            cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1, use_hsdp=False
+        ),
+        additional_config=None,
+        step_execution=False,
+        quantization_config=None,
+        host_weight_runtime_mode="disabled",
+        cache_backend="none",
         controlnet_model_path=str(path),
         diffusion_offload_config=None,
         revision=None,
+        diffusion_attention_schedule=None,
     )
     return pipeline_module, config
 
@@ -472,16 +480,34 @@ def test_startup_rejects_public_and_legacy_offload(control_startup, offload):
         pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
-@pytest.mark.parametrize("partition", ["combined", "ref2va"])
-def test_control_rejects_secondary_or_ref2va_partition_before_loading(control_startup, monkeypatch, partition):
+def test_startup_rejects_reference_kv_offload(control_startup):
+    """Reference rows are compacted during the loop; the control branch needs every row."""
     pipeline_module, config = control_startup
-    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: partition)
+    config.kv_offload_config = {"enabled": True}
+    with pytest.raises(ValueError, match="reference-KV offload"):
+        pipeline_module.MiniMaxH3Pipeline(od_config=config)
+
+
+def test_control_rejects_a_combined_server_before_loading(control_startup, monkeypatch):
+    pipeline_module, config = control_startup
+    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: "combined")
     config.model = "/unused/MiniMax-H3"
     config.task_type = "auto"
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
-        with pytest.raises(ValueError, match="FL2VA checkpoint partition"):
+        with pytest.raises(ValueError, match="binds to one DiT"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)
         resolve_root.assert_not_called()
+
+
+def test_control_startup_accepts_the_ref2va_partition(control_startup, monkeypatch):
+    """Base Ref2VA weights take control with references, as the FastH3 Omni student does."""
+    pipeline_module, config = control_startup
+    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: "ref2va")
+    config.model = "/unused/MiniMax-H3"
+    config.task_type = "ref2va"
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root", side_effect=RuntimeError("guard accepted")):
+        with pytest.raises(RuntimeError, match="guard accepted"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
 def test_startup_accepts_resident_default_policy(control_startup):
@@ -666,15 +692,17 @@ def test_control_rejects_external_vae_encoder_before_weight_loading(control_star
         resolve_root.assert_not_called()
 
 
-def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatch):
+def _control_request(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 
     pipeline = object.__new__(pipeline_module.MiniMaxH3Pipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace(
+        additional_config={},
         controlnet_model_path="/control.safetensors",
         step_execution=False,
+        diffusion_attention_schedule=None,
     )
     pipeline.load_vae_encoder = True
     pipeline.video_vae = nn.Module()
@@ -684,7 +712,7 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     pipeline._release_stage_cache = lambda: None
     pipeline._resolve_task = lambda *args, **kwargs: "t2va"
     pipeline._active_turbo_spec = lambda sampling: None
-    pipeline._has_active_native_lora = lambda sampling: False
+    pipeline._active_native_spec = lambda sampling: None
     pipeline._fasth3_checkpoint = None
     pipeline._fasth3 = None
     pipeline._resolve_sigma_positions = lambda task, sampling: (None, 2)
@@ -721,13 +749,22 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         quality="lossless",
         seed=7,
         num_outputs_per_prompt=1,
+        lora_request=None,
+        lora_scale=1.0,
         attention_schedule=None,
+        attention_sigma_schedule=None,
     )
     pixels = torch.ones(1, 3, num_frames, 32, 32)
     rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)
     media = {"control_path": "control.mkv"}
     monkeypatch.setattr(pipeline_module, "load_control_pixels", lambda *args, **kwargs: pixels)
     monkeypatch.setattr(pipeline_module, "build_control_rows", lambda *args, **kwargs: rows)
+
+    return pipeline_module, pipeline, conditioning, sampling, media, rows
+
+
+def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatch):
+    pipeline_module, pipeline, conditioning, sampling, media, rows = _control_request(monkeypatch)
 
     context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
 
@@ -754,3 +791,148 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     assert same_canvas["control_rows"] is rows
     assert same_canvas["latent_upscale"] is target
     assert same_canvas["latent_refine"] is refine
+
+
+def test_control_hints_target_rows_and_skip_reference_rows(cpu_layers):
+    """Ref2VA packs clean reference rows among the video rows; control describes only the target."""
+    arch = tiny_arch()
+    config = SimpleNamespace(
+        tf_model_config=vars(arch),
+        parallel_config=SimpleNamespace(ulysses_degree=1, ring_degree=1),
+        controlnet_model_path=None,
+    )
+    model = h3.MiniMaxH3DiTModel(config)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0, 0.1)
+    model.controlnet = MiniMaxH3ControlNet(arch, (0, 1))
+    model.controlnet.load_weights(original_weights(arch).items())
+    for module in model.modules():
+        if hasattr(module, "forward_native"):
+            module._forward_method = module.forward_native
+    # Packed rows: text 0, target video 1 and 3, audio 2, reference video 4, text 5.
+    kwargs = {
+        "x": torch.randn(1, 6, 96),
+        "audio_x": torch.randn(1, 6, 32),
+        "img_position_ids": torch.zeros(1, 6, 3, dtype=torch.long),
+        "unique_timesteps": torch.tensor([0.2, 1.0]),
+        "inverse_indices": torch.tensor([0, 0, 0, 0, 1, 0]),
+        "update_mask": torch.tensor([True, True, False]),
+        "token_tags": torch.tensor([1, 0, 2, 0, 0, 1]),
+        "prompt_embeds": torch.randn(2, 8),
+        "img_pos_info": {"position_ids": torch.tensor([1, 3, 4])},
+        "img_pos_for_infer_output_info": {"position_ids": torch.tensor([1, 3, 4])},
+        "audio_pos_info": {"position_ids": torch.tensor([2])},
+        "text_pos_info": {"position_ids": torch.tensor([0, 5])},
+        "packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 6], dtype=torch.int32), "max_seqlen_q": 6},
+        "refiner_packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 2], dtype=torch.int32), "max_seqlen_q": 2},
+    }
+    calls = []
+    original_forward = model.controlnet.forward
+
+    def spy(hidden, control_rows, video_indices, hint_free_indices, **block_kwargs):
+        hints = original_forward(hidden, control_rows, video_indices, hint_free_indices, **block_kwargs)
+        calls.append((video_indices.clone(), hint_free_indices.clone(), hints))
+        return hints
+
+    rows = torch.randn(2, 196)  # one row per target video token, none for the reference
+    with patch.object(model.controlnet, "forward", side_effect=spy):
+        controlled = model(**kwargs, control_rows=rows, control_context_scale=1)
+    ((video_indices, hint_free_indices, hints),) = calls
+    assert video_indices.tolist() == [1, 3]
+    assert sorted(hint_free_indices.tolist()) == [2, 4]
+    for hint in hints.values():
+        assert torch.count_nonzero(hint[[2, 4]]) == 0
+        assert torch.count_nonzero(hint[[1, 3]]) > 0
+    assert not torch.equal(model(**kwargs)[0], controlled[0])
+    # A full target set keeps the original T2VA behavior: every video row is described.
+    with pytest.raises(ValueError, match=r"control_rows must be \(3, 196\)"):
+        model(**{**kwargs, "update_mask": torch.ones(3, dtype=torch.bool)}, control_rows=rows)
+
+
+@pytest.mark.parametrize(
+    ("case", "accepted"),
+    [("omni", True), ("v2-on-ref2va", False), ("omni-nvfp4", False)],
+)
+def test_control_startup_guard_for_fasth3_checkpoints(control_startup, monkeypatch, tmp_path, case, accepted):
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
+        FastH3CheckpointSpec,
+        FastH3OmniCheckpointSpec,
+    )
+
+    pipeline_module, config = control_startup
+    (tmp_path / "fastvideo_inference.json").write_text("{}")
+    spec = FastH3CheckpointSpec() if case == "v2-on-ref2va" else FastH3OmniCheckpointSpec()
+    if case == "omni-nvfp4":
+        (tmp_path / spec.transformer_component).mkdir()
+        (tmp_path / spec.transformer_component / "nvfp4_weights.safetensors").touch()
+    config.model = "/unused/FastH3"
+    # An explicit task type keeps the Ref2VA partition even for a non-Omni spec.
+    config.task_type = "ref2va"
+    monkeypatch.setattr(pipeline_module, "is_minimax_h3_modular", lambda *args: True)
+    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: "ref2va")
+    monkeypatch.setattr(pipeline_module, "_resolve_minimax_h3_model_root", lambda *args, **kwargs: tmp_path)
+    monkeypatch.setattr(FastH3CheckpointSpec, "from_metadata", classmethod(lambda cls, metadata: spec))
+    monkeypatch.setattr(
+        type(spec), "check_serving_contract", lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("accepted"))
+    )
+    if accepted:
+        with pytest.raises(RuntimeError, match="accepted"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+    else:
+        message = "dense weights" if case == "omni-nvfp4" else "FastH3 V2 requires --task-type fl2va"
+        with pytest.raises(ValueError, match=message):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+
+
+def test_control_task_follows_the_partition_not_the_release():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    assert pipeline._control_task() == "t2va"
+    # Any Ref2VA DiT hints its target rows: base weights, an adapter on them, or a full student.
+    pipeline.partition = "ref2va"
+    assert pipeline._control_task() == "ref2va"
+
+
+def test_control_rejects_continue_from(monkeypatch):
+    """continue_from guides the hidden overlap at frame 0; control rows describe the returned frames."""
+    from vllm_omni.errors import OmniClientError
+
+    _, pipeline, conditioning, sampling, media, _ = _control_request(monkeypatch)
+    sampling.extra_args = {**sampling.extra_args, "continue_from": "video_gen_source"}
+    with pytest.raises(OmniClientError, match="does not support continue_from"):
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
+
+
+def test_base_control_rejects_ref2va_references(monkeypatch):
+    from vllm_omni.errors import OmniClientError
+
+    _, pipeline, conditioning, sampling, media, _ = _control_request(monkeypatch)
+    conditioning.task = "ref2va"
+    pipeline._resolve_task = lambda *args, **kwargs: "ref2va"
+    with pytest.raises(OmniClientError, match="supports t2va only; references and keyframes"):
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
+
+
+def test_fasth3_omni_control_runs_as_ref2va(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+    from vllm_omni.errors import OmniClientError
+
+    _, pipeline, conditioning, sampling, media, rows = _control_request(monkeypatch)
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    pipeline.partition = "ref2va"
+    conditioning.task = "ref2va"
+    pipeline._resolve_task = lambda *args, **kwargs: "ref2va"
+    sampling.extra_args = {**sampling.extra_args, "task": "ref2va"}
+    sampling.timesteps = sampling.sigmas = sampling.guidance_scale = sampling.num_inference_steps = None
+    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
+    assert context["control_rows"] is rows
+    # The Omni checkpoint takes control as Ref2VA only.
+    conditioning.task = "t2va"
+    pipeline._resolve_task = lambda *args, **kwargs: "t2va"
+    sampling.extra_args = {key: value for key, value in sampling.extra_args.items() if key != "task"}
+    with pytest.raises(OmniClientError, match="supports ref2va only; keyframes"):
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)

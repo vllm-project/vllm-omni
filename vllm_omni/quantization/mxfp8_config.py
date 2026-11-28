@@ -12,23 +12,15 @@ Architecture:
       NPUMxfp8OnlineLinearMethod  – NPU online: _LazyWeightMixin for create_weights,
                                      overrides process_weights to quantize BF16 → FP8.
 
-XPU reuses vLLM's own MXFP8 methods and adds only what diffusion needs on top.
+CUDA and XPU reuse vLLM's MXFP8 methods and add what diffusion needs on top.
 Offline AutoRound MXFP8 checkpoints never reach this file: they are served by
 vLLM's INC path (see inc_config.py).
 
   VllmMxfp8OnlineLinearMethod   – vLLM Mxfp8OnlineLinearMethod plus the (B, S, K) reshape
   VllmMxfp8OnlineMoEMethod      – vLLM Mxfp8OnlineMoEMethod, re-exported unchanged
 
-Extending to a new platform (e.g. CUDA MXFP8 once the ops are available):
-
-    class CUDAMxfp8LinearMethod(MXFPLinearMethodBase):
-        def create_weights(self, ...): ...
-        def process_weights_after_loading(self, layer): ...
-        def _quantize_activation(self, x): ...   # CUDA FP8 quant op
-        def _quant_matmul(self, ...): ...         # CUDA FP8 GEMM
-
-    class CUDAMxfp8OnlineLinearMethod(_LazyWeightMixin, CUDAMxfp8LinearMethod):
-        def process_weights_after_loading(self, layer): ...  # BF16 → FP8
+CUDA online linears reuse the same vLLM online method through mxfp8_cuda.py.
+vLLM selects the CUDA kernel; Omni supplies the diffusion activation reshape.
 
 Extending to a new MX precision with a different calling convention (e.g. dual-scale FP4):
 
@@ -163,9 +155,18 @@ class DiffusionMXFP8Config(QuantizationConfig):
                 if self.is_checkpoint_mxfp8_serialized:
                     raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
                 return VllmMxfp8OnlineLinearMethod()
+            if current_omni_platform.is_cuda():
+                if self.is_checkpoint_mxfp8_serialized:
+                    raise NotImplementedError(
+                        "Native MXFP8 offline mode is not supported on CUDA. "
+                        "Use a BF16/FP16 checkpoint with online MXFP8 quantization."
+                    )
+                from .mxfp8_cuda import CUDAMxfp8OnlineLinearMethod
+
+                return CUDAMxfp8OnlineLinearMethod()
             raise NotImplementedError(
                 "DiffusionMXFP8Config (W8A8 MXFP8) is currently only supported "
-                "on NPU (Ascend) and XPU (Intel) platforms."
+                "on CUDA (Blackwell/Rubin), NPU (Ascend) and XPU (Intel) platforms."
             )
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
@@ -178,7 +179,8 @@ class DiffusionMXFP8Config(QuantizationConfig):
             if current_omni_platform.is_xpu():
                 if self.is_checkpoint_mxfp8_serialized:
                     raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
-                return VllmMxfp8OnlineMoEMethod(layer=layer)
+                # vLLM's online MoE methods take the FusedMoEConfig as keyword-only `moe`.
+                return VllmMxfp8OnlineMoEMethod(moe=layer.moe_config)
             # NPU has no MXFP8 MoE op yet; leave the experts in BF16 rather
             # than failing the whole model load.
             return None
@@ -517,12 +519,11 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
 
 
 # ---------------------------------------------------------------------------
-# XPU method — vLLM's online MXFP8 method plus what diffusion needs on top
+# CUDA/XPU method — vLLM's online MXFP8 method plus diffusion reshaping
 #
-# Weight quantization, the e8m0 scale relayout and the oneDNN fp8_gemm call are
-# all vLLM's (Mxfp8OnlineLinearMethod -> XPUMxFp8LinearKernel), and so is the
-# layer-by-layer meta-device loading. Only the (B, S, K) activation reshape is
-# added here.
+# Weight quantization, scale layout, platform kernel selection and layerwise
+# meta-device loading belong to vLLM. Only the (B, S, K) activation reshape is
+# added here; CUDA capability validation lives in mxfp8_cuda.py.
 # ---------------------------------------------------------------------------
 
 try:

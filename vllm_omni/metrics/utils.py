@@ -12,6 +12,10 @@ from prettytable import PrettyTable
 from vllm_omni.metrics import definitions as metric_defs
 
 if TYPE_CHECKING:
+    from typing import SupportsFloat, SupportsIndex, SupportsInt
+
+    from _typeshed import SupportsTrunc
+
     from vllm_omni.metrics.modality import OmniModalityMetrics
     from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
     from vllm_omni.metrics.stats import StageRequestStats
@@ -58,6 +62,28 @@ def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float 
     if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
         return None
     return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def diffusion_output_metrics(engine_output: object) -> dict[str, object]:
+    """Return the metrics dict on one engine output, or an empty dict."""
+    raw = getattr(engine_output, "metrics", None)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def extract_diffusion_scheduler_wait_ms(output: object) -> float | None:
+    """Diffusion scheduler admission on one output, in milliseconds.
+
+    A missing key means the stage did not measure it. A present ``0`` is a
+    real measurement.
+    """
+    wait_ms = diffusion_output_metrics(output).get(metric_defs.SCHEDULER_QUEUE_WAIT_MS)
+    if wait_ms is None:
+        return None
+    return float(wait_ms)
 
 
 def observe_stage_workload_metrics(
@@ -250,10 +276,10 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(cast(Any, value))
+        converted = int(cast("str | bytes | bytearray | SupportsInt | SupportsIndex | SupportsTrunc", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def coerce_positive_float_scalar(value: object) -> float | None:
@@ -278,10 +304,10 @@ def coerce_positive_float_scalar(value: object) -> float | None:
         except Exception:
             return None
     try:
-        value = float(cast(Any, value))
+        converted = float(cast("str | bytes | bytearray | SupportsFloat | SupportsIndex", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def resolve_int_by_sequential_keys(
@@ -326,7 +352,7 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     if isinstance(mm, Mapping) and mm:
         return mm
     outs = getattr(mm_source, "outputs", None)
-    if outs:
+    if isinstance(outs, Sequence) and outs:
         nested = getattr(outs[0], "multimodal_output", None)
         if isinstance(nested, Mapping) and nested:
             return nested

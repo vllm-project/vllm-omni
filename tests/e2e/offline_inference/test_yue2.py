@@ -18,7 +18,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.tts,
-    *hardware_marks(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1),
+    *hardware_marks(res={"cuda": ["L4", "H100", "B200"], "rocm": "MI325"}, num_cards=1),
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 @pytest.fixture(scope="module")
 def vae_path() -> Path:
-    path = Path(os.environ.get("YUE2_VAE", get_model_prefix() + "m-a-p/YuE2-Vae"))
+    path = Path(get_model_prefix() + "m-a-p/YuE2-Vae")
     if not path.is_dir():
         path = Path(hf_api().snapshot_download(str(path), allow_patterns=["*.json", "*.safetensors"]))
     return path

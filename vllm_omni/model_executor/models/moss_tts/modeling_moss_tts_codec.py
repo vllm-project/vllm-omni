@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -784,7 +785,9 @@ class MossTTSCodecDecoder(nn.Module):
                 },
             )
 
-        if self._async_chunk and runtime_additional_information is None:
+        # MRv2 OmniModelState.prepare_dummy_inputs and empty dummy slots pass {}
+        # without _is_dummy; real scheduled requests always carry req_id / meta.
+        if self._async_chunk and all(not info or info.get("_is_dummy") for info in info_list):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -1048,9 +1051,21 @@ class MossTTSCodecDecoder(nn.Module):
         if session._packed_wrapper is not None:
             return self._decode_streaming_packed(session, items)
 
+        if any(int(codes.shape[1]) > max(1, self._stream_max_step_frames) for _, _, codes, _ in items):
+            return self._decode_streaming_rounds(session, items, output_buffers=output_buffers)
+        return self._decode_streaming_step(session, items, output_buffers=output_buffers)
+
+    def _decode_streaming_step(
+        self,
+        session: _MossCodecStreamSession,
+        items: list[tuple[int, str, torch.Tensor, bool]],
+        *,
+        output_buffers: dict[int, torch.Tensor] | None = None,
+    ) -> dict[int, torch.Tensor]:
+        """Decode one bounded piece per stream with the existing frame buckets."""
+
         outputs: dict[int, torch.Tensor] = {}
         grouped: dict[int, list[tuple[int, str, int, torch.Tensor, bool]]] = {}
-        max_step_frames = max(1, int(self._stream_max_step_frames))
         graph = session._cudagraph_wrapper
         # Terminal tails join the regular padded frame bucket when every
         # execution batch width has a graph, so a step stays one replay
@@ -1067,25 +1082,6 @@ class MossTTSCodecDecoder(nn.Module):
                         f"against max_num_seqs={self._stream_state_capacity}; refusing to drop audio codes."
                     )
                 self._stream_req_slots[request_id] = slot
-
-            if int(codes_nq_t.shape[1]) > max_step_frames:
-                wav = self._decode_stream_slot_sequence(
-                    session,
-                    slot,
-                    codes_nq_t,
-                    terminal=finished,
-                    output_buffer=output_buffers.get(output_index) if output_buffers is not None else None,
-                )
-                if wav is not None:
-                    outputs[output_index] = wav
-                if finished:
-                    self._finish_stream_request(
-                        request_id,
-                        session,
-                        slot,
-                        state_already_reset=True,
-                    )
-                continue
 
             frame_count = int(codes_nq_t.shape[1])
             group_frames = frame_count
@@ -1120,6 +1116,42 @@ class MossTTSCodecDecoder(nn.Module):
                         state_already_reset=True,
                     )
 
+        return outputs
+
+    def _decode_streaming_rounds(
+        self,
+        session: _MossCodecStreamSession,
+        items: list[tuple[int, str, torch.Tensor, bool]],
+        *,
+        output_buffers: dict[int, torch.Tensor] | None = None,
+    ) -> dict[int, torch.Tensor]:
+        """Decode long inputs in frame rounds, batching equal-length pieces."""
+        step_frames = max(1, int(self._stream_max_step_frames))
+        collected = {index: [] for index, _, _, _ in items}
+        max_frames = max(int(codes.shape[1]) for _, _, codes, _ in items)
+        for start in range(0, max_frames, step_frames):
+            pieces = []
+            buffers = {} if output_buffers is not None else None
+            for index, request_id, codes, finished in items:
+                frames = int(codes.shape[1])
+                if start >= frames and not (start == 0 and frames == 0):
+                    continue
+                stop = min(start + step_frames, frames)
+                pieces.append((index, request_id, codes[:, start:stop], finished and stop == frames))
+                if output_buffers is not None and index in output_buffers:
+                    rate = self._codec.downsample_rate
+                    buffers[index] = output_buffers[index][..., start * rate : stop * rate]
+            decoded = self._decode_streaming_step(session, pieces, output_buffers=buffers)
+            for index, wav in decoded.items():
+                collected[index].append(wav)
+        outputs = {}
+        for index, wavs in collected.items():
+            if not wavs:
+                continue
+            if session._gpu_output and output_buffers is not None and index in output_buffers:
+                outputs[index] = output_buffers[index]
+            else:
+                outputs[index] = torch.cat(wavs, dim=-1) if len(wavs) > 1 else wavs[0]
         return outputs
 
     @property
@@ -1180,44 +1212,6 @@ class MossTTSCodecDecoder(nn.Module):
                     state_already_reset=int(codes_nq_t.shape[1]) > 0,
                 )
         return outputs
-
-    def _decode_stream_slot_sequence(
-        self,
-        session: _MossCodecStreamSession,
-        slot: int,
-        codes_nq_t: torch.Tensor,
-        *,
-        terminal: bool = False,
-        output_buffer: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        if codes_nq_t.numel() == 0:
-            return None
-        max_step_frames = max(1, int(self._stream_max_step_frames))
-        parts: list[torch.Tensor] = []
-        for start in range(0, int(codes_nq_t.shape[1]), max_step_frames):
-            chunk = codes_nq_t[:, start : start + max_step_frames]
-            is_terminal_chunk = terminal and start + max_step_frames >= int(codes_nq_t.shape[1])
-            chunk_samples = int(chunk.shape[1]) * self._codec.downsample_rate
-            chunk_buffer = (
-                output_buffer[
-                    ..., start * self._codec.downsample_rate : start * self._codec.downsample_rate + chunk_samples
-                ]
-                if output_buffer is not None
-                else None
-            )
-            decoded = session.step(
-                {slot: chunk},
-                terminal_slots={slot} if is_terminal_chunk else None,
-                output_buffers={slot: chunk_buffer} if chunk_buffer is not None else None,
-            )
-            wav = decoded.get(slot)
-            if wav is not None:
-                parts.append(wav)
-        if output_buffer is not None:
-            return output_buffer
-        if not parts:
-            return None
-        return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
 
     def _finish_stream_request(
         self,
@@ -1294,7 +1288,10 @@ class MossTTSCodecDecoder(nn.Module):
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
         )
+        # Reference encoding belongs to the API process.
+        codec.encoder = None
         if device.type in ("cuda", "npu"):
+            current_omni_platform.empty_cache()
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
 
             shared = 0

@@ -11,7 +11,7 @@ Code: `vllm_omni/model_executor/models/minicpmo_4_5/`. Recipe:
 |-------|---------------|------|-----------|--------|
 | 0 | `llm` | `MiniCPMO45OmniForConditionalGeneration` | `minicpmo_4_5_omni_llm.py`, vision/audio encoders | Text (final) + latents |
 | 1 | `tts` | same unified class | `minicpmo_4_5_omni_tts.py` | Codec tokens |
-| 2 | `code2wav` | `MiniCPMO45Code2Wav` (separate arch) | `minicpmo_4_5_code2wav.py`, `batched_token2wav.py`, `minicpmo_4_5_token2wav.py` | Waveform (final) |
+| 2 | `code2wav` | `MiniCPMO45Code2Wav` (separate arch) | `minicpmo_4_5_code2wav.py`, `code2wav/token2wav.py` | Waveform (final) |
 
 Stage names differ from Qwen3-Omni (`llm` / `tts`, not `thinker` / `talker`).
 Hand-off: `stage_input_processors/minicpmo_4_5_omni.py` (`llm2tts`,
@@ -23,7 +23,7 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
 
 | YAML | Use |
 |------|-----|
-| `minicpmo_4_5.yaml` | Default: **duplex**, CUDA llm/code2wav on MRv2 with tts on v1 for multi-frame decode (v1 elsewhere), all stages on GPU 0 (0.55 / 0.15 / 0.18), `max_sessions: 16`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 3` |
+| `minicpmo_4_5.yaml` | Default: **duplex**, all stages on MRv2 on CUDA, ROCm, NPU and XPU (MUSA rejected until validated), all stages on GPU 0 (0.55 / 0.15 / 0.18), `max_sessions: 16`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 3` |
 | `minicpmo_4_5_2gpu.yaml` | Recommended production: llm (stage 0) on GPU 0, tts + code2wav on GPU 1 |
 | `minicpmo_4_5_3gpu.yaml` | One GPU per stage |
 | `minicpmo_4_5_{3,4}gpu_stage1_replicas.yaml` | Experimental tts replicas (2 or 3) |
@@ -45,7 +45,7 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
   by default, configurable via `--hf-overrides`. CPU, grad, autocast, and stateful
   duplex audio stay eager. Capture failure is fatal. `--enforce-eager` disables them.
 - Stage-2 flow-encoder graph replay must run inside the same autocast context as
-  capture (`batched_token2wav.py`); replay outside it changed numerics. Regression
+  capture (`code2wav/token2wav.py`); replay outside it changed numerics. Regression
   test: `test_decode_replays_encoder_graph_in_capture_autocast` in
   `tests/model_executor/models/minicpmo_4_5/test_code2wav_batching.py`.
 - CUDA duplex runs llm and code2wav on MRv2 through the default

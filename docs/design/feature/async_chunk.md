@@ -197,8 +197,14 @@ In sequential mode, each stage must wait for the previous stage to complete enti
      - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information and clears chunk-ready flags. Generation stages declaring `supports_pending_generation` retain the ready input until their runner stops reporting it as pending. This capability also serializes executions of that input on the legacy path; ordinary stateless legacy stages retain their existing overlap.
    - **put_chunk** `save_async(pooler_output, request)`; **get_chunk** / **get_chunk_for_generation** `load_async(request)`
    - On the native MRv2 receive path, `chunk_transfer_adapter` is `None`; **OmniSchedulingCoordinator** tracks input readiness from the runner's connector events instead. Its public `receives_chunks` property defines the receive predicate used by both chunk processing and generation scheduling, matching the legacy adapter's public contract. An async coordinator on stage zero is bookkeeping, not evidence of a downstream chunk receiver; sender-only stages and full-payload coordinators are not async-chunk receivers.
+   - Both endpoints of a worker-to-worker payload edge must declare `supports_native_mrv2_data_plane`; otherwise the MRv2 runner creates no transport owner. This applies to async chunks and non-async full payloads. A full-payload consumer also declares `requires_full_payload_input` so it waits for the payload before executing its placeholder prompt.
+   - A chunk processor that derives deltas from cumulative token IDs declares `_requires_full_token_history = True`. This keeps token-only decode steps eligible for publication and preserves the complete prefix after the first emitted chunk, including the terminal flush. Processors consuming per-step codec tensors or explicit token deltas do not need this capability.
+   - A processor that sends a cumulative field rather than a delta marks that field in `meta.override_keys`. For example, Nemotron VoiceChat marks `("ids", "all")` so AR receive accumulation replaces its text timeline on each chunk, including the independent terminal flush, instead of concatenating repeated prefixes.
+   - Native MRv2 publishes EOF after deferred outputs drain, independently of the last model payload. Chunk processors retain any unsent tail in per-request state and flush it on this empty terminal call. If every frame was already emitted, they publish an empty terminal marker without replaying audio. Connector dispatch prefers the processor's explicit `pooling_output` or `multimodal_output` parameter over a `**kwargs` fallback.
+   - Generation request slots may be released between chunks. Conditioning needed by later chunks must either travel with each chunk (CosyVoice3) or be retained by the decoder under the external request ID (GLM-TTS); the runner's intermediate buffer is not a persistent conditioning cache.
    - **OmniGenerationScheduler atomic scheduling contract**: Connector-delivered async chunks are indivisible scheduling units on both the legacy adapter and native MRv2 coordinator receive paths. Atomicity follows the async-chunk receive contract, not the presence of a legacy adapter. The generation scheduler must either admit a ready chunk in its entirety or defer it intact with its codes and metadata unchanged. This applies to waiting and running requests, including when chunked prefill is enabled. It must never slice a chunk to fit the remaining step token budget, because consumers such as the Qwen3-TTS ICL first chunk validate received chunks against their declared metadata.
    - Oversized rejection inspects only chunks already handed to the scheduler, using the adapter's `requests_with_ready_chunks` on the legacy path or the coordinator's set on the native path. A ready chunk larger than the full step budget (`max_num_scheduled_tokens`) can never be admitted in any step. Such a request is terminated through the standard cleanup path with `FINISHED_ERROR` and exactly one terminal ERROR engine output carrying the rejection reason. Placeholders and requests still waiting for a chunk must not be rejected based on their prompt length.
+   - A ready AR connector input must also fit the receiving stage's per-request `max_model_len`. Validate the delivered prompt IDs or resized prompt length before applying the metadata and admitting model work. An oversized input produces one request-local terminal ERROR through normal cleanup, with the received length and configured limit. Placeholder lengths remain provisional until input readiness. The scheduler keeps pending error outputs alive through an otherwise empty step so the client receives the failure.
    - Native requests retain the in-flight execution fence: a ready chunk must neither be admitted nor rejected as oversized while a previous execution still owns that request's state. Preserve readiness, deliver the previous execution's valid output first, and reject an oversized chunk on a later scheduling step after the fence clears. Budget deferral must likewise preserve readiness so the unchanged chunk remains eligible for a later step.
    - Budget-based deferral stops scanning the current queue rather than skipping a ready chunk to pack smaller chunks behind it. This preserves queue order at that admission point, but can reduce step utilization under mixed chunk sizes; it does not guarantee priority for the deferred chunk in the next step.
    - Non-chunk prompt inputs, including orchestrator-fed sender-only stages and full-payload inputs, retain their existing scheduling behavior rather than acquiring async-chunk atomicity.
@@ -310,7 +316,82 @@ Single-stage pipelines without a connector set the same three keys in the
 stage's `additional_config`. When both sources are present, connector `extra`
 overrides `additional_config` per key. The policy remains disabled by default.
 
+#### Coalescing AR Execution Batches
+
+To coalesce both admissions and ongoing AR work, use these settings instead
+of `ar_prefill_admission_*`:
+
+```yaml
+generation_min_batch_size: 16
+generation_max_wait_ms: 6
+generation_always_wait_target_batch: false
+```
+
+Both AR and generation schedulers accept these keys in stage
+`engine_extras.additional_config` or connector `extra`, with connector values
+taking precedence for compatibility. Waiting is disabled by default and requires
+a batch target greater than one and a positive wait bound. Enabling it together
+with active prefill admission batching (`ar_prefill_admission_min_batch > 1`)
+or `minicpmo_talker_refill_coalesce: true` raises a configuration error on AR
+stages. Inactive prefill admission settings do not conflict.
+The legacy admission-only policy retains its existing behavior when execution
+coalescing is disabled.
+
+For both AR and generation schedulers, `generation_min_batch_size` must be in
+`[1, max_num_seqs]`, including when batch waiting is disabled.
+
+The AR gate counts distinct input-ready streams, runnable waiting requests,
+and running requests with outstanding token work. In-flight execution alone
+does not disqualify an async AR continuation. Input-blocked and finished requests
+do not count. This is a candidate count: upstream token budgets and allocation
+constraints can produce a smaller execution batch.
+
+Ready work executes when the target is reached or a monotonic wait bound
+expires. Below the configured target population, work executes immediately
+unless `generation_always_wait_target_batch: true` caps the target at the
+registered request count and retains the wait. The deadline does not restart
+when more requests become ready; an empty candidate set clears it. Final inputs
+share the bounded window.
+
+The V2 AR runner supports this policy with TP1/PP1 and
+`generation_coalescing_policy: fixed`. It revisits readiness on scheduler ticks,
+so dispatch includes tick granularity and does not block the scheduler thread.
+Input/control processing continues during the wait, and deferred steps schedule
+zero tokens before any allocation. AR does not support the generation
+scheduler's `idle_wait`, regular-batch cap or express scheduling features.
+
+Seeded-request isolation takes precedence: coalescing is bypassed and its
+deadline cleared during isolation-controlled solo or drain steps. Only explicit
+client seeds marked by upstream's `omni_user_seed` opt into isolation; deployment
+default seeds retain normal batching. Streaming text waits and isolation-hidden
+queues are excluded from the candidate count. Deferred steps retain upstream's
+chunk commits, receiver resumes, terminal cleanup and duplex carry operations.
+
+The default readiness hook supports legacy async-chunk receivers, native
+async-chunk coordinators, and orchestrator-fed Stage 0. For Stage 0 without a
+connector receive path, queued `WAITING` and `PREEMPTED` requests count as
+input-ready; streams parked for another append do not. Unsupported input sources
+disable AR batch waiting with a warning. Other input sources can override
+`OmniSchedulerMixin._get_coalescing_ready_request_ids()`; it must return a set,
+including an empty set before input arrives, and be safe during initialization.
+
 ### Code2Wav Batch Configuration
+
+Generation stages use the same `generation_*` settings, configuration precedence,
+and batch-target/timeout policy described in
+[Coalescing AR Execution Batches](#coalescing-ar-execution-batches). Generation
+counts input-ready requests with no execution in flight. Transport support differs:
+
+- **V2 with legacy transport:** stateful and stateless TP1/PP1 stages support the `fixed` policy.
+  Readiness is polled on scheduler ticks without blocking or consuming deferred
+  inputs. Async-chunk receivers and orchestrator-fed Stage 0 are supported;
+  other input sources can use the readiness hook described above.
+- **Native MRV2:** requires a stateful TP1/PP1 stage and retains notification-inbox
+  waiting, including the MRV2-only `idle_wait` policy.
+
+Legacy-transport inputs yielding `pending_generation` continue without another batch wait
+for the same input. `generation_max_regular_batch` caps execution batch size;
+first-chunk express scheduling retains its native MRV2 scope.
 
 For optimal performance with async_chunk, the code2wav stage should be configured with batching:
 
@@ -329,9 +410,26 @@ stages:
 - `vllm_omni/distributed/omni_connectors/connectors/shm_connector.py`: SharedMemoryConnector (transport-only put/get)
 - `vllm_omni/core/sched/omni_ar_scheduler.py`: AR scheduler with chunk_transfer_adapter
 - `vllm_omni/core/sched/omni_generation_scheduler.py`: Generation scheduler with same async chunk pattern
-- `vllm_omni/worker/gpu_model_runner.py`: Model runner with chunk handling
-- `vllm_omni/worker/gpu_generation_model_runner.py`: Generation model runner with batch output handling and ubatch_slices support
+- `vllm_omni/worker_v2/omni_model_runner.py`: V2 model runner with chunk handling
+- `vllm_omni/worker_v2/omni_generation_model_runner.py`: V2 generation runner with batch output handling
 - `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py`: Model implementation with code2wav batching
 - `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`: Code2wav decoder with batch support
 - `vllm_omni/engine/arg_utils.py`: Configuration definitions (async_chunk, worker_type)
 - `vllm_omni/config/model.py`: Model config with async_chunk field
+
+Ready AR connector prompts must leave room for one sampling step, including
+speculative sampling width. Native generation scheduler outputs carry segment
+completion separately from input termination: Code2Wav parks an open resumable
+session after a payload-bearing or marker-only segment, and releases it only
+after true request termination.
+
+MRv2 request admission carries the scheduler's resumable segment generation to
+the native data plane. Re-admitting the same generation preserves the live
+ledger and output holds after preemption. A new generation refreshes prompt IDs
+and metadata even when computed tokens are nonzero, without releasing pending
+output reservations or replacing the uncommitted payload queue.
+
+When a same-generation native resumable request is re-admitted with zero
+computed tokens after preemption, discard its unpublished Thinker prefill
+accumulator before replaying prompt rows. Retain accepted token history,
+output reservations and queued commits; recomputed rows must appear once.

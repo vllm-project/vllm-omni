@@ -39,14 +39,16 @@ _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
 
 # Assertions that sample a random variable rather than testing whether serving works:
-# whether TTS audio is intelligible enough to transcribe back, and whether a preset voice's
-# timbre estimates as the expected gender. Both are decided by the model and the estimator,
-# so a caller measuring a success rate has to tell them apart from a serving failure. The
+# whether TTS audio is intelligible enough to transcribe back, whether a preset voice's
+# timbre estimates as the expected gender, and whether a sampled rendition's harmonics
+# clear an HNR floor. All are decided by the model and the estimator, so a caller
+# measuring a success rate has to tell them apart from a serving failure. The
 # messages are constants because a caller matching the wording by hand would silently stop
 # matching if it were reworded, reclassifying every quality failure as a hard failure.
 AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
 GENDER_MISMATCH_MESSAGE = "estimated gender is"
-_QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE)
+HNR_FLOOR_MESSAGE = "is below the configured floor"
+_QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE, HNR_FLOOR_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -765,21 +767,24 @@ def _assert_preset_voice_gender_from_audio(
 def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
     frame_len = int(0.03 * sr)
     hop = frame_len // 2
+    lags = np.arange(max(1, int(sr / 400)), min(int(sr / 80), frame_len - 1) + 1)
     hnr_values: list[float] = []
     for start in range(0, len(pcm_samples) - frame_len, hop):
-        frame = pcm_samples[start : start + frame_len].astype(np.float32, copy=False)
+        frame = pcm_samples[start : start + frame_len].astype(np.float64, copy=False)
         frame = frame - np.mean(frame)
-        if np.max(np.abs(frame)) < 0.01:
+        if np.max(np.abs(frame)) < 0.01 or lags.size == 0:
             continue
         ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
-        ac = ac / (ac[0] + 1e-10)
-        min_lag = int(sr / 400)
-        max_lag = min(int(sr / 80), len(ac))
-        if min_lag >= max_lag:
-            continue
-        peak = float(np.max(ac[min_lag:max_lag]))
-        if 0 < peak < 1:
-            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+        # At lag k only N-k samples overlap. Dividing by the full frame's
+        # energy attenuates low-pitch peaks even for a noiseless periodic
+        # signal. Normalize each correlation by the two overlapping segments'
+        # energies instead; their geometric mean also bounds it by one.
+        energy = np.concatenate(([0.0], np.cumsum(frame * frame)))
+        denominator = np.sqrt(energy[frame_len - lags] * (energy[-1] - energy[lags]))
+        correlation = np.divide(ac[lags], denominator, out=np.zeros(lags.size), where=denominator > 1e-10)
+        peak = min(float(np.max(correlation)), 1.0 - 1e-7)
+        if peak > 0:
+            hnr_values.append(10 * np.log10(peak / (1 - peak)))
     # Silence and constant signals provide no usable harmonic estimate. They
     # must not pass a model-specific floor of zero or below.
     return float(np.mean(hnr_values)) if hnr_values else float("-inf")
@@ -793,12 +798,11 @@ def _assert_pcm_int16_speech_hnr(
 ) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
-    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
-    which matches the cleaner TTS models the helper was originally calibrated
-    for. Quieter codecs (e.g. MOSS-TTS-Nano, whose voice_clone output is
-    intrinsically around -2 dB) can pass a lower per-test threshold via
-    request_config["min_hnr_db"] to keep the catastrophic-failure check
-    while not gating CI on a model-intrinsic property.
+    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB).
+    Tests can override it via request_config["min_hnr_db"]. The estimate uses
+    overlap-normalized correlation so a lower fundamental frequency does not
+    itself lower the score. Silence, constant signals and noise must fail;
+    HNR alone does not establish transcript correctness or perceptual quality.
 
     ``sr`` must be the stream's real sample rate: the autocorrelation lag window
     is derived from it, so a wrong rate detunes the 80-400 Hz pitch search and
@@ -1012,7 +1016,15 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                             f"transcript={transcript!r}"
                         )
                     else:
-                        assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
+                        try:
+                            assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
+                        except AssertionError as error:
+                            if request_config.get("stream"):
+                                # The chat client joins streamed audio chunks into a WAV before ASR.
+                                _retain_failed_speech_audio(
+                                    getattr(response, "audio_bytes", None), transcript, text_output, error
+                                )
+                            raise
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(

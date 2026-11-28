@@ -22,14 +22,18 @@ stage can evict a selected component before it runs. Only components listed in
 The hook moves parameters and buffers without recursively calling
 `module.to()`. This avoids recursion through modules that retain references to
 other transformer blocks. Host tensors are pinned when configured; DTensors
-are not pinned through the ordinary tensor path.
+are not pinned through the ordinary tensor path. A module built in host memory
+starts pageable and is pinned by its first offload, so later loads never stage
+the whole module through pageable memory.
 
 On ROCm, pinned host copies of dense local modules share allocator-aware slabs
 when that reduces or preserves the estimated backing size. The packed path
 preserves physical-storage aliases, offsets, strides, dtypes, and the values at
 each offload. Ordinary sequential movement falls back before module storage
 changes for unsupported layouts, mixed residency, distributed tensors, and
-slab-allocation failures. Persistent module-residency stagers use the same
+slab-allocation failures. A module that already sits pageable on the host is
+packed by the same path on its first offload; a module whose host copies are
+already pinned is left alone. Persistent module-residency stagers use the same
 packing for their immutable pinned masters.
 
 Before forward returns control to the model, the hook synchronizes the active

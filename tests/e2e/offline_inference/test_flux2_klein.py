@@ -9,9 +9,9 @@ Inpainting uses ``offline_client.send_diffusion_request`` with
 :meth:`OfflineOmniClient.send_diffusion_request` in ``tests.helpers.runtime``.
 """
 
+import numpy as np
 import pytest
-import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import DiffusionResponse, OfflineOmniClient
@@ -29,6 +29,7 @@ pytestmark = [pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indir
 _HEIGHT = 512
 _WIDTH = 512
 _NUM_INFERENCE_STEPS = 4
+_ROCM_REPEAT_MAX_MEAN_ABSOLUTE_ERROR = 0.015
 
 
 def _create_test_image(width: int = _WIDTH, height: int = _HEIGHT, color: tuple = (128, 128, 128)) -> Image.Image:
@@ -54,9 +55,29 @@ def _images_from_response(response: DiffusionResponse) -> list[Image.Image]:
     return list(images)
 
 
-def _send_inpaint_with_generator(
-    offline_client: OfflineOmniClient, prompt: str, input_image, mask_image, generator: torch.Generator
+def _image_difference_bbox(first: Image.Image, second: Image.Image) -> tuple[int, int, int, int] | None:
+    """Compare generated images without materializing every pixel as Python objects."""
+    assert first.mode == second.mode, f"Image modes differ: {first.mode} != {second.mode}"
+    assert first.size == second.size, f"Image sizes differ: {first.size} != {second.size}"
+    return ImageChops.difference(first, second).getbbox(alpha_only=False)
+
+
+def _image_difference_metrics(first: Image.Image, second: Image.Image) -> tuple[float, float, float]:
+    """Return normalized MAE, maximum channel delta, and changed-channel ratio."""
+    assert first.mode == second.mode, f"Image modes differ: {first.mode} != {second.mode}"
+    assert first.size == second.size, f"Image sizes differ: {first.size} != {second.size}"
+    deviation = np.abs(np.asarray(first, dtype=np.float32) - np.asarray(second, dtype=np.float32))
+    return (
+        float(deviation.mean() / 255.0),
+        float(deviation.max()),
+        float((deviation > 0).mean()),
+    )
+
+
+def _send_inpaint_with_seed(
+    offline_client: OfflineOmniClient, prompt: str, input_image, mask_image, seed: int
 ) -> DiffusionResponse:
+    """Exercise the serializable request seed contract across the worker boundary."""
     return offline_client.send_diffusion_request(
         {
             "model": MODEL,
@@ -67,7 +88,7 @@ def _send_inpaint_with_generator(
                 width=_WIDTH,
                 num_inference_steps=_NUM_INFERENCE_STEPS,
                 guidance_scale=0.0,
-                generator=generator,
+                seed=seed,
                 num_outputs_per_prompt=1,
             ),
         }
@@ -77,40 +98,47 @@ def _send_inpaint_with_generator(
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI300"}, num_cards=1)
 def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
     seed = 12345
 
-    gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
-    gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
-
-    r1 = _send_inpaint_with_generator(offline_client, "A red flower in a field", input_image, mask_image, gen1)
-    r2 = _send_inpaint_with_generator(offline_client, "A red flower in a field", input_image, mask_image, gen2)
+    r1 = _send_inpaint_with_seed(offline_client, "A red flower in a field", input_image, mask_image, seed)
+    r2 = _send_inpaint_with_seed(offline_client, "A red flower in a field", input_image, mask_image, seed)
 
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
 
-    assert list(images1[0].getdata()) == list(images2[0].getdata()), (
-        "Same input with same seed should produce identical output. This is critical for offline/online consistency."
-    )
+    if current_omni_platform.is_rocm():
+        mean_absolute_error, max_difference, differing_ratio = _image_difference_metrics(images1[0], images2[0])
+        print(
+            f"same-seed repeat: MAE={mean_absolute_error:.6f} "
+            f"maxdiff={max_difference:.0f} differing={differing_ratio:.4f}"
+        )
+        assert mean_absolute_error < _ROCM_REPEAT_MAX_MEAN_ABSOLUTE_ERROR, (
+            "Same input with the same seed diverged materially on ROCm: "
+            f"MAE={mean_absolute_error:.6f}, maxdiff={max_difference:.0f}, differing={differing_ratio:.4f}"
+        )
+    else:
+        assert _image_difference_bbox(images1[0], images2[0]) is None, (
+            "Same input with the same seed should produce identical output. "
+            "This is critical for offline/online consistency."
+        )
 
 
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI300"}, num_cards=1)
 def test_flux2_klein_inpaint_different_seeds_different_output(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
 
-    gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(42)
-    gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(99999)
-
-    r1 = _send_inpaint_with_generator(offline_client, "A beautiful landscape", input_image, mask_image, gen1)
-    r2 = _send_inpaint_with_generator(offline_client, "A beautiful landscape", input_image, mask_image, gen2)
+    r1 = _send_inpaint_with_seed(offline_client, "A beautiful landscape", input_image, mask_image, 42)
+    r2 = _send_inpaint_with_seed(offline_client, "A beautiful landscape", input_image, mask_image, 99999)
 
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
 
-    different_pixel_count = sum(1 for p1, p2 in zip(images1[0].getdata(), images2[0].getdata()) if p1 != p2)
-    assert different_pixel_count > 0, "Different seeds should produce different outputs"
+    assert _image_difference_bbox(images1[0], images2[0]) is not None, (
+        "Different seeds should produce different outputs"
+    )

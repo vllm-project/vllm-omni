@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AURA Omni pipeline topology.
 
 Semantic modules:
@@ -11,6 +11,8 @@ The Qwen3-TTS module is represented as two native engine stages, Talker and
 Code2Wav, to reuse the existing vLLM-Omni implementation without wrapping or
 duplicating codec streaming behavior.
 """
+
+from dataclasses import replace
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -37,6 +39,8 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             engine_output_type="text",
             model_arch="Qwen3ASRForConditionalGeneration",
+            # Takes effect only when the deploy selects model_runner v2.
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -51,6 +55,8 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="text",
             model_arch="AuraQwen3VLForConditionalGeneration",
             custom_process_input_func=f"{_AURA_PROC}.asr2aura",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -64,6 +70,10 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_AURA_PROC}.aura2tts",
             custom_process_next_stage_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_async_chunk",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
+            # Qwen3-TTS MTP embeddings cannot be replayed from layer-0 codec IDs.
+            recompute_preemption="fail",
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [2150],
@@ -79,9 +89,45 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="Qwen3TTSCode2Wav",
             sync_process_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_token_only",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
             requires_full_payload_input=True,
         ),
+    ),
+)
+
+
+# Opt-in variant: a response-judge stage between ASR and AURA. A turn that
+# needs no reply (backchannel, cough, noise, side talk) ends at the judge;
+# AURA and TTS do not run. The judge model is set by the deploy config
+# (``deploy/aura_omni_judged.yaml``); the default ``aura_omni`` pipeline above
+# is unchanged and loads no judge. The other stages are the ones above, shifted
+# by one.
+_ASR, _AURA, _TALKER, _CODE2WAV = AURA_OMNI_PIPELINE.stages
+
+AURA_OMNI_JUDGED_PIPELINE = PipelineConfig(
+    model_type="aura_omni_judged",
+    default_deploy_config_name="aura_omni_judged.yaml",
+    model_arch="Qwen3ASRForConditionalGeneration",
+    duplex_plugin="vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
+    stages=(
+        _ASR,
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="response_judge",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            owns_tokenizer=True,
+            engine_output_type="text",
+            # Default judge; a deploy config may set another model_arch/runner.
+            model_arch="ResponseJudgeQwen3ForCausalLM",
+            custom_process_input_func=f"{_AURA_PROC}.asr2judge",
+            sampling_constraints={"detokenize": True},
+        ),
+        replace(_AURA, stage_id=2, input_sources=(1,), custom_process_input_func=f"{_AURA_PROC}.judge2aura"),
+        replace(_TALKER, stage_id=3, input_sources=(2,)),
+        replace(_CODE2WAV, stage_id=4, input_sources=(3,)),
     ),
 )

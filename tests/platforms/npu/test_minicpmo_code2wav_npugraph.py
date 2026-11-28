@@ -13,8 +13,9 @@ import torch.nn as nn
 pytest.importorskip("vllm_ascend")
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
 )
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
@@ -24,8 +25,6 @@ from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
     npu_token2wav_sdpa_context,
 )
-from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [
     pytest.mark.core_model,
@@ -53,25 +52,6 @@ class _Token2Wav:
         self.speech_window = torch.ones(4, device="npu")
 
 
-def test_npu_runner_inherits_runtime_snapshot_replacement():
-    assert issubclass(OmniNPUModelRunner, OmniGPUModelRunner)
-    assert OmniNPUModelRunner._replace_intermediate_buffer is OmniGPUModelRunner._replace_intermediate_buffer
-    runner = object.__new__(OmniNPUModelRunner)
-    request = SimpleNamespace(additional_information_cpu=None)
-    runner.requests = {"req": request}
-    runner.model_intermediate_buffer = {
-        "req": {
-            "codes": {"audio": torch.tensor([1, 2])},
-            "meta": {"last_chunk": True},
-        }
-    }
-
-    runner._replace_intermediate_buffer("req", {"meta": {"is_segment_finished": True}})
-
-    assert runner.model_intermediate_buffer["req"] == {"meta": {"is_segment_finished": True}}
-    assert request.additional_information_cpu == runner.model_intermediate_buffer["req"]
-
-
 @torch.inference_mode()
 def test_npu_whole_euler_precomputes_modulation_without_fused_body():
     decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
@@ -81,7 +61,10 @@ def test_npu_whole_euler_precomputes_modulation_without_fused_body():
         .npu()
         .eval()
     )
-    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={"enabled": True, "fused_body": False})
+    adapter = BatchedToken2Wav(
+        _Token2Wav(estimator),
+        cfm_graph_config={"enabled": True, "fused_body": False},
+    )
     assert not adapter._ragged_fused_body
     assert adapter._whole_euler_graph_wrapper.modulation_fn is not None
 
@@ -104,7 +87,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         .eval()
     )
     graph_runner = NPUExactGraphRunner(max_graphs=4)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={})
 
     def inputs(seed: int):
         def make(shape: tuple[int, ...], offset: float):
@@ -189,8 +172,8 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
 @torch.inference_mode()
 def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames, precompute_modulation, fused_body):
     """A whole solve, including masked padding and cached replay, uses one graph."""
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import WholeEulerCFMGraphWrapper
-    from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import dit_modulation
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.dit_fused import dit_modulation
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import WholeEulerCFMGraphWrapper
 
     # The fused tap-GEMM convolution has a different FP32 reduction order
     # from upstream Conv1d. Keep the original tolerance for the ragged body;
@@ -208,7 +191,7 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames, prec
     # block and make modulation/output parity meaningful.
     for parameter in estimator.parameters():
         parameter.normal_(0.0, 0.08)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={})
     adapter.flow.decoder.rand_noise = torch.randn(1, 2, 128, device="npu")
     adapter.flow.decoder.inference_cfg_rate = 0.7
     wrapper = WholeEulerCFMGraphWrapper(
@@ -289,7 +272,7 @@ def test_hift_npugraph_matches_eager_with_source_cache():
         _F0Predictor,
     )
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import HiFTGraphWrapper
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import HiFTGraphWrapper
 
     prepare_code2wav_graph_runtime()
     hift = (
@@ -347,7 +330,7 @@ def test_hift_npugraph_replay_from_parts_matches_concatenated_replay():
         _F0Predictor,
     )
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import HiFTGraphWrapper
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import HiFTGraphWrapper
 
     prepare_code2wav_graph_runtime()
     hift = (
@@ -529,13 +512,10 @@ def test_fused_body_npugraph_matches_its_eager_path_with_inference_weights():
                 torch.testing.assert_close(value, unfused, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("rows", [1, 4])
-@torch.inference_mode()
-def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
+def _encoder_backend() -> BatchedToken2Wav:
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import _undecorate_dynamo
-    from vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph import FlowEncoderGraphs
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import _undecorate_dynamo
 
     prepare_code2wav_graph_runtime()
     backend = BatchedToken2Wav.__new__(BatchedToken2Wav)
@@ -556,6 +536,15 @@ def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
     backend.flow.encoder_proj = nn.Linear(32, 16).npu()
     backend.flow.eval()
     _undecorate_dynamo(backend.flow.encoder, "forward_chunk")
+    return backend
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+@torch.inference_mode()
+def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph import FlowEncoderGraphs
+
+    backend = _encoder_backend()
     graph = FlowEncoderGraphs(
         partial(backend._encode_chunk_eager, last_chunk=False),
         chunk_forward=backend._encode_chunk_eager,
@@ -615,3 +604,50 @@ def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
     for actual, saved in retained:
         for a, b in zip(actual, saved, strict=True):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_padded_flow_graph_matches_eager_across_continuations_and_tails():
+    torch.manual_seed(307)
+    backend = _encoder_backend()
+    backend._chunk_encoder_steady_width = 35
+    backend._padded_flow_history = 416
+    backend._padded_flow_encoder = None
+    width = backend._chunk_encoder_steady_width
+
+    def tokens(count):
+        return torch.randint(0, 64, (count,), device="npu")
+
+    def eager(codes, last, cnn_cache=None, att_cache=None):
+        batch = codes.unsqueeze(0)
+        backend._ensure_relpos_pe(batch, att_cache)
+        return backend._encode_chunk_eager(batch, last_chunk=last, cnn_cache=cnn_cache, att_cache=att_cache)
+
+    with npu_token2wav_sdpa_context(require_math=True):
+        initial = [eager(tokens(history // 2 + 3), False) for history in (16, 44, 96, 224, 416)]
+        assert [entry[2].shape[3] for entry in initial] == [16, 44, 96, 224, 416]
+        assert backend._precapture_padded_flow_encoder(*initial[0][1:]) == 1
+
+        def compare_chunks(actual, expected, widths, last):
+            graph = backend._padded_flow_encoder
+            hits = graph.stats["hits"]
+            states = [
+                BatchedToken2WavState({"conformer_cnn_cache": cnn, "conformer_att_cache": att}, {})
+                for _, cnn, att in actual
+            ]
+            codes = [tokens(count) for count in widths]
+            actual = backend._encode_padded_flow_chunks(codes, states, [last] * len(codes))
+            assert graph.stats["hits"] == hits + 1
+            expected = [eager(ids, last, cnn, att) for ids, (_, cnn, att) in zip(codes, expected, strict=True)]
+            for result, reference in zip(actual, expected, strict=True):
+                for value, wanted in zip(result, reference, strict=True):
+                    torch.testing.assert_close(value, wanted, rtol=1e-4, atol=1e-4)
+            return actual, expected
+
+        actual = expected = initial[:4]
+        for _ in range(3):
+            actual, expected = compare_chunks(actual, expected, [width] * 4, False)
+        assert [entry[2].shape[3] for entry in actual] == [208, 236, 288, 416]
+        compare_chunks(actual, expected, [2, 3, 13, width], True)
+        for rows in (1, 2, 3):
+            compare_chunks(initial[-rows:], initial[-rows:], [2, 7, 19][:rows], True)

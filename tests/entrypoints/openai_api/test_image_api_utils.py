@@ -5,6 +5,8 @@
 
 import base64
 import io
+import multiprocessing
+import threading
 
 import pytest
 from PIL import Image
@@ -83,3 +85,37 @@ def test_compressed_png_still_uses_pil(image):
     encoded = encode_image_base64_with_compression(image, format="png", output_compression=50)
     with io.BytesIO(base64.b64decode(encoded)) as buffer:
         assert Image.open(buffer).tobytes() == image.tobytes()
+
+
+def _encode_uncompressed_png() -> None:
+    from vllm_omni.entrypoints.openai.image_api_utils import encode_png_uncompressed
+
+    image = Image.new("RGB", (64, 64), color=(12, 34, 56))
+    with Image.open(io.BytesIO(encode_png_uncompressed(image))) as decoded:
+        assert decoded.size == image.size and decoded.mode == image.mode
+        assert decoded.tobytes() == image.tobytes()
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_uncompressed_png_encodes_in_a_forked_child():
+    from vllm_omni.entrypoints.openai import image_api_utils
+
+    # Start every pool worker in this process, then encode in a forked child.
+    workers = image_api_utils._PNG_THREADS
+    barrier = threading.Barrier(workers)
+    pool = image_api_utils._png_pool()
+    list(pool.map(lambda _: barrier.wait(timeout=10), range(workers)))
+
+    child = multiprocessing.get_context("fork").Process(target=_encode_uncompressed_png)
+    child.start()
+    try:
+        child.join(timeout=30)
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
+        exitcode = child.exitcode
+        child.close()
+    assert exitcode == 0
+    assert image_api_utils._png_pool() is pool
+    _encode_uncompressed_png()

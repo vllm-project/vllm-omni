@@ -53,17 +53,17 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["diffusion_kv_cache_dtype"] == "fp8_e4m3"
 
 
-def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+def test_default_stage_config_preserves_ulysses_a2a_backend() -> None:
     stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "ulysses_degree": 4,
-            "ulysses_a2a_permute": True,
+            "ulysses_a2a_backend": "copy_engine",
         }
     )[0]
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["ulysses_degree"] == 4
-    assert parallel_config["ulysses_a2a_permute"] is True
+    assert parallel_config["ulysses_a2a_backend"] == "copy_engine"
 
 
 def test_default_stage_config_preserves_model_extras():
@@ -419,18 +419,48 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_serve_cli_preserves_ulysses_a2a_permute(enabled: bool) -> None:
+def test_serve_cli_accepts_hsdp_data_parallel():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
-    flag = "--ulysses-a2a-permute" if enabled else "--no-ulysses-a2a-permute"
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", flag])
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--use-hsdp",
+            "--hsdp-shard-size",
+            "8",
+            "--hsdp-data-parallel",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.hsdp_data_parallel is True
+    assert parallel_config["hsdp_data_parallel"] is True
+    assert parallel_config["data_parallel_size"] == 8
+    # Unset, so OmniDiffusionConfig can apply the HSDP data-parallel default.
+    assert args.request_batch_max_wait_ms is None
+    assert stage_cfg["engine_args"].get("request_batch_max_wait_ms") is None
+
+
+@pytest.mark.parametrize("backend", ["auto", "nccl", "copy_engine"])
+def test_serve_cli_preserves_ulysses_a2a_backend(backend: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--ulysses-degree", "4", "--ulysses-a2a-backend", backend]
+    )
 
     stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["ulysses_degree"] == 4
-    assert parallel_config["ulysses_a2a_permute"] is enabled
+    assert parallel_config["ulysses_a2a_backend"] == backend
 
 
 def test_serve_cli_accepts_text_encoder_tp_size():
@@ -713,22 +743,26 @@ def test_serve_cli_accepts_diffusion_attention_backend():
 
 @pytest.mark.diffusion
 @pytest.mark.parametrize("style", ["json", "dotted"])
-def test_serve_cli_forwards_attention_schedule_to_default_stage(style):
+@pytest.mark.parametrize("schedule_kind", ["step", "sigma"])
+def test_serve_cli_forwards_attention_schedule_to_default_stage(style, schedule_kind):
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
-    raw = {
-        "profiles": {"dense": {"default": "TORCH_SDPA"}},
-        "default": [{"start": 3, "end": None, "profile": "dense"}],
-    }
+    schedule_key = "default" if schedule_kind == "step" else "sigma"
+    ranges: list[dict[str, Any]] = (
+        [{"start": 3, "end": None, "profile": "dense"}]
+        if schedule_kind == "step"
+        else [{"low": 0.3, "high": 1.0, "profile": "dense"}]
+    )
+    raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}, schedule_key: ranges}
     flags = (
         ["--diffusion-attention-schedule", json.dumps(raw)]
         if style == "json"
         else [
             "--diffusion-attention-schedule.profiles.dense.default",
             "TORCH_SDPA",
-            "--diffusion-attention-schedule.default",
-            json.dumps(raw["default"]),
+            f"--diffusion-attention-schedule.{schedule_key}",
+            json.dumps(ranges),
         ]
     )
     args = parser.parse_args(["serve", "Qwen/Qwen-Image", "--omni", *flags])
@@ -736,8 +770,14 @@ def test_serve_cli_forwards_attention_schedule_to_default_stage(style):
     config = _terminal_config(stage)
 
     assert config.diffusion_attention_schedule.profiles["dense"].default.backend == "TORCH_SDPA"
-    assert config.diffusion_attention_schedule.default[0].start == 3
-    assert config.diffusion_attention_schedule.default[0].end is None
+    if schedule_kind == "step":
+        assert config.diffusion_attention_schedule.default[0].start == 3
+        assert config.diffusion_attention_schedule.default[0].end is None
+        assert config.diffusion_attention_schedule.sigma == ()
+    else:
+        assert config.diffusion_attention_schedule.sigma[0].low == 0.3
+        assert config.diffusion_attention_schedule.sigma[0].high == 1.0
+        assert config.diffusion_attention_schedule.default == ()
 
 
 def test_serve_cli_accepts_request_batch_max_wait_ms():
@@ -928,6 +968,26 @@ def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(m
     assert stage.parallel_config.data_parallel_size == 2
     assert stage.parallel_config.world_size == 4
     assert stage.runtime_config.devices == "0,1,2,3"
+
+
+def test_generic_diffusion_preserves_env_stage_override(mocker):
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "FakeDiffusionPipeline"),
+    )
+
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides={"num_gpus": 1},
+        stage_overrides={"0": {"env": {"TEST_ENV": "1"}}},
+        strategy_config_path=None,
+    )
+
+    assert len(resolved.stage_configs) == 1
+    assert resolved.stage_configs[0].runtime_config.env == {"TEST_ENV": "1"}
 
 
 def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):

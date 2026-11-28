@@ -89,8 +89,10 @@ frame while idle. **Send observation** also submits the current frame. During
 generation and playback, newer frames replace the pending observation; the
 next turn starts after both `response.done` and local playback finish.
 
-Replies appear as text and play through the existing speaker component, which
-sends `playback.ack`. This profile uses camera input and text instructions;
+Replies stream as assistant text (`response.output_audio_transcript.delta` /
+`response.output_text.delta`) while JoyAI is still generating, then play through
+the existing speaker component, which sends `playback.ack`. This profile uses
+camera input and text instructions;
 the default does not request microphone access. The browser only requests camera
 permission when **Camera** is enabled. Use localhost or HTTPS for browser capture.
 
@@ -145,7 +147,7 @@ Create an overlay named `qwen3_vad.yaml`, replacing both paths with absolute pat
 on the backend host:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   server_vad_model_path: /path/to/silero_vad.onnx
 ```
@@ -176,14 +178,18 @@ Each committed utterance starts a normal Thinker → Talker → Code2Wav request
 it does not append input to a live Qwen KV cache. The capability response reports
 `implementation_level: turn_based_duplex` and `supports_core_resumable_request: false`.
 
-The plugin retains up to four audio inputs (including the current turn), pruning
-older audio at an 8 MiB base64 budget; one current utterance is bounded by the
-engine's pending-input limit. The UI reports playback progress both on normal
+The default `full_history` policy retains original input audio and images until
+their source items are deleted. Each request must fit the deployed model's
+context and media limits; overflow returns `input_capacity_exceeded` without
+clipping history. Select `recent` explicitly to use the legacy four-audio window
+and 8 MiB base64 cache. One current utterance is bounded by the engine's
+pending-input limit. The UI reports playback progress both on normal
 drain and on interruption. Qwen does not provide text/audio alignment, so assistant
 text enters history only after the complete audio response has been generated and
 acknowledged as played. A partially played answer contributes no guessed text
 prefix. Image conversation items remain available until deleted. Model context limits still apply.
-The bundled duplex deploy allows four audio inputs and eight images per prompt.
+The bundled MRv2 deployment inherits vLLM's per-request media-count defaults;
+Session image admission and pending-input budgets still apply.
 Use headphones to avoid speaker audio triggering VAD interruption. Reference
 voices and tool calls are not supported by this plugin.
 
@@ -235,7 +241,7 @@ while serving. Pre-download it into the Hugging Face cache, or point the overlay
 local copy next to the Silero artifact:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   server_vad_model_path: /path/to/silero_vad.onnx
   semantic_vad_model_path: /path/to/smart-turn-v3.2-cpu.onnx
@@ -342,6 +348,11 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 - `--ref-audio`: optional MiniCPM assistant voice override; the server uses the
   model-bundled `assets/HT_ref_audio.wav` when it is omitted. Rejected for
   Qwen3 and AURA.
+
+WebFetch stays off unless `VLLM_REALTIME_WEB_TOOL_WEBFETCH=1` and the tool
+profile is `safe`. The private-address check resolves the host once, then the
+HTTP client resolves it again, so a DNS rebinding answer can still reach a
+private address. Treat that check as best effort.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from vllm.v1.request import Request
 
@@ -389,7 +389,8 @@ def construct_next_stage_streaming_input_prompt(
         # declares that transport behavior explicitly in payload metadata.
         new_prompt = [0] * replacement_prompt_len
         request._output_token_ids.clear()
-        request._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; no .clear().
+        del request._all_token_ids[:]
         request._all_token_ids.extend(new_prompt)
         request.prompt_token_ids = new_prompt
         request.num_computed_tokens = 0
@@ -412,7 +413,7 @@ def construct_next_stage_streaming_input_prompt(
     # Extend prompt with kept output tokens.
     request.prompt_token_ids.extend(kept_output_tokens)
     if has_declared_prompt_len:
-        next_prompt_len = next_stage_prompt_len
+        next_prompt_len = cast(int, next_stage_prompt_len)
     else:
         next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
     new_prompt = [0] * next_prompt_len

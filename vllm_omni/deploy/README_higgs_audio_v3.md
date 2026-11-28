@@ -1,24 +1,59 @@
 # Higgs-Audio V3 Deploy Profiles
 
-Higgs-Audio V3 has two Stage 0 graph profiles. They are intentionally separate
-because the graph paths are mutually exclusive.
+With vLLM 0.34, Model Runner V2 is the only supported runner. The default
+profile is `higgs_multimodal_qwen3.yaml`; `model_runner: v1` is rejected.
+
+## Legacy profile names
+
+The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for
+compatibility, but both files are V2 profiles after #10800. The former keeps
+the eager local MLP graph for throughput; the latter uses the external
+`FULL_DECODE_ONLY` graph for low latency. Neither file is a V1 opt-out.
+
+## Model Runner V2 (default)
+
+The default profile uses Stage 0 `model_runner: v2`, `FULL` CUDA graph capture,
+`FLASH_ATTN`, and `async_scheduling: true`; Stage 1 stays eager with codec
+graph windows `[8, 33]`. The connector emits 25 steady frames with 8 frames
+of left context; its first 8-frame chunk holds about 320 ms of audio.
+
+`higgs_multimodal_qwen3_high_throughput.yaml` is the V2 high-throughput
+profile. It keeps Stage 0 `enforce_eager: true` and the Higgs local MLP graph.
+`higgs_multimodal_qwen3_low_latency.yaml` is the V2 low-latency profile; it
+uses the external `FULL_DECODE_ONLY` graph. Both profiles use
+`async_scheduling: true` and the v2 async payload overrides required by the
+talker.
+
+Sampling surface under v2: **temperature / top_p / top_k / seed only** (the
+self-owned sampler captures tensor-valued temperature/top-k/top-p; penalties,
+logprobs, min_tokens, min_p, allowed/bad token ids, and logit_bias are
+text-generation machinery it does not wire in). A non-neutral unsupported
+value in `default_sampling_params` fails at startup with the remediation
+named; per-request use raises. Remove the parameter or run the affected stage
+with a compatible runner configuration to use them.
+
+For a tuned large-card V2 profile see `higgs_multimodal_qwen3_mrv2_h200.yaml`
+(H200-validated: 64-sequence capacities, larger capture sizes, MPS).
 
 ## High Throughput
 
 Use `higgs_multimodal_qwen3_high_throughput.yaml` for medium/high concurrency
 serving. This profile keeps Stage 0 `enforce_eager: true`, which preserves the
-Higgs-specific local MLP CUDA graph path. It is the default production profile
-for throughput-oriented serving.
-
-`higgs_multimodal_qwen3.yaml` is kept as the auto-discovered default deploy
-config for `model_type=higgs_multimodal_qwen3`, and matches the high-throughput
-profile.
+Higgs-specific local MLP CUDA graph path. It is the throughput-oriented
+production profile.
 
 ```bash
 vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
     --omni --trust-remote-code \
     --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml
 ```
+
+Non-CUDA overrides preserve eager execution and the previous connector
+geometry. They keep V2 and async scheduling enabled, with the six CUDA-tuned
+`audio_mrv2_*` optimizations disabled. They are retained for configuration and
+test coverage only: ROCm, NPU, XPU, and MUSA are not supported for Higgs Audio
+v3 on this vLLM 0.34 head until platform-specific quality and performance
+validation is available. Do not treat these overrides as production support.
 
 ## Low Latency
 
@@ -44,9 +79,9 @@ vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
     --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml
 ```
 
-## Why Stage 0 Pins Native FlashInfer
+## Why the High-Throughput and Low-Latency Profiles Pin Native FlashInfer
 
-The three Stage 0 profiles set `attention_backend: FLASHINFER` and also set:
+The two Stage 0 profiles set `attention_backend: FLASHINFER` and also set:
 
 ```yaml
 attention_config:
@@ -103,9 +138,67 @@ trace for the exact Higgs batch/context distribution. Until vLLM has a
 workload-aware selector or XQA is faster for this BF16 shape, the model-level
 pin is the deterministic choice.
 
+## MRv2 INT8 drafting
+
+`higgs_audio_int8` is opt-in. The INT8 copy drafts one eight-codebook row and the
+BF16 Talker verifies it using the seeded single-step sampler's noise. Use one
+CUDA SM80+ GPU, BF16 target weights, FlashAttention, async scheduling, and
+`VLLM_BATCH_INVARIANT=1`. Keep prefix caching disabled. The extra weights reduce
+the memory available for the Stage 0 KV cache.
+
+Copy `higgs_multimodal_qwen3_mrv2_h200.yaml` to `higgs-k1.yaml`. For Stage 0,
+merge the fields below into the existing stage entry and remove
+`compilation_config.max_cudagraph_capture_size`.
+
+```yaml
+max_num_seqs: 16
+gpu_memory_utilization: 0.45
+async_scheduling: true
+enable_prefix_caching: false
+attention_backend: FLASH_ATTN
+max_num_batched_tokens: 2048
+max_model_len: 2048
+default_sampling_params:
+  max_tokens: 512
+compilation_config:
+  mode: 0
+  cudagraph_capture_sizes: [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48]
+speculative_config:
+  method: higgs_audio_int8
+  num_speculative_tokens: 1
+hf_overrides:
+  audio_full_sample_graph: true
+  enable_mlp_cudagraph: false
+```
+
+For Stage 1, set `max_num_seqs: 16`, `gpu_memory_utilization: 0.2`, and
+`hf_overrides.codec_cuda_graph: false`. For the single-step baseline, copy
+the resulting profile and remove Stage 0's `speculative_config`.
+
+```bash
+VLLM_BATCH_INVARIANT=1 VLLM_USE_DEEP_GEMM=0 VLLM_MOE_USE_DEEP_GEMM=0 \
+  vllm-omni serve bosonai/higgs-tts-3-4b --omni --trust-remote-code \
+  --revision 239f63fb7b02b1aa085f98d9efae5e35cc5523e8 --port 8098 \
+  --deploy-config higgs-k1.yaml
+```
+
+Send the same seeded request to each server and compare the audio chunk sizes
+and completion events.
+
+```bash
+curl --fail-with-body --no-buffer http://127.0.0.1:8098/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bosonai/higgs-tts-3-4b","input":"The morning train arrived just as the lights came on.","seed":42,"max_new_tokens":512,"stream":true,"stream_format":"sse","response_format":"pcm"}'
+```
+
+Unseeded requests and the closing delay ramp use single-step sampling.
+
 ## Notes
 
-- Stage 1 remains `enforce_eager: true` in both profiles.
+- Stage 1 remains `enforce_eager: true` in every profile (the codec CUDA
+  graphs under v2 are stage-local and independent of `compilation_config`).
+- The MRV2 default runs FLASH_ATTN, where the XQA routing question below does
+  not arise; the pin matters only for the FLASHINFER-shaped profiles.
 - Keep `VLLM_USE_DEEP_GEMM=0` and `VLLM_MOE_USE_DEEP_GEMM=0` for this model
   unless DeepGEMM support is revalidated.
 - Revalidate end-to-end throughput and audio quality before changing the default

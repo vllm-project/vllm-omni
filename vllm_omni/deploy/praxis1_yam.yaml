@@ -1,0 +1,50 @@
+# Praxis-1 YAM: two arms, three cameras, one GPU. Contract: docs/models/praxis1.md.
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Praxis1Pipeline
+    default_sampling_params:
+      seed: 0
+    model_config:
+      max_num_steps: 16
+      session_idle_timeout: 300
+      warmup: true
+      max_sessions: 4
+      max_context_chunks: 1
+      exec_horizon: 24
+      cfg_scale: 1.0
+      cfg_video_scale: 1.0
+      t_shift: 1.0
+      control_mode: none
+      policy_server_config:
+        policy: praxis
+        model_id: praxis-1-yam
+        needs_session_id: true
+        supports_close_session: true
+        image_resolution: [416, 416]
+        tile_size: [256, 416]
+        video_antialias: true
+        action_space: cartesian_position_rotation_matrix_gripper
+        action_dim: 26
+        action_horizon: 24
+        first_action_horizon: 21
+        fps: 15
+        control_mode: none
+        embodiment: yam_ee2
+        pose_frame: rig
+        action_layout: "ee-20d [L: xyz3 rot6d6 grip1 | R: same], rel-to-anchor, grip abs"
+        wire_commands: [robot_command.left, robot_command.right, target_grip.left, target_grip.right]
+        camera_keys: [image.exterior, image.wrist_left, image.wrist_right]
+        stack_keys:
+          - image.exterior
+          - image.wrist_left
+          - image.wrist_right
+          - robot_state.left.ee_pose
+          - robot_state.right.ee_pose
+          - grip.left
+          - grip.right

@@ -209,6 +209,59 @@ def test_tool_call_as_the_first_token_forwards_no_speech(publish):
     assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
 
 
+@pytest.mark.parametrize("consumed", [False, True])
+@pytest.mark.parametrize("first_chunk", [False, True])
+@pytest.mark.parametrize("preface", [[], [11, 12]])
+def test_speculative_tool_span_keeps_only_spoken_rows(consumed, first_chunk, preface):
+    manager = _Manager()
+    if first_chunk:
+        assert manager.process(_output(PROMPT), _request([11])) is None
+    else:
+        manager.put_req_chunk["r"] = 1
+
+    span = preface + [TOOL_CALL_START_TOKEN_ID, 99]
+    history = ([] if first_chunk else [10]) + span + ([100] if consumed else [])
+    delta = span[1:] + [100] if consumed else span[int(first_chunk) :]
+    payload = {
+        "hidden_states": {"layers": {0: torch.cat([_embed(t) for t in span])}},
+        "ids": {"output": span},
+        "meta": {"decode_span": True, "consumed_input_span": consumed, "committed_token_count": len(span)},
+    }
+    output = q3.thinker2talker_async_chunk(manager, payload, _request(history), new_token_ids=delta)
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+    if first_chunk:
+        assert output is not None
+        assert output.ids.all == PROMPT + preface[:1]
+        assert output.embed.prefill.shape[0] == len(PROMPT) + min(1, len(preface))
+        assert output.embed.decode.shape[0] == max(0, len(preface) - 1)
+        if preface:
+            assert torch.equal(output.embed.prefill[-1:], _embed(preface[0]))
+            assert torch.equal(output.embed.decode, _embed(preface[1]))
+        # The prompt's accept-hidden rows survive marking the speech cut.
+        assert output.hidden_states.output.shape[0] == len(PROMPT)
+    elif preface:
+        assert output.ids.output == preface
+        assert output.meta.committed_token_count == len(preface)
+        assert output.embed.decode_token_start == 1
+        assert output.embed.decode_token_end == 1 + len(preface)
+        assert torch.equal(output.embed.decode, torch.cat([_embed(t) for t in preface]))
+    else:
+        assert output is None
+
+    # Later chunks need not contain the marker: their JSON is still not speech.
+    following = {
+        "hidden_states": {"layers": {0: _embed(100)}},
+        "ids": {"output": [100]},
+        "meta": {"decode_span": True, "consumed_input_span": consumed, "committed_token_count": 1},
+    }
+    assert (
+        q3.thinker2talker_async_chunk(
+            manager, following, _request(history + [101]), is_finished=True, new_token_ids=[101]
+        )
+        is None
+    )
+
+
 def test_cleanup_lets_the_same_external_id_speak_again():
     import threading
 

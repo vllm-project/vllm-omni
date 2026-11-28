@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-Omni duplex playback, interruption, and semantic VAD regressions."""
+"""Qwen3-Omni duplex playback, semantic VAD, and tool-calling regressions."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ from tests.entrypoints.openai_api.helpers import (
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
+from vllm_omni.clients.tool_calls import DuplexToolRunner
 from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 
@@ -43,6 +45,7 @@ _DUPLEX_REPEATS_ADVANCED = 5
 _DUPLEX_REPEATS_FULL = 20
 _DUPLEX_LONG_INSTRUCTIONS = "Answer the user's question in English using at least eight complete sentences."
 _DUPLEX_SHORT_INSTRUCTIONS = "Answer the user's question in one short English sentence."
+_DUPLEX_AUDIO_HISTORY_LIMIT = 4
 _SEMANTIC_VAD_ASSETS = Path(__file__).resolve().parents[2] / "assets" / "semantic_vad"
 
 
@@ -52,24 +55,31 @@ class _DuplexTestRuntime(NamedTuple):
     artifacts: Path
 
 
-@pytest.fixture(scope="class")
-def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
-    """Load real weights once for all interruption repetitions and history checks."""
+@pytest.fixture(scope="module")
+def qwen_duplex_server(
+    request: pytest.FixtureRequest,
+    tmp_path_factory,
+    cached_silero_vad_artifact,
+    cached_smart_turn_artifact,
+    run_level,
+):
+    """Share real weights across playback, history, and tool-calling checks."""
     from transformers import AutoProcessor
 
     assert run_level in {"advanced_model", "full_model"}, "Duplex playback acceptance requires real weights"
     artifacts = tmp_path_factory.mktemp("qwen_duplex_playback")
     deploy = artifacts / "deploy.yaml"
-    # An absolute base keeps the production YAML's relative inheritance intact
-    # when the test's Silero override lives in a temporary directory.
+    duplex_options: dict[str, object] = {
+        "server_vad_model_path": cached_silero_vad_artifact,
+        "semantic_vad_model_path": cached_smart_turn_artifact,
+    }
+    overrides = getattr(request, "param", {})
     deploy.write_text(
         yaml.safe_dump(
             {
-                "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
-                "duplex_session": {
-                    "server_vad_model_path": cached_silero_vad_artifact,
-                    "semantic_vad_model_path": cached_smart_turn_artifact,
-                },
+                "base_config": get_deploy_config_path("qwen3_omni_duplex_mrv2.yaml"),
+                **overrides,
+                "duplex_session": {**duplex_options, **overrides.get("duplex_session", {})},
             }
         )
     )
@@ -218,6 +228,7 @@ def _duplex_assert_prompt(
     instructions: str,
     request_count: int,
     assistant_texts: list[str] | None = None,
+    full_history: bool = False,
 ):
     captures = []
     for path in runtime.artifacts.glob("*/input.json"):
@@ -227,8 +238,8 @@ def _duplex_assert_prompt(
     assert len(captures) == request_count, captures
     capture = max(captures, key=lambda item: item[0])[1]
     assert capture["audio_count"] == audio_count
-    # The camera belongs to the first user turn and leaves with its audio.
-    image_retained = request_count <= 4
+    # Only the recent policy drops the first turn's camera with its audio.
+    image_retained = full_history or request_count <= _DUPLEX_AUDIO_HISTORY_LIMIT
     assert len(capture["images"]) == int(image_retained)
     messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
     if assistant_texts is None:
@@ -378,7 +389,40 @@ async def _run_semantic_vad_endpoint(runtime, log_path: Path, *, fixture: str) -
     return events
 
 
-async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
+async def _reject_fifth_audio_and_retry(ws, events, pcm):
+    oldest = next(e["item_id"] for e in events if e["type"] == "input_audio_buffer.committed")
+    cursor = len(events)
+    await _duplex_send_pcm(ws, pcm, trailing_silence=False)
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+    await ws.send(json.dumps({"type": "response.create"}))
+    code = "input_capacity_exceeded"
+    await _duplex_receive_until(
+        ws,
+        events,
+        lambda: {"response.done", "error"} <= {e["type"] for e in events[cursor:]},
+        expected_error_code=code,
+    )
+    [failed] = [e["response"] for e in events[cursor:] if e["type"] == "response.done"]
+    assert failed["status"] == "failed" and failed["status_details"]["reason"] == code
+    [error] = [e["error"] for e in events[cursor:] if e["type"] == "error"]
+    assert error["code"] == code and error["retryable"] is True
+    await ws.send(json.dumps({"type": "conversation.item.delete", "item_id": oldest}))
+    await _duplex_receive_until(
+        ws,
+        events,
+        lambda: any(e["type"] == "conversation.item.deleted" and e["item_id"] == oldest for e in events[cursor:]),
+    )
+    cursor = len(events)
+    await ws.send(json.dumps({"type": "response.create"}))
+    await _duplex_receive_until(ws, events, lambda: any(e["type"] == "response.done" for e in events[cursor:]))
+    [retry] = [e["response"]["id"] for e in events[cursor:] if e["type"] == "response.done"]
+    assert retry != failed["id"]
+    return failed["id"], retry
+
+
+async def _run_duplex_history(
+    runtime, log_path: Path, *, full_history: bool = False, explicit_cap: bool = False
+) -> None:
     async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_SHORT_INSTRUCTIONS, vad=False) as (
         ws,
         events,
@@ -387,12 +431,17 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
         response_ids = []
         heard_texts: list[str] = []
         pcm = _duplex_fixture_pcm(validated_input_wav())
-        for turn in range(6):
+        successful_turns = _DUPLEX_AUDIO_HISTORY_LIMIT if explicit_cap else 6
+        for turn in range(successful_turns):
             cursor = len(events)
             await _duplex_send_pcm(ws, pcm, trailing_silence=False)
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
-            await _duplex_receive_until(ws, events, lambda: any(e["type"] == "response.done" for e in events[cursor:]))
+            await _duplex_receive_until(
+                ws,
+                events,
+                lambda: any(e["type"] == "response.done" for e in events[cursor:]),
+            )
             response_id = next(_duplex_response_id(e) for e in events[cursor:] if e["type"] == "response.done")
             assert response_id and response_id not in response_ids
             response_ids.append(response_id)
@@ -400,10 +449,11 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
             _duplex_assert_prompt(
                 runtime,
                 session_id,
-                audio_count=min(turn + 1, 4),
+                audio_count=turn + 1 if full_history else min(turn + 1, _DUPLEX_AUDIO_HISTORY_LIMIT),
                 instructions=_DUPLEX_SHORT_INSTRUCTIONS,
                 request_count=turn + 1,
-                assistant_texts=heard_texts[-3:],
+                assistant_texts=heard_texts if full_history else heard_texts[-(_DUPLEX_AUDIO_HISTORY_LIMIT - 1) :],
+                full_history=full_history,
             )
             # Complete playback so pruning is checked against real assistant
             # answers paired with retained user audio. Repeated empty assistant
@@ -435,12 +485,233 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
             assert ack["item_id"] == f"item_{response_id}"
             assert ack["committed_ms"] == ack["playback"]["sent_ms"] == played_ms
             assert ack["history_committed"] is True
+        if explicit_cap:
+            rejected_id, retry_id = await _reject_fifth_audio_and_retry(ws, events, pcm)
+            response_ids.append(retry_id)
+    if explicit_cap:
+        assert len(_duplex_response_events(events, rejected_id, "response.done")) == 1
+        assert not _duplex_response_events(events, rejected_id, "response.output_audio.delta")
     for response_id in response_ids:
         _duplex_assert_completed_audio(events, response_id)
 
 
+TURN_TIMEOUT_S = 180.0
+WEATHER_TOOL = {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get the current weather for a city.",
+    "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string", "description": "The city name."}},
+        "required": ["city"],
+    },
+}
+INSTRUCTIONS = (
+    "You are a helpful assistant. For any question about the weather you must call the get_weather tool "
+    "instead of guessing. After receiving its result, respond briefly."
+)
+WEATHER_QUESTION = "What is the weather in Paris right now?"
+WEATHER_RESULT = json.dumps({"city": "Paris", "temperature_c": 17})
+
+
+def _tool_session_config(**extra_body: object) -> SessionConfig:
+    return SessionConfig(
+        modalities=("text",),
+        auto_response=False,
+        temperature=0.0,
+        instructions=INSTRUCTIONS,
+        max_output_tokens=128,
+        extra_body=extra_body,
+    )
+
+
+class _ToolSession:
+    """One connected client, with its events kept for the assertions."""
+
+    def __init__(self, client: DuplexClient, collector: EventCollector) -> None:
+        self.client = client
+        self.collector = collector
+
+    def events_since(self, start: int) -> list[dict[str, object]]:
+        return self.collector.events[start:]
+
+    def calls(self) -> list[dict[str, object]]:
+        """Every function call the model published to the client."""
+        items = [
+            event.get("item") for event in self.collector.events if event.get("type") == "response.output_item.done"
+        ]
+        return [item for item in items if isinstance(item, dict) and item.get("type") == "function_call"]
+
+    def duplex_events(self, event_type: str) -> list[dict[str, object]]:
+        bodies = [event.get("event") for event in self.collector.events if event.get("type") == event_type]
+        return [body for body in bodies if isinstance(body, dict)]
+
+    def error_codes(self) -> list[object]:
+        codes = []
+        for event in self.collector.errors():
+            error = event.get("error")
+            codes.append(error.get("code") if isinstance(error, dict) else None)
+        return codes
+
+    async def finish_response(self, start: int, *, after_tool_result: str | None = None) -> str:
+        """Wait for the turn's own response, and return its text.
+
+        The turn's response opens first. A function call inside it is projected
+        as a separate response, which must not be mistaken for the end.
+        For a tool continuation, require its result acknowledgement before a
+        newly created response; earlier responses cannot satisfy this wait.
+        """
+        deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
+        while asyncio.get_running_loop().time() < deadline:
+            events = self.events_since(start)
+            previous_response_ids = set()
+            if after_tool_result is not None:
+                accepted = next(
+                    (
+                        index
+                        for index, event in enumerate(events)
+                        if event.get("type") == "conversation.item.created"
+                        and isinstance(item := event.get("item"), dict)
+                        and item.get("type") == "function_call_output"
+                        and item.get("call_id") == after_tool_result
+                    ),
+                    None,
+                )
+                if accepted is None:
+                    await asyncio.sleep(0.1)
+                    continue
+                previous_response_ids = {
+                    self.collector.response_id(event) for event in self.collector.events[: start + accepted + 1]
+                }
+                events = events[accepted + 1 :]
+            created = next(
+                (
+                    event
+                    for event in events
+                    if event.get("type") == "response.created"
+                    and self.collector.response_id(event) not in previous_response_ids
+                ),
+                None,
+            )
+            response_id = self.collector.response_id(created) if created is not None else None
+            if response_id is not None and self.collector.response_is_done(response_id):
+                if after_tool_result is not None:
+                    assert any(
+                        event.get("type") == "response.done"
+                        and self.collector.response_id(event) == response_id
+                        and isinstance(response := event.get("response"), dict)
+                        and response.get("status") == "completed"
+                        for event in events
+                    ), events
+                text = self.collector.response_text(response_id)
+                print(f"[qwen-tools] answer {response_id}: {text!r}")
+                return text
+            await asyncio.sleep(0.1)
+        raise AssertionError(f"the turn did not finish; events: {[event.get('type') for event in events][-12:]}")
+
+    async def ask(self, text: str) -> str:
+        start = len(self.collector.events)
+        await self.client.send(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+            }
+        )
+        await self.client.send({"type": "response.create"})
+        return await self.finish_response(start)
+
+    async def ask_for_weather(self) -> str:
+        """Ask the weather question and return the call_id the model published."""
+        await self.ask(WEATHER_QUESTION)
+        calls = self.calls()
+        assert calls, f"Qwen published no function call: {self.collector.errors()}"
+        assert calls[-1]["name"] == "get_weather"
+        return str(calls[-1]["call_id"])
+
+    def report(self) -> None:
+        """Keep what the model did in the test output, pass or fail."""
+        print(
+            f"[qwen-tools] calls={len(self.calls())} "
+            f"suppressed={len(self.duplex_events('duplex.function_call.suppressed'))} errors={self.error_codes()}"
+        )
+        for event in self.collector.events:
+            event_type = str(event.get("type"))
+            if event_type in {"response.created", "response.done", "duplex.function_call.suppressed"}:
+                print(f"[qwen-tools] {event_type} {self.collector.response_id(event)}")
+            elif event_type == "response.output_item.done":
+                print(f"[qwen-tools] output_item {json.dumps(event.get('item'))[:200]}")
+
+
+async def _in_tool_session(url: str, config: SessionConfig, body) -> None:
+    collector = EventCollector()
+    async with DuplexClient(url, model=MODEL, config=config, reconnect=None) as client:
+        consumer = asyncio.create_task(collector.consume(client))
+        await asyncio.sleep(0)
+        session = _ToolSession(client, collector)
+        try:
+            await client.send({"type": "session.update", "session": {"tools": [WEATHER_TOOL]}})
+            capabilities = client.session_info.get("capabilities")
+            assert isinstance(capabilities, dict)
+            assert capabilities["tool_mode"] == "declared"
+            assert capabilities["function_call_output_continuation"] == "client_response_create"
+            await body(session)
+        finally:
+            session.report()
+            await client.close()
+            await asyncio.wait_for(consumer, timeout=10)
+
+
+def _run_tool_session(omni_server, config: SessionConfig, body) -> None:
+    url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1"
+    asyncio.run(_in_tool_session(url, config, body))
+
+
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+class TestQwen3OmniDuplexTools:
+    @pytest.mark.advanced_model
+    def test_live_tool_runner_completes_a_tool_round_trip(self, qwen_duplex_server):
+        """Smoke-test real model/tool integration without prescribing the answer."""
+
+        async def body(session: _ToolSession) -> None:
+            handled = []
+
+            async def get_weather(arguments):
+                handled.append(arguments)
+                return WEATHER_RESULT
+
+            runner = DuplexToolRunner(session.client, {"get_weather": get_weather})
+            start = len(session.collector.events)
+            task = asyncio.create_task(runner.run())
+            try:
+                await asyncio.sleep(0)
+                call_id = await session.ask_for_weather()
+                await session.finish_response(start, after_tool_result=call_id)
+                if task.done():
+                    await task
+                call = next(call for call in session.calls() if call["call_id"] == call_id)
+                arguments = call["arguments"]
+                assert isinstance(arguments, str)
+                assert json.loads(arguments) in handled
+                assert any(
+                    event.get("type") == "conversation.item.created"
+                    and isinstance(item := event.get("item"), dict)
+                    and item.get("type") == "function_call_output"
+                    and item.get("call_id") == call_id
+                    and item.get("output") == WEATHER_RESULT
+                    for event in session.events_since(start)
+                )
+                assert session.error_codes() == []
+                assert runner.undelivered_results == {}
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
+
+
+@pytest.mark.omni
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
     @pytest.mark.advanced_model
     @pytest.mark.parametrize(
@@ -513,7 +784,6 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.full_model
-    @hardware_test(res={"rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
     @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
     def test_speech_interrupts_playback_full(
@@ -556,5 +826,29 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
+    def test_full_history_keeps_six_audio_turns(self, qwen_duplex_server, tmp_path: Path):
+        """The unconfigured default keeps all six audio inputs and heard answers."""
+        asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", full_history=True))
+
+    @pytest.mark.advanced_model
+    @pytest.mark.parametrize(
+        "qwen_duplex_server",
+        [{"stages": [{"stage_id": 0, "limit_mm_per_prompt": {"audio": 4}}]}],
+        indirect=True,
+        ids=["four-audio-cap"],
+    )
+    def test_full_history_retries_after_audio_overflow(self, qwen_duplex_server, tmp_path: Path):
+        asyncio.run(
+            _run_duplex_history(qwen_duplex_server, tmp_path / "events.json", full_history=True, explicit_cap=True)
+        )
+
+    @pytest.mark.advanced_model
+    @pytest.mark.parametrize(
+        "qwen_duplex_server",
+        [{"duplex_session": {"model_custom_options": {"history_policy": "recent"}}}],
+        indirect=True,
+        ids=["recent"],
+    )
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
-        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
+        """Explicit recent history evicts old audio and its paired image/answer."""
+        asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json"))

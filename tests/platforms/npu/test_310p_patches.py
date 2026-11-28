@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -254,6 +255,77 @@ def _load_qwen3_tts_patch(monkeypatch: pytest.MonkeyPatch):
     path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "qwen3_tts.py"
     module = _load_source_module("vllm_omni_test_310p_qwen3_tts_patch", path)
     return module, fakes
+
+
+def _load_distributed_vae_patch(monkeypatch: pytest.MonkeyPatch):
+    class FakeExecutor:
+        pass
+
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor",
+        DistributedVaeExecutor=FakeExecutor,
+    )
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "distributed_vae.py"
+    module = _load_source_module("vllm_omni_test_310p_distributed_vae_patch", path)
+    return module, FakeExecutor
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_distributed_vae_publish_all_reduces_rank0_payload(monkeypatch: pytest.MonkeyPatch, rank: int) -> None:
+    """310P HCCL cannot broadcast: rank 0's payload must arrive by all_reduce.
+
+    ``dist.broadcast`` returns without error but leaves the receiver's buffer
+    untouched on 310P3, so a broadcast-based sync hands every non-zero rank
+    uninitialized data. The contract here is rank 0 contributes the payload and
+    every other rank contributes zeros.
+    """
+    module, _ = _load_distributed_vae_patch(monkeypatch)
+
+    executor = SimpleNamespace(rank=rank, group=object())
+    payload = torch.arange(4, dtype=torch.float32)
+    tensor = payload.clone() if rank == 0 else torch.full((4,), -7.0)
+
+    def unexpected_broadcast(*args, **kwargs):
+        pytest.fail("dist.broadcast is a silent no-op on 310P3 HCCL")
+
+    def all_reduce(source, *, op, group):
+        assert op is torch.distributed.ReduceOp.SUM
+        assert group is executor.group
+        if rank == 0:
+            # If rank 0 zeroed itself too, the emulated all-reduce would still
+            # return the payload while the real one returns zeros.
+            torch.testing.assert_close(source, payload, msg="rank 0 must contribute its payload")
+        else:
+            assert torch.count_nonzero(source) == 0, "non-zero ranks contribute zeros"
+        source.copy_(payload)  # emulate the collective: rank 0's payload wins
+
+    monkeypatch.setattr(torch.distributed, "broadcast", unexpected_broadcast)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    module.publish_tensor_310p(executor.rank, tensor, executor.group)
+    torch.testing.assert_close(tensor, payload)
+
+
+def test_distributed_vae_patch_uses_int32_control_tensors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """310P HCCL has no int64 collective, so the shared control tensors go int32."""
+    module, executor_cls = _load_distributed_vae_patch(monkeypatch)
+    executor_cls._control_dtype = torch.int64
+
+    module.apply_patch()
+
+    assert executor_cls._control_dtype is torch.int32
+
+
+def test_distributed_vae_patch_replaces_publish_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, executor_cls = _load_distributed_vae_patch(monkeypatch)
+
+    module.apply_patch()
+    patched = executor_cls._publish_tensor
+    module.apply_patch()
+
+    assert executor_cls._publish_tensor is patched, "re-applying must not wrap twice"
+    assert getattr(executor_cls, "_310p_publish_patched", False)
 
 
 @pytest.mark.parametrize("device_is_310p", [True, False])
@@ -684,6 +756,7 @@ def _load_qwen3_tts_code2wav_npu_patch(
             self.deconv = torch.nn.ConvTranspose1d(4, 4, 4)
             self.grouped_conv = torch.nn.Conv1d(4, 4, 3, groups=2)
             self.cache_precompute_calls = 0
+            self._npu_incremental = None
 
         def precompute_snake_caches(self):
             self.cache_precompute_calls += 1
@@ -737,6 +810,7 @@ def _make_patched_code2wav(target, *, dtype=torch.bfloat16):
         vllm_config=SimpleNamespace(
             device_config=SimpleNamespace(device=torch.device("cpu")),
             model_config=SimpleNamespace(dtype=dtype),
+            additional_config={"npu_incremental_codec": False},
         ),
         prefix="stage1",
     )
@@ -770,3 +844,110 @@ def test_qwen3_tts_code2wav_npu_patch_preserves_stage_dtype(
     assert model.load_weights(iter(())) == {"loaded"}
     assert all(parameter.dtype is dtype for parameter in model.decoder.parameters())
     assert model.decoder.cache_precompute_calls == 1
+
+
+class _FakeQwenImage21Vae:
+    """Records the ``use_tiling`` state seen by each ``encode`` call."""
+
+    def __init__(self, *, fail_untiled: bool = False):
+        self.use_tiling = True
+        self.fail_untiled = fail_untiled
+        self.encode_calls: list[bool] = []
+
+    def encode(self, x):
+        self.encode_calls.append(self.use_tiling)
+        if self.fail_untiled and not self.use_tiling:
+            raise RuntimeError("NPU out of memory. Tried to allocate 2.00 GiB")
+        return x
+
+
+def _load_qwen_image_21_patch(monkeypatch: pytest.MonkeyPatch):
+    logger = SimpleNamespace(info=lambda *_: None, warning=lambda *_: None)
+    _install_fake_module(monkeypatch, "vllm")
+    _install_fake_module(monkeypatch, "vllm.logger", init_logger=lambda _name: logger)
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "qwen_image_21.py"
+    return _load_source_module("vllm_omni_test_310p_qwen_image_21_patch", path)
+
+
+def test_vae_encode_patch_keeps_decode_tiling_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_qwen_image_21_patch(monkeypatch)
+    vae = _FakeQwenImage21Vae()
+    model = SimpleNamespace(vae=vae)
+
+    module.apply_vae_encode_tiling_patch(model, None)
+    assert vae._310p_untiled_encode is True  # type: ignore[attr-defined]
+
+    assert vae.encode("image") == "image"
+    assert vae.encode("image") == "image"
+    assert vae.encode_calls == [False, False]
+    # The flag is restored after every call, so decode still tiles.
+    assert vae.use_tiling is True
+
+
+def test_vae_encode_patch_leaves_untiled_vae_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_qwen_image_21_patch(monkeypatch)
+    vae = _FakeQwenImage21Vae()
+    vae.use_tiling = False
+    original_encode = vae.encode
+
+    module.apply_vae_encode_tiling_patch(SimpleNamespace(vae=vae), None)
+
+    assert vae.encode == original_encode
+    assert not getattr(vae, "_310p_untiled_encode", False)
+
+
+def test_vae_encode_patch_releases_failed_frame_before_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tiled retry must not run while the OOM traceback pins the failed frames.
+
+    A traceback keeps the failing frame's locals - the encoder's intermediates -
+    alive, and ``empty_cache()`` cannot free live allocations. Retrying inside
+    the handler therefore asks the tiled encode for memory that the failed
+    attempt is still holding.
+    """
+    module = _load_qwen_image_21_patch(monkeypatch)
+    vae = _FakeQwenImage21Vae()
+    probe: dict[str, weakref.ReferenceType] = {}
+    tiled_call_saw_released: list[bool] = []
+
+    def encode(x):
+        if not vae.use_tiling:
+            activation = torch.zeros(4)  # stands in for the failed encode's intermediates
+            probe["ref"] = weakref.ref(activation)
+            raise RuntimeError("NPU out of memory. Tried to allocate 2.00 GiB")
+        tiled_call_saw_released.append(probe["ref"]() is None)
+        return x
+
+    vae.encode = encode  # type: ignore[method-assign]
+    module.apply_vae_encode_tiling_patch(SimpleNamespace(vae=vae), None)
+
+    assert vae.encode("image") == "image"
+    assert tiled_call_saw_released == [True]
+    assert vae.use_tiling is True
+
+
+def test_vae_encode_patch_falls_back_to_tiling_on_oom(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_qwen_image_21_patch(monkeypatch)
+    vae = _FakeQwenImage21Vae(fail_untiled=True)
+
+    module.apply_vae_encode_tiling_patch(SimpleNamespace(vae=vae), None)
+    assert vae.encode("image") == "image"
+
+    assert vae.encode_calls == [False, True]
+    assert vae.use_tiling is True
+
+
+def test_vae_encode_patch_does_not_hide_other_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_qwen_image_21_patch(monkeypatch)
+    vae = _FakeQwenImage21Vae()
+
+    def encode_raises(_x):
+        vae.encode_calls.append(vae.use_tiling)
+        raise RuntimeError("aclnnConvolution failed")
+
+    vae.encode = encode_raises  # type: ignore[method-assign]
+    module.apply_vae_encode_tiling_patch(SimpleNamespace(vae=vae), None)
+
+    with pytest.raises(RuntimeError, match="aclnnConvolution"):
+        vae.encode("image")
+    assert vae.encode_calls == [False]
+    assert vae.use_tiling is True

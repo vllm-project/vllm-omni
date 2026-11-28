@@ -288,7 +288,7 @@ class ARDiffusionSegmentedKVState:
         self._assembled.clear()
 
     def _release(self, handle: SegmentHandle) -> None:
-        self.cache.end_request(self._allocations.pop(handle).adapter)
+        self.cache.release_history(self._allocations.pop(handle).adapter)
 
     def close(self) -> None:
         """Release committed and pending allocations; safe to call twice."""

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,29 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import (
 )
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
+
+
+def _make_member(
+    tf,
+    req: str,
+    *,
+    seeds: dict[str, int],
+    prompts: dict[str, torch.Tensor],
+    grids: dict[str, list[float]] | None,
+    shared_grid: list[float] | None,
+) -> WanCell:
+    """Build one member, taking the per-case seed/prompt/grid inputs explicitly."""
+    if grids is not None:
+        return _member(tf, seed=seeds[req], prompt=prompts[req].clone(), timesteps=grids[req])
+    assert shared_grid is not None
+    return _member(
+        tf,
+        seed=seeds[req],
+        prompt=prompts[req].clone(),
+        num_denoise_steps=len(shared_grid),
+        timesteps=shared_grid,
+    )
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -85,6 +109,11 @@ class _FakeTransformer:
 
     def seq_len_for_latent(self, latent_shape):
         return 2
+
+
+def _failing_forward(*_args, **_kwargs):
+    """Transformer forward stand-in that fails the shared tick."""
+    raise RuntimeError("fused forward failure")
 
 
 def _member(
@@ -212,22 +241,18 @@ def test_wan_cell_fused_matches_serial(case):
     grids = case.get("member_timesteps")
     shared_grid = case.get("grid")
 
-    def _make(tf, req: str) -> WanCell:
-        if grids is not None:
-            return _member(tf, seed=seeds[req], prompt=prompts[req].clone(), timesteps=grids[req])
-        assert shared_grid is not None
-        return _member(
-            tf,
-            seed=seeds[req],
-            prompt=prompts[req].clone(),
-            num_denoise_steps=len(shared_grid),
-            timesteps=shared_grid,
-        )
+    make = partial(
+        _make_member,
+        seeds=seeds,
+        prompts=prompts,
+        grids=grids,
+        shared_grid=shared_grid,
+    )
 
     tf_serial = _FakeTransformer()
     serial_live: dict[str, torch.Tensor] = {}
     for req in ("A", "B"):
-        member = _make(tf_serial, req)
+        member = make(tf_serial, req)
         _one(member, req, cells[req], SimpleNamespace(name=req))
         chunk = cells[req][0]
         serial_live[req] = member._live[req][chunk].detach().clone()
@@ -237,7 +262,7 @@ def test_wan_cell_fused_matches_serial(case):
     assert not torch.allclose(serial_live["A"], serial_live["B"])
 
     tf_fused = _FakeTransformer()
-    fused = {req: _make(tf_fused, req) for req in ("A", "B")}
+    fused = {req: make(tf_fused, req) for req in ("A", "B")}
     batches = _run_batches(
         fused,
         [("A", cells["A"]), ("B", cells["B"])],
@@ -296,3 +321,27 @@ def test_wan_cell_mid_group_uses_per_member_hidden_inputs():
     assert tf.last_latent is not None and tf.last_latent.shape[0] == 2
     assert torch.allclose(tf.last_latent[0], torch.full((4, 1, 2, 2), 1.0))
     assert torch.allclose(tf.last_latent[1], torch.full((4, 1, 2, 2), 2.0))
+
+
+@pytest.mark.parametrize("fail_attr", ["block", "unembed"])
+def test_failed_fused_tick_leaves_every_member_untouched(monkeypatch, fail_attr):
+    """A raising shared forward must not advance any member's state.
+
+    The executor publishes KV only after a successful forward, so a partially
+    applied tick would leave the pool claiming writes that never happened.
+    """
+    tf = _FakeTransformer()
+    a = _member(tf, seed=1, prompt=torch.ones(1, 3, 4))
+    b = _member(tf, seed=2, prompt=torch.ones(1, 3, 4) * 2)
+    members = {"A": a, "B": b}
+    tasks = [("A", (0, 0, 0)), ("B", (0, 0, 0))]
+    kvs = [object(), object()]
+
+    monkeypatch.setattr(tf, fail_attr, _failing_forward)
+    with pytest.raises(RuntimeError, match="fused forward failure"):
+        _run_batches(members, tasks, kvs, max_batch_size=2)
+
+    for req in ("A", "B"):
+        assert members[req].finished == {}, req
+        # The live map may be pre-created per member, but no chunk may advance.
+        assert members[req]._live.get(req, {}) == {}, req

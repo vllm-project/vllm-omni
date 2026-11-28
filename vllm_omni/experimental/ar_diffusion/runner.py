@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,12 +15,13 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.distributed.member_batch import ExecutionBatch
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import cfg_step_replicas
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, StepRequestState
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionNoisyKV,
@@ -27,10 +29,12 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
+from vllm_omni.experimental.ar_diffusion.chunk_executor import advance_chunk
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -38,6 +42,11 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
 
 logger = init_logger(__name__)
+
+
+def _is_legal_paging_size(supported: Sequence[int | Any], size: int) -> bool:
+    """Whether the kernel accepts ``size`` as a paging unit."""
+    return size > 0 and any(size == entry if isinstance(entry, int) else size % entry.base == 0 for entry in supported)
 
 
 def paging_block_size(tokens_per_frame: int, supported: Sequence[int | MultipleOf] | None = None) -> int:
@@ -76,10 +85,7 @@ def paging_block_size(tokens_per_frame: int, supported: Sequence[int | MultipleO
     if not supported:
         raise ValueError("The attention kernel advertises no legal block size.")
 
-    def legal(size: int) -> bool:
-        return size > 0 and any(
-            size == entry if isinstance(entry, int) else size % entry.base == 0 for entry in supported
-        )
+    legal = partial(_is_legal_paging_size, supported)
 
     if legal(tokens_per_frame):
         return tokens_per_frame
@@ -371,7 +377,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         errors: list[Exception] = []
         if state is not None:
             try:
-                state.close()
+                state.release_history(session_id)
             except Exception as exc:  # noqa: BLE001 - notify the pipeline even if pool cleanup fails
                 errors.append(exc)
         capability = self._ar_diffusion_capability
@@ -453,6 +459,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 yield
             if synchronize:
                 current_omni_platform.synchronize()
+                state.finish_request(session_id)
         except Exception:
             self._release_session(
                 session_id,
@@ -504,22 +511,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         otherwise the request id is ephemeral and versions are released after
         the forward.
         """
-        session_id, extra_args, tick = ARDiffusionModelRunner._request_session(req)
-        if tick is not None:
-            return tick.session_id, not bool(tick.close_session), bool(tick.reset), bool(tick.close_session)
-        raw = extra_args.get("session_id")
-        explicit = raw is not None and str(raw) != ""
-        kv_id = str(raw) if explicit else str(getattr(req, "request_id", None) or session_id)
-        reset = bool(extra_args.get("reset", False))
-        close_session = bool(extra_args.get("close_session", False))
-        persist = explicit and not close_session
-        return kv_id, persist, reset, close_session
+        binding = kv_request_binding(req)
+        return binding.owner, binding.persist, binding.reset, binding.close
 
     def release_noisy_kv(self, kv_id: str) -> None:
-        """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close)."""
+        """Drop retained Noisy PP versions for ``kv_id`` via the cache owner."""
         if self.noisy_kv_cache is None:
             return
-        NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+        self.noisy_kv_cache.release_session(kv_id)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
     def _bound_noisy_kv(self) -> AbstractContextManager[None]:
@@ -699,6 +698,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             and supports_chunk_step_grouping(self.pipeline)
         )
 
+    def _step_execution_batch(self, states: Sequence[StepRequestState]) -> ExecutionBatch:
+        batch = super()._step_execution_batch(states)
+        return ExecutionBatch(
+            tuple(
+                dataclasses.replace(
+                    member, kv_view=getattr(self, "_sessions", {}).get(member.request_id, member.kv_view)
+                )
+                for member in batch.members
+            )
+        )
+
     def _execute_stepwise_core(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -749,42 +759,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             kv_prefetch_job=None,
             kv_connector_metadata=None,
         )
-        if not self._chunk_step_pending(output, request_id):
-            return output
-        max_steps = self.state_cache[request_id].chunk_num_steps
-        if max_steps is None:
-            return output
-        steps = 1
-        while self._chunk_step_pending(output, request_id):
-            state = self.state_cache[request_id]
-            if (
-                state.step_in_chunk > 0
-                and state.step_in_chunk == max_steps - 1
-                and state.step_in_chunk != previous_step_in_chunk
-            ):
-                break
-            if steps >= max_steps:
-                self.state_cache.pop(request_id)
-                runner_output = output.get_request_output(request_id)
-                assert runner_output is not None
-                runner_output.finished = True
-                runner_output.result = DiffusionOutput(error=f"Chunk did not complete within {max_steps} denoise steps")
-                break
-            previous_step_in_chunk = state.step_in_chunk
-            steps += 1
-            output = super()._execute_stepwise_core(
+        return advance_chunk(
+            request_id,
+            self.state_cache,
+            output,
+            lambda: super(ARDiffusionModelRunner, self)._execute_stepwise_core(
                 continuation,
                 record_output_peak_memory=record_output_peak_memory,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
-            )
-        return output
-
-    def _chunk_step_pending(self, output: BatchRunnerOutput, request_id: str) -> bool:
-        """More steps of the request's current chunk remain after ``output``."""
-        runner_output = output.get_request_output(request_id)
-        if runner_output is None or runner_output.finished or runner_output.result is not None:
-            return False
-        return request_id in self.state_cache
+            ),
+            previous_step=previous_step_in_chunk,
+        )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Bind runner-owned KV for one stepwise invocation, then inherit the step loop."""
@@ -846,6 +831,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 # it must sit inside the same fail-closed scope as the step
                 # itself rather than leave cleanup to the scheduler's next cycle.
                 current_omni_platform.synchronize()
+                if not errored:
+                    self._sessions[session_id].finish_request(session_id)
         except Exception:
             self._fail_closed_stepwise(request_id)
             raise

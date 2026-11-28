@@ -11,11 +11,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -28,6 +30,7 @@ from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBack
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.indexed_modulation import (
@@ -40,11 +43,13 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
+from .ops.fc1_swiglu import fc1_swiglu, fc1_swiglu_supported
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+    from .reference_isolation import MiniMaxH3ReferenceIsolation
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 _BF16_DTYPE = torch.bfloat16
@@ -354,6 +359,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
@@ -407,7 +413,8 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                backend.supports_packed_mask_free()
+                (reference_isolation is not None and reference_isolation.reference_rows > 0)
+                or backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
                     and backend.get_name() == "RAINFUSION_ATTN"
@@ -438,6 +445,8 @@ class MiniMaxH3Attention(nn.Module):
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:
                 extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
+        if reference_isolation is not None and reference_isolation.reference_rows:
+            extra[REFERENCE_ISOLATION] = (reference_isolation, reference_kv_compact)
         if vdn_window is not None:
             extra["vdn_window"] = vdn_window
         if reference_kv_compact:
@@ -520,6 +529,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
@@ -573,6 +583,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
+            reference_isolation=reference_isolation,
             vdn_window=vdn_window,
         )
         if self.vdn is not None:
@@ -616,10 +627,22 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
+        if self._fuse_fc1_swiglu(x):
+            hidden = fc1_swiglu(x, self.fc1.weight)
+        else:
+            hidden, _ = self.fc1(x)
+            hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
+
+    def _fuse_fc1_swiglu(self, x: torch.Tensor) -> bool:
+        fc1 = self.fc1
+        return (
+            not isinstance(fc1, BaseLayerWithLoRA)
+            and type(getattr(fc1, "quant_method", None)) is UnquantizedLinearMethod
+            and fc1.bias is None
+            and fc1_swiglu_supported(x, fc1.weight)
+        )
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -696,8 +719,8 @@ class MiniMaxH3AdalnProj(nn.Module):
     def _prepare_weight_stager(self, device: torch.device) -> None:
         if not self._offload_weights:
             return
-        if device.type != "cuda" or torch.is_grad_enabled() or torch.compiler.is_compiling():
-            raise RuntimeError("MiniMax H3 AdaLN offload requires eager CUDA inference")
+        if device.type not in {"cuda", "npu"} or torch.is_grad_enabled() or torch.compiler.is_compiling():
+            raise RuntimeError("MiniMax H3 AdaLN offload requires eager CUDA or NPU inference")
         assert self._adaln_cache is not None
         if self._adaln_cache._has_forward_hooks(self.linear):
             raise RuntimeError("MiniMax H3 AdaLN offload does not support projection forward hooks")
@@ -813,8 +836,11 @@ class MiniMaxH3DiTBlock(nn.Module):
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
-    ) -> torch.Tensor:
+        pending_gate: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_gate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
 
@@ -831,15 +857,27 @@ class MiniMaxH3DiTBlock(nn.Module):
             gate_mlp,
         ) = self.adaln_proj(t_emb)
 
-        residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
+        if pending_gate is None:
+            residual = x
+            h = rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
+        else:
+            residual, h = indexed_gate_rms_norm_scale_shift(
+                x,
+                pending_gate[0],
+                pending_gate[1],
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
         h = self.attn(
             h,
             rope_table=rope_table,
@@ -853,6 +891,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=self.layer_index,
             reference_kv_compact=reference_kv_compact,
+            reference_isolation=reference_isolation,
             vdn_window=vdn_window,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
@@ -867,4 +906,6 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
         residual = x
         h = self.mlp(h)
+        if defer_gate:
+            return residual, (gate_mlp, h)
         return indexed_gate(residual, gate_mlp, h, combined_indices)

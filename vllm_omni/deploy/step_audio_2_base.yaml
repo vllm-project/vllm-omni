@@ -1,0 +1,9 @@
+# Step-Audio-2-mini-Base deploy: thinker -> token2wav.
+# Inherits all settings from step_audio_2.yaml; only adds the stage-0 variant
+# marker so /v1/audio/speech formats prompts for Step-Audio-2-mini-Base.
+base_config: step_audio_2.yaml
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      step_audio2_variant: base

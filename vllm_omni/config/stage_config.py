@@ -8,7 +8,7 @@ import functools
 import math
 import re
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+SERVE_CLI_SCOPE_KEY = "_scope_serve_stage_flags"
 
 _RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
     {
@@ -44,8 +45,27 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     {
         "requires_full_payload_input",
         "scheduling_metadata_adapter",
+        "scheduler_window_policy",
     }
 )
+
+STREAMING_UPDATE_TRANSFORM_ATTR = "_omni_streaming_update_transform"
+
+
+def on_streaming_updates(
+    transform: Callable[..., Any] | None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a ``prompt_transform_func`` to run ``transform`` on streaming-input updates instead.
+
+    Those updates carry the later chunks of a request that already passed the
+    transform. ``None`` skips them.
+    """
+
+    def mark(func: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(func, STREAMING_UPDATE_TRANSFORM_ATTR, transform)
+        return func
+
+    return mark
 
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
@@ -102,6 +122,7 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
+    warn_dropped: bool = True,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -113,6 +134,7 @@ def build_stage_runtime_overrides(
     uniformly for every stage, they are not per-stage knobs. Callers can
     pass an explicit set for tests or specialized flows.
     """
+    stage_internal_keys: set[str] | frozenset[str]
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
@@ -122,6 +144,11 @@ def build_stage_runtime_overrides(
         # allowing any field explicitly represented by the deploy schema to
         # continue flowing into per-stage overrides.
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
+        # The top-level object belongs to the orchestrator, but a nested
+        # per-stage parallel config is consumed by the stage builder.
+        stage_internal_keys = internal_keys - {"parallel_config"}
+    else:
+        stage_internal_keys = internal_keys
 
     result: dict[str, Any] = {}
     stage_overrides: dict[str, Any] = {}
@@ -134,8 +161,15 @@ def build_stage_runtime_overrides(
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
-            if override_stage_id == stage_id and param_name not in internal_keys:
-                stage_overrides[param_name] = value
+            if override_stage_id == stage_id:
+                if param_name not in stage_internal_keys:
+                    stage_overrides[param_name] = value
+                elif warn_dropped:
+                    logger.warning(
+                        "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                        stage_id,
+                        param_name,
+                    )
             continue
 
         result[key] = value
@@ -151,6 +185,7 @@ def normalize_pipeline_cli_overrides(
 ) -> dict[str, Any]:
     """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
     normalized = dict(cli_overrides)
+    selected_stage_id = normalized.get("stage_id") if normalized.get(SERVE_CLI_SCOPE_KEY) else None
     for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
         invalid_stage_keys = [
             key
@@ -169,6 +204,12 @@ def normalize_pipeline_cli_overrides(
         value = normalized.pop(source, None)
         if value is None:
             continue
+        if isinstance(selected_stage_id, int) and selected_stage_id >= 0 and selected_stage_id != stage_id:
+            flag = "--" + source.replace("_", "-")
+            raise ValueError(
+                f"{flag} is not used by stage {selected_stage_id} of pipeline {pipeline.model_type!r}; "
+                f"use it on stage {stage_id}, or set {target} in that stage's deploy YAML or --stage-overrides."
+            )
         stage_key = f"stage_{stage_id}_{target}"
         stage_value = normalized.get(stage_key)
         if stage_value is not None and stage_value != value:
@@ -393,9 +434,19 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
+    # Sampling keys this stage's model_runner: v2 implementation does not
+    # support. Checked against ``default_sampling_params`` at deploy-merge time
+    # and request sampling at the frontend admission boundary. An unsupported
+    # default fails at startup (with the v1 opt-out named), while an unsupported
+    # request fails before it can enter the engine queue. Keys whose
+    # engine-default value is neutral (e.g. repetition_penalty=1.0) pass; any
+    # non-neutral value fails.
+    mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
-    # stages continue to receive the original prompt.
+    # stages continue to receive the original prompt. It also runs on
+    # streaming-input updates unless ``on_streaming_updates`` names another
+    # transform (or none) for them.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -439,6 +490,8 @@ class StagePipelineConfig:
     # Optional model-owned adapter for runner payload metadata that affects
     # scheduling. The scheduler only receives its typed effects.
     scheduling_metadata_adapter: str | None = None
+    # Optional scheduler-side streaming window policy, owned by this stage.
+    scheduler_window_policy: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -492,6 +545,7 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    chat_template: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
 
@@ -610,7 +664,8 @@ class StageDeployConfig:
     # Diffusion parallel_config deploy/runtime override fields.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
-    ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
@@ -619,6 +674,7 @@ class StageDeployConfig:
     vae_parallel_mode: str | None = None
     text_encoder_tp_size: int | None = None
     use_hsdp: bool | None = None
+    hsdp_data_parallel: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
 
@@ -657,6 +713,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
@@ -672,12 +729,14 @@ class StageDeployConfig:
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
     enable_distributed_layerwise_offload: bool | None = None
+    enable_submodule_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
@@ -725,6 +784,7 @@ class DuplexSessionRuntimeConfig:
     max_tool_calls_per_session: int = 4096
     replica_policy: Literal["legacy", "least_sessions"] = "legacy"
     max_sessions_per_replica: int | None = None
+    # Omitted groups join every replica combination across the pipeline stages.
     replica_groups: list[dict[int, int]] | None = None
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
@@ -746,6 +806,9 @@ class DuplexSessionRuntimeConfig:
     history_ms_per_token: float | None = None
     history_calibration_timeout_ms: int = 1000
     history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
+    # Server-only model configuration. Models validate their own options;
+    # client session.update cannot select code or change these limits.
+    model_custom_options: dict[str, object] = field(default_factory=dict)
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -763,6 +826,8 @@ class DuplexSessionRuntimeConfig:
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_custom_options, dict):
+            raise ValueError("duplex_session.model_custom_options must be a mapping")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
@@ -880,7 +945,7 @@ class DeployConfig:
     async_chunk: bool | None = None
     weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
-    model_runner: Literal["v1", "v2"] = "v1"
+    model_runner: Literal["v1", "v2"] = "v2"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
@@ -925,6 +990,23 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
+# These fields need a deploy-config route. They do not have a supported
+# --stage-overrides route. Keep env and default_sampling_params out: env has a
+# runtime owner, and default_sampling_params is valid for generic diffusion.
+NON_STAGE_OVERRIDE_FIELDS = frozenset(
+    {
+        "session_mode",
+        "connectors",
+        "edges",
+        "stages",
+        "platforms",
+        "pipeline",
+        "duplex_session",
+        "input_connectors",
+        "output_connectors",
+    }
+)
+
 # Pipeline-wide DeployConfig fields that are propagated to every stage's
 # engine args during merge. These live at top level of the deploy YAML.
 PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
@@ -940,8 +1022,6 @@ PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "custom_voice_dir",
     "weight_transfer_config",
 )
-
-
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
@@ -1066,7 +1146,9 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Deep-merge two ``platforms:`` blocks per-platform, per-stage_id."""
+    """Deep-merge two ``platforms:`` blocks per-platform, stages by stage_id,
+    connectors by name. An overlay cannot clear a platform's inherited
+    connectors; omitted keys keep the base connector restores."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1075,8 +1157,11 @@ def _merge_platforms(
     for plat in set(base) | set(overlay):
         bp = base.get(plat) or {}
         op = overlay.get(plat) or {}
-        merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
+        merged_plat = {**bp, **{k: v for k, v in op.items() if k not in ("stages", "connectors")}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
+        merged_conns = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if merged_conns is not None:
+            merged_plat["connectors"] = merged_conns
         merged[plat] = merged_plat
     return merged
 
@@ -1135,7 +1220,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
-    model_runner = raw_dict.get("model_runner", "v1")
+    model_runner = raw_dict.get("model_runner", "v2")
     if model_runner not in ("v1", "v2"):
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
@@ -1199,6 +1284,63 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 _MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
+# Engine-default (neutral) values for sampling params a v2 stage may list as
+# unsupported: a default equal to the engine default is a no-op and passes.
+# Unlisted keys have no scalar neutral; an empty value (None, [], {}) passes.
+# logprobs/prompt_logprobs stay unlisted: 0 still requests the sampled
+# token's logprob, and the request path rejects any explicit value.
+_MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "min_tokens": 0,
+    "min_p": 0.0,
+}
+_MRV2_EXPLICIT_SAMPLING_PARAMS = frozenset({"logprobs", "prompt_logprobs"})
+
+
+def get_unsupported_mrv2_sampling_params(
+    params: Mapping[str, Any] | Any,
+    unsupported: Collection[str],
+) -> tuple[str, ...]:
+    """Return unsupported MRV2 sampling keys that are active in *params*.
+
+    The same neutral-value rules apply to deploy defaults and request objects.
+    ``logprobs`` and ``prompt_logprobs`` are presence-sensitive: even zero
+    explicitly requests log-probabilities and therefore cannot be treated as a
+    neutral value.
+    """
+    bad: list[str] = []
+    for key in unsupported:
+        value = params.get(key) if isinstance(params, Mapping) else getattr(params, key, None)
+        if key in _MRV2_EXPLICIT_SAMPLING_PARAMS:
+            invalid = value is not None
+        elif key in _MRV2_NEUTRAL_SAMPLING_VALUES:
+            invalid = value not in (_MRV2_NEUTRAL_SAMPLING_VALUES[key], None, [], {})
+        else:
+            # Collection-valued options (allowed_token_ids, bad_words, and
+            # logit_bias) are neutral when empty; any populated value is active.
+            invalid = bool(value)
+        if invalid:
+            bad.append(key)
+    return tuple(sorted(set(bad)))
+
+
+def _validate_mrv2_default_sampling_params(
+    ps: StagePipelineConfig, ds: StageDeployConfig | None, stage_runner: str
+) -> None:
+    """Reject non-neutral unsupported ``default_sampling_params`` under v2 at startup."""
+    if stage_runner != "v2" or not ps.mrv2_unsupported_sampling_params:
+        return
+    params = (ds.default_sampling_params if ds is not None else None) or {}
+    bad = get_unsupported_mrv2_sampling_params(params, ps.mrv2_unsupported_sampling_params)
+    if bad:
+        raise ValueError(
+            f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
+            "model_runner: v2 path; remove the unsupported parameters"
+        )
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1210,6 +1352,16 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    platform_connectors = platform_section.get("connectors") if platform_section else None
+    if platform_connectors is not None:
+        if not isinstance(platform_connectors, dict):
+            raise ValueError("platform connectors must be a mapping of connector name to overrides")
+        for conn_name, override in platform_connectors.items():
+            if not deploy.connectors or conn_name not in deploy.connectors:
+                raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
+            if not isinstance(override, dict):
+                raise ValueError(f"platform connectors override for {conn_name!r} must be a mapping")
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_connectors)
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):
@@ -1300,7 +1452,10 @@ def _resolve_execution_mode(
 def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
     """The stage's own ``model_runner`` if set, else the deploy-level one."""
     runner = getattr(stage, "model_runner", None) if stage is not None else None
-    return runner or deploy.model_runner
+    selected = runner or deploy.model_runner
+    if selected != "v2":
+        raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
+    return selected
 
 
 def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
@@ -1317,7 +1472,7 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
     if deploy.session_mode != "turn":
         raise ValueError(
             f"stage {ps.stage_id}: model_runner v2 supports session_mode 'turn' only, got "
-            f"{deploy.session_mode!r}; run this stage with model_runner: v1 for streaming sessions."
+            f"{deploy.session_mode!r}; this stage does not support streaming sessions with Model Runner V2."
         )
 
 
@@ -1415,14 +1570,16 @@ def _build_engine_args(
                 )
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
-    engine_args["use_v2_model_runner"] = stage_runner == "v2"
+    _validate_mrv2_default_sampling_params(ps, ds, stage_runner)
+    # This flag selects the LLM runner; diffusion stages own their runner.
+    engine_args["use_v2_model_runner"] = stage_runner == "v2" and ps.execution_type is not StageExecutionType.DIFFUSION
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if engine_args["use_v2_model_runner"] and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "
-            "MRV2 support for this pipeline has not been validated. Use model_runner=v1 "
-            "unless you are validating a new MRV2 integration.",
+            "MRV2 support for this pipeline has not been validated. "
+            "Validate its V2 hooks before deployment.",
             ps.stage_id,
             ps.model_arch or pipeline.model_arch or pipeline.model_type,
         )
@@ -1434,6 +1591,8 @@ def _build_engine_args(
     if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":
         engine_args["recompute_preemption"] = ps.recompute_preemption
     engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
+    if ps.scheduler_window_policy is not None:
+        engine_args["scheduler_window_policy"] = ps.scheduler_window_policy
     return engine_args
 
 
@@ -1476,6 +1635,8 @@ def _build_extras(
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
     if ps.async_chunk_prewarm_payload_func:
         extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
+    if ps.mrv2_unsupported_sampling_params:
+        extras["mrv2_unsupported_sampling_params"] = tuple(ps.mrv2_unsupported_sampling_params)
     if ps.extras:
         extras.update(ps.extras)
     return extras

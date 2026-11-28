@@ -4,8 +4,8 @@
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
 ~77% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
-text modalities, and server ``--interleave-mm-strings`` + 1fps / 128-frame
-media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
+text modalities, and interleaved multimodal strings with video at 1 fps and
+128 frames on stage 0, also pinned in ``minicpmo_4_5.yaml``).
 
 Seed-TTS WER, speaker similarity (SIM), and UTMOS are gated over
 ``/v1/chat/completions`` (whole-utterance TTS) on the duplex deploy config
@@ -43,12 +43,12 @@ _RESULT_DIR = Path(
     )
 )
 
-# The 0.78 gate (934/1197) sits 1 item above the observed NPU mean
-# (~933/1197) and inside the observed 932~940 spread, so it flips nightly -
-# 3 failures in the latest 7 dated NPU nightlies (#6887). 0.77 (922/1197)
-# sits 10 items below the observed minimum (932) while still failing a
-# >=1pp real accuracy regression.
-_MIN_DAILY_OMNI_ACCURACY = 0.77
+# The deterministic 599-row sample scored 455/599 (0.7596) on MI300 in AMD
+# NIGHTLY #17796, with all requests and gold answers present. A 0.75 floor
+# requires at least 450 correct answers and fails at 449, preserving the
+# approximately 1 percentage-point regression guard used by the full dataset.
+_MIN_DAILY_OMNI_ACCURACY = 0.75
+_DAILY_OMNI_NUM_PROMPTS = 599  # ceil(1197 / 2); the shared runner uses deterministic seed 0.
 _MAX_SEED_TTS_MEAN_WER = 0.05
 # English Seed-TTS, 1088 utterances. 2026-10-08 mean SIM 0.865 (median 0.869),
 # WER 0.021. 2026-10-20 L20X stock and bfloat16-cache runs scored SIM 0.8655
@@ -70,15 +70,12 @@ _SEED_EXTRA_BODY = {
         "use_tts_template": True,
     },
 }
-# Server flags required for MiniCPM interleaved image/audio packs (Daily-Omni only).
-# Do not reuse these for Seed-TTS: ``--interleave-mm-strings`` + TTS ref_audio can trip
-# msgspec ValidationError and kill the orchestrator mid-suite.
-# Also pinned in ``minicpmo_4_5.yaml`` stage 0 so they survive config-path routing.
+# Daily-Omni's interleaved image/audio packs are handled by the Thinker.
+# Interleaving TTS ref_audio can raise a msgspec ValidationError in the orchestrator.
 _DAILY_OMNI_SERVER_ARGS = [
     "--trust-remote-code",
-    "--interleave-mm-strings",
-    "--media-io-kwargs",
-    '{"video":{"fps":1,"num_frames":128}}',
+    "--stage-overrides",
+    '{"0":{"interleave_mm_strings":true,"media_io_kwargs":{"video":{"fps":1,"num_frames":128}}}}',
 ]
 _SEED_TTS_SERVER_ARGS = [
     "--trust-remote-code",
@@ -144,6 +141,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
         omni_server,
         skip_seed=True,
         skip_daily=False,
+        num_prompts=_DAILY_OMNI_NUM_PROMPTS,
     )
     argv.extend(
         [
@@ -159,6 +157,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
             "all",
             "--daily-omni-pack-mode",
             "minicpm-interleave",
+            "--daily-omni-save-eval-items",
             "--daily-extra-body-json",
             json.dumps(_DAILY_EXTRA_BODY, separators=(",", ":")),
             "--trust-remote-code",

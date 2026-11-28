@@ -21,6 +21,7 @@ class Conversation:
     def __init__(self, keep_media_user_turns: int | None = None) -> None:
         self.session = DuplexEngineSession(session_id="qwen-view", config=DuplexSessionConfig(model="qwen"))
         self.plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+        self.plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
         self.state = self.plugin.create_session_state()
         self.policy = (
             None
@@ -83,6 +84,7 @@ CAMERA_SESSION_PROMPT = [
 
 def test_qwen3_policy_follows_knob():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     knob = DuplexSessionRuntimeConfig(context_keep_media_turns=2)
 
     assert plugin.context_view_policy(stage_id=0, runtime_config=DuplexSessionRuntimeConfig()) is None

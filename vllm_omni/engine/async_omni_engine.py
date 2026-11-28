@@ -20,6 +20,7 @@ from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
+from vllm_omni.config.stage_config import STREAMING_UPDATE_TRANSFORM_ATTR, get_unsupported_mrv2_sampling_params
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
@@ -35,6 +36,7 @@ from vllm_omni.engine.messages import (
     InteractionMessage,
     NextStageInputMessage,
     StageSubmissionMessage,
+    TextInputUpdate,
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
@@ -54,6 +56,27 @@ class AsyncOmniEngine(OmniEngineBase):
     # ---- request helpers ----
 
     _DEFAULT_MM_HASHER_ALGORITHM = "blake3"
+
+    def _validate_stage0_sampling_params(
+        self,
+        request_id: str,
+        params: OmniSamplingParams,
+        *,
+        entry_stage_id: int,
+    ) -> None:
+        """Reject active MRV2-incompatible sampling before queue admission."""
+        if entry_stage_id != 0 or not getattr(self, "stage_metadata", None):
+            return
+        unsupported = tuple(getattr(self.stage_metadata[0], "mrv2_unsupported_sampling_params", ()))
+        if not unsupported:
+            return
+        bad = get_unsupported_mrv2_sampling_params(params, unsupported)
+        if bad:
+            raise ValueError(
+                "model_runner: v2 supports temperature/top-k/top-p/seed sampling only; "
+                f"request {request_id} set unsupported sampling parameter(s): {', '.join(bad)}. "
+                "Remove the unsupported parameters"
+            )
 
     def _resolve_mm_hasher_algorithm(self) -> str:
         """Return the MM hash algorithm configured for stage 0.
@@ -265,6 +288,7 @@ class AsyncOmniEngine(OmniEngineBase):
             effective_sampling_params_list = disable_watermarking(effective_sampling_params_list)
 
         params = effective_sampling_params_list[0]
+        self._validate_stage0_sampling_params(request_id, params, entry_stage_id=entry_stage_id)
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
@@ -310,6 +334,10 @@ class AsyncOmniEngine(OmniEngineBase):
                     inject_global_id(item, request_id)
 
             prompt_transform_func = getattr(self, "prompt_transform_func", None)
+            if message_type == "streaming_update":
+                prompt_transform_func = getattr(
+                    prompt_transform_func, STREAMING_UPDATE_TRANSFORM_ATTR, prompt_transform_func
+                )
             if prompt_transform_func is not None:
                 prompt = prompt_transform_func(
                     copy.copy(prompt),
@@ -656,7 +684,13 @@ class AsyncOmniEngine(OmniEngineBase):
             # because a model whose guidance is mandatory cannot decode a request
             # whose companion never arrived.
             companions: list[AddCompanionRequestMessage] = []
-            if self.prompt_expand_func is not None and final_stage_id > 0:
+            # A prompt that declares a cfg_group is paired by the atomic CFG
+            # scheduler, which admits it only with its companion, whatever stage
+            # the request ends at; without one it would wait forever.
+            declares_cfg_group = isinstance(prompt, dict) and "cfg_group" in (
+                prompt.get("additional_information") or {}
+            )
+            if self.prompt_expand_func is not None and (final_stage_id > 0 or declares_cfg_group):
                 effective_spl = msg.sampling_params_list
                 stage0_params = effective_spl[0] if effective_spl else None
                 if stage0_params is not None:
@@ -940,7 +974,7 @@ class AsyncOmniEngine(OmniEngineBase):
 
     async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
         """Send a next stage input returned by an earlier request to the Orchestrator."""
-        self.request_queue.sync_q.put(msg)
+        await self._put_request_queue(msg)
 
     def add_streaming_update(
         self,
@@ -1008,6 +1042,14 @@ class AsyncOmniEngine(OmniEngineBase):
             message_type="streaming_update",
         )
         await self._put_request_queue(msg)
+
+    async def append_text_async(self, request_id: str, token_ids: list[int], *, final: bool = False) -> None:
+        """Enqueue committed body tokens in submission order.
+
+        Returning means queued, not acknowledged by the scheduler. Each call
+        appends new text; callers must not retry a submitted chunk.
+        """
+        await self._put_request_queue(TextInputUpdate(request_id=request_id, token_ids=list(token_ids), final=final))
 
     def submit_interaction(
         self,

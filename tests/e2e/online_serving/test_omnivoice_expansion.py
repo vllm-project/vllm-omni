@@ -254,6 +254,7 @@ class TestOmniVoiceVoiceCloning:
             "ref_audio": REF_AUDIO_URL,
             "ref_text": REF_TEXT,
             "response_format": "wav",
+            "seed": _OMNIVOICE_REF_AUDIO_SEED,
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
             "transcript_escalation_model": "large-v3",
@@ -406,6 +407,7 @@ def test_voice_request_before_and_after_clone_registration(omni_server, online_c
         "model": omni_server.model,
         "input": get_prompt("text"),
         "voice": _DEFAULT_VOICE_NAME,
+        "seed": _OMNIVOICE_REF_AUDIO_SEED,
         "transcript_escalation_model": "large-v3",
     }
 
@@ -447,6 +449,7 @@ def test_registered_default_voice_overrides_placeholder(omni_server, online_clie
         "model": omni_server.model,
         "input": get_prompt("text"),
         "voice": _DEFAULT_VOICE_NAME,
+        "seed": _OMNIVOICE_REF_AUDIO_SEED,
         "transcript_escalation_model": "large-v3",
     }
 

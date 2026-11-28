@@ -19,6 +19,7 @@ from tests.diffusion.lora.helpers import (
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import build_lora_batch_key
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -292,7 +293,7 @@ def test_moe_adapter_fails_before_dense_layers_are_wrapped_without_token_capacit
     )()
     with pytest.raises(
         RuntimeError,
-        match="request-time MoE adapters cannot use the native MXFP4 path",
+        match="request-time MoE adapters cannot use the native path",
     ):
         manager._replace_layers_with_lora(peft_helper)
 
@@ -371,7 +372,7 @@ def test_rejected_moe_adapter_preserves_cache_active_adapter_and_rank(monkeypatc
     for _ in range(2):
         with pytest.raises(
             RuntimeError,
-            match="request-time MoE adapters cannot use the native MXFP4 path",
+            match="request-time MoE adapters cannot use the native path",
         ):
             manager.set_active_adapter(moe_request, lora_scale=1.0)
         assert _state() == state_before_rejection
@@ -491,7 +492,8 @@ def test_moe_lora_context_is_skipped_without_token_capacity(monkeypatch):
     assert calls == []
 
 
-def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
+@pytest.mark.parametrize("defer_moe_wrap", [False, True])
+def test_moe_runners_are_wrapped_at_init_unless_pipeline_defers(monkeypatch, defer_moe_wrap):
     import vllm.model_executor.layers.fused_moe as upstream_moe
 
     import vllm_omni.lora.manager as manager_mod
@@ -519,6 +521,7 @@ def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
     pipeline = torch.nn.Module()
     pipeline.transformer = torch.nn.Module()
     pipeline.transformer.experts = _TargetMoERunner()
+    pipeline.diffusion_lora_defer_moe_wrap = defer_moe_wrap
     manager = DiffusionLoRAManager(
         pipeline=pipeline,
         device=torch.device("cpu"),
@@ -526,8 +529,8 @@ def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
         max_num_batched_tokens=8,
     )
 
-    assert "transformer.experts" in manager._lora_modules
-    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+    assert ("transformer.experts" in manager._lora_modules) is not defer_moe_wrap
+    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA) is not defer_moe_wrap
 
 
 def test_publish_moe_lora_context_uses_no_lora_mapping_until_adapter_is_active(monkeypatch):
@@ -1730,6 +1733,7 @@ def test_rank_growth_invalidates_moe_punica_before_republish(monkeypatch):
     # The rank bump clears the punica cache before the first republish, and
     # the reactivation publishes again once the adapter state is committed.
     assert published_cache_values[0] is None
+    assert isinstance(manager._moe_punica_wrapper, SimpleNamespace)
     assert manager._moe_punica_wrapper.max_lora_rank == 128
 
 
@@ -1743,9 +1747,9 @@ def test_scale_keys_are_rounded():
         dtype=torch.bfloat16,
     )
     adapter_id = 1
-    # Currently we round keys to 3 decimal places
-    manager._update_adapter_scale(adapter_id, 0.0031)
-    assert manager._adapter_scales[adapter_id] == 0.003
+    # Scales are quantized to the canonical 4 decimal places (round_lora_scale).
+    manager._update_adapter_scale(adapter_id, 0.00316)
+    assert manager._adapter_scales[adapter_id] == 0.0032
 
 
 def test_lora_manager_uses_valid_max_rank(monkeypatch):
@@ -1793,6 +1797,8 @@ def test_lora_manager_max_rank_validation(monkeypatch, rank):
     req1 = _dummy_lora_request(1)
     with pytest.raises(ValueError):
         manager.add_adapter(req1)
+    # A rejected adapter must not stay cached: a retry would skip loading and fail while binding.
+    assert req1.lora_int_id not in manager._registered_adapters
 
 
 def test_lora_manager_discovers_bagel_component(monkeypatch):
@@ -2124,3 +2130,593 @@ def test_hunyuan_image3_real_qkv_hook_head_dimension(head_dim_key):
     expected_rows = [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
     torch.testing.assert_close(pipeline._deinterleave_fused_qkv_lora_b(b), b[expected_rows])
     assert pipeline._deinterleave_fused_qkv_lora_b(b[:-1]) is None
+
+
+def _make_lora_model(adapter_id: int, modules: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> LoRAModel:
+    """Build a LoRAModel with optimized (scaling-folded) per-module weights."""
+    loras = {}
+    for name, (lora_a, lora_b) in modules.items():
+        rank = lora_a.shape[0]
+        assert lora_b.shape[1] == rank
+        loras[name] = LoRALayerWeights(
+            module_name=name,
+            rank=rank,
+            lora_alpha=rank,
+            lora_a=lora_a,
+            lora_b=lora_b,
+        ).optimize()
+    rank = max((lora.rank for lora in loras.values()), default=1)
+    return LoRAModel(lora_model_id=adapter_id, rank=rank, loras=loras)
+
+
+def _make_unoptimized_lora_model(
+    adapter_id: int, modules: dict[str, tuple[int, torch.Tensor, torch.Tensor]]
+) -> LoRAModel:
+    """Build a LoRAModel without optimize(): per-module scaling (lora_alpha /
+    rank) stays unfolded, as in the epilogue-scaled load path."""
+    loras = {}
+    for name, (lora_alpha, lora_a, lora_b) in modules.items():
+        loras[name] = LoRALayerWeights(
+            module_name=name,
+            rank=lora_a.shape[0],
+            lora_alpha=lora_alpha,
+            lora_a=lora_a,
+            lora_b=lora_b,
+        )
+    rank = max((lora.rank for lora in loras.values()), default=1)
+    return LoRAModel(lora_model_id=adapter_id, rank=rank, loras=loras)
+
+
+def test_compose_lora_models_concatenates_rank_dim():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    a1 = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+    b1 = torch.arange(12, dtype=torch.float32).reshape(6, 2) / 12
+    a2 = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 12
+    b2 = torch.arange(18, dtype=torch.float32).reshape(6, 3) / 18
+    model1 = _make_lora_model(1, {"transformer.to_q": (a1, b1)})
+    model2 = _make_lora_model(2, {"transformer.to_q": (a2, b2)})
+
+    composed, peft_helper = manager._compose_lora_models(99, [(model1, 0.5), (model2, 2.0)])
+
+    assert composed.id == 99
+    assert composed.rank == 5
+    assert peft_helper.r == 5
+    assert peft_helper.target_modules == ["to_q"]
+    composed_lora = composed.loras["transformer.to_q"]
+    assert composed_lora.rank == 5
+    assert composed_lora.scaling == 1.0
+    torch.testing.assert_close(composed_lora.lora_a, torch.cat([a1, a2], dim=0))
+    torch.testing.assert_close(composed_lora.lora_b, torch.cat([b1 * 0.5, b2 * 2.0], dim=1))
+
+    # The composed delta must equal the manual per-adapter sum.
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+    expected = 0.5 * (x @ a1.t()) @ b1.t() + 2.0 * (x @ a2.t()) @ b2.t()
+    actual = (x @ composed_lora.lora_a.t()) @ composed_lora.lora_b.t()
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compose_lora_models_folds_unoptimized_source_scaling():
+    """Epilogue-scaled pipelines skip optimize(), so sources keep scaling != 1;
+    composition must fold each source's scaling * request-scale into B."""
+    pipeline = torch.nn.Module()
+    pipeline.diffusion_lora_scale_in_epilogue = True
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    a1 = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+    b1 = torch.arange(12, dtype=torch.float32).reshape(6, 2) / 12
+    a2 = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 12
+    b2 = torch.arange(18, dtype=torch.float32).reshape(6, 3) / 18
+    model1 = _make_unoptimized_lora_model(1, {"transformer.to_q": (8, a1, b1)})
+    model2 = _make_unoptimized_lora_model(2, {"transformer.to_q": (6, a2, b2)})
+    assert model1.loras["transformer.to_q"].scaling == 4.0
+    assert model2.loras["transformer.to_q"].scaling == 2.0
+
+    composed, _ = manager._compose_lora_models(99, [(model1, 0.5), (model2, 2.0)])
+
+    composed_lora = composed.loras["transformer.to_q"]
+    assert composed_lora.scaling == 1.0
+    torch.testing.assert_close(composed_lora.lora_a, torch.cat([a1, a2], dim=0))
+    torch.testing.assert_close(composed_lora.lora_b, torch.cat([b1 * (4.0 * 0.5), b2 * (2.0 * 2.0)], dim=1))
+
+    # The composed delta must equal the per-adapter scaling-weighted sum.
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+    expected = 4.0 * 0.5 * (x @ a1.t()) @ b1.t() + 2.0 * 2.0 * (x @ a2.t()) @ b2.t()
+    actual = (x @ composed_lora.lora_a.t()) @ composed_lora.lora_b.t()
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compose_lora_models_partial_coverage():
+    """A module covered by only one adapter takes just its contribution."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    a1 = torch.ones(2, 4)
+    b1 = torch.ones(6, 2)
+    a2 = torch.ones(3, 4) * 2
+    b2 = torch.ones(6, 3) * 3
+    a3 = torch.ones(4, 5) * 4
+    b3 = torch.ones(7, 4) * 5
+    model1 = _make_lora_model(1, {"transformer.to_q": (a1, b1), "transformer.to_k": (a3, b3)})
+    model2 = _make_lora_model(2, {"transformer.to_q": (a2, b2)})
+
+    composed, peft_helper = manager._compose_lora_models(100, [(model1, 0.5), (model2, 1.0)])
+
+    assert set(composed.loras) == {"transformer.to_q", "transformer.to_k"}
+    torch.testing.assert_close(composed.loras["transformer.to_q"].lora_b, torch.cat([b1 * 0.5, b2], dim=1))
+    # to_k is only covered by model1: keep its rank and scaled B unchanged.
+    assert composed.loras["transformer.to_k"].rank == 4
+    torch.testing.assert_close(composed.loras["transformer.to_k"].lora_a, a3)
+    torch.testing.assert_close(composed.loras["transformer.to_k"].lora_b, b3 * 0.5)
+    assert peft_helper.r == 5
+    assert composed.rank == 5
+
+
+def test_compose_lora_models_rejects_rank_sum_over_limit():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    max_rank = DiffusionLoRAManager._VALID_MAX_RANKS[-1]
+    big_a = torch.ones(max_rank, 2)
+    big_b = torch.ones(2, max_rank)
+    model1 = _make_lora_model(1, {"transformer.to_q": (big_a, big_b)})
+    model2 = _make_lora_model(2, {"transformer.to_q": (torch.ones(1, 2), torch.ones(2, 1))})
+
+    with pytest.raises(ValueError, match="exceeding the maximum supported rank"):
+        manager._compose_lora_models(101, [(model1, 1.0), (model2, 1.0)])
+
+
+def test_compose_lora_models_rejects_mixed_packed_and_fused_layouts():
+    from vllm.lora.lora_weights import PackedLoRALayerWeights
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    packed = PackedLoRALayerWeights(
+        module_name="transformer.to_qkv",
+        rank=2,
+        lora_alphas=[2, 2],
+        lora_a=[torch.ones(2, 4), torch.ones(2, 4)],
+        lora_b=[torch.ones(6, 2), torch.ones(6, 2)],
+        scaling=[1.0, 1.0],
+    )
+    model1 = LoRAModel(lora_model_id=1, rank=2, loras={"transformer.to_qkv": packed})
+    model2 = _make_lora_model(2, {"transformer.to_qkv": (torch.ones(2, 4), torch.ones(6, 2))})
+
+    with pytest.raises(ValueError, match="packed and fused"):
+        manager._compose_lora_models(102, [(model1, 1.0), (model2, 1.0)])
+
+
+def test_compose_lora_models_rejects_empty_coverage():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    empty1 = LoRAModel(lora_model_id=1, rank=2, loras={})
+    empty2 = LoRAModel(lora_model_id=2, rank=2, loras={})
+
+    with pytest.raises(ValueError, match="none of the adapters cover any module"):
+        manager._compose_lora_models(103, [(empty1, 1.0), (empty2, 1.0)])
+
+
+def _composed_harness(monkeypatch, max_cached_adapters: int = 4):
+    """Manager with stubbed load/replace/activate plus two source adapters."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=max_cached_adapters,
+    )
+    models = {
+        1: _make_lora_model(1, {"transformer.foo": (torch.ones(2, 4), torch.ones(4, 2))}),
+        2: _make_lora_model(2, {"transformer.foo": (torch.ones(3, 4) * 2, torch.ones(4, 3) * 3)}),
+    }
+    load_calls: list[int] = []
+
+    def _fake_load(req: LoRARequest):
+        load_calls.append(req.lora_int_id)
+        return models[req.lora_int_id], type("PH", (), {"r": models[req.lora_int_id].rank})()
+
+    activations: list[tuple[int, float]] = []
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
+    monkeypatch.setattr(manager, "_activate_adapter", lambda aid, scale: activations.append((aid, scale)))
+    return manager, models, load_calls, activations
+
+
+def test_set_active_adapters_composes_and_caches(monkeypatch):
+    manager, models, load_calls, activations = _composed_harness(monkeypatch)
+    req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
+    validate = Mock()
+    manager.pipeline._validate_diffusion_lora_composition = validate
+
+    manager.set_active_adapters([req1, req2], [0.5, 2.0])
+
+    assert sorted(load_calls) == [1, 2]
+    assert [call.kwargs["lora_model"].id for call in validate.call_args_list] == [1, 2]
+    assert len(manager._composed_adapters) == 1
+    composed_id = next(iter(manager._composed_adapters.values()))
+    assert composed_id in manager._registered_adapters
+    assert activations == [(composed_id, 1.0)]
+
+    composed = manager._registered_adapters[composed_id]
+    foo = composed.loras["transformer.foo"]
+    torch.testing.assert_close(
+        foo.lora_a,
+        torch.cat([models[1].loras["transformer.foo"].lora_a, models[2].loras["transformer.foo"].lora_a], dim=0),
+    )
+    torch.testing.assert_close(
+        foo.lora_b,
+        torch.cat(
+            [models[1].loras["transformer.foo"].lora_b * 0.5, models[2].loras["transformer.foo"].lora_b * 2.0],
+            dim=1,
+        ),
+    )
+
+    # Same combo again: composed cache hit, no reload, no re-registration.
+    manager.set_active_adapters([req2, req1], [2.0, 0.5])
+    assert sorted(load_calls) == [1, 2]
+    assert validate.call_count == 2
+    assert len(manager._composed_adapters) == 1
+    assert activations == [(composed_id, 1.0), (composed_id, 1.0)]
+
+    # A different scale combination composes a distinct adapter.
+    manager.set_active_adapters([req1, req2], [0.5, 1.0])
+    assert len(manager._composed_adapters) == 2
+    assert activations[-1][0] != composed_id
+
+
+def test_composition_validates_each_source_before_loading_the_next(monkeypatch):
+    manager, _, load_calls, _ = _composed_harness(monkeypatch)
+
+    def validate(*, lora_model):
+        # A later model-specific load may prune a transient source's metadata.
+        assert load_calls == [lora_model.id]
+        raise ValueError("source cannot be composed")
+
+    manager.pipeline._validate_diffusion_lora_composition = validate
+    compose = Mock()
+    monkeypatch.setattr(manager, "_compose_lora_models", compose)
+    with pytest.raises(ValueError, match="source cannot be composed"):
+        manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(2)])
+    compose.assert_not_called()
+    assert manager._registered_adapters == {}
+    assert manager._composed_adapters == {}
+
+
+@pytest.mark.parametrize("disabled_index", [0, 1])
+def test_zero_scale_source_bypasses_composition_validation(monkeypatch, disabled_index):
+    manager, _, load_calls, _ = _composed_harness(monkeypatch)
+    validate = Mock(side_effect=AssertionError("one active source does not need composition"))
+    manager.pipeline._validate_diffusion_lora_composition = validate
+    activate_single = Mock()
+    monkeypatch.setattr(manager, "set_active_adapter", activate_single)
+    requests = [_dummy_lora_request(1), _dummy_lora_request(2)]
+    scales = [1.0, 1.0]
+    scales[disabled_index] = 0.0
+
+    manager.set_active_adapters(requests, scales)
+
+    validate.assert_not_called()
+    activate_single.assert_called_once_with(requests[1 - disabled_index], 1.0)
+    assert not load_calls
+
+
+def test_set_active_adapters_single_and_empty_fall_back(monkeypatch):
+    manager, models, load_calls, activations = _composed_harness(monkeypatch)
+    deactivate_calls: list[int] = []
+    monkeypatch.setattr(manager, "_deactivate_all_adapters", lambda: deactivate_calls.append(1))
+    manager._active_adapter_id = 1
+
+    # None and single-request inputs delegate to the single-adapter path.
+    manager.set_active_adapters(None)
+    assert deactivate_calls == [1]
+    manager._active_adapter_id = 1
+
+    manager.set_active_adapters(_dummy_lora_request(1), 0.5)
+    assert activations == [(1, 0.5)]
+    assert manager._composed_adapters == {}
+
+    # A single-entry list takes the same path.
+    manager.set_active_adapters([_dummy_lora_request(2)], [0.25])
+    assert activations == [(1, 0.5), (2, 0.25)]
+    assert manager._composed_adapters == {}
+
+    # All-zero scales deactivate instead of composing.
+    manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(2)], [0.0, 0.0])
+    assert deactivate_calls == [1, 1]
+    assert manager._composed_adapters == {}
+    assert sorted(load_calls) == [1, 2]
+
+
+def test_set_active_adapters_composed_eviction_with_transient_sources(monkeypatch):
+    """Stacking loads missing sources transiently (never registered), so it
+    works with the default cache capacity of 1; composed adapters still share
+    the adapter LRU and evict each other, purging their composed-cache keys."""
+    manager, _, load_calls, activations = _composed_harness(monkeypatch, max_cached_adapters=1)
+    req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
+
+    manager.set_active_adapters([req1, req2], [1.0, 1.0])
+    first_composed_id = activations[-1][0]
+    assert manager.list_adapters() == [first_composed_id], "sources must not occupy the adapter cache"
+    assert len(manager._composed_adapters) == 1
+
+    # A new combo with a single slot: registering it evicts the LRU entry,
+    # which is the first composed adapter; its composed-cache key is purged.
+    manager.set_active_adapters([req1, req2], [0.5, 1.0])
+    second_composed_id = activations[-1][0]
+    assert second_composed_id != first_composed_id
+    assert manager.list_adapters() == [second_composed_id]
+    assert all(cid != first_composed_id for cid in manager._composed_adapters.values())
+    # Sources were reloaded transiently for the second composition.
+    assert sorted(load_calls) == [1, 1, 2, 2]
+
+    # Removing a composed adapter also drops its composed-cache key.
+    manager.remove_adapter(second_composed_id)
+    assert second_composed_id not in manager._registered_adapters
+    assert manager._composed_adapters == {}
+
+
+def test_remove_source_adapter_purges_dependent_composed(monkeypatch):
+    """Removing a source adapter must purge every composed cache entry that
+    references it (and the composed adapter itself), so re-registering the
+    source id with new weights cannot resurrect the stale composition."""
+    manager, models, load_calls, activations = _composed_harness(monkeypatch)
+    req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
+
+    manager.set_active_adapter(req1, 1.0)
+    manager.set_active_adapters([req1, req2], [1.0, 1.0])
+    composed_id = activations[-1][0]
+    assert len(manager._composed_adapters) == 1
+    assert composed_id in manager._registered_adapters
+
+    manager.remove_adapter(1)
+    assert 1 not in manager._registered_adapters
+    assert manager._composed_adapters == {}
+    assert composed_id not in manager._registered_adapters
+
+    # Re-registering the same source id with new weights must compose fresh.
+    models[1] = _make_lora_model(1, {"transformer.foo": (torch.ones(2, 4), torch.full((4, 2), 7.0))})
+    load_calls.clear()
+    manager.set_active_adapters([req1, req2], [1.0, 1.0])
+    assert sorted(load_calls) == [1, 2], "a stale composed-cache hit would skip the reload"
+    new_composed_id = activations[-1][0]
+    assert new_composed_id == composed_id, "the same stack key keeps its stable id"
+    new_composed = manager._registered_adapters[new_composed_id]
+    torch.testing.assert_close(
+        new_composed.loras["transformer.foo"].lora_b,
+        torch.cat([torch.full((4, 2), 7.0), models[2].loras["transformer.foo"].lora_b], dim=1),
+    )
+
+
+def test_set_active_adapters_rejects_duplicate_adapter_ids(monkeypatch):
+    manager, _, load_calls, _ = _composed_harness(monkeypatch)
+
+    with pytest.raises(ValueError, match="Duplicate LoRA adapter in stack"):
+        manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(1)], [0.5, 1.0])
+    assert load_calls == []
+
+    # Duplicates are rejected regardless of scale, matching parse_lora_requests
+    # at the API layer; a zero-scale entry does not excuse a repeated id.
+    with pytest.raises(ValueError, match="Duplicate LoRA adapter in stack"):
+        manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(1)], [0.0, 1.0])
+    assert load_calls == []
+
+
+def test_stacked_scale_keys_match_scheduler_batch_key():
+    """Regression: the manager's composed-adapter key and the scheduler/KV
+    batch key must quantize scales identically; otherwise requests scheduled
+    into separate batches could share an adapter composed at another scale."""
+    req_a, req_b = _dummy_lora_request(1), _dummy_lora_request(2)
+    scale_sets = ([0.5001, 0.7], [0.5004, 0.7], [0.12345, 0.67895], [1.0, 1.0])
+    keys = []
+    for scales in scale_sets:
+        batch_key = build_lora_batch_key([req_a, req_b], scales)
+        manager_key = tuple(
+            sorted(
+                (req.lora_int_id, DiffusionLoRAManager._get_rounded_scale(s)) for req, s in zip([req_a, req_b], scales)
+            )
+        )
+        assert batch_key == manager_key
+        keys.append(batch_key)
+    # The first three combos must stay distinct (they differ at/below the
+    # canonical quantization step), so each gets its own composed adapter.
+    assert len(set(keys)) == len(scale_sets)
+
+
+@pytest.mark.parametrize("scales", [(0.65, 1.0), (0.0, 1.0), (-0.5, 0.7)])
+def test_compose_h3_packed_and_separate_projections(scales):
+    from vllm.lora.lora_weights import PackedLoRALayerWeights
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.float32, max_cached_adapters=3
+    )
+    manager._packed_modules_mapping = {"qkv_proj": ["to_q", "to_k", "to_v"]}
+    generator = torch.Generator().manual_seed(42)
+    packed_weights = {}
+    separate_weights = {}
+    expected = {}
+    for module, slices in (("attn.qkv_proj", 3), ("mlp.fc1", 2)):
+        name = f"transformer.blocks.0.{module}"
+        a = [torch.randn(2, 4, generator=generator) for _ in range(slices)]
+        b = [torch.randn(6, 2, generator=generator) for _ in range(slices)]
+        packed_weights[name] = PackedLoRALayerWeights(
+            module_name=name, rank=2, lora_alphas=[2] * slices, lora_a=a, lora_b=b, scaling=[1.0] * slices
+        )
+        a2 = [torch.randn(3, 4, generator=generator) for _ in range(slices)]
+        b2 = [torch.randn(6, 3, generator=generator) for _ in range(slices)]
+        if module == "attn.qkv_proj":
+            for index, suffix in enumerate(("to_q", "to_k", "to_v")):
+                sub_name = f"transformer.blocks.0.attn.{suffix}"
+                separate_weights[sub_name] = LoRALayerWeights(
+                    sub_name, 3, 3, lora_a=a2[index], lora_b=b2[index], scaling=1.0
+                )
+                expected[sub_name] = scales[0] * b[index] @ a[index] + scales[1] * b2[index] @ a2[index]
+        else:
+            separate_weights[name] = PackedLoRALayerWeights(name, 3, [3] * slices, a2, b2, scaling=[1.0] * slices)
+            expected[name] = [scales[0] * b[i] @ a[i] + scales[1] * b2[i] @ a2[i] for i in range(slices)]
+    first = LoRAModel(lora_model_id=1, rank=2, loras=packed_weights)
+    second = LoRAModel(lora_model_id=2, rank=3, loras=separate_weights)
+    composed, _ = manager._compose_lora_models(101, [(first, scales[0]), (second, scales[1])])
+    for name, delta in expected.items():
+        weights = composed.loras[name]
+        if isinstance(delta, list):
+            for slice_a, slice_b, target in zip(weights.lora_a, weights.lora_b, delta):
+                torch.testing.assert_close(slice_b @ slice_a, target)
+        else:
+            assert isinstance(weights.lora_a, torch.Tensor)
+            assert isinstance(weights.lora_b, torch.Tensor)
+            torch.testing.assert_close(weights.lora_b @ weights.lora_a, delta)
+    assert set(first.loras) == set(packed_weights)
+    assert first.loras["transformer.blocks.0.attn.qkv_proj"] is packed_weights["transformer.blocks.0.attn.qkv_proj"]
+
+
+@pytest.mark.parametrize(("rank", "buffer_rank"), [(513, 768), (768, 768), (769, 1024), (1024, 1024)])
+def test_lora_manager_holds_ranks_above_the_vllm_literal(monkeypatch, rank, buffer_rank):
+    """A fused few-step adapter concatenates its sources; its rank only sizes the buffers."""
+    manager = DiffusionLoRAManager(pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.bfloat16)
+
+    def _fake_load(_req: LoRARequest):
+        return type("LM", (), {"id": _req.lora_int_id})(), type("PH", (), {"r": rank})()
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    manager.add_adapter(_dummy_lora_request(1))
+    assert manager._max_lora_rank == buffer_rank
+    config = manager._buffer_lora_config()
+    assert (config.max_lora_rank, config.max_loras) == (buffer_rank, 1)
+    # Ranks vLLM names are passed through unchanged.
+    assert manager._lora_config(64, lora_dtype=torch.bfloat16).max_lora_rank == 64
+
+
+def test_failed_buffer_growth_restores_the_previous_rank():
+    """A growth that fails partway must not leave layers at two ranks or the manager at the new one."""
+
+    class _Layer:
+        def __init__(self, fail_above: int | None = None):
+            self.rank, self.fail_above = 64, fail_above
+
+        def create_lora_weights(self, max_loras, lora_config, model_config=None):
+            if self.fail_above is not None and lora_config.max_lora_rank > self.fail_above:
+                raise torch.OutOfMemoryError("buffer allocation failed")
+            self.rank = lora_config.max_lora_rank
+
+    manager = DiffusionLoRAManager(pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.bfloat16)
+    manager._max_lora_rank = 64
+    first, second = _Layer(), _Layer(fail_above=64)
+    manager._lora_modules = {"transformer.a": first, "transformer.b": second}
+    manager._active_adapter_id = 7
+
+    with pytest.raises(torch.OutOfMemoryError):
+        manager._ensure_max_lora_rank(768)
+    assert manager._max_lora_rank == 64
+    assert (first.rank, second.rank) == (64, 64)
+    # The buffers were reset, so nothing is uploaded any more.
+    assert manager._active_adapter_id is None
+
+    second.fail_above = None
+    manager._ensure_max_lora_rank(768)
+    assert (manager._max_lora_rank, first.rank, second.rank) == (768, 768, 768)
+
+
+def _install_harness(monkeypatch, layer_names: tuple[str, ...], fail_layer: str | None, fail_above: int = 64):
+    """A real ``_replace_layers_with_lora`` over fake layers; wrapping ``fail_layer`` above a rank runs out of memory."""
+    import vllm_omni.lora.manager as manager_mod
+
+    class _Wrapper(DummyBaseLayerWithLoRA):
+        def __init__(self, base_layer, rank):
+            super().__init__(base_layer)
+            self.rank = rank
+
+        def create_lora_weights(self, max_loras, lora_config, model_config=None):
+            self.rank = lora_config.max_lora_rank
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    layers = {name: _FakeLinearBase() for name in layer_names}
+    for name, layer in layers.items():
+        setattr(pipeline.transformer, name, layer)
+    state = {"fail_layer": fail_layer}
+
+    def _from_layer(*, layer, lora_config, **_kwargs):
+        if not isinstance(layer, _FakeLinearBase):
+            return layer
+        failing = state["fail_layer"]
+        if failing is not None and layer is layers[failing] and lora_config.max_lora_rank > fail_above:
+            raise torch.OutOfMemoryError("buffer allocation failed")
+        return _Wrapper(layer, lora_config.max_lora_rank)
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(manager_mod, "from_layer", _from_layer)
+    manager = DiffusionLoRAManager(pipeline=pipeline, device=torch.device("cpu"), dtype=torch.bfloat16)
+    return manager, pipeline, layers, state
+
+
+def test_failed_first_installation_removes_its_wrappers_and_rank(monkeypatch):
+    """A fresh worker whose first adapter runs out of memory partway is left as it started."""
+    manager, pipeline, layers, state = _install_harness(monkeypatch, ("a", "b", "c"), fail_layer="b")
+    monkeypatch.setattr(
+        manager,
+        "_load_adapter",
+        lambda request: (
+            type("LM", (), {"id": request.lora_int_id})(),
+            type("PH", (), {"r": 768 if request.lora_int_id == 1 else 16})(),
+        ),
+    )
+
+    with pytest.raises(torch.OutOfMemoryError):
+        manager.add_adapter(_dummy_lora_request(1))
+    assert manager._max_lora_rank == 0
+    assert manager._lora_modules == {}
+    assert manager.list_adapters() == []
+    # "a" was wrapped before "b" failed; its base layer is back in the module tree.
+    assert {name: getattr(pipeline.transformer, name) for name in layers} == layers
+
+    # The next adapter sizes every layer for its own rank, not for the one that failed.
+    manager.add_adapter(_dummy_lora_request(2))
+    assert manager._max_lora_rank == 16
+    assert {name: layer.rank for name, layer in manager._lora_modules.items()} == {
+        "transformer.a": 16,
+        "transformer.b": 16,
+        "transformer.c": 16,
+    }
+
+
+def test_failed_installation_keeps_earlier_wrappers_at_their_rank(monkeypatch):
+    """Growing for an adapter that targets a new layer: a failed wrap undoes the growth and the new wrappers only."""
+    manager, pipeline, layers, state = _install_harness(monkeypatch, ("a", "b"), fail_layer=None)
+    manager._replace_layers_with_lora(type("PH", (), {"r": 64, "target_modules": ["a"]})())
+    wrapped_a = manager._lora_modules["transformer.a"]
+    assert (manager._max_lora_rank, wrapped_a.rank, list(manager._lora_modules)) == (64, 64, ["transformer.a"])
+    manager._active_adapter_id = 7
+    manager._adapter_scales[7] = 1.0
+    monkeypatch.setattr(manager, "_activate_adapter", lambda adapter_id, scale: None)
+
+    state["fail_layer"] = "b"
+    with pytest.raises(torch.OutOfMemoryError):
+        manager._replace_layers_with_lora(type("PH", (), {"r": 768, "target_modules": ["a", "b"]})())
+    assert manager._max_lora_rank == 64
+    assert manager._lora_modules == {"transformer.a": wrapped_a}
+    assert wrapped_a.rank == 64
+    assert pipeline.transformer.a is wrapped_a
+    assert pipeline.transformer.b is layers["b"]
+    # The buffers were rebuilt at the previous rank, so nothing is uploaded any more.
+    assert manager._active_adapter_id is None

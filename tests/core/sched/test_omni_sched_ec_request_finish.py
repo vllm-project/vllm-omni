@@ -41,6 +41,7 @@ def _make_free_request_sched(*, ec_connector) -> tuple[OmniARScheduler, MagicMoc
     firing relative to the encoder-cache free."""
     order = MagicMock()
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._model_input_streams = {}
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
     sched.ec_connector = ec_connector
@@ -165,7 +166,8 @@ def _finish_frame_parts(request: Request):
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {request.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [request.request_id]
     model_runner_output.routed_experts = None
     return scheduler_output, model_runner_output
 

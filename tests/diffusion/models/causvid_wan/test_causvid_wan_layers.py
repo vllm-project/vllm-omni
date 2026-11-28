@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import ComputeBatch, MemberRef
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellRunSpec,
@@ -44,6 +46,115 @@ def _bare_pipeline(*, step_replicas: int = 1, history: int = 1, layer_groups: in
     return pipeline
 
 
+class _GroupTransformer:
+    """Layer-group stand-in: emits tokens and zeroes the latent on unembed."""
+
+    def __init__(self, *, is_layer_group_first: bool, is_layer_group_last: bool) -> None:
+        self.is_layer_group_first = is_layer_group_first
+        self.is_layer_group_last = is_layer_group_last
+        self.start_layer = 0
+        self.end_layer = 1
+        self.dim = 8
+
+    def prepare_cell(self, *_a, **_k) -> None:
+        return None
+
+    def seq_len_for_latent(self, _shape) -> int:
+        return 3
+
+    def embed(self, latent):
+        return torch.ones(latent.shape[0], 3, 8, device=latent.device, dtype=latent.dtype)
+
+    def block(self, _index, tokens, **_kw):
+        return tokens
+
+    def unembed(self, _tokens, *, latent, **_kw):
+        return torch.zeros_like(latent)
+
+
+class _CancelJob:
+    """Stream job whose ``cancel`` records the request it belonged to."""
+
+    def __init__(self, rid: str, cancelled: list[str]) -> None:
+        self.rid = rid
+        self.cancelled = cancelled
+
+    def cancel(self) -> None:
+        self.cancelled.append(self.rid)
+
+
+def _warp(sigma: torch.Tensor, *, shift: float) -> torch.Tensor:
+    """Diffusers' shifted schedule warp."""
+    return shift * sigma / (1 + (shift - 1) * sigma)
+
+
+def _compute_cell(adapter, req: str, cell, member_input=None):
+    """Run one Cell through ``adapter`` exactly as the executor would."""
+    chunk, step, block = cell
+    batch = ComputeBatch(
+        members=(MemberRef(req, chunk=chunk, step=step, block=block, task_index=0),),
+        kv_views=(None,),
+    )
+    return adapter.forward(batch, [adapter], member_inputs=[member_input])
+
+
+def _admit_cell(req: OmniDiffusionRequest, *, decode_tag: int, tags: dict[str, int], cells: dict):
+    """Record the decode tag and hand back the prebuilt Cell, without a job."""
+    tags[req.request_id] = decode_tag
+    return cells[req.request_id], req.request_id, False, None
+
+
+def _admit_cell_with_job(
+    req: OmniDiffusionRequest,
+    *,
+    decode_tag: int,
+    cells: dict,
+    failure_stage: str,
+    cancelled: list[str],
+):
+    """Admit a Cell with a cancellable job, optionally failing the second request."""
+    del decode_tag
+    if req.request_id == "B" and failure_stage == "admit":
+        raise ValueError("decode wave failed")
+    return cells[req.request_id], req.request_id, False, _CancelJob(req.request_id, cancelled)
+
+
+def _emit_cell(adapter, kv_id, stream_job=None, *, emitted: list[str]):
+    """Record the emitted request and report the Cell finished."""
+    del adapter, stream_job
+    emitted.append(kv_id)
+    return DiffusionOutput(finished=True)
+
+
+def _run_pipeline_or_fail(**_kwargs):
+    """``run_cell_pipeline`` stand-in for the compute-failure case."""
+    raise ValueError("decode wave failed")
+
+
+def _fail_output(*_args):
+    """``emit_cell_output`` stand-in for the output-failure case."""
+    raise ValueError("decode wave failed")
+
+
+def _recording_condition(calls: list, timestep, text, *_args, **_kwargs):
+    """Condition embedder that logs each call and mixes timestep into the text mean."""
+    calls.append((timestep.clone(), text.clone()))
+    value = text.mean(dim=1) + timestep[:, None]
+    return value, value, text, None
+
+
+def _forbid_tensor_to(*_args, **_kwargs):
+    """Fail if a cache hit copies the timestep to the device."""
+    raise AssertionError("cache hit must not copy timestep to the device")
+
+
+def _recording_rope(calls: list, latent, *, start_frame: int):
+    """RoPE stand-in that records the temporal offset it was asked for."""
+    del latent
+    calls.append(start_frame)
+    return torch.zeros(1, 4, 1, 8), torch.zeros(1, 4, 1, 8)
+
+
 def test_stage_layer_range_covers_all_layers():
     from vllm.distributed.utils import get_pp_indices
 
@@ -64,9 +175,7 @@ def test_flow_euler_matches_diffusers_shifted_endpoint():
     """Match FlowMatchEulerDiscreteScheduler: linspace ends at warp(1/1000), then warp again."""
     shift = 5.0
     steps = 4
-
-    def warp(sigma: torch.Tensor) -> torch.Tensor:
-        return shift * sigma / (1 + (shift - 1) * sigma)
+    warp = partial(_warp, shift=shift)
 
     sampler = FlowEuler(steps, shift=shift)
     expected = warp(torch.linspace(1.0, float(warp(torch.tensor(1.0 / 1000))), steps, dtype=torch.float64))
@@ -74,6 +183,15 @@ def test_flow_euler_matches_diffusers_shifted_endpoint():
     # Diffusers' own endpoint double-warp yields a larger last step than warp(1/1000).
     last_delta = abs(sampler.sigmas[-1] - sampler.sigmas[-2])
     assert last_delta > 0.01
+
+
+def _log_then_succeed(**_kwargs):
+    """``run_cell_pipeline`` stand-in that completes without failing."""
+
+
+def _emit_nothing(*_args, **_kwargs):
+    """``emit_cell_output`` stand-in that reports success without side effects."""
+    return DiffusionOutput(finished=True)
 
 
 def test_causvid_wan_chunk_noise_matches_reference_seed():
@@ -178,7 +296,23 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_same_step_pipeline_single_chunk_sink_matches_session_policy(persistent):
+    pipeline = _bare_pipeline(step_replicas=3, history=2)
+    request = OmniDiffusionRequest(
+        prompt="x",
+        request_id="same-step",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 3, "num_chunks": 1}
+        ),
+    )
+    plan, _, _ = pipeline._plan_for(request, same_step_session=persistent)
+    produced = {plan.task(slot, rank) for slot in range(plan.num_slots) for rank in range(plan.world)}
+    assert ((0, 3, 0) in produced) is persistent
+    assert (0, 0, 0) in produced
+
+
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -247,7 +381,7 @@ def test_cell_schedule_default_derives_from_topology(stages, expected_ordering):
 
 
 @pytest.mark.parametrize(("layer_groups", "expect_reject"), [(1, False), (2, True)])
-def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
+def test_causvid_s1_chunk_decode_single_rank_only(layer_groups, expect_reject):
     """S=1 keeps local streaming on a single rank (G=1); G>1 has no VAE on the finish rank."""
     pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=layer_groups)
     req = OmniDiffusionRequest(
@@ -258,7 +392,7 @@ def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
                 "cell_schedule": "self_forcing",
                 "num_denoise_steps": 3,
                 "num_chunks": 2,
-                "stream_decode": True,
+                "async_chunk_decode": True,
             }
         ),
     )
@@ -366,33 +500,9 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     device = torch.device("cpu")
     dtype = torch.float32
     prompt = torch.zeros(1, 8, 16, device=device, dtype=dtype)
-
-    class _FakeTransformer:
-        def __init__(self, *, is_layer_group_first: bool, is_layer_group_last: bool) -> None:
-            self.is_layer_group_first = is_layer_group_first
-            self.is_layer_group_last = is_layer_group_last
-            self.start_layer = 0
-            self.end_layer = 1
-            self.dim = 8
-
-        def prepare_cell(self, *_a, **_k) -> None:
-            return None
-
-        def seq_len_for_latent(self, _shape) -> int:
-            return 3
-
-        def embed(self, latent):
-            return torch.ones(latent.shape[0], 3, 8, device=latent.device, dtype=latent.dtype)
-
-        def block(self, _index, tokens, **_kw):
-            return tokens
-
-        def unembed(self, _tokens, *, latent, **_kw):
-            return torch.zeros_like(latent)
-
     sampler = FlowEuler(2, shift=1.0)
     mid = WanCell(
-        _FakeTransformer(is_layer_group_first=True, is_layer_group_last=False),  # type: ignore[arg-type]
+        _GroupTransformer(is_layer_group_first=True, is_layer_group_last=False),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
         latent_shape=shape,
@@ -401,7 +511,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         dtype=dtype,
     )
     last = WanCell(
-        _FakeTransformer(is_layer_group_first=False, is_layer_group_last=True),  # type: ignore[arg-type]
+        _GroupTransformer(is_layer_group_first=False, is_layer_group_last=True),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
         latent_shape=shape,
@@ -409,31 +519,17 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         device=device,
         dtype=dtype,
     )
-
-    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import (
-        ComputeBatch,
-        MemberRef,
-    )
-
-    def _compute(adapter, req, cell, member_input=None):
-        chunk, step, block = cell
-        batch = ComputeBatch(
-            members=(MemberRef(req, chunk=chunk, step=step, block=block, task_index=0),),
-            kv_views=(None,),
-        )
-        return adapter.forward(batch, [adapter], member_inputs=[member_input])
-
-    mid_out = _compute(mid, "r0", (0, 0, 0))
+    mid_out = _compute_cell(mid, "r0", (0, 0, 0))
     assert {"latent", "hidden_states"} <= set(mid_out)
     packed = mid.pack_activation(mid_out)
     assert "latent" in packed and "hidden_states" in packed
 
     last_in = last.unpack_activation(packed)
-    last_out = _compute(last, "r0", (0, 0, 0), member_input=last_in)
+    last_out = _compute_cell(last, "r0", (0, 0, 0), member_input=last_in)
     assert "latent" in last_out
     assert 0 not in last.finished.get("r0", {})
     # Next denoise step on a non-first group still needs peer hidden_states.
-    last_out2 = _compute(
+    last_out2 = _compute_cell(
         last,
         "r0",
         (0, 1, 0),
@@ -450,24 +546,22 @@ def test_pipeline_forward_passes_members_map_once(monkeypatch):
     tags: dict[str, int] = {}
     cells = {"A": WanCell.__new__(WanCell), "B": WanCell.__new__(WanCell)}
 
-    def _admit(req: OmniDiffusionRequest, *, decode_tag=0):
-        tags[req.request_id] = decode_tag
-        return cells[req.request_id], req.request_id, False, None
-
     monkeypatch.setattr(pipeline, "_execution_context", lambda: pipeline._chunk_ctx)
-    monkeypatch.setattr(pipeline, "admit_cell_request", _admit)
+    monkeypatch.setattr(
+        pipeline,
+        "admit_cell_request",
+        partial(_admit_cell, tags=tags, cells=cells),
+    )
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
         lambda **kwargs: calls.append(kwargs),
     )
     emitted: list[str] = []
-
-    def _emit(adapter, kv_id, stream_job=None):
-        del adapter, stream_job
-        emitted.append(kv_id)
-        return DiffusionOutput(finished=True)
-
-    monkeypatch.setattr(pipeline, "emit_cell_output", _emit)
+    monkeypatch.setattr(
+        pipeline,
+        "emit_cell_output",
+        partial(_emit_cell, emitted=emitted),
+    )
     batch = DiffusionRequestBatch(
         [
             OmniDiffusionRequest(prompt="a", request_id="A", sampling_params=OmniDiffusionSamplingParams()),
@@ -491,32 +585,19 @@ def test_pipeline_forward_cancels_stream_jobs_on_failure(monkeypatch, failure_st
     pipeline._chunk_ctx = SimpleNamespace()
     cancelled: list[str] = []
 
-    class _Job:
-        def __init__(self, rid: str) -> None:
-            self.rid = rid
-
-        def cancel(self) -> None:
-            cancelled.append(self.rid)
-
     cells = {rid: WanCell.__new__(WanCell) for rid in ("A", "B")}
 
-    def _admit(req: OmniDiffusionRequest, *, decode_tag=0):
-        if req.request_id == "B" and failure_stage == "admit":
-            raise ValueError("decode wave failed")
-        return cells[req.request_id], req.request_id, False, _Job(req.request_id)
-
     monkeypatch.setattr(pipeline, "_execution_context", lambda: pipeline._chunk_ctx)
-    monkeypatch.setattr(pipeline, "admit_cell_request", _admit)
-
-    def run(**kwargs):
-        if failure_stage == "compute":
-            raise ValueError("decode wave failed")
-
-    def emit(*args):
-        raise ValueError("decode wave failed")
-
-    monkeypatch.setattr("vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline", run)
-    monkeypatch.setattr(pipeline, "emit_cell_output", emit)
+    monkeypatch.setattr(
+        pipeline,
+        "admit_cell_request",
+        partial(_admit_cell_with_job, cells=cells, failure_stage=failure_stage, cancelled=cancelled),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
+        _log_then_succeed if failure_stage != "compute" else _run_pipeline_or_fail,
+    )
+    monkeypatch.setattr(pipeline, "emit_cell_output", _fail_output if failure_stage == "output" else _emit_nothing)
     batch = DiffusionRequestBatch(
         [
             OmniDiffusionRequest(prompt="a", request_id="A", sampling_params=OmniDiffusionSamplingParams()),
@@ -534,10 +615,7 @@ def test_conditioning_cache_reuses_blocks_and_invalidates_member_order(monkeypat
     torch.nn.Module.__init__(tf)
     calls = []
 
-    def condition(timestep, text, *_args, **_kwargs):
-        calls.append((timestep.clone(), text.clone()))
-        value = text.mean(dim=1) + timestep[:, None]
-        return value, value, text, None
+    condition = partial(_recording_condition, calls)
 
     tf._wan = SimpleNamespace(condition_embedder=condition, timestep_proj_prepare=lambda value, _: value)
     a, b = torch.ones(1, 3, 4), torch.full((1, 3, 4), 7.0)
@@ -549,11 +627,7 @@ def test_conditioning_cache_reuses_blocks_and_invalidates_member_order(monkeypat
     second = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
     assert second is first
     with monkeypatch.context() as patch:
-
-        def no_transfer(*_args, **_kwargs):
-            raise AssertionError("cache hit must not copy timestep to the device")
-
-        patch.setattr(torch.Tensor, "to", no_transfer)
+        patch.setattr(torch.Tensor, "to", _forbid_tensor_to)
         assert tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype) is first
     assert len(calls) == 1
     assert 0 in tf._rotary
@@ -570,6 +644,65 @@ def test_conditioning_cache_reuses_blocks_and_invalidates_member_order(monkeypat
         assert len(tf._embeddings) == 1
 
 
+def _tick_request(*, session_id: str, chunk_index: int, request_id: str = "turn-5", **tick) -> OmniDiffusionRequest:
+    """A request whose session identity lives only in the typed streaming tick."""
+    payload = {
+        "session_id": session_id,
+        "request_id": request_id,
+        "chunk_index": chunk_index,
+        **tick,
+    }
+    return OmniDiffusionRequest(
+        prompt="x",
+        request_id=request_id,
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"ar_diffusion_tick": payload}),
+    )
+
+
+def test_noisy_lifecycle_agrees_with_the_shared_binding_for_typed_ticks():
+    """CausVid must resolve session ownership the same way the Runner does.
+
+    A streaming tick puts the session in ``ar_diffusion_tick``. Reading only the
+    legacy top-level ``session_id`` made CausVid fall back to the request id, drop
+    history retention and restart at chunk 0 while the Runner used the session --
+    the same request, two different answers.
+    """
+    from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
+
+    req = _tick_request(session_id="s", chunk_index=5)
+
+    kv_id, persist, reset, close = CausVidWanPipeline._noisy_request_lifecycle(req)
+    binding = kv_request_binding(req)
+
+    assert kv_id == binding.owner == "s"
+    assert persist is binding.persist is True
+    assert reset is binding.reset is False
+    assert close is binding.close is False
+
+
+def test_noisy_lifecycle_agrees_with_the_shared_binding_for_reset_and_close():
+    """Reset/close ticks must also reach the model layer unchanged."""
+    from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
+
+    for tick_kwargs in ({"reset": True}, {"close_session": True}):
+        req = _tick_request(session_id="s", chunk_index=5, **tick_kwargs)
+        kv_id, persist, reset, close = CausVidWanPipeline._noisy_request_lifecycle(req)
+        binding = kv_request_binding(req)
+
+        assert (kv_id, persist, reset, close) == (binding.owner, binding.persist, binding.reset, binding.close)
+
+
+def test_noisy_lifecycle_keeps_the_legacy_fields_working():
+    """A request with no tick still resolves from the legacy top-level fields."""
+    legacy = OmniDiffusionRequest(
+        prompt="x",
+        request_id="turn-5",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"session_id": "s", "reset": True}),
+    )
+
+    assert CausVidWanPipeline._noisy_request_lifecycle(legacy) == ("s", True, True, False)
+
+
 @pytest.mark.parametrize("texts", [(torch.zeros(2, 3, 4),), (torch.zeros(1, 3, 4), torch.zeros(1, 5, 4))])
 def test_conditioning_rejects_invalid_member_shapes(texts):
     tf = StageWanTransformer.__new__(StageWanTransformer)
@@ -584,13 +717,9 @@ def test_rotary_cache_refreshes_hot_member_before_eviction():
     tf._wan = SimpleNamespace()
     tf._text = torch.zeros(2, 3, 4)
     tf._rotary = {}
-    calls = []
+    calls: list[int] = []
 
-    def rope(latent, *, start_frame):
-        calls.append(start_frame)
-        return torch.zeros(1, 4, 1, 8), torch.zeros(1, 4, 1, 8)
-
-    tf._rope_with_temporal_offset = rope
+    tf._rope_with_temporal_offset = partial(_recording_rope, calls)
     latent = torch.zeros(1, 4, 1, 2, 2)
     first = tf._rotary_emb(0, latent)
     tf._rotary_emb(1, latent)
@@ -599,3 +728,27 @@ def test_rotary_cache_refreshes_hot_member_before_eviction():
     assert {key[0] for key in tf._rotary} == {0, 2}
     assert tf._rotary_emb(0, latent) is first
     assert calls == [0, 1, 2]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("async_decode", [False, True])
+def test_async_chunk_decode_automatically_enabled_for_streaming(streaming, async_decode):
+    pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=1)
+    pipeline.od_config = SimpleNamespace(streaming_output=streaming)
+    assert pipeline._use_async_chunk_decode({"async_chunk_decode": async_decode}) is (streaming or async_decode)
+
+
+@pytest.mark.parametrize("layer_groups", [1, 2])
+def test_streaming_uses_async_decode_topology_validation(layer_groups):
+    pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=layer_groups)
+    pipeline.od_config = SimpleNamespace(streaming_output=True)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="auto-stream",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"num_chunks": 2, "num_denoise_steps": 3}),
+    )
+    if layer_groups > 1:
+        with pytest.raises(ValueError, match="no VAE on its finish rank|no sync mid-request decode fallback"):
+            pipeline._plan_for(req)
+    else:
+        pipeline._plan_for(req)

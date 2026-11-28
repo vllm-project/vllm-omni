@@ -42,7 +42,12 @@ def test_isolated_import_ignores_conflicting_gpu_visibility(monkeypatch: pytest.
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
 
-    _assert_isolated_import_succeeds("import vllm_omni.outputs")
+    _assert_isolated_import_succeeds("""
+import os
+
+assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+assert os.environ["HIP_VISIBLE_DEVICES"] == ""
+""")
 
 
 def test_turn_based_stack_has_no_duplex_vocabulary() -> None:
@@ -69,6 +74,7 @@ forbidden_prefixes = (
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
+    "vllm_omni.model_executor.models.sage_interaction.duplex",
 )
 loaded = sorted(
     name
@@ -109,6 +115,9 @@ forbidden_prefixes = (
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
+    "vllm_omni.model_executor.models.sage_interaction.duplex",
+    "vllm_omni.model_executor.models.response_judge",
+    "vllm_omni.engine.duplex.response_judge",
 )
 loaded = sorted(
     name
@@ -155,8 +164,12 @@ import vllm_omni  # the package __init__ loads its own baseline graph
 baseline = set(sys.modules)
 
 from vllm_omni.clients.duplex import EventCollector
+from vllm_omni.clients.realtime import RealtimeDuplexClient
+from vllm_omni.clients.video_stacking import unit_subframe_offsets
 
-collector = EventCollector()
+assert unit_subframe_offsets(1) == []
+collector = RealtimeDuplexClient("ws://unused").events
+assert isinstance(collector, EventCollector)
 chunk = base64.b64encode(b"\\x00\\x00" * 2400).decode("ascii")
 collector.add({"type": "response.created", "response_id": "r1"}, received_at_s=1.0)
 collector.add({"type": "response.output_audio.delta", "response_id": "r1", "delta": chunk}, received_at_s=1.1)
@@ -175,11 +188,38 @@ if added:
 """)
 
 
-def test_stable_engine_does_not_expose_duplex_contract_modules() -> None:
+def test_response_judge_module_loads_no_model_code() -> None:
+    # The response judge's logic and configuration live in engine/duplex;
+    # its model classes stay under model_executor and are loaded lazily by
+    # the registry. Importing the judge module must not pull them in.
+    _assert_isolated_import_succeeds("""
+import sys
+
+import vllm_omni  # the package __init__ loads its own baseline graph
+
+baseline = set(sys.modules)
+
+import vllm_omni.engine.duplex.response_judge
+
+added = sorted(
+    name
+    for name in set(sys.modules) - baseline
+    if name.startswith(("vllm_omni.model_executor", "vllm.model_executor"))
+)
+if added:
+    raise SystemExit("the response judge module pulled in model code: " + ", ".join(added))
+""")
+
+
+def test_stable_duplex_contract_boundaries() -> None:
+    # These schema/module-location assertions do not depend on import order.
+    # Check them together instead of importing the serving stack in three children.
     _assert_isolated_import_succeeds("""
 import importlib.util
+import dataclasses
 
 from vllm_omni.engine import messages
+from vllm_omni.outputs import OmniRequestOutput
 
 legacy_modules = (
     "vllm_omni.engine.duplex_contracts",
@@ -193,24 +233,10 @@ if present:
 duplex_exports = sorted(name for name in vars(messages) if name.startswith("Duplex"))
 if duplex_exports:
     raise SystemExit("stable messages still expose duplex contracts: " + ", ".join(duplex_exports))
-""")
-
-
-def test_stable_outputs_do_not_declare_duplex_decision_field() -> None:
-    _assert_isolated_import_succeeds("""
-import dataclasses
-
-from vllm_omni.outputs import OmniRequestOutput
 
 fields = {field.name for field in dataclasses.fields(OmniRequestOutput)}
 if "duplex_output_decision" in fields:
     raise SystemExit("stable output declares duplex_output_decision")
-""")
-
-
-def test_duplex_sampling_helper_lives_in_model_executor() -> None:
-    _assert_isolated_import_succeeds("""
-import importlib.util
 
 if importlib.util.find_spec("vllm_omni.model_executor.duplex_sampling") is None:
     raise SystemExit("model_executor duplex_sampling helper module is missing")

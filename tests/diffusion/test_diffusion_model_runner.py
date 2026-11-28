@@ -370,9 +370,14 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
     runner.state_cache = {}
     runner.prompt_embed_cache = None
     runner.od_config = SimpleNamespace(
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        step_execution=False,
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        diffusion_attention_schedule=None,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, use_hsdp=False),
         streaming_output=False,
         video_output_transport=VideoOutputTransportConfig(),
     )
@@ -482,6 +487,7 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
         record_output_peak_memory=False,
     )
 
+    assert runner.pipeline.bound is not None
     schedule, from_request = runner.pipeline.bound
     assert schedule == runner.od_config.diffusion_attention_schedule.default
     assert from_request is explicit
@@ -497,6 +503,7 @@ def _make_compile_runner(
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
     runner.od_config = SimpleNamespace(
+        diffusion_use_graph=False,
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
@@ -915,6 +922,49 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_compile_pipeline_transformers_logs_when_nothing_to_compile(monkeypatch):
+    class NoCompileTargetsPipeline(torch.nn.Module):
+        pass
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = NoCompileTargetsPipeline()
+    compiled: list[str] = []
+    debug: list[str] = []
+    monkeypatch.setattr(DiffusionModelRunner, "_compile_transformer", lambda self, name: compiled.append(name))
+    monkeypatch.setattr(model_runner_module.logger, "debug", lambda msg, *args: debug.append(msg % args))
+
+    DiffusionModelRunner._compile_pipeline_transformers(runner)
+
+    assert compiled == []
+    assert len(debug) == 1
+    assert "NoCompileTargetsPipeline has no setup_compile()" in debug[0]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_pipeline_transformers_compiles_declared_targets_without_logging(monkeypatch):
+    class DitModulesPipeline(torch.nn.Module):
+        _dit_modules = ("dit",)
+
+        def __init__(self):
+            super().__init__()
+            self.dit = torch.nn.Linear(2, 2)
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = DitModulesPipeline()
+    compiled: list[str] = []
+    debug: list[str] = []
+    monkeypatch.setattr(DiffusionModelRunner, "_compile_transformer", lambda self, name: compiled.append(name))
+    monkeypatch.setattr(model_runner_module.logger, "debug", lambda msg, *args: debug.append(msg % args))
+
+    DiffusionModelRunner._compile_pipeline_transformers(runner)
+
+    assert compiled == ["dit"]
+    assert debug == []
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model)
@@ -1064,7 +1114,7 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypatch):
     """Guard cache diagnostics with runtime backend state to avoid stale-config crashes."""
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
@@ -1089,7 +1139,7 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeypatch):
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
@@ -1115,7 +1165,7 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("cache_dit_enabled", [False, True])
 def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monkeypatch, cache_dit_enabled):
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
@@ -1306,8 +1356,11 @@ def _make_batch_runner(pipeline):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.od_config = SimpleNamespace(
+        cfg_kv_collect_func=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         cache_backend="none",
-        enable_cache_dit_summary=False,
+        streaming_output=False,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
         video_output_transport=VideoOutputTransportConfig(),
     )
@@ -1576,6 +1629,11 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
     runner.cache_backend = None
     runner.offload_backend = None
     runner.od_config = SimpleNamespace(
+        step_execution=False,
+        diffusion_use_graph=False,
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         cache_backend="cache_dit",
@@ -1583,6 +1641,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
@@ -1629,11 +1688,7 @@ def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monke
         parallel_config=SimpleNamespace(data_parallel_size=2),
         enable_prompt_embed_cache=False,
         prompt_embed_cache_size=32,
-        cache_backend="none",
-        model_class_name="Wan22Pipeline",
-        enforce_eager=True,
-        streaming_output=False,
-        step_execution=False,
+        diffusion_attention_schedule=None,
     )
     monkeypatch.setenv("OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "1")
     runtime_init = Mock(side_effect=pytest.fail)

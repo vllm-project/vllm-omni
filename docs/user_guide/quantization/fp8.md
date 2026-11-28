@@ -28,6 +28,29 @@ in deep DiT blocks.
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available.
 
+### Online blockwise FP8
+
+The upstream `fp8_per_block` method is also available through Omni's
+quantization factory. It quantizes checkpoint weights in 128×128 blocks and
+uses dynamic activation scales for groups of 128 elements. For DiT-only
+quantization, use:
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-quantization-config '{"transformer":{"method":"fp8_per_block"}}'
+```
+
+The Python equivalent is
+`quantization_config={"transformer": {"method": "fp8_per_block"}}` when
+constructing `Omni`. Kernel availability depends on the installed vLLM runtime
+and GPU. This path reuses vLLM's online blockwise FP8 implementation; it does
+not require the CUDA MXFP8 adapter. MXFP8 uses a different scaling format and
+is selected with `mxfp8`.
+
+For the separate ROCm-specific `online_block_size` option, which exposes
+32/64/128-element groups through the `fp8` method, see
+[Online FP8 Block Scaling](rocm_online_fp8.md).
+
 ### Faster FP8 GEMM on Blackwell (quack)
 
 On Blackwell (SM 100+), vLLM runs FP8 linears through the FlashInfer kernel, which
@@ -275,6 +298,14 @@ weight and scale sharding contracts are qualified.
 
 The available `ignored_layers` names depend on the model architecture, for
 example `to_qkv`, `to_out`, `img_mlp`, or `txt_mlp`.
+
+An entry names a layer's **full prefix** by default, so a short module name
+covers nothing on its own. A pipeline that documents short names as patterns
+raises the match mode for its own components — Qwen-Image-2.1 does, which is
+what makes `img_mlp` there stand for every block's `img_mlp.*` and keeps whole
+subtrees such as the text encoder's vision tower out of FP8. Check the model
+recipe before relying on a short name, and give the full prefix
+(`transformer_blocks.3.attn.to_qkv`) for a model that does not document one.
 
 ## Validation and Notes
 

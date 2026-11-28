@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared long-video request limits for encoder and diffusion entry points."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_MAX_FULL_SECONDS = 30.0
 MINIMAX_H3_MAX_CONTINUATION_SECONDS = 300.0
+# Ref2VA carries the previous window's tail as a ``latent_guide`` reference; T2VA and FL2VA carry it
+# as a frame-0 timeline guide, the layout ``continue_from`` uses across requests.
+MINIMAX_H3_CONTINUATION_TASKS = ("ref2va", "t2va", "fl2va")
 
 
 def resolve_long_video_mode(extra: Mapping[str, Any], task: str) -> str:
@@ -18,9 +21,24 @@ def resolve_long_video_mode(extra: Mapping[str, Any], task: str) -> str:
     mode = extra.get("long_video_mode", "continuation" if long_video and task == "ref2va" else "full")
     if mode not in ("full", "continuation"):
         raise OmniClientError("MiniMax H3 long_video_mode must be full or continuation")
-    if mode == "continuation" and task != "ref2va":
-        raise OmniClientError("MiniMax H3 continuation requires Ref2VA request execution (not step execution)")
+    if mode == "continuation" and task not in MINIMAX_H3_CONTINUATION_TASKS:
+        raise OmniClientError(
+            f"MiniMax H3 continuation supports {', '.join(MINIMAX_H3_CONTINUATION_TASKS)} requests, got {task!r}"
+        )
     return mode
+
+
+def check_continuation_conditions(task: str, keyframe_frame_indices: Sequence[int]) -> None:
+    """Reject request conditions the windowed loop cannot place.
+
+    A T2VA or FL2VA window after the first carries only its predecessor's tail,
+    so a keyframe past the first frame would have no window to land in.
+    """
+    if task != "ref2va" and any(keyframe_frame_indices):
+        raise OmniClientError(
+            "MiniMax H3 continuation conditions FL2VA on a first frame only; "
+            "use long_video_mode=full for other keyframes"
+        )
 
 
 def max_output_seconds(extra: Mapping[str, Any], task: str) -> float:

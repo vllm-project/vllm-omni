@@ -23,6 +23,7 @@ from uuid import uuid4
 
 import pybase64 as base64
 from vllm.logger import init_logger
+from websockets.exceptions import ConnectionClosed
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex_session_inputs import (
@@ -38,18 +39,9 @@ from vllm_omni.benchmarks.duplex_session_inputs import (
     session_turn_detection,
     turn_activity_count,
 )
-from vllm_omni.experimental.fullduplex.client import (
-    PCM16_BYTES_PER_SAMPLE,
-    PCM16_SAMPLE_RATE,
-    ConnectionClosed,
-    RealtimeDuplexClient,
-    RealtimeEventCollector,
-    build_realtime_url,
-    wait_for,
-)
 
 if TYPE_CHECKING:
-    from vllm_omni.clients.duplex import EventCollector
+    from vllm_omni.clients.realtime import RealtimeDuplexClient
 
 from .omni_duplex_eval_clock import extract_timed_chunks, extract_timed_sentences, has_response_chunks
 from .omni_duplex_eval_media import (
@@ -135,6 +127,7 @@ class GenerateSampleResult:
     audio_bytes: int = 0
     audio_sample_rate: int = 24_000
     error: str = ""
+    generated: bool = True
 
 
 @dataclass(frozen=True)
@@ -262,24 +255,91 @@ def write_failed_sample_diagnostics(result: GenerateSampleResult) -> Path:
     return diagnostics
 
 
-def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventCollector:
-    """Replay experimental collector events onto the public EventCollector."""
-    from vllm_omni.clients.duplex import EventCollector
-
-    collector = EventCollector()
-    for event, received_at_s in zip(source.events, source.event_received_at_s, strict=True):
-        collector.add(event, received_at_s=received_at_s)
-    for record in source.client_appends:
-        sent_at_s = record.get("sent_at_s")
-        event_id = record.get("event_id")
-        if not isinstance(sent_at_s, int | float) or not isinstance(event_id, str):
-            continue
-        collector.note_client_append({"sent_at_s": float(sent_at_s), "event_id": event_id})
-    return collector
-
-
 def _with_sample_identity(payload: dict[str, object], sample: DuplexSample) -> dict[str, object]:
     return {"sample_id": sample.id, "split": sample.split, **payload}
+
+
+def _session_stats_diagnostics(stats: object) -> dict[str, object]:
+    """Keep timing evidence from the existing snapshot, excluding content/configuration."""
+    if not isinstance(stats, dict):
+        return {}
+    result: dict[str, object] = {
+        key: stats[key] for key in ("dropped_turns", "dropped_spans") if type(stats.get(key)) is int
+    }
+    stages = stats.get("stages")
+    if isinstance(stages, list):
+        result["stages"] = [
+            {"stage_id": stage["stage_id"]}
+            for stage in stages
+            if isinstance(stage, dict) and type(stage.get("stage_id")) is int
+        ]
+    turns = stats.get("turns")
+    if not isinstance(turns, list):
+        return result
+    retained_turns = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        retained: dict[str, object] = {
+            key: turn[key] for key in ("epoch", "turn_id", "late_spans") if type(turn.get(key)) is int
+        }
+        if type(turn.get("final")) is bool:
+            retained["final"] = turn["final"]
+        status = turn.get("status")
+        if isinstance(status, str) and status in {"open", "done", "cancelled", "listen"}:
+            retained["status"] = status
+        response_ids = turn.get("response_ids")
+        if isinstance(response_ids, list):
+            retained["response_ids"] = [value for value in response_ids if isinstance(value, str)]
+        chunks = turn.get("chunks")
+        retained_chunks = []
+        for chunk in chunks if isinstance(chunks, list) else ():
+            if not isinstance(chunk, dict):
+                continue
+            item: dict[str, object] = {
+                key: chunk[key] for key in ("seq", "turn_seq", "submitted_ns") if type(chunk.get(key)) is int
+            }
+            if chunk.get("done_ns") is None or type(chunk.get("done_ns")) is int:
+                item["done_ns"] = chunk.get("done_ns")
+            item.update({key: chunk[key] for key in ("complete", "truncated") if type(chunk.get(key)) is bool})
+            work = chunk.get("stage_work")
+            retained_work = []
+            for stage in work if isinstance(work, list) else ():
+                if not isinstance(stage, dict) or type(stage.get("stage_id")) is not int:
+                    continue
+                spans = stage.get("spans")
+                retained_work.append(
+                    {
+                        "stage_id": stage["stage_id"],
+                        "spans": [
+                            list(span)
+                            for span in spans
+                            if isinstance(span, list) and len(span) == 2 and all(type(value) is int for value in span)
+                        ]
+                        if isinstance(spans, list)
+                        else [],
+                    }
+                )
+            item["stage_work"] = retained_work
+            retained_chunks.append(item)
+        retained["chunks"] = retained_chunks
+        audio = turn.get("audio")
+        retained_audio = []
+        for piece in audio if isinstance(audio, list) else ():
+            if not isinstance(piece, dict):
+                continue
+            emitted = piece.get("emitted_ns")
+            duration = piece.get("duration_ms")
+            response_id = piece.get("response_id")
+            if type(emitted) is int and (type(duration) is int or type(duration) is float and math.isfinite(duration)):
+                item = {"emitted_ns": emitted, "duration_ms": duration}
+                if response_id is None or isinstance(response_id, str):
+                    item["response_id"] = response_id
+                retained_audio.append(item)
+        retained["audio"] = retained_audio
+        retained_turns.append(retained)
+    result["turns"] = retained_turns
+    return result
 
 
 def _event_related_ids(event: dict[str, object]) -> tuple[str, ...]:
@@ -578,8 +638,10 @@ async def _bounded_ack_join(task: asyncio.Task) -> None:
     if pending:
         task.add_done_callback(_consume_task_exception)
         logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
-    elif not task.cancelled() and task.exception() is not None:
-        raise task.exception()
+    elif not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            raise error
 
 
 async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:
@@ -676,6 +738,7 @@ async def generate_sample(
     clock: str = "media",
     overwrite: bool = False,
     unit_ms: int = 1000,
+    collect_stage_metrics: bool = False,
     prepared: PreparedSample | None = None,
     defer_artifacts: bool = False,
     additional_headers: dict[str, str] | None = None,
@@ -695,6 +758,11 @@ async def generate_sample(
     Metadata written before mix was recorded counts as ``question``. RTD only
     reads sentences, so its bare sentence lists are still reused.
     """
+    # The CLI imports this module while composing the server. Load client
+    # libraries only when a benchmark session actually runs.
+    from vllm_omni.clients.duplex import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE, wait_for_condition
+    from vllm_omni.clients.realtime import RealtimeDuplexClient, build_realtime_url
+
     if pace not in {"realtime", "as-fast-as-possible"}:
         raise ValueError("pace must be realtime or as-fast-as-possible")
     if turn_detection not in TURN_DETECTION_MODES:
@@ -716,7 +784,7 @@ async def generate_sample(
             raise ValueError(
                 f"existing response {output} has no chunk times; pass --overwrite or choose another response directory"
             )
-        return GenerateSampleResult(output=output)
+        return GenerateSampleResult(output=output, generated=False)
     if prepared is not None and prepared.mix != mix:
         raise ValueError(f"prepared input uses mix={prepared.mix!r}, not {mix!r}")
     if server_turns:
@@ -754,6 +822,8 @@ async def generate_sample(
     stats_event_id: str | None = None
     input_committed = False
     stream_start: float | None = None
+    if collect_stage_metrics:
+        extra_body = {**(extra_body or {}), "return_stage_metrics": True}
     async with client:
         await client.configure(
             model,
@@ -762,6 +832,8 @@ async def generate_sample(
             extra_body=extra_body,
             auto_response=not server_turns,
             turn_detection=session_turn_detection(turn_detection),
+            # Use the deployment default; a text-only deployment rejects audio.
+            modalities=None,
         )
         frame_transport = select_frame_transport(_session_capabilities(client))
         if not server_turns:
@@ -843,7 +915,7 @@ async def generate_sample(
                 else:
                     silence_task, commit_timeout = await _commit_clip_then_pad(client, period_ms, silence_stop)
                     input_committed = commit_timeout is None
-                    await wait_for(
+                    await wait_for_condition(
                         responses_finished,
                         timeout_s=_drain_timeout_s(prepared.duration),
                         label="response.done",
@@ -918,7 +990,7 @@ async def generate_sample(
             close_timeout = str(exc)
             logger.warning("DuplexEval: session close not delivered for sample %s: %s", sample.id, exc)
         events = list(client.events.events)
-        collector = _event_collector_from_realtime(client.events)
+        collector = client.events
     if drain_timeout_state is not None:
         drain_timeout_state["completion_state_events_after_timeout"] = _completion_diagnostics(
             events,
@@ -989,16 +1061,25 @@ async def generate_sample(
             finished.add(response.get("id"))
             # Barge-in cancels an individual turn, not the input clip. Its
             # preceding responses and already emitted text remain judge input.
-            if response.get("status", "completed") not in {"completed", "cancelled"}:
+            status = response.get("status", "completed")
+            details = response.get("status_details")
+            # A reply stopped at the continuation limit keeps the text it already emitted.
+            at_limit = (
+                status == "incomplete" and isinstance(details, dict) and details.get("reason") == "continuation_limit"
+            )
+            if status not in {"completed", "cancelled"} and not at_limit:
                 errors.append(f"Response did not complete: {response}")
     # A turn may be created while closing the continuous session. Record this
     # boundary in metadata; drain/close timeouts and server errors above still
     # fail the sample instead of silently publishing a broken session.
     meta["unfinished_response_ids"] = sorted(set(client.events.response_ids) - finished)
+    session_metrics = _with_sample_identity(bundle.session_metrics, sample)
+    if server_stats := _session_stats_diagnostics(session_stats):
+        session_metrics["server_stats"] = server_stats
     result = GenerateSampleResult(
         output=output,
         request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],
-        session_metrics=_with_sample_identity(bundle.session_metrics, sample),
+        session_metrics=session_metrics,
         timed_sentences=timed,
         timed_chunks=chunks,
         metadata=meta,

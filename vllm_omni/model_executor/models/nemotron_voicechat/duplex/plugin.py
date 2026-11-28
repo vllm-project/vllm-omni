@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -32,6 +33,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputAction,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
 )
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
@@ -42,6 +44,7 @@ from vllm_omni.engine.duplex.plugin import (
     reject_private_runtime_keys,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.capabilities import (
+    MAX_SESSION_TOOLS,
     nemotron_voicechat_capabilities,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import (
@@ -57,6 +60,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are an AI voice assistant developed by NVIDIA. "
@@ -85,6 +89,8 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     }
 )
 
+logger = init_logger(__name__)
+
 
 class NemotronVoiceChatClientRuntimeConfigError(DuplexRuntimeConfigError):
     pass
@@ -94,6 +100,10 @@ class NemotronVoiceChatClientRuntimeConfigError(DuplexRuntimeConfigError):
 #: stay bounded. Once acknowledged, their tokens remain in the model-owned
 #: queue and drain at one forced token per 80 ms frame.
 _MAX_PENDING_FUNCTION_RESPONSE_BATCHES = 8
+
+#: Back-to-back silence frames one tool call may decode, like NVIDIA's
+#: ``MAX_TOOL_TOKENS``. Past it the call finishes at the client frame rate again.
+_FAST_PATH_MAX_STEPS = 512
 
 
 def _stt_config(model_config: Any) -> dict[str, Any]:
@@ -112,8 +122,10 @@ def _normalized_tools(config: DuplexSessionConfig) -> tuple[list[dict[str, objec
         return [], "[]"
     if not isinstance(raw_tools, list):
         raise NemotronVoiceChatClientRuntimeConfigError("Nemotron VoiceChat tools must be a list")
-    if len(raw_tools) > 5:
-        raise NemotronVoiceChatClientRuntimeConfigError("Nemotron VoiceChat supports at most 5 tools per session")
+    if len(raw_tools) > MAX_SESSION_TOOLS:
+        raise NemotronVoiceChatClientRuntimeConfigError(
+            f"Nemotron VoiceChat supports at most {MAX_SESSION_TOOLS} tools per session"
+        )
 
     normalized: list[dict[str, object]] = []
     for index, tool in enumerate(raw_tools):
@@ -230,6 +242,16 @@ def _positive_int(value: object, *, name: str) -> int:
 class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
     """Nemotron-owned sampling policy, append planning, session state and output projection."""
 
+    #: A batch belongs to one request, and an epoch cancellation replaced it.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+            ToolCallAbandonReason.SUPPRESSED,
+        }
+    )
+
     plugin_id = "nemotron_voicechat"
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
     #: One silence continuation unit is one 80 ms acoustic frame at 16 kHz.
@@ -243,6 +265,8 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         # once per tokenizer ref, off the orchestrator loop.
         self._tokenizers: dict[str, Any] = {}
         self._tokenizer_lock = asyncio.Lock()
+        # Fast-path steps already issued per request, reset when its call ends.
+        self._fast_path_steps: dict[str, int] = {}
 
     # ---- engine policy (the frame-locked resumable Stage-0 request) ----
 
@@ -336,6 +360,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_finished, output
         if stage_id != 0:
@@ -351,6 +376,36 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             metadata=metadata,
             final_output_type="text",
         )
+
+    def fast_path_active(self, request_id: str, output_metadata: Mapping[str, object]) -> bool:
+        """Decode back to back on silence frames while the function head is inside a tool call.
+
+        The thinker publishes ``nvc_function_fast_path`` as the call state the
+        frame was decoded in, so the first frame inside the call opens the
+        stretch and the frame that decodes ``EOTC`` closes it. One call may
+        issue at most ``_FAST_PATH_MAX_STEPS`` such frames: a model that never
+        leaves the call degrades to one token per client frame again instead of
+        spinning unbounded. The count is per request and resets when the flag
+        drops, which is also the frame that ends the stretch.
+        """
+        flag = output_metadata.get("nvc_function_fast_path")
+        if isinstance(flag, list | tuple):
+            flag = flag[-1] if flag else 0
+        item = getattr(flag, "item", None)
+        if callable(item):
+            flag = item()
+        try:
+            active = int(flag) == 1
+        except (TypeError, ValueError):
+            active = False
+        if not active:
+            self._fast_path_steps.pop(request_id, None)
+            return False
+        steps = self._fast_path_steps.get(request_id, 0)
+        if steps >= _FAST_PATH_MAX_STEPS:
+            return False
+        self._fast_path_steps[request_id] = steps + 1
+        return True
 
     # ---- session policy ----
 
@@ -482,6 +537,10 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
                 "function_call_output requires a string output",
                 code="invalid_function_call_output",
             )
+        return self._queue_function_response(current, output)
+
+    def _queue_function_response(self, current: Mapping[str, object], output: str) -> dict[str, object]:
+        """Tokenize one function-channel response and queue it for a later frame."""
         tokenizer_ref = current.get("nvc_tokenizer_ref")
         cached = self._tokenizers.get(str(tokenizer_ref)) if tokenizer_ref else None
         tokenizer = cached[1] if cached is not None else None

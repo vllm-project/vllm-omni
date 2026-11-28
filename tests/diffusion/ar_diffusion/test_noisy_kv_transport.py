@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import CellAdapter
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     Cell,
     CellSchedule,
@@ -31,6 +32,96 @@ def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class _PostCallRecorder:
+    """Count fixed-shape post activations while delegating to the real one.
+
+    Replaces the previous ``nonlocal fixed_calls`` closure: the count lives on
+    this object so the worker can read it after the pipeline returns.
+    """
+
+    def __init__(self, original) -> None:
+        self.original = original
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.original(*args, **kwargs)
+
+
+class _SinkAdapter(CellAdapter):
+    """Scalar reference adapter for the sink same-step pipeline.
+
+    Its expected inputs/outputs come from the serial rollout the worker computed
+    offline, so every per-member value and device is explicit constructor state.
+    """
+
+    def __init__(
+        self,
+        *,
+        device,
+        inputs: dict,
+        outputs: dict,
+        blocks: int,
+        steps: int,
+        fixed_shape: bool,
+    ) -> None:
+        self.device = device
+        self.inputs = inputs
+        self.outputs = outputs
+        self.blocks = blocks
+        self.steps = steps
+        self.fixed_shape = fixed_shape
+        self.clean_calls = 0
+        self.completed: dict[int, torch.Tensor] = {}
+
+    def compatibility_key(self, cell):
+        return cell
+
+    def activation_spec(self, *, batch, include_hidden):
+        if not self.fixed_shape:
+            return None
+        schema = [("latent", (batch,), torch.float32)]
+        if include_hidden:
+            schema.append(("hidden_states", (batch,), torch.float32))
+        return schema
+
+    def forward(self, batch, members, *, member_inputs):
+        del members
+        m0 = batch.members[0]
+        cell = (m0.chunk, m0.step, m0.block)
+        chunk, step, block = cell
+        self.clean_calls += int(step == self.steps)
+        payload = member_inputs[0] if member_inputs else None
+        if block == 0:
+            if step > 0:
+                assert payload is not None, "step input must come from the executor or transport"
+            value = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)], device=self.device)
+        else:
+            assert payload is not None
+            value = payload["hidden_states"]
+        torch.testing.assert_close(value, torch.tensor([self.inputs[cell]], device=self.device), rtol=1e-5, atol=1e-5)
+        context = batch.kv_views[0]
+        n = context.seq_len - 1
+        table = context.block_table[0, :n].long()
+        past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=self.device)
+        slot = context.video_slots.long()
+        context.key_pool[slot] = value.reshape(1, 1, 1)
+        context.value_pool[slot] = value.reshape(1, 1, 1)
+        result = value + past * 0.01 + 0.1 * (block + 1)
+        torch.testing.assert_close(result, torch.tensor([self.outputs[cell]], device=self.device), rtol=1e-5, atol=1e-5)
+        current = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)], device=self.device)
+        if block == self.blocks - 1:
+            if step < self.steps:
+                current = result + 0.5
+            if step == self.steps - 1:
+                self.completed[chunk] = current
+            return {"latent": current}
+        return {"latent": current, "hidden_states": result}
+
+    def pack_activation(self, output):
+        return output
 
 
 def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind: str, mode: str) -> None:
@@ -87,7 +178,7 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     for handle in handles:
         handle.wait()
     expected_bytes = 2 * chunk_tokens * spec.num_kv_heads * spec.head_size * 4
-    if mode != "immediate":
+    if mode not in ("immediate", "retain"):
         assert cache.transport.await_ready(frozenset()) == (1 if rank == xfer.dst else 0)
         torch.distributed.barrier()
         cache.transport.exchange((), rank=rank, pp_group=pp_group, chunk_tokens_by_request={"A": chunk_tokens})
@@ -126,7 +217,15 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
         flush=True,
     )
     torch.distributed.barrier()
-    state.end_request("A")
+    if mode == "retain":
+        state.retain_history("A", [xfer.version])
+        state.evict(plan.last_use(rank)[xfer.version])
+        state.finish_request("A")
+        assert pool.has(key)
+        state.release_history("A")
+        assert not pool.has(key)
+    else:
+        state.end_request("A")
     pp_group.destroy()
     torch.distributed.destroy_process_group()
 
@@ -151,6 +250,14 @@ def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
     )
 
 
+def test_noisy_kv_transfer_retains_history_after_completion() -> None:
+    torch.multiprocessing.spawn(
+        _transfer_worker,
+        args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cpu", "retain"),
+        nprocs=2,
+    )
+
+
 def _sink_pipeline_worker(
     rank: int,
     steps: int,
@@ -164,7 +271,6 @@ def _sink_pipeline_worker(
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel import noisy_pp_executor as cell_executor
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
         ARDiffusionCellContext,
-        CellAdapter,
         CellRunSpec,
         CellTopology,
         run_cell_pipeline,
@@ -175,15 +281,9 @@ def _sink_pipeline_worker(
     device = torch.device("cuda", rank) if device_kind == "cuda" else torch.device("cpu")
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
-    fixed_calls = 0
     original_post = cell_executor._post_activations_ws
-
-    def record_fixed_post(*args, **kwargs):
-        nonlocal fixed_calls
-        fixed_calls += 1
-        return original_post(*args, **kwargs)
-
-    cell_executor._post_activations_ws = record_fixed_post
+    fixed_recorder = _PostCallRecorder(original_post)
+    cell_executor._post_activations_ws = fixed_recorder
     try:
         torch.distributed.init_process_group(
             backend, init_method=init_method, rank=rank, world_size=world, timeout=timedelta(seconds=90)
@@ -239,70 +339,21 @@ def _sink_pipeline_worker(
             outputs[chunk, step, block] = value + sum(pages[x] for x in sources) * 0.01 + 0.1 * (block + 1)
             if block == blocks - 1 and step < steps:
                 latent[chunk] = outputs[chunk, step, block] + 0.5
-
-        class Adapter(CellAdapter):
-            def __init__(self):
-                self.device = device
-                self.clean_calls = 0
-                self.completed = {}
-
-            def compatibility_key(self, cell):
-                return cell
-
-            def activation_spec(self, *, batch, include_hidden):
-                if not fixed_shape:
-                    return None
-                schema = [("latent", (batch,), torch.float32)]
-                if include_hidden:
-                    schema.append(("hidden_states", (batch,), torch.float32))
-                return schema
-
-            def forward(self, batch, members, *, member_inputs):
-                del members
-                m0 = batch.members[0]
-                cell = (m0.chunk, m0.step, m0.block)
-                chunk, step, block = cell
-                self.clean_calls += int(step == steps)
-                payload = member_inputs[0] if member_inputs else None
-                if block == 0:
-                    if step > 0:
-                        assert payload is not None, "step input must come from the executor or transport"
-                    value = (
-                        payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)], device=device)
-                    )
-                else:
-                    assert payload is not None
-                    value = payload["hidden_states"]
-                torch.testing.assert_close(value, torch.tensor([inputs[cell]], device=device), rtol=1e-5, atol=1e-5)
-                context = batch.kv_views[0]
-                n = context.seq_len - 1
-                table = context.block_table[0, :n].long()
-                past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=device)
-                slot = context.video_slots.long()
-                context.key_pool[slot] = value.reshape(1, 1, 1)
-                context.value_pool[slot] = value.reshape(1, 1, 1)
-                result = value + past * 0.01 + 0.1 * (block + 1)
-                torch.testing.assert_close(result, torch.tensor([outputs[cell]], device=device), rtol=1e-5, atol=1e-5)
-                current = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)], device=device)
-                if block == blocks - 1:
-                    if step < steps:
-                        current = result + 0.5
-                    if step == steps - 1:
-                        self.completed[chunk] = current
-                    return {"latent": current}
-                return {"latent": current, "hidden_states": result}
-
-            def pack_activation(self, output):
-                return output
-
-        adapter = Adapter()
+        adapter = _SinkAdapter(
+            device=device,
+            inputs=inputs,
+            outputs=outputs,
+            blocks=blocks,
+            steps=steps,
+            fixed_shape=fixed_shape,
+        )
         ctx = ARDiffusionCellContext(
             spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
         )
         ctx.enqueue("A", plan, chunk_tokens=1)
         run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
         assert state.resident_versions == 0
-        assert bool(fixed_calls) == fixed_shape
+        assert bool(fixed_recorder.calls) == fixed_shape
         expected_clean = sum(
             cell is not None and cell[1] == steps for cell in (plan.task(t, rank) for t in range(plan.num_slots))
         )
@@ -313,7 +364,7 @@ def _sink_pipeline_worker(
         assert totals.tolist() == [expected_bytes, expected_bytes]
         print(
             f"sink_pipeline rank={rank} device={device_kind} S={steps} G={groups} H={history} chunks={chunks} "
-            f"fixed_calls={fixed_calls} clean_calls={adapter.clean_calls} kv_bytes={expected_bytes}",
+            f"fixed_calls={fixed_recorder.calls} clean_calls={adapter.clean_calls} kv_bytes={expected_bytes}",
             flush=True,
         )
         if rank == world - 1:

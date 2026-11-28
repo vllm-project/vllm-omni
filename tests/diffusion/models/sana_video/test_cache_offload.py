@@ -12,9 +12,8 @@ from torch import nn
 
 import vllm_omni.diffusion.cache.cachedit.backend as cachedit_backend_module
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
-from tests.diffusion.models.sana_video.test_transformer_sana_video import (  # noqa: F401
+from tests.diffusion.models.sana_video.test_transformer_sana_video import (
     _TINY_CONFIG,
-    _init_distributed,
 )
 from tests.diffusion.offloader.helpers import DummyEvent, DummyStream, dummy_stream
 from vllm_omni.diffusion.attention import selector as attention_selector
@@ -73,6 +72,7 @@ def test_sana_video_declares_cache_and_layerwise_metadata():
     assert SanaVideoPipeline.default_num_inference_steps == 50
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_two_layer_tiny_transformer_enables_cache_dit(monkeypatch):
     transformer = _tiny_transformer(monkeypatch)
     pipeline = _PipelineWithTransformer(transformer=transformer)
@@ -93,6 +93,7 @@ def test_two_layer_tiny_transformer_enables_cache_dit(monkeypatch):
             cache_dit.disable_cache(enabled_adapters[0])
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_second_engine_enables_cache_dit_after_undisabled_first(monkeypatch):
     """An engine never disables Cache-DiT on shutdown, and cache_dit marks the
     shared wrapper-pipe class as cached; a second engine in the same process
@@ -113,6 +114,7 @@ def test_second_engine_enables_cache_dit_after_undisabled_first(monkeypatch):
             cache_dit.disable_cache(adapter)
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_cache_dit_pattern_mismatch_fails_closed(monkeypatch):
     transformer = _tiny_transformer(monkeypatch)
     transformer.transformer_blocks[1].forward = lambda unexpected_input: unexpected_input
@@ -295,6 +297,7 @@ def _enable_layerwise_offload(pipeline: SanaVideoPipeline) -> LayerWiseOffloadBa
     return backend
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeypatch):
     _patch_layerwise_platform(monkeypatch)
     pipeline = _tiny_pipeline(monkeypatch)
@@ -324,6 +327,7 @@ def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeyp
         assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is None
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_layerwise_offload_then_cache_dit_install_and_cleanup(monkeypatch):
     _patch_layerwise_platform(monkeypatch)
     pipeline = _tiny_pipeline(monkeypatch)

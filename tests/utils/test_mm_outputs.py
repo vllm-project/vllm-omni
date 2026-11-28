@@ -64,7 +64,7 @@ def test_build_mm_cpu_d2h_count_grows_per_request(num_requests, mocker):
     assert len(result["codes"]["ref"]) == num_requests
 
 
-def test_build_mm_cpu_preserves_int_dtypes_of_talker_metadata():
+def test_build_mm_cpu_preserves_metadata_dtypes_and_cpu_leaves():
     """ref_code_len is int32 and codec_streaming int8 at the source; a W2 that
     stages passthrough through a float buffer would corrupt both silently."""
     result = build_mm_cpu(multimodal_outputs=make_talker_passthrough_payload(3))
@@ -73,17 +73,7 @@ def test_build_mm_cpu_preserves_int_dtypes_of_talker_metadata():
     assert result["meta"]["codec_streaming"].dtype == torch.int8
     assert all(ref.dtype == torch.long for ref in result["codes"]["ref"])
 
-
-def test_build_mm_cpu_returns_cpu_tensors_for_every_nested_leaf():
-    """The output contract: every tensor leaf, including those inside the
-    ``codes.ref`` list, comes back on CPU.
-
-    On this lane the inputs are already CPU, so this documents the contract
-    rather than proving it -- ``.to("cpu")`` is a no-op here. The GPU-gated
-    sibling below is the one that can actually fail.
-    """
-    result = build_mm_cpu(multimodal_outputs=make_talker_passthrough_payload(3))
-
+    # CPU inputs exercise the output contract; the GPU test below proves D2H.
     leaves = list(iter_tensors(result))
     assert len(leaves) == NUM_TOKEN_ALIGNED_TENSORS + 3
     assert all(leaf.device.type == "cpu" for leaf in leaves)

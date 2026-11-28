@@ -167,6 +167,36 @@ def test_get_quant_method_online(mocker: MockerFixture):
         assert type(method).__name__ == "VllmMxfp8OnlineLinearMethod"
 
 
+def test_get_quant_method_online_moe_xpu_passes_moe_config(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    """XPU online MXFP8 experts must hand vLLM's MoE method the FusedMoEConfig as the
+    keyword-only ``moe``; ``layer=`` raised TypeError for every MoE model at load."""
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    import vllm_omni.quantization.mxfp8_config as mxfp8_config
+
+    assert "moe" in inspect.signature(mxfp8_config.VllmMxfp8OnlineMoEMethod.__init__).parameters
+
+    calls: list[dict] = []
+    sentinel = object()
+
+    def fake_moe_method(**kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(mxfp8_config, "VllmMxfp8OnlineMoEMethod", fake_moe_method)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: True)
+
+    layer = mocker.Mock(spec=RoutedExperts)
+    layer.moe_config = object()
+    method = mxfp8_config.DiffusionMXFP8Config().get_quant_method(layer, "model.layers.0.mlp.experts")
+
+    assert method is sentinel
+    assert calls == [{"moe": layer.moe_config}]
+
+
 def test_xpu_online_method_keeps_vllm_weight_lifecycle():
     """XPU online MXFP8 must not replace vLLM's create_weights: that is where vLLM
     builds the meta-device weight and selects the shape-dependent MXFP8 kernel."""
@@ -179,7 +209,7 @@ def test_xpu_online_method_keeps_vllm_weight_lifecycle():
 
 
 def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    """Unsupported platform (CUDA, ROCm) must raise NotImplementedError."""
+    """Platforms without an MXFP8 implementation must fail explicitly."""
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 
     config = DiffusionMXFP8Config()
@@ -190,6 +220,33 @@ def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, mon
 
     with pytest.raises(NotImplementedError):
         config.get_quant_method(layer, "blocks.0.attn1.to_q")
+
+
+def test_cuda_mxfp8_rejects_native_offline(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    layer = mocker.Mock(spec=LinearBase)
+    with pytest.raises(NotImplementedError, match="offline mode is not supported on CUDA"):
+        DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True).get_quant_method(layer, "linear")
+
+
+@pytest.mark.parametrize("capability", [None, (9, 0), (12, 0)])
+def test_cuda_mxfp8_rejects_unsupported_device(monkeypatch: pytest.MonkeyPatch, capability):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.quantization import mxfp8_cuda
+
+    monkeypatch.setattr(mxfp8_cuda.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        mxfp8_cuda.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(*capability) if capability else None,
+    )
+    with pytest.raises(NotImplementedError, match="SM100, SM103 or SM107"):
+        mxfp8_cuda.CUDAMxfp8OnlineLinearMethod()
 
 
 def test_get_quant_method_ignored_layer(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):

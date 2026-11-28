@@ -35,7 +35,7 @@ _EDIT_PROMPT = (
     f"请制作一张清晰的产品展示图：{_PROMPT}。保留标志的形状、文字与颜色，"
     "呈现真实的材质纹理，使用柔和的自然光和简洁背景，不添加其他物体。"
 )
-# Match the official Instruct reference thresholds in test_hunyuan_image3.py.
+# Reference-quality thresholds for the Instruct checkpoint.
 _ACCURACY_THRESHOLDS = {"clip_score": 90.0, "ssim": 0.26, "psnr": 12.5}
 _PREFILL_RE = re.compile(
     r"Diffusion prefix prefill: request_id=(\S+) sequence_id=(\d+) "
