@@ -8,7 +8,7 @@ import os
 import random
 import warnings
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.attention.backends.sla_config import SLASpec
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     collect_calibration_specs,
     propagate_skip_softmax_calibration,
@@ -2524,6 +2525,7 @@ class AttentionSpec:
     fastvideo_vsa_precision: str = "bf16"
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
+    sla: SLASpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -2533,6 +2535,11 @@ class AttentionSpec:
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sla = self._coerce(self.sla, SLASpec, "sla")
+        if self.backend.upper() == "SLA_ATTN":
+            self.sla = self.sla or SLASpec()
+        elif self.sla is not None:
+            raise ValueError("sla options require the SLA_ATTN backend.")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2584,6 +2591,8 @@ class AttentionSpec:
     def backend_kwargs(self) -> dict[str, Any] | None:
         """Serialize typed backend config into the kwargs dict the backend impl consumes."""
         kw: dict[str, Any] = {}
+        if self.sla is not None:
+            kw["sla"] = asdict(self.sla)
         if self.backend.upper() == "FASTVIDEO_VSA" and self.fastvideo_vsa_provider != "auto":
             kw["provider"] = self.fastvideo_vsa_provider
         if self.fastvideo_vsa_precision != "bf16":
@@ -2707,6 +2716,7 @@ class AttentionConfig:
             "fastvideo_vsa_precision",
             "sparge",
             "block_sparse",
+            "sla",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)

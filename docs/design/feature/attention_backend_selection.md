@@ -75,6 +75,7 @@ unstructured keyword dictionaries:
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
 - `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
 - `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
+- `sla` is consumed by MindIE-SD SLA on MiniMax-H3 main DiT blocks.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend
@@ -139,6 +140,21 @@ missing-kernel errors remain startup failures, not runtime fallbacks.
 
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
+
+`SLA_ATTN` is an NPU-only provider contract for MiniMax-H3. Its implementation
+owns the MindIE-SD call, while each H3 attention block registers that same
+provider module as `sla_module` so checkpoint loading and offload include
+`proj_l`. Projection weights are required unless explicit `sla.zero_init`
+permits zero defaults. The text refiner must resolve to a dense backend.
+The default sparse branch is BF16. Explicit `sla.precision=fp8` uses
+block-scaled E4M3 Q/K/V and MindIE-SD quantized BlockSparseAttention, while
+retaining BF16 inputs and the existing linear correction. Missing provider
+FP8 support is an error.
+Only one square BF16 document with structural suffix padding is supported;
+padding is removed before sparse selection and linear reduction. Pure Ulysses
+uses the shared dispatcher. Ring, AllGather-KV, reference isolation/reuse,
+and attention schedules are rejected. No dense fallback or training-specific
+token routing is introduced. See the [SLA guide](../../user_guide/diffusion/attention_backends/sla_attn.md).
 
 ## Adding or changing a backend
 

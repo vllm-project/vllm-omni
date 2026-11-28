@@ -273,6 +273,24 @@ class MiniMaxH3Attention(nn.Module):
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
+        self.sla_module: nn.Module | None = None
+        if self.attention.attn_backend.get_name() == "SLA_ATTN":
+            from vllm_omni.diffusion.attention.backends.sla_attn import SLAAttentionImpl
+
+            impl = self.attention.attention
+            assert isinstance(impl, SLAAttentionImpl)
+            if self.attention.use_ring or self.attention.parallel_strategy.name not in ("none", "ulysses"):
+                raise ValueError("MiniMax-H3 SLA supports local attention or pure Ulysses only (ring_degree=1).")
+            self.sla_module = impl.sla_module
+            for parameter in self.sla_module.proj_l.parameters():
+                parameter.is_checkpoint_optional = impl.config.zero_init
+                parameter.is_checkpoint_required = not impl.config.zero_init
+        self.attention.add_schedule_candidate_check(self._sla_candidate_check)
+
+    def _sla_candidate_check(self, record: ScheduleCandidate) -> str | None:
+        if self.sla_module is not None or record.backend_cls.get_name() == "SLA_ATTN":
+            return "MiniMax-H3 SLA does not support attention schedules; select a fixed per-role backend."
+        return None
 
     def enable_vsa_gate(self) -> None:
         """Build the VSA compression gate this attention would otherwise lack.
@@ -398,6 +416,13 @@ class MiniMaxH3Attention(nn.Module):
         # the candidate the layer dispatches to, and the packed layout below
         # must match that backend rather than the baseline.
         backend = self.attention.effective_attention()[1]
+        if getattr(self, "sla_module", None) is not None and (
+            reference_kv_state is not None
+            or reference_kv_compact
+            or (reference_isolation is not None and reference_isolation.reference_rows > 0)
+            or vdn_window is not None
+        ):
+            raise ValueError("MiniMax-H3 SLA does not support reference-KV reuse, reference isolation or VDN windows.")
         if num_requests > 1:
             if not _attention_isolates_packed_requests(self.attention, backend):
                 backend_name = backend.get_name()

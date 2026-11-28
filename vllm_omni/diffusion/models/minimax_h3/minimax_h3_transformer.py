@@ -1023,7 +1023,7 @@ class MiniMaxH3DiTModel(nn.Module):
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
-            param.missing_param_init = "error"
+            param.missing_param_init = "zeros" if getattr(param, "is_checkpoint_optional", False) else "error"
 
     def _rope_local_span(self, seq_len: int) -> tuple[int, int]:
         """Return the sequence-parallel rows owned by this DiT rank."""
@@ -1106,6 +1106,16 @@ class MiniMaxH3DiTModel(nn.Module):
         source_names: set[str] = set()
         for name, loaded_weight in weights:
             layout = "plain"
+            if ".attn.sla_module." in name:
+                # SLA checkpoints use native names even when the base model
+                # uses Diffusers naming. Never skip an unrecognized projection.
+                if name not in params:
+                    raise ValueError(f"SLA weight has no model parameter (enable SLA_ATTN): {name}")
+                if name in loaded:
+                    raise ValueError(f"duplicate MiniMax-H3 SLA weight: {name}")
+                default_weight_loader(params[name], loaded_weight)
+                loaded.add(name)
+                continue
             if diffusers_weights:
                 if name in source_names:
                     raise ValueError(f"duplicate Diffusers H3 weight: {name}")
@@ -1207,6 +1217,16 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        required_sla = {
+            name
+            for name, param in params.items()
+            if ".attn.sla_module." in name and getattr(param, "is_checkpoint_required", False)
+        }
+        if missing_sla := required_sla - loaded:
+            raise ValueError(f"MiniMax-H3 SLA checkpoint is missing projection weights: {sorted(missing_sla)}")
+        for name, param in params.items():
+            if ".attn.sla_module." in name and name not in loaded and getattr(param, "is_checkpoint_optional", False):
+                nn.init.zeros_(param)
         return loaded
 
     @staticmethod

@@ -40,6 +40,9 @@ class _FakeAttention(nn.Module):
     def __init__(self, **kwargs):
         del kwargs
         super().__init__()
+        from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+
+        self.attn_backend = FlashAttentionBackend
 
     def add_schedule_candidate_check(self, check):
         del check
