@@ -65,6 +65,7 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.dit_load_state import DitLoadState
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -495,6 +496,11 @@ class OrchestratorBase:
     _orch_monitor: OrchestratorMonitorBase = _NULL_ORCH_MONITOR
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
+    _dit_load_state: DitLoadState | None = None
+    _dit_load_aware: bool = False
+    _dit_load_fail_count: dict[tuple[int, int], int] | None = None
+    _DIT_LOAD_POLL_INTERVAL_S: float = 0.01
+    _DIT_LOAD_EVICT_THRESHOLD: int = 5
 
     def __init__(
         self,
@@ -514,6 +520,7 @@ class OrchestratorBase:
         collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
         tracer: Tracer | None = None,
+        dit_load_aware_config: list[dict[str, Any]] | None = None,
     ) -> None:
         self.tracer = tracer
         self.request_async_queue = request_async_queue
@@ -568,6 +575,13 @@ class OrchestratorBase:
         self._event_driven_orch = _event_driven_orch_enabled()
 
         # Distributed membership (optional, injected by DistStageRuntime)
+        self._dit_load_aware = dit_load_aware_config is not None
+        self._dtps_pairs: list[dict[str, Any]] = dit_load_aware_config or []
+        self._dit_load_dirty_pairs: set[int] = set()
+        if self._dit_load_aware:
+            self._dit_load_state = DitLoadState()
+            self._dit_load_fail_count: dict[tuple[int, int], int] = {}
+
         self._membership = membership_controller
 
     def _init_metrics_state(
@@ -863,6 +877,8 @@ class OrchestratorBase:
 
     def _background_tasks(self) -> list[Coroutine[Any, Any, None]]:
         """Extra coroutines gathered with the request/output handlers in ``run()``."""
+        if self._dit_load_aware:
+            return [self._dit_load_poll_loop()]
         return []
 
     async def _shutdown_extensions(self) -> None:
@@ -1415,6 +1431,138 @@ class OrchestratorBase:
                 self._update_stage_replica_waiting(stage_id, replica_id, int(n_waiting))
         return diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID
 
+    async def _dit_load_poll_loop(self) -> None:
+        """Periodically collect DiT load and push snapshots to paired AR stages."""
+        while not self._shutdown_event.is_set():
+            try:
+                await self._poll_dit_load_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("[Orchestrator] DTPS load poll cycle failed", exc_info=True)
+            await asyncio.sleep(self._DIT_LOAD_POLL_INTERVAL_S)
+
+    async def _poll_dit_load_cycle(self) -> None:
+        """One bounded DTPS pass: collect loads per pair, push one snapshot per pair."""
+        state = self._dit_load_state
+        if state is None or not self._dit_load_aware:
+            return
+        for pair in self._dtps_pairs:
+            dit_stage_id = pair["dit_stage_id"]
+            pool = self.stage_pools[dit_stage_id]
+            changed = await self._collect_pair_dit_load(dit_stage_id, pool)
+            if not changed and dit_stage_id not in self._dit_load_dirty_pairs:
+                continue
+            success = await self._push_dit_load_to_ar(state, dit_stage_id)
+            if success:
+                self._dit_load_dirty_pairs.discard(dit_stage_id)
+            else:
+                self._dit_load_dirty_pairs.add(dit_stage_id)
+
+    async def _collect_pair_dit_load(self, stage_id: int, pool: StagePool) -> bool:
+        """Poll one pair's live DiT replicas; return True when any entry changed."""
+        state = self._dit_load_state
+        if state is None:
+            return False
+        changed = False
+        for replica_id in pool.available_replica_ids():
+            if not pool.check_dit_health(replica_id):
+                logger.warning(
+                    "[OmniDTPS] DiT health check failed for stage-%s rep-%s; evicting its load entry",
+                    stage_id,
+                    replica_id,
+                )
+                self._remove_dit_load_entry(stage_id, replica_id)
+                changed = True
+                continue
+            load = await pool.poll_dit_load(replica_id)
+            key = (stage_id, replica_id)
+            if load is None:
+                self._dit_load_fail_count[key] = self._dit_load_fail_count.get(key, 0) + 1
+                if self._dit_load_fail_count[key] >= self._DIT_LOAD_EVICT_THRESHOLD:
+                    logger.warning(
+                        "[OmniDTPS] DiT load poll returned None %d times for stage-%s rep-%s; evicting its load entry",
+                        self._DIT_LOAD_EVICT_THRESHOLD,
+                        stage_id,
+                        replica_id,
+                    )
+                    self._remove_dit_load_entry(stage_id, replica_id)
+                    self._dit_load_fail_count[key] = 0
+                    changed = True
+                continue
+            self._dit_load_fail_count[key] = 0
+            waiting, running, waiting_ids, running_ids = load
+            try:
+                replica_changed = state.update(
+                    stage_id,
+                    replica_id,
+                    waiting,
+                    running,
+                    waiting_ids=waiting_ids,
+                    running_ids=running_ids,
+                )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] DitLoadState.update failed for stage-%s rep-%s",
+                    stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
+                continue
+            if replica_changed:
+                logger.info(
+                    "[OmniDTPS] poll stage-%s rep-%s: waiting=%d running=%d",
+                    stage_id,
+                    replica_id,
+                    waiting,
+                    running,
+                )
+                changed = True
+        return changed
+
+    def _remove_dit_load_entry(self, stage_id: int, replica_id: int) -> None:
+        """Drop one replica's load entry, tolerating state-level failures."""
+        state = self._dit_load_state
+        if state is None:
+            return
+        try:
+            state.remove(stage_id, replica_id)
+        except Exception:
+            logger.debug(
+                "[Orchestrator] DitLoadState.remove failed for stage-%s rep-%s",
+                stage_id,
+                replica_id,
+                exc_info=True,
+            )
+
+    async def _invalidate_dit_load(self, stage_id: int, replica_id: int) -> None:
+        """Drop a departed DiT replica's load entry and republish the pair snapshot."""
+        if not self._dit_load_aware or self._dit_load_state is None:
+            return
+        if stage_id not in {p["dit_stage_id"] for p in self._dtps_pairs}:
+            return
+        self._remove_dit_load_entry(stage_id, replica_id)
+        success = await self._push_dit_load_to_ar(self._dit_load_state, stage_id)
+        if success:
+            self._dit_load_dirty_pairs.discard(stage_id)
+        else:
+            self._dit_load_dirty_pairs.add(stage_id)
+
+    async def _push_dit_load_to_ar(self, state: DitLoadState, dit_stage_id: int | None = None) -> bool:
+        """Push pair snapshots to their AR stages via the UTILITY channel."""
+        if not self._dit_load_aware:
+            return True
+        all_ok = True
+        for pair in self._dtps_pairs:
+            if dit_stage_id is not None and pair["dit_stage_id"] != dit_stage_id:
+                continue
+            ar_stage_id = pair["ar_stage_id"]
+            snapshot = state.snapshot(stage_id=pair["dit_stage_id"])
+            pool = self.stage_pools[ar_stage_id]
+            if not await pool.push_dit_load(snapshot):
+                all_ok = False
+        return all_ok
+
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
@@ -1896,6 +2044,7 @@ class OrchestratorBase:
         sessions with a typed error instead of letting them time out.
         """
         self._remove_stage_replica_metrics(stage_id, replica_id)
+        await self._invalidate_dit_load(stage_id, replica_id)
         await self._on_replica_removed(stage_id, replica_id)
 
     async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
@@ -1947,6 +2096,7 @@ class OrchestratorBase:
         )
         pool.evict_replica(replica_id)
         self._remove_stage_replica_metrics(stage_id, replica_id)
+        await self._invalidate_dit_load(stage_id, replica_id)
         if failed_request_id is not None:
             # A rejected submission can retain its binding when abort also
             # fails. Evict before cleanup so it cannot abort the dead engine

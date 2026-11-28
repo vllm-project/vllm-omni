@@ -65,6 +65,7 @@ CHECK_IMPORTS = {
         allowed_dirs=_NON_LIBRARY_DIRS,
         allowed_files={
             "vllm_omni/benchmarks/data_modules/daily_omni_dataset.py",
+            "vllm_omni/benchmarks/data_modules/mixed_omni_dataset.py",
             "vllm_omni/benchmarks/data_modules/random_multi_modal_dataset.py",
             "vllm_omni/benchmarks/data_modules/seed_tts_dataset.py",
             "vllm_omni/entrypoints/openai/api_server.py",
