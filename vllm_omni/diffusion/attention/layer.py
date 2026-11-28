@@ -437,6 +437,21 @@ def _is_nvidia_cuda() -> bool:
     return current_omni_platform.is_cuda() and torch.version.hip is None
 
 
+def _strict_ulysses_ce(layer, strategy, query, use_paged_attention):
+    if strategy.name != "ulysses" or use_paged_attention or layer.use_ring or layer._has_custom_attention:
+        return False
+    if getattr(layer, "_explicit_cross_contract", False) or not getattr(strategy, "_ulysses_a2a_permute", False):
+        return False
+    if getattr(strategy, "_scatter_idx", None) != 2 or getattr(strategy, "_gather_idx", None) != 1:
+        return False
+    sp_group = getattr(strategy, "_sp_group", None)
+    if sp_group is None or sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1:
+        return False
+    if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
+        return False
+    return True
+
+
 class Attention(nn.Module):
     _scheduler_paged_kv = False
     _has_custom_attention = False
@@ -490,8 +505,11 @@ class Attention(nn.Module):
         computation: AttentionComputation | str | None = None,
         cross_parallel_layout: CrossAttentionParallelLayout | str | None = None,
         cross_mask_kind: str | None = None,
+        borrow_ulysses_output: bool = False,
     ):
         super().__init__()
+        # The caller consumes this result before the next attention on the compute stream.
+        self.borrow_ulysses_output = borrow_ulysses_output
 
         self.role = role
         self.role_category = role_category
@@ -1211,22 +1229,11 @@ class Attention(nn.Module):
     def _ulysses_ce_overlap_chunks(self, strategy, query, key, value, attn_metadata, use_paged_attention) -> int:
         """Chunk count for the copy-engine overlapped strict-Ulysses path, or 0 when it does not apply."""
         chunks = int(getattr(strategy, "ce_overlap_chunks", 0))
-        if chunks <= 0 or strategy.name != "ulysses" or use_paged_attention or self.use_ring:
-            return 0
-        if getattr(self, "_explicit_cross_contract", False) or not getattr(strategy, "_ulysses_a2a_permute", False):
-            return 0
-        if getattr(strategy, "_scatter_idx", None) != 2 or getattr(strategy, "_gather_idx", None) != 1:
-            return 0
-        sp_group = getattr(strategy, "_sp_group", None)
-        if sp_group is None or sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1:
-            return 0
-        if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
+        if chunks <= 0 or not _strict_ulysses_ce(self, strategy, query, use_paged_attention):
             return 0
         if torch.cuda.is_current_stream_capturing():
-            # The overlap's cross-rank flags carry host-side epochs that a replayed graph would not advance.
             return 0
-        if self._has_custom_attention:
-            return 0
+        sp_group = strategy._sp_group
         if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
             return 0
         if any(x.dtype != query.dtype or x.stride(-1) != 1 or x.stride(-2) != x.shape[-1] for x in (query, key, value)):
@@ -1372,6 +1379,19 @@ class Attention(nn.Module):
             if not isinstance(isolation, tuple) or len(isolation) != 2:
                 raise TypeError("reference isolation metadata must be a (state, compact) tuple")
             isolated_dense = self._reference_isolation_dense_impl()
+        policy = getattr(strategy, "head_policy", None)
+        if (
+            policy is not None
+            and policy.enabled_for_call
+            and not torch.compiler.is_compiling()
+            and isolation is None
+            and not strategy._use_sync
+            and _strict_ulysses_ce(self, strategy, query, use_paged_attention)
+        ):
+            result = policy.try_run(strategy, self, query, key, value, attn_metadata)
+            if result is not None:
+                return result
+
         chunks = self._ulysses_ce_overlap_chunks(strategy, query, key, value, attn_metadata, use_paged_attention)
         if chunks:
             output = self._ulysses_ce_overlap_or_none(strategy, query, key, value, attn_metadata, chunks)

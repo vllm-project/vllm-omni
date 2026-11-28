@@ -424,6 +424,7 @@ class WanSelfAttention(nn.Module):
 
         # Unified attention layer
         self.attn = Attention(
+            borrow_ulysses_output=True,  # to_out consumes the workspace on this stream.
             num_heads=self.num_heads,
             head_size=head_dim,
             num_kv_heads=self.num_kv_heads,

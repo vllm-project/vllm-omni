@@ -91,10 +91,11 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.ring_degree == 1
         assert od.parallel_config.ulysses_a2a_backend == "copy_engine"
 
-    def test_ulysses_ce_overlap_roundtrip(self):
-        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_backend="copy_engine", ulysses_overlap_chunks=4)
+    @pytest.mark.parametrize("chunks", [4, "auto"])
+    def test_ulysses_ce_overlap_roundtrip(self, chunks):
+        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_backend="copy_engine", ulysses_overlap_chunks=chunks)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
-        assert od.parallel_config.ulysses_overlap_chunks == 4
+        assert od.parallel_config.ulysses_overlap_chunks == chunks
         assert od.parallel_config.ulysses_a2a_backend == "copy_engine"
 
     @pytest.mark.parametrize(

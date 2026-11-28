@@ -568,6 +568,13 @@ source_file_dependencies:
     - vllm_omni/diffusion/distributed/comm.py
     - vllm_omni/platforms/
 
+  diffusion_ulysses_ce_overlap:
+    - tests/diffusion/distributed/test_ulysses_ce_overlap.py
+    - vllm_omni/diffusion/attention/parallel/ulysses_ce_overlap.py
+    - vllm_omni/diffusion/attention/parallel/head_overlap/
+    - vllm_omni/diffusion/attention/layer.py
+    - vllm_omni/diffusion/distributed/a2a_permute.py
+
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/test_mossimage_rope.py

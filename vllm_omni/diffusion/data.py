@@ -10,7 +10,7 @@ import warnings
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import diffusers
 import huggingface_hub
@@ -333,12 +333,13 @@ class DiffusionParallelConfig:
     ranks and torch symmetric memory, and NCCL otherwise (and always with CUDA-graphed denoising).
     """
 
-    ulysses_overlap_chunks: int = 0
-    """Overlap the copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
+    ulysses_overlap_chunks: int | Literal["auto"] = 0
+    """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
     Applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL) and requires strict pure
     Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and outputs return as each
-    chunk finishes. The first call for each attention kernel and shape runs the overlap and the standard path on
+    chunk finishes. The ``auto`` chunk setting compares an uneven split against native attention on real layers.
+    For a fixed chunk count, the first call for each attention kernel and shape runs both paths on
     every rank and keeps the overlap only if all ranks are bit-identical, so results match the unchunked path
     exactly; other kernels and shapes keep the standard exchange.
     """
@@ -446,9 +447,13 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
-        if self.ulysses_overlap_chunks < 0:
-            raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
-        if self.ulysses_overlap_chunks > 0 and (
+        if self.ulysses_overlap_chunks != "auto" and (
+            not isinstance(self.ulysses_overlap_chunks, int) or self.ulysses_overlap_chunks < 0
+        ):
+            raise ValueError(f"ulysses_overlap_chunks must be auto or >= 0, but got {self.ulysses_overlap_chunks}")
+        if self.ulysses_overlap_chunks == "auto" and self.ulysses_degree < 2:
+            raise ValueError("ulysses_overlap_chunks=auto requires ulysses_degree >= 2")
+        if self.ulysses_overlap_chunks and (
             self.ulysses_a2a_backend == "nccl"
             or self.ulysses_mode != "strict"
             or self.ring_degree != 1

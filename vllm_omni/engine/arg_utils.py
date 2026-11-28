@@ -481,7 +481,7 @@ class OmniEngineArgs(EngineArgs):
     # invariant 1 below requires the overlap to stay a subset of that set.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
-    ulysses_overlap_chunks: int | None = None
+    ulysses_overlap_chunks: int | Literal["auto"] | None = None
     ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
@@ -854,7 +854,7 @@ class OrchestratorArgs:
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
-    ulysses_overlap_chunks: int | None = None
+    ulysses_overlap_chunks: int | Literal["auto"] | None = None
     ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None

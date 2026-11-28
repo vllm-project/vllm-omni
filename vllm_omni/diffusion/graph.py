@@ -208,6 +208,10 @@ def build_denoise_graph_runner(
     device = get_local_device()
     graph_cls = current_omni_platform.get_graphed_forward_cls()
     release = bool(od_config.diffusion_graph_release_after_denoise)
+    if getattr(od_config.parallel_config, "ulysses_overlap_chunks", 0) == "auto" and graph_cls is GraphedForward:
+        from vllm_omni.diffusion.attention.parallel.head_overlap.graph import AdaptiveDenoiseGraph
+
+        graph_cls = AdaptiveDenoiseGraph
     runner = graph_cls(
         _StepForward(fn),
         device=device,

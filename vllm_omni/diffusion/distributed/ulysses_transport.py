@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import socket
 import zlib
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -134,7 +135,7 @@ def select_transport(
     *,
     cuda_graphs: bool,
     strict_pure: bool,
-    overlap_chunks: int = 0,
+    overlap_chunks: int | Literal["auto"] = 0,
 ) -> str:
     """The copy engine is faster: use it if it is supported here, otherwise NCCL.
 

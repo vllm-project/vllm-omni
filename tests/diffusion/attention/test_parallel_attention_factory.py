@@ -49,7 +49,7 @@ def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, e
     assert strategy.call_args.kwargs["ulysses_a2a_permute"] is enabled
 
 
-@pytest.mark.parametrize("chunks", [0, 4])
+@pytest.mark.parametrize("chunks", [0, 4, "auto"])
 def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_context, chunks):
     parallel_context.ulysses_overlap_chunks = chunks
     parallel_context.ulysses_a2a_backend = "copy_engine"  # the overlap runs on the copy-engine exchange only
@@ -59,3 +59,10 @@ def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_c
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
     assert strategy.call_args.kwargs["ce_overlap_chunks"] == chunks
+
+
+def test_auto_head_overlap_follows_resolved_transport(parallel_context):
+    parallel_context.ulysses_overlap_chunks = "auto"
+    strategy = factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+    assert not strategy.auto_head_overlap
+    assert strategy.ce_overlap_chunks == 0

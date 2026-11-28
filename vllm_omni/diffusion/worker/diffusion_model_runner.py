@@ -468,6 +468,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
+        if getattr(self.od_config.parallel_config, "ulysses_overlap_chunks", 0) == "auto":
+            from vllm_omni.diffusion.attention.parallel.head_overlap.head_policy import configure_head_overlap
+
+            configure_head_overlap(self.pipeline)
 
         if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
             logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")

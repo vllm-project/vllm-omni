@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -251,10 +252,11 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
-        ce_overlap_chunks: int = 0,
+        ce_overlap_chunks: int | Literal["auto"] = 0,
     ) -> None:
         self._sp_group = sp_group
-        self.ce_overlap_chunks = int(ce_overlap_chunks)
+        self.auto_head_overlap = ce_overlap_chunks == "auto"
+        self.ce_overlap_chunks = 0 if self.auto_head_overlap else int(ce_overlap_chunks)
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx

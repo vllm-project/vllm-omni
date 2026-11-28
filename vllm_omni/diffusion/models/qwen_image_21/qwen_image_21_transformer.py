@@ -570,6 +570,7 @@ class QwenImage21Attention(nn.Module):
         )
 
         self.attn = Attention(
+            borrow_ulysses_output=True,  # to_out consumes the workspace on this stream.
             num_heads=self.num_heads,
             head_size=dim_head,
             softmax_scale=1.0 / (dim_head**0.5),
