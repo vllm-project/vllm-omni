@@ -783,7 +783,14 @@ def _fused_cuda_supported(
         return False
     if interleaved:
         return fused_qk_norm_rope_available(q.device, q.dtype, head_dim, rotary_dim, interleaved=True)
-    if not (HAS_TRITON and current_platform.is_cuda() and q.dtype == torch.bfloat16):
+    # MACA uses the CUDA dispatch key. Keep its compiled path visible to Inductor.
+    if not (
+        HAS_TRITON
+        and q.dtype == torch.bfloat16
+        and (
+            current_platform.is_cuda() or (current_platform.device_name == "maca" and not torch.compiler.is_compiling())
+        )
+    ):
         return False
     # Half-split traffic keeps the pre-existing per-tensor kernel and its
     # exact MiniMax-H3 geometry contract (that kernel is untouched by the
