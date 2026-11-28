@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -306,7 +309,11 @@ class GroupCoordinator:
 
     def broadcast_object_list(self, obj_list: list[Any], src: int = 0, group: ProcessGroup | None = None):
         """Broadcast the input object list.
-        NOTE: `src` is the local rank of the source rank.
+
+        NOTE: `src` is the group-local rank of the source rank; the global rank
+        passed to PyTorch is `self.ranks[src]`. Object payloads are serialized
+        on the host, so the collective defaults to `self.cpu_group` when
+        `group` is omitted, matching `broadcast_object`.
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -314,7 +321,9 @@ class GroupCoordinator:
         if self.world_size == 1:
             return obj_list
         # Broadcast.
-        torch.distributed.broadcast_object_list(obj_list, src=self.ranks[src], group=self.device_group)
+        if group is None:
+            group = self.cpu_group
+        torch.distributed.broadcast_object_list(obj_list, src=self.ranks[src], group=group)
         return obj_list
 
     def send_object(self, obj: Any, dst: int) -> None:
@@ -375,14 +384,22 @@ class GroupCoordinator:
         metadata_group: ProcessGroup | None = None,
     ) -> dict[str, torch.Tensor | Any] | None:
         """Broadcast the input tensor dictionary.
-        NOTE: `src` is the local rank of the source rank.
+
+        NOTE: `src` is the group-local rank of the source rank. CPU tensor
+        payloads use `metadata_group` (defaults to `self.cpu_group`); device
+        tensors use `group` (defaults to `self.device_group`). The serialized
+        metadata list is broadcast through `broadcast_object`, i.e. the shared
+        memory broadcaster when available and `self.cpu_group` otherwise;
+        `metadata_group` does not change that host-side path.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
 
-        group = self.device_group
-        metadata_group = self.cpu_group
+        if group is None:
+            group = self.device_group
+        if metadata_group is None:
+            metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
         source_rank_in_group = src
         src = self.ranks[src]
