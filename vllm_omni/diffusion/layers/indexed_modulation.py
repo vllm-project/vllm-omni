@@ -247,6 +247,23 @@ def _indexed_gate_impl(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     """Return ``x + gate[indices] * other`` without indexed temporaries."""
+    if x.device.type == "npu":
+        try:
+            from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
+        except ImportError:
+            pass
+        else:
+            output = torch.empty_like(x, memory_format=torch.contiguous_format)
+            return mindiesd_indexed_gate(output, x, gate, other, indices)
+    return _indexed_gate(x, gate, other, indices)
+
+
+def _indexed_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
     if x.is_cpu:
         return (x + gate.index_select(0, indices) * other).to(x.dtype)
     output = torch.empty_like(x)
@@ -301,6 +318,24 @@ def _rms_norm_indexed_scale_shift_impl(
     eps: float,
 ) -> torch.Tensor:
     """Fuse RMSNorm with an indexed affine transform."""
+    if x.device.type == "npu":
+        try:
+            from mindiesd.layers.index_modulation import rms_norm_indexed_scale_shift as mindiesd_rms_norm
+        except ImportError:
+            pass
+        else:
+            return mindiesd_rms_norm(x, weight, shift, scale, indices, eps)
+    return _rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+
+
+def _rms_norm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
     if x.is_cpu:
         input_dtype = x.dtype
         normalized = x.float()

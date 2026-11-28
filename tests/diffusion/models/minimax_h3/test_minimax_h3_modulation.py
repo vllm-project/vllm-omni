@@ -153,6 +153,29 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+def test_indexed_gate_returns_mindiesd_output(mocker):
+    sdk = pytest.importorskip("mindiesd.layers.index_modulation", exc_type=ImportError)
+    sdk_gate = mocker.spy(sdk, "indexed_gate")
+    device = current_omni_platform.get_torch_device()
+    hidden_size = 5376
+    x = torch.ones(3, hidden_size, device=device, dtype=torch.bfloat16)
+    other = torch.full_like(x, 2)
+    table = torch.zeros(2, 6 * hidden_size, device=device, dtype=x.dtype)
+    gate = table.chunk(6, dim=-1)[-1]
+    gate[0].fill_(0.5)
+    gate[1].fill_(-1)
+    indices = torch.tensor([1, 0, 1], device=device)
+
+    actual = indexed_gate(x, gate, other, indices)
+
+    sdk_gate.assert_called_once()
+    assert actual is sdk_gate.call_args.args[0]
+    expected = torch.tensor([[-1], [2], [-1]], dtype=x.dtype).expand(3, hidden_size)
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
