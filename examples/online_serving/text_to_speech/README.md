@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| CSM-1B | `sesame/csm-1b` | ✓ (`ref_audio`+`ref_text`, continues the reference turn) | ✓ (PCM stream) | uploaded audio voice only; no presets | — |
 | Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✓ (`ref_audio`, no transcript) | ✓ (PCM / WAV + WebSocket) | built-in `default` or uploaded audio | ✓ |
 | Confucius4-TTS | `netease-youdao/Confucius4-TTS` | ✓ (`ref_audio`, required) | — | uploaded audio voice supported; no presets | — |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
@@ -193,6 +194,85 @@ tokens. The adapter does not normalize or segment long text automatically.
 At about 50 semantic tokens per second, one request yields at most about 30
 seconds of audio; longer text is cut off without an error, and the server logs
 a truncation warning. Split long text into shorter requests.
+
+---
+
+## CSM-1B
+
+Two-stage AR TTS at 24 kHz mono: a talker generates Mimi codes and the Mimi codec decodes them. It speaks one turn of text, optionally after a reference turn whose speaker it continues.
+
+### Prerequisites
+
+`sesame/csm-1b` is gated. Accept its license on Hugging Face and log in (`hf auth login`, or set `HF_TOKEN`) before the first launch. The first launch downloads the whole repository, about 19 GB.
+
+### Launch
+
+```bash
+vllm serve sesame/csm-1b --omni --port 8091
+```
+
+The packaged `vllm_omni/deploy/csm.yaml` is selected automatically. It keeps chunked delivery on; the pipeline has no `--no-async-chunk` mode.
+
+### Sending requests
+
+Text only (speaker label `0`):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello from Sesame.",
+        "response_format": "wav"
+    }' --output output.wav
+```
+
+Another speaker label, a fixed seed and a longer budget:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "This sentence is a little longer and needs more than ten seconds of budget.",
+        "extra_params": {"speaker_id": 1},
+        "seed": 7,
+        "max_new_tokens": 250
+    }' --output output.wav
+```
+
+Continuing a reference turn (the recording and its transcript are both required):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "And this is the next thing I want to say.",
+        "ref_audio": "https://example.com/reference.wav",
+        "ref_text": "This is what the reference recording says."
+    }' --output output.wav
+```
+
+Streaming PCM:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello from Sesame.",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
+```
+
+### Notes
+
+- Output: 24 kHz mono. `max_new_tokens` is a token budget: one token per 80 ms frame, plus two tokens (the end frame and the stop token) when the response ends on its own. The default is 125 tokens, at most 10 s; a non-streaming response cut off at the budget sets the `x-audio-truncated: true` header.
+- `extra_params.speaker_id` labels the speaker of the turn; it does not select a fixed voice. Without a reference turn the voice differs from request to request unless `seed` is set.
+- `temperature`, `top_k` and `top_p` in `extra_params` apply to the first codebook only. The depth decoder (codebooks 1-31) uses the model-wide `subtalker_sampling_params` of the deploy YAML.
+- `voice` is used only when it names an uploaded voice (`POST /v1/audio/voices`), which then supplies the reference turn. There are no preset voices.
+- Unsupported: `instructions`, `language`, `sample_rate`, `ref_audio_2`, `speaker_embedding`, `x_vector_only_mode`, and `extra_params` keys other than the four above. See the [Speech API reference](../../../docs/serving/speech_api.md#csm-1b).
+- A reference recording must be 1 to 30 s long.
+- See [`recipes/sesame/CSM-1B-RTX4090.md`](../../../recipes/sesame/CSM-1B-RTX4090.md) for memory and speed measured on an RTX 4090. Generation there is faster than real time (0.3 to 0.4 s per second of audio with up to 8 concurrent requests).
 
 ---
 

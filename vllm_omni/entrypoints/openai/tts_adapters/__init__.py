@@ -111,6 +111,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     confucius4_tts,
     cosyvoice3,
     covo_audio,
+    csm,
     fish_omni,
     fish_speech,
     gepard,

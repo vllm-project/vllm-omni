@@ -35,6 +35,7 @@ The consumer therefore reports and does not subtract.
 | MiniCPM-o Whisper encoder (streaming only) | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | fixed 1, per session |
 | ming_flash_omni talker | `StaticCache` | hardcoded `max_cache_len = 2048` | 24.00 MiB | fixed 1 |
 | LFM3-Omni temporal model (reference attention) | request-owned full and sliding KV tensors | `max_model_len` for full attention; `sliding_window - 1` for retained sliding KV | computed from checkpoint geometry | `max_num_seqs` |
+| CSM-1B Mimi decoder | per-request sliding `DynamicCache` | `sliding_window - 1 = 249`, plus the one chunk (`2 * codec_chunk_frames = 10` positions) its kept views still hold | 8.09 MiB | `max_num_seqs` |
 
 Most caches have their own bound: a sliding window, a decode-loop trip count,
 an encoder frame limit, or a constant. LFM3-Omni's full-attention cache instead

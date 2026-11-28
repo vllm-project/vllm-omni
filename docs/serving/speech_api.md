@@ -8,6 +8,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 - **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
+- **CSM-1B** (`sesame/csm-1b`) -- Llama backbone + depth decoder with the Mimi codec. Text-to-speech, optionally continuing a reference turn (`ref_audio` + `ref_text`). Output: 24 kHz.
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
@@ -53,6 +54,9 @@ vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
 
 # Chatterbox Turbo (built-in voice or one reference recording; `pip install 'vllm-omni[chatterbox]'`)
 vllm serve ResembleAI/chatterbox-turbo --omni --port 8091
+
+# CSM-1B (gated: accept the license on Hugging Face and log in first)
+vllm serve sesame/csm-1b --omni --port 8091
 ```
 
 ### Generate Speech
@@ -245,7 +249,7 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 - absent: the model does not report truncation, or the server did not record
   why generation stopped. This does not mean the audio is complete.
 
-Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
+Models that report it today: Qwen3-TTS, Breeze-TTS-2, CSM-1B, Fish Audio Drama 3,
 CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
 its own metadata). Qwen3-TTS returns the generated audio when any task
 (Base, CustomVoice or VoiceDesign) reaches its length limit, including a
@@ -1283,6 +1287,32 @@ output can vary slightly with concurrency and cache state; see the
 
 See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original)
 and the [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
+
+### CSM-1B
+
+| Model | Description |
+| ----- | ----------- |
+| `sesame/csm-1b` | Two-stage AR TTS: a Llama backbone with a depth decoder generates 32 Mimi codebooks at 12.5 frames per second, and the Mimi codec decodes them to 24 kHz mono. Text only, or text after one reference turn (`ref_audio` + `ref_text`) whose speaker it continues. Gated on Hugging Face. |
+
+CSM request fields:
+
+| Field | Behavior |
+| ----- | -------- |
+| `input` | Required. Empty text returns 400, and so does text that contains the tokenizer's special tokens (such as `<\|AUDIO\|>`). |
+| `extra_params.speaker_id` | Non-negative integer, default `0`. It labels the speaker of the turn (`[0]`, `[1]`, ...); it does not select a fixed voice. |
+| `extra_params.temperature` / `top_k` / `top_p` | Sampling of the first codebook only. Other `extra_params` keys return 400. |
+| `ref_audio` + `ref_text` | One recording and its transcript, both required. They form an earlier turn of the same speaker, which the model continues in that voice. The recording must be 1 to 30 s long and is resampled to 24 kHz. |
+| `voice` | The name of an uploaded voice supplies `ref_audio` and its stored transcript. Any other value is ignored; there are no preset voices. |
+| `max_new_tokens` | Token budget. One token is one 80 ms frame. A response that ends on its own spends two more tokens, on the end frame and the stop token, so N frames of audio need a budget of N + 2 to finish without being reported as [truncated](#truncated-audio). Default 125 from the deploy YAML (at most 10 s); adapter bounds 1..2048. |
+| `seed` | Optional. Reaches both the first-codebook sampler and the depth decoder. |
+| `sample_rate` | Not supported; output is 24 kHz. |
+| Other conditioning fields | `instructions`, `language`, `ref_audio_2`, `speaker_embedding`, `x_vector_only_mode` and `ref_audio_codes` return 400. |
+
+Codebooks 1-31 are sampled by the depth decoder with model-wide settings from the deploy YAML (`subtalker_sampling_params`: `do_sample`, `temperature`, `top_k`, `top_p`); a request cannot change them. For repeatable output pass `seed`, or turn sampling off in the deploy YAML.
+
+A request whose generated codes the codec cannot decode fails with HTTP 500 (`speech.audio.error` on an SSE stream) instead of returning silent audio. The two stages are always connected by chunks, so `--no-async-chunk` is not supported.
+
+See the [CSM-1B section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#csm-1b) for launch and request examples, and the [RTX 4090 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/sesame/CSM-1B-RTX4090.md) for measured memory and speed.
 
 ## Error Responses
 

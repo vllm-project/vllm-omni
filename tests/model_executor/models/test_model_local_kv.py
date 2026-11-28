@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """A declaration must match the cache that actually gets allocated.
 
 Two earlier versions of this file could not fail. The first asserted hand-typed
@@ -389,6 +389,7 @@ def test_protocol_is_structural():
         ("minicpmo_4_5/minicpmo_4_5_omni_llm.py", "MiniCPMWhisperEncoder"),
         ("ming_flash_omni/talker_module.py", "MingAudioGenerator"),
         ("ming_flash_omni/ming_flash_omni_talker.py", "MingFlashOmniTalkerForConditionalGeneration"),
+        ("csm/csm_code2wav.py", "CsmCode2Wav"),
     ],
 )
 def test_known_cache_owners_still_declare(relative_path: str, owner: str):

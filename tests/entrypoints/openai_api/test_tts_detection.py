@@ -145,6 +145,8 @@ _PIPELINE_STAGES = [
     "confucius4_tts_talker",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
+    "csm_code2wav",
+    "csm_talker",
     "dac_decoder",
     "diffusion",
     "dit",
