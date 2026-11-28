@@ -96,6 +96,13 @@ JoyAI's native pipeline uses the engine-resident contract. Its action parser and
 prompts live in the JoyAI model package and are shared with the HTTP service.
 See [standalone services](../../serving/standalone_servers.md) for their routes.
 
+`entrypoints/mage_vl/core` is intentionally internal to Mage-VL, its only
+production consumer. Its `DuplexRuntime`, `DuplexAdapter`, `DuplexSession`, and
+protocol helpers are not a shared model-integration API. The scaffold cases in
+`tests/e2e/features/fullduplex/test_runtime.py` and `test_core_contracts.py`
+retain coverage for this service's lifecycle behavior. Shared native duplex
+integrations use `engine/duplex`.
+
 ## Contract status
 
 This document describes current entrypoint responsibilities plus the boundary
