@@ -41,6 +41,8 @@ _RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
     }
 )
 
+_STAGE_RUNNER_FIELDS = ("use_v2_model_runner", "supports_native_mrv2_data_plane")
+
 _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     {
         "requires_full_payload_input",
@@ -496,6 +498,8 @@ class StagePipelineConfig:
     # Optional scheduler-side streaming window policy, owned by this stage.
     scheduler_window_policy: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    # Set by a model whose stage cannot start on the current runner.
+    unsupported_runner_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1308,19 +1312,6 @@ def get_unsupported_mrv2_sampling_params(
     return tuple(sorted(set(bad)))
 
 
-def _validate_mrv2_default_sampling_params(ps: StagePipelineConfig, ds: StageDeployConfig | None) -> None:
-    """Reject non-neutral unsupported ``default_sampling_params`` under v2 at startup."""
-    if not ps.mrv2_unsupported_sampling_params:
-        return
-    params = (ds.default_sampling_params if ds is not None else None) or {}
-    bad = get_unsupported_mrv2_sampling_params(params, ps.mrv2_unsupported_sampling_params)
-    if bad:
-        raise ValueError(
-            f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
-            "Model Runner V2 path; remove the unsupported parameters"
-        )
-
-
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1408,12 +1399,28 @@ def _resolve_execution_mode(
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
 
 
-def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig) -> None:
-    """Reject session modes a downstream MRv2 native-data-plane stage lacks.
+def validate_stage_runner_overrides(stage_id: int, overrides: Mapping[str, Any]) -> None:
+    for key in _STAGE_RUNNER_FIELDS:
+        if key in overrides:
+            raise ValueError(
+                f"stage {stage_id}: {key!r} must not be set via engine_extras or CLI overrides; "
+                "the pipeline defines its runner and transport capabilities."
+            )
 
-    Native downstream stages accept turn-based sessions. Duplex sessions
-    require a model-owned handoff declared by supports_duplex_mrv2.
-    """
+
+def resolve_stage_runner_args(deploy: DeployConfig, ps: StagePipelineConfig) -> dict[str, bool]:
+    """Resolve the stage's runner and transport capabilities for both config projections."""
+    if ps.unsupported_runner_reason:
+        raise ValueError(f"stage {ps.stage_id} ({ps.model_stage}): {ps.unsupported_runner_reason}")
+    validate_native_mrv2_session(deploy, ps)
+    return {
+        "use_v2_model_runner": ps.execution_type is not StageExecutionType.DIFFUSION,
+        "supports_native_mrv2_data_plane": ps.supports_native_mrv2_data_plane,
+    }
+
+
+def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig) -> None:
+    """Reject session modes a downstream MRv2 native-data-plane stage lacks."""
     if not ps.supports_native_mrv2_data_plane or not ps.input_sources:
         return
     if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:
@@ -1507,17 +1514,8 @@ def _build_engine_args(
         # retain the global admission limit as their worker capacity.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.worker_max_sessions
     if ds is not None:
-        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
-            if reserved in ds.engine_extras:
-                raise ValueError(
-                    f"stage {ds.stage_id}: {reserved!r} must not be set via engine_extras; "
-                    "the pipeline defines its runner and transport capabilities."
-                )
-    validate_native_mrv2_session(deploy, ps)
-    _validate_mrv2_default_sampling_params(ps, ds)
-    # This flag selects the LLM runner; diffusion stages own their runner.
-    engine_args["use_v2_model_runner"] = ps.execution_type is not StageExecutionType.DIFFUSION
-    engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
+        validate_stage_runner_overrides(ps.stage_id, ds.engine_extras)
+    engine_args.update(resolve_stage_runner_args(deploy, ps))
     if engine_args["use_v2_model_runner"] and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) uses Model Runner V2 without declaring "
@@ -1553,16 +1551,25 @@ def merge_sampling_constraints(
     return {**(sampling_params or {}), **resolved_constraints}
 
 
+def resolve_stage_sampling_defaults(ps: StagePipelineConfig, ds: StageDeployConfig | None) -> dict[str, Any]:
+    """Merge stage defaults and enforce the model's sampling limits on the effective values."""
+    params = merge_sampling_constraints(ds.default_sampling_params if ds is not None else None, ps.sampling_constraints)
+    bad = get_unsupported_mrv2_sampling_params(params, ps.mrv2_unsupported_sampling_params)
+    if bad:
+        raise ValueError(
+            f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
+            "Model Runner V2 path; remove the unsupported parameters"
+        )
+    return params
+
+
 def _build_extras(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
 ) -> dict[str, Any]:
     """Assemble ``yaml_extras`` (sampling + connectors + pipeline extras)."""
     extras: dict[str, Any] = {}
-    sampling = merge_sampling_constraints(
-        ds.default_sampling_params if ds is not None else None,
-        ps.sampling_constraints,
-    )
+    sampling = resolve_stage_sampling_defaults(ps, ds)
     if sampling:
         extras["default_sampling_params"] = sampling
     if ds is not None and ds.default_pooling_params:
@@ -1756,6 +1763,7 @@ class StageConfig:
         # Start with YAML engine_args defaults
         engine_args: dict[str, Any] = dict(self.yaml_engine_args)
         runtime_overrides = dict(self.runtime_overrides)
+        validate_stage_runner_overrides(self.stage_id, runtime_overrides)
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage

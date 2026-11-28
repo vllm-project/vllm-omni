@@ -1,5 +1,9 @@
 # LFM3-Audio-2B on CUDA
 
+> **Unavailable with vLLM 0.34.** Configuration resolution rejects both speech and text profiles
+> before loading weights because V2 warmup cannot initialize the temporal stage's per-request state.
+> The commands and measurements below document the earlier runtime.
+
 ## Model and execution
 
 [LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B)

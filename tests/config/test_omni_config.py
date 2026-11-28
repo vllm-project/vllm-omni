@@ -590,6 +590,14 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
     pipeline = _resolve_pipeline_or_skip(model_type)
     legacy_deploy = _load_default_deploy(pipeline)
 
+    if model_type in {"lfm3_omni", "lfm3_omni_text", "lfm3_audio", "lfm3_audio_text"}:
+        reason = "Model Runner V2 warmup cannot initialize the LFM3 temporal stage"
+        with pytest.raises(ValueError, match=reason):
+            merge_pipeline_deploy(pipeline, legacy_deploy)
+        with pytest.raises(ValueError, match=reason):
+            VllmOmniConfig.from_pipeline_config(pipeline)
+        return
+
     legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
     omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
 

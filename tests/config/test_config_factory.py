@@ -3458,56 +3458,62 @@ class TestPlatformOverrides:
         assert extra["codec_left_context_frames"] == 25
         assert extra["initial_codec_chunk_frames"] == 2
 
-    def test_higgs_audio_v3_v2_rejects_unsupported_default_sampling_params(self):
-        """Non-neutral unsupported sampling defaults fail at startup under v2.
-
-        The v2 path's self-owned sampler supports temperature/top-k/top-p/seed
-        only; a yaml carrying e.g. repetition_penalty=1.1 must fail at deploy
-        merge, not on every request. Neutral engine defaults (repetition_penalty=1.0) pass, and falsy neutral
-        values (logprobs: null, bad_words: [], logit_bias: {}) pass too,
-        matching the request-path checks in model_state.py add_request.
-        """
-        deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+    @pytest.mark.parametrize(
+        ("defaults", "invalid_key"),
+        [
+            ({}, None),
+            (
+                {
+                    "repetition_penalty": 1.0,
+                    "logprobs": None,
+                    "prompt_logprobs": None,
+                    "allowed_token_ids": None,
+                    "bad_words": [],
+                    "logit_bias": {},
+                },
+                None,
+            ),
+            ({"repetition_penalty": 1.2}, "repetition_penalty"),
+            ({"logprobs": 5}, "logprobs"),
+            ({"logprobs": 0}, "logprobs"),
+        ],
+    )
+    @pytest.mark.parametrize("platform", ["cuda", "rocm"])
+    def test_higgs_audio_v3_validates_default_sampling_params(self, monkeypatch, defaults, invalid_key, platform):
+        monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", platform)
         pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        deploy = load_deploy_config(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+        deploy.stages[0].default_sampling_params.update(defaults)
+        if invalid_key is not None:
+            with pytest.raises(ValueError, match=invalid_key):
+                merge_pipeline_deploy(pipeline, deploy)
+            with pytest.raises(ValueError, match=invalid_key):
+                VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+            return
 
-        # Shipped defaults are neutral: merge succeeds.
-        stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
-        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+        legacy = merge_pipeline_deploy(pipeline, deploy)[0].yaml_extras["default_sampling_params"]
+        assert structured.stage_by_id(0).model_config.default_sampling_params == legacy
 
-        # Explicitly neutral None/collection values are no-ops, not failures.
-        deploy = load_deploy_config(deploy_path)
-        deploy.stages[0].default_sampling_params.update(
-            logprobs=None,
-            prompt_logprobs=None,
-            allowed_token_ids=None,
-            bad_words=[],
-            logit_bias={},
-        )
-        merge_pipeline_deploy(pipeline, deploy)
-
-        deploy = load_deploy_config(deploy_path)
-        deploy.stages[0].default_sampling_params["repetition_penalty"] = 1.1
-        with pytest.raises(ValueError, match="unsupported parameters"):
-            merge_pipeline_deploy(pipeline, deploy)
-
-        # Non-neutral collection values fail the same way as scalars.
-        deploy = load_deploy_config(deploy_path)
-        deploy.stages[0].default_sampling_params["logprobs"] = 5
-        with pytest.raises(ValueError, match="unsupported parameters"):
-            merge_pipeline_deploy(pipeline, deploy)
-
-        # 0 looks neutral but still requests a logprob; keep it rejected so
-        # startup matches add_request.
-        deploy = load_deploy_config(deploy_path)
-        deploy.stages[0].default_sampling_params["logprobs"] = 0
-        with pytest.raises(ValueError, match="unsupported parameters"):
-            merge_pipeline_deploy(pipeline, deploy)
-
-        # Non-CUDA profiles also use V2; they have the same sampling limits.
-        rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
-        rocm.stages[0].default_sampling_params["repetition_penalty"] = 1.1
-        with pytest.raises(ValueError, match="unsupported parameters"):
-            merge_pipeline_deploy(pipeline, rocm)
+    @pytest.mark.parametrize(("platform_penalty", "cli_penalty"), [(1.2, 1.0), (1.0, 1.2)])
+    @pytest.mark.parametrize("strategy_specs", [None, {"higgs_audio_v3": []}], ids=["default", "parallel-strategy"])
+    def test_higgs_sampling_validation_uses_final_cli_defaults(self, platform_penalty, cli_penalty, strategy_specs):
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        deploy = load_deploy_config(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+        deploy.platforms["cpu"] = {
+            "stages": [{"stage_id": 0, "default_sampling_params": {"repetition_penalty": platform_penalty}}]
+        }
+        overrides = {"default_sampling_params": {"0": {"repetition_penalty": cli_penalty}}}
+        if cli_penalty != 1.0:
+            with pytest.raises(ValueError, match="repetition_penalty"):
+                VllmOmniConfig.from_pipeline_config(
+                    pipeline, user_deploy_config=deploy, cli_overrides=overrides, strategy_specs=strategy_specs
+                )
+        else:
+            config = VllmOmniConfig.from_pipeline_config(
+                pipeline, user_deploy_config=deploy, cli_overrides=overrides, strategy_specs=strategy_specs
+            )
+            assert config.stage_by_id(0).model_config.default_sampling_params["repetition_penalty"] == cli_penalty
 
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -3812,17 +3818,24 @@ class TestPlatformOverrides:
         if warning.called:
             assert "legacy transport path" in warning.call_args.args[0]
 
-    def test_runner_selection_rejects_engine_extras_override(self):
-        pipeline = PipelineConfig(
-            model_type="runner_selection_reserved",
-            stages=SINGLE_STAGE_PIPE_CFG,
-        )
-        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
-            deploy = DeployConfig(
-                stages=[StageDeployConfig(stage_id=0, engine_extras={reserved: False})],
-            )
-            with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
-                merge_pipeline_deploy(pipeline, deploy)
+    @pytest.mark.parametrize("reserved", ["use_v2_model_runner", "supports_native_mrv2_data_plane"])
+    def test_runner_selection_rejects_engine_extras_override(self, reserved):
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras={reserved: False})])
+        with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
+            merge_pipeline_deploy(pipeline, deploy)
+        with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
+            VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+    @pytest.mark.parametrize("reserved", ["use_v2_model_runner", "supports_native_mrv2_data_plane"])
+    def test_runner_selection_rejects_stage_cli_override(self, reserved):
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        stage = merge_pipeline_deploy(pipeline, DeployConfig())[0]
+        stage.runtime_overrides = {reserved: False}
+        with pytest.raises(ValueError, match=reserved):
+            stage.to_omegaconf()
+        with pytest.raises(ValueError, match=reserved):
+            VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={f"stage_0_{reserved}": False})
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

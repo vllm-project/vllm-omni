@@ -335,8 +335,11 @@ request ID. Automatic ABC transitions reset the same request's phase state.
 The profile requires one GPU, synchronous scheduling, and disabled prefix
 caching and external KV transfer. See the [YuE2 recipe](gh-file:recipes/m-a-p/YuE2-3B.md).
 
-Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
-are unavailable. Their retired serving E2E tests covered speech generation,
+Drama 3 / Fish-Omni serving and the LFM3-Omni speech and text-only profiles
+are unavailable. LFM3-Omni and LFM3-Audio share a temporal stage whose
+per-request state cannot be initialized during V2 warmup. Configuration
+resolution rejects their speech and text profiles before loading weights.
+The retired Fish-Omni and LFM3-Omni serving E2E tests covered speech generation,
 voice cloning, streaming, concurrency and request validation across those
 workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
 serving replacements; LFM3-Audio uses a different checkpoint and profile.

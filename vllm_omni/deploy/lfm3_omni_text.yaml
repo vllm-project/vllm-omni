@@ -1,4 +1,4 @@
-# Historical LFM3-Omni text profile. End-to-end V2 serving has not been validated.
+# The LFM3 temporal stage rejects V2 startup until warmup supports its per-request state.
 pipeline: lfm3_omni_text
 # LFM3-Omni bring-up profile. Eager execution owns per-request convolution state.
 async_chunk: false
