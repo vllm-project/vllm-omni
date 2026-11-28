@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -82,7 +85,7 @@ def _make_pipeline(
     drop_idx: int,
     input_kind: str,
 ):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: nn.Module = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -289,7 +292,7 @@ def test_edit_pipelines_validate_text_prompt_length_before_image_token_expansion
     pipeline_class: type,
     drop_idx: int,
 ):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: nn.Module = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -300,7 +303,7 @@ def test_edit_pipelines_validate_text_prompt_length_before_image_token_expansion
     pipeline.processor = _FakeProcessor(drop_idx + 1500)
 
     with pytest.raises(AssertionError, match="text encoder should not run"):
-        pipeline.encode_prompt(prompt="short prompt")
+        pipeline.encode_prompt(prompt="short prompt", image=torch.zeros(1, 3, 16, 16))
 
 
 @pytest.mark.parametrize(
@@ -311,7 +314,7 @@ def test_edit_pipelines_validate_text_prompt_length_before_image_token_expansion
     ],
 )
 def test_qwen_generation_validator_excludes_template_suffix_from_budget(pipeline_class: type):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: nn.Module = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -332,7 +335,7 @@ def test_qwen_generation_validator_excludes_template_suffix_from_budget(pipeline
     ],
 )
 def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_class: type):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: nn.Module = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -343,4 +346,4 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
     pipeline.processor = _FakeProcessor(1500)
 
     with pytest.raises(AssertionError, match="text encoder should not run"):
-        pipeline.encode_prompt(prompt="short prompt")
+        pipeline.encode_prompt(prompt="short prompt", image=torch.zeros(1, 3, 16, 16))
