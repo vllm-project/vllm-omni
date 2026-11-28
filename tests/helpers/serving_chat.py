@@ -113,9 +113,9 @@ def build_serving_chat(
         **init_overrides,
     )
     instance._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: mock_audio_choices(
-            index=omni_res.outputs[0].index,
-            role=role,
+        side_effect=lambda omni_res, role, request, stream=False, wav_header_sent=None: (
+            mock_audio_choices(index=omni_res.outputs[0].index, role=role),
+            set(),
         )
     )
     return instance
