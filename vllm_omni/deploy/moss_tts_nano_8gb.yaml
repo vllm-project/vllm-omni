@@ -1,0 +1,7 @@
+# Qualified on one RTX 5060 Laptop 8 GB; keep requests serial.
+base_config: moss_tts_nano.yaml
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.2

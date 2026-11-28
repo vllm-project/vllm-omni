@@ -36,6 +36,17 @@ def test_t2v_pipeline_declares_text_encoder_offload_blocks() -> None:
     assert plan.on_demand_component_paths == frozenset()
 
 
+def test_text_encoder_stays_on_cpu_until_layerwise_hooks_exist() -> None:
+    # The whole UMT5 checkpoint exceeds 8 GB, and this decision runs before the
+    # offload hooks that stream it block by block are installed.
+    device = torch.device("cuda:0")
+    offloaded = SimpleNamespace(diffusion_offload_config={"mode": "layer", "components": ["text_encoder"]})
+    resident = SimpleNamespace(diffusion_offload_config=None)
+
+    assert wan22_module._text_encoder_load_device(offloaded, device) == "cpu"
+    assert wan22_module._text_encoder_load_device(resident, device) == device
+
+
 @pytest.fixture(autouse=True)
 def _float32_default_dtype():
     # Other suites leave the global default dtype at bfloat16, which skews the
