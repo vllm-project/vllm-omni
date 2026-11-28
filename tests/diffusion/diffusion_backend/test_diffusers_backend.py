@@ -150,10 +150,12 @@ class TestPipelineArgumentsHandling:
         assert output.output.image is stub_image
 
     @staticmethod
-    def _make_adapter(backend: str, set_attention_backend):
+    def _make_adapter(backend: str | None, set_attention_backend):
         adapter = DiffusersAdapterPipeline(
             od_config=_make_od_config(
-                diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend=backend)),
+                diffusion_attention_config=AttentionConfig(
+                    default=AttentionSpec(backend=backend) if backend is not None else None
+                ),
             )
         )
         adapter._pipeline = SimpleNamespace(
@@ -227,6 +229,47 @@ class TestPipelineArgumentsHandling:
         adapter._set_attention_backend()
 
         assert calls == ["native"]
+
+    @staticmethod
+    def _patch_platform(monkeypatch, *, rocm: bool, major: int = 9, minor: int = 0):
+        from vllm.platforms.interface import DeviceCapability
+
+        import vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter as adapter_module
+        from vllm_omni.platforms.interface import OmniPlatformEnum
+
+        # Patch the real platform object so is_cuda()/is_rocm() keep their real implementation.
+        platform = adapter_module.current_omni_platform
+        monkeypatch.setattr(platform, "_omni_enum", OmniPlatformEnum.ROCM if rocm else OmniPlatformEnum.CUDA)
+        monkeypatch.setattr(platform, "get_device_capability", lambda *_: DeviceCapability(major, minor))
+
+    def test_rocm_rdna_is_not_blackwell(self, monkeypatch):
+        self._patch_platform(monkeypatch, rocm=True, major=12, minor=0)
+
+        assert DiffusersAdapterPipeline._is_blackwell_gpu() is False
+
+    @pytest.mark.parametrize("rocm,major,minor", [(False, 9, 0), (False, 10, 0), (True, 9, 4), (True, 11, 5)])
+    @pytest.mark.parametrize(
+        "backend", [None, "FLASH_ATTN", "FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB", "SAGE_ATTN", "TORCH_SDPA", "ASCEND"]
+    )
+    def test_attempted_backends_exist_in_installed_diffusers(self, monkeypatch, rocm, major, minor, backend):
+        # Diffusers renames backends between releases (e.g. "aiter" -> "aiter_fa2_hub");
+        # catch stale names when the diffusers pin is bumped.
+        from diffusers.models.attention_dispatch import AttentionBackendName
+
+        self._patch_platform(monkeypatch, rocm=rocm, major=major, minor=minor)
+        calls: list[str] = []
+
+        def reject_backend(name):
+            calls.append(name)
+            raise RuntimeError(f"{name} rejected")
+
+        adapter = self._make_adapter(backend, reject_backend)
+        try:
+            adapter._set_attention_backend()
+        except (ValueError, RuntimeError):
+            pass
+
+        assert set(calls) <= {b.value for b in AttentionBackendName}
 
     @pytest.mark.parametrize(
         "feature_id",
