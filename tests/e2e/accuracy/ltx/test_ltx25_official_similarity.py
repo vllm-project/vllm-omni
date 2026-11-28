@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 skip_pending_natten_build = pytest.mark.skipif(
-    os.getenv("BUILDKITE") == "true" and torch.version.cuda == "13.0" and torch.__version__.startswith("2.14."),
+    torch.version.cuda == "13.0" and torch.__version__.startswith("2.14."),
     reason="NATTEN Hub build for PyTorch 2.14 with CUDA 13.0 is pending at https://github.com/SHI-Labs/NATTEN/issues/356",
 )
 
