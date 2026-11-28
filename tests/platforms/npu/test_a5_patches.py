@@ -7,7 +7,7 @@ device detection, ``npu/models/qwen3_tts.py`` for the Qwen3-TTS
 patch). The tests load those modules from source with fake Qwen3-TTS
 dependencies, so they validate the patch contract without loading real model
 or NPU kernels. A5 device detection is exercised with a fake
-``vllm_ascend.utils`` module.
+``vllm_ascend.device.device_config`` module.
 """
 
 from __future__ import annotations
@@ -144,33 +144,24 @@ def test_is_a5_detects_a5_device(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_is_a5_falls_back_false_without_is_950(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_npu_init(monkeypatch)
     # Older vllm-ascend releases have no `is_950`; detection must fall back.
-    _install_fake_module(monkeypatch, "vllm_ascend")
-    _install_fake_module(monkeypatch, "vllm_ascend.utils")
+    vllm_ascend = _install_fake_module(monkeypatch, "vllm_ascend")
+    vllm_ascend.__path__ = []
+    device = _install_fake_module(monkeypatch, "vllm_ascend.device")
+    device.__path__ = []
+    _install_fake_module(monkeypatch, "vllm_ascend.device.device_config")
 
     assert module.is_a5(torch.device("cuda")) is False
     assert module.is_a5() is False
 
 
-def test_qwen3_tts_patch_swaps_prompt_builder_on_a5(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("a5", [True, False])
+def test_qwen3_tts_patch_keeps_prompt_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    a5: bool,
+) -> None:
     module, fake_prompt_builder, fake_talker = _load_qwen3_tts_code2wav_patch(
         monkeypatch,
-        a5=True,
-    )
-    original = fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder
-
-    module.apply_qwen3_tts_patches()
-
-    assert fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder is not original
-    assert fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder is fake_talker.Qwen3TTSPromptEmbedsBuilder
-
-    module.apply_qwen3_tts_patches()
-    assert fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder is fake_talker.Qwen3TTSPromptEmbedsBuilder
-
-
-def test_qwen3_tts_patch_keeps_prompt_builder_off_a5(monkeypatch: pytest.MonkeyPatch) -> None:
-    module, fake_prompt_builder, fake_talker = _load_qwen3_tts_code2wav_patch(
-        monkeypatch,
-        a5=False,
+        a5=a5,
     )
     original = fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder
 
@@ -178,23 +169,6 @@ def test_qwen3_tts_patch_keeps_prompt_builder_off_a5(monkeypatch: pytest.MonkeyP
 
     assert fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder is original
     assert fake_talker.Qwen3TTSPromptEmbedsBuilder is original
-
-
-def test_a5_prompt_patch_sets_cpu_mel_front_end_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    module, fake_prompt_builder, fake_talker = _load_qwen3_tts_code2wav_patch(
-        monkeypatch,
-        a5=True,
-    )
-    original = fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder
-
-    module.apply_qwen3_tts_patches()
-
-    # The A5 builder keeps the base implementation and only opts into the CPU
-    # mel front-end, because the NPU has no torch.stft.
-    builder_cls = fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder
-    assert builder_cls is not original
-    assert builder_cls._mel_spectrogram_on_cpu is True
-    assert fake_talker.Qwen3TTSPromptEmbedsBuilder is builder_cls
 
 
 def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(
