@@ -131,6 +131,7 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
+        history_codes: torch.Tensor | None = None,
         generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
@@ -143,12 +144,24 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         ``history_per_codebook[i]`` is a list of recently-emitted token ids for
         codebook ``i``; when ``repetition_penalty != 1.0`` those tokens get
         their logits scaled down (mirrors upstream's rep-penalty behaviour).
+
+        ``history_codes`` is the device-resident alternative: a ``(B, rvq,
+        window)`` LongTensor padded with ``-1``. It lets batched callers keep
+        history on the GPU; pass at most one of the two history arguments.
         """
         device = backbone_last_hidden.device
         B = backbone_last_hidden.shape[0]
         generators = _normalize_generators(generators, B)
         rvq = self.config.rvq
         hidden_size = self.config.hidden_size
+
+        if history_codes is not None:
+            if history_codes.ndim != 3 or history_codes.shape[:2] != (B, rvq):
+                raise ValueError("history_codes must have shape (batch, rvq, window)")
+            if history_codes.device != device:
+                raise ValueError("history_codes must remain on the same device as hidden states")
+            if history_per_codebook is not None:
+                raise ValueError("Pass either history_codes or legacy history_per_codebook")
 
         codec_embeds = self.model.codec_embedding
         codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
@@ -165,7 +178,11 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
                 hidden = self.model.forward_cached(cur_embed, pos_ids, kv_views, write_pos, key_mask)
                 logits = lm_heads[step](hidden[:, 0, :]).float()
 
-                if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
+                if repetition_penalty != 1.0 and history_codes is not None:
+                    logits = _apply_batched_repetition_penalty(logits, history_codes[:, step, :], repetition_penalty)
+                elif (
+                    repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook)
+                ):
                     hist = history_per_codebook[step]
                     if hist:
                         hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
@@ -199,7 +216,9 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             hidden = self.model(embeds[:, :seq_len, :], pos_ids_full[:, :seq_len])
             logits = lm_heads[step](hidden[:, step, :]).float()
 
-            if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
+            if repetition_penalty != 1.0 and history_codes is not None:
+                logits = _apply_batched_repetition_penalty(logits, history_codes[:, step, :], repetition_penalty)
+            elif repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
                 hist = history_per_codebook[step]
                 if hist:
                     hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
@@ -221,6 +240,20 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
                 embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)
 
         return codes
+
+
+def _apply_batched_repetition_penalty(logits: torch.Tensor, history: torch.Tensor, penalty: float) -> torch.Tensor:
+    """Apply a row-local penalty without reading GPU history on the host.
+
+    -1 padding writes only a disposable sentinel column. Repeated history IDs
+    gather the same original logit, so the penalty applies once, not per hit.
+    """
+    vocab = logits.shape[-1]
+    indices = torch.where((history >= 0) & (history < vocab), history, vocab)
+    padded = F.pad(logits, (0, 1))
+    selected = padded.gather(1, indices)
+    selected = torch.where(selected > 0, selected / penalty, selected * penalty)
+    return padded.scatter(1, indices, selected)[:, :vocab]
 
 
 def _normalize_generators(
