@@ -1,9 +1,9 @@
 # LFM3-Omni-2B on Ascend and CUDA
 
-> **Unavailable with vLLM 0.34 / V2-only execution.** Both speech and text profiles require the retired Model Runner V1.
-> The commands, configurations, and measurements below are historical reference,
-> not installation or serving instructions for this version. Configuration loading
-> rejects the V1 profile; changing its runner flag does not add V2 support.
+> **Model Runner V2.** With vLLM 0.34, both profiles run on Model Runner V2.
+> They are validated on CUDA; see [Model Runner V2 validation](#model-runner-v2-validation).
+> The Ascend path has not been revalidated on V2, so the Ascend measurements
+> below, like the RTX 4090 ones, are historical Model Runner V1 results.
 
 ## Model and execution
 
@@ -158,6 +158,29 @@ reveal order and repetition penalty. Stochastic sampling retains the original
 scalar random-draw order. Use `--audio-temperature 0.4` to measure that path.
 Compare output lengths and retained audio before reporting a speedup; inspect
 worker logs for forced shutdown even when the benchmark process exits normally.
+
+## Model Runner V2 validation
+
+One RTX 5090 D v2 (24 GB), vLLM 0.34.0, PyTorch 2.14.0+cu130 and Transformers
+5.22.2, with checkpoint revision `21d75123f86c1f7ffb4bef1ea202710c4e7ebe67`.
+The reference is `AutoModelForMultimodalLM` with eager attention in BF16 under
+the same Transformers version. Each request ran alone.
+
+- Text-only profile: greedy text token IDs matched the reference for four
+  prompts. They were a one-word answer, a 64-token arithmetic answer, a
+  781-token prompt beyond the 256-token sliding window, and a multi-turn chat
+  with a system prompt.
+- Speech profile with full payloads (no `--async-chunk`): for two sentences,
+  each with greedy and seeded temperature-0.4 audio, waveforms were bitwise
+  identical to the reference codes decoded by LiquidCodec. The four cases had
+  23, 23, 44 and 42 frames.
+- Speech profile with `--async-chunk`: both requests completed. A stream whose
+  frame count is a multiple of four ends 480 samples earlier than the full
+  payload, as described under Validation.
+- `tests/e2e/online_serving/test_lfm3_omni.py` covers streamed, concurrent and
+  full-payload speech plus the text-only profile.
+
+Performance has not been remeasured on Model Runner V2.
 
 ## Measured NPU performance
 

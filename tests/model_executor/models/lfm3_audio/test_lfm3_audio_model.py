@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
+
 import pytest
 import torch
 
@@ -73,3 +75,23 @@ def test_audio_pipelines_reuse_codec_and_override_speech_sampling():
     # Inherited from the LFM3-Omni profile.
     assert sampling["seed"] == 42 and deploy["stages"][0]["enforce_eager"] is True
     assert resolve_deploy_yaml(get_deploy_config_path("lfm3_audio_text.yaml"))["pipeline"] == "lfm3_audio_text"
+
+
+def test_checkpoint_config_wins_over_the_vllm_one(tmp_path):
+    from vllm.transformers_utils.config import get_config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "lfm3_audio",
+                "architectures": ["Lfm3AudioForConditionalGeneration"],
+                "auto_map": {"AutoConfig": "configuration_checkpoint.CheckpointConfig"},
+            }
+        )
+    )
+    (tmp_path / "configuration_checkpoint.py").write_text(
+        "from transformers import PreTrainedConfig\n\n\n"
+        "class CheckpointConfig(PreTrainedConfig):\n"
+        '    model_type = "lfm3_audio"\n'
+    )
+    assert type(get_config(str(tmp_path), trust_remote_code=True)).__name__ == "CheckpointConfig"

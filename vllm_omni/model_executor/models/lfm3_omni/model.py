@@ -27,6 +27,16 @@ from .processing import Lfm3OmniDummyInputsBuilder, Lfm3OmniMultiModalProcessor,
 from .reference import reference_module
 
 
+def _request_id(info: dict) -> str | None:
+    # Model Runner V2 keys its per-request buffers by ``req_id``.
+    return info.get("request_id") or info.get("req_id")
+
+
+def _sampling_extra_args(info: dict) -> dict:
+    params = info.get("sampling_params")
+    return dict(getattr(params, "extra_args", None) or {})
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Lfm3OmniMultiModalProcessor, info=Lfm3OmniProcessingInfo, dummy_inputs=Lfm3OmniDummyInputsBuilder
 )
@@ -34,6 +44,9 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
     have_multimodal_outputs = True
     has_preprocess = True
     has_postprocess = False
+    # Media understanding runs through the native Model Runner V2 encoder;
+    # preprocess only replaces the rows that feed back generated audio.
+    preprocess_keeps_mm_inputs = True
     omni_pooler_payload_include_hidden = False
     # Checkpoint module and class that define the encoders and depth head.
     _reference = ("modeling_lfm3_omni", "Lfm3OmniModel")
@@ -101,7 +114,7 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
         self._depth_graph = None
         self._states: dict[str, RequestState] = {}
         self._forced_tokens: list[int | None] = []
-        self._batch_states: list[RequestState] = []
+        self._batch_states: list[RequestState | None] = []
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str:
@@ -162,7 +175,9 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
                 state.slots_left = self.config.interleaved_n_audio if state.speaking else self.config.interleaved_n_text
 
     def preprocess(self, input_ids, input_embeds, **info):
-        req_id = info["request_id"]
+        req_id = _request_id(info)
+        if req_id is None:
+            raise ValueError("LFM3-Omni preprocess requires a scheduler request id")
         is_prefill = info["_omni_is_prefill"]
         state = self._states.get(req_id)
         if state is None:
@@ -261,11 +276,21 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         infos = kwargs.get("runtime_additional_information") or []
-        requests, self._batch_states = [], []
-        start = 0
-        extras = kwargs.get("sampling_extra_args") or [{} for _ in infos]
-        for info, extra in zip(infos, extras, strict=True):
-            state = self._states[info["request_id"]]
+        counts = kwargs.get("seq_token_counts")
+        rows, start = [], 0
+        extras = kwargs.get("sampling_extra_args") or [_sampling_extra_args(info) for info in infos]
+        for index, (info, extra) in enumerate(zip(infos, extras, strict=True)):
+            req_id = _request_id(info)
+            if req_id is None and "lfm3_span" not in info:
+                # Model Runner V2 dummy batches (memory profiling) have rows
+                # that carry no request. Skip each such row in place, so every
+                # row keeps its own token span and logits row.
+                if counts is None:
+                    raise ValueError("LFM3-Omni needs seq_token_counts to skip a row without a request")
+                rows.append((start, start + counts[index], None))
+                start += counts[index]
+                continue
+            state = self._states[req_id]
             for name in ("audio_temperature", "audio_top_k", "audio_repetition_penalty", "audio_repetition_window"):
                 if name in extra:
                     setattr(state, name, extra[name])
@@ -273,14 +298,19 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
                 raise ValueError("Audio repetition penalty and window must be positive")
             state.text_only = extra.get("generation_mode") == "text"
             end = start + info["lfm3_span"]
-            requests.append((start, end, state))
-            self._batch_states.append(state)
+            rows.append((start, end, state))
             start = end
+        requests = [row for row in rows if row[2] is not None]
+        self._batch_states = [state for _, _, state in rows]
         x = self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds
         hidden = self.model.language_model(x, positions, requests)
         self._forced_tokens = []
         frames = []
-        for start, end, state in requests:
+        for start, end, state in rows:
+            if state is None:
+                frames.append(torch.empty((0, self.config.num_codebooks), device=hidden.device, dtype=torch.long))
+                self._forced_tokens.append(None)
+                continue
             is_audio = state.mode == "audio" or (state.mode == "interleaved" and state.speaking)
             state.last_was_audio = is_audio
             if is_audio:
@@ -301,7 +331,7 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
             else:
                 frames.append(torch.empty((0, self.config.num_codebooks), device=hidden.device, dtype=torch.long))
                 self._forced_tokens.append(self.config.text_config.eos_token_id if state.mode == "finished" else None)
-        if not infos:
+        if not requests:
             return hidden
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": frames}})
 
@@ -310,7 +340,8 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
         c = self.config
         logits[:, self._placeholder_token_ids] = -torch.inf
         for row, forced in enumerate(self._forced_tokens):
-            if self._batch_states[row].text_only:
+            state = self._batch_states[row]
+            if state is not None and state.text_only:
                 logits[row, [c.audio_start_token_id, c.mixed_start_token_id]] = -torch.inf
             if forced is not None:
                 logits[row].fill_(-torch.inf)

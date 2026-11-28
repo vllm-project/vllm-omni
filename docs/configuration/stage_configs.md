@@ -328,13 +328,14 @@ does not change `PipelineConfig` topology or the connector payload contract.
 
 The default Qwen3-TTS and Qwen3-Omni profiles select V2 on CUDA, ROCm, NPU and
 XPU. MiniCPM-o 4.5 selects V2 through its CUDA, ROCm and NPU platform overlays,
-while Moss-TTS-local selects V2 on CUDA. The CUDA-tuned `*_mrv2.yaml` overlays
-are not NPU profiles. A V2 worker implementation alone does not qualify every
-model or deployment on a platform.
+while Moss-TTS-local selects V2 on CUDA. The LFM3-Omni and LFM3-Audio profiles
+(speech and text-only) select V2 and are validated on CUDA. The CUDA-tuned
+`*_mrv2.yaml` overlays are not NPU profiles. A V2 worker implementation alone
+does not qualify every model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
-PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
+PersonaPlex's Talker, and VibeVoice. Selecting
 `v2` manually does not establish support for those paths.
 The complete PersonaPlex workflow is also unavailable: its Talker still
 requires V1, although its Code2Wav stage has V2 components.
@@ -350,11 +351,11 @@ request ID. Automatic ABC transitions reset the same request's phase state.
 The profile requires one GPU, synchronous scheduling, and disabled prefix
 caching and external KV transfer. See the [YuE2 recipe](gh-file:recipes/m-a-p/YuE2-3B.md).
 
-Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
-are unavailable. Their retired serving E2E tests covered speech generation,
-voice cloning, streaming, concurrency and request validation across those
-workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
-serving replacements; LFM3-Audio uses a different checkpoint and profile.
+Drama 3 / Fish-Omni serving is unavailable. Its retired serving E2E tests
+covered speech generation, voice cloning, streaming, concurrency and request
+validation. Retained Fish AR component tests are not complete V2 serving
+replacements. The LFM3-Omni and LFM3-Audio serving E2E tests run in the CUDA
+Merge matrix.
 Drama jobs are removed from CUDA Weekly and AMD CI. The Merge matrix also
 excludes VibeVoice. These exclusions do not count as passing V2 model tests.
 
