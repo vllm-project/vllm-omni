@@ -45,8 +45,9 @@ def baseline_path_for_current_hardware() -> Path:
     raise AssertionError(f"HiDream accuracy requires an H100 or MI300 accelerator, got {device_name}")
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
-def test_hidream_o1_image_tp2_matches_baseline(
+def _assert_matches_baseline(
+    parallel_config: DiffusionParallelConfig,
+    label: str,
     accuracy_artifact_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -58,7 +59,7 @@ def test_hidream_o1_image_tp2_matches_baseline(
     model = os.environ.get("HIDREAM_O1_IMAGE_MODEL", MODEL_ID)
     with OmniRunner(
         model,
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+        parallel_config=parallel_config,
         enforce_eager=True,
     ) as runner:
         outputs = runner.omni.generate(
@@ -76,7 +77,7 @@ def test_hidream_o1_image_tp2_matches_baseline(
         image = images[0].convert("RGB")
 
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
-    image.save(output_dir / "vllm_omni_tp2.png")
+    image.save(output_dir / f"vllm_omni_{label}.png")
     baseline_path = baseline_path_for_current_hardware()
     assert baseline_path.exists()
     baseline = Image.open(baseline_path).convert("RGB")
@@ -91,6 +92,7 @@ def test_hidream_o1_image_tp2_matches_baseline(
         dataset="image_similarity",
         metrics={"ssim": ssim, "psnr": psnr},
         baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+        extra={"label": label},
     )
     assert_similarity(
         model_name=MODEL_ID,
@@ -100,4 +102,30 @@ def test_hidream_o1_image_tp2_matches_baseline(
         psnr_threshold=PSNR_THRESHOLD,
         ssim_score=ssim,
         psnr_score=psnr,
+    )
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
+def test_hidream_o1_image_tp2_matches_baseline(
+    accuracy_artifact_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_matches_baseline(
+        DiffusionParallelConfig(tensor_parallel_size=2),
+        "tp2",
+        accuracy_artifact_root,
+        monkeypatch,
+    )
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+def test_hidream_o1_image_cfg_parallel2_matches_baseline(
+    accuracy_artifact_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_matches_baseline(
+        DiffusionParallelConfig(cfg_parallel_size=2),
+        "cfg_parallel2",
+        accuracy_artifact_root,
+        monkeypatch,
     )
