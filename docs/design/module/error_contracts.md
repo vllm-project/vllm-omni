@@ -79,6 +79,11 @@ When tracing is enabled, pipeline and stage error spans use that same resolved
 classification, including upstream `RequestError.code` and cache-miss
 `ServiceUnavailableError`. Unclassified stage failures use `stage_error`.
 
+CFG companion deadline failures are request-scoped `GatewayTimeoutError`
+responses with HTTP status 504. The orchestrator emits them against the parent
+request after claiming the terminal transition; the frontend preserves the
+status and type across ordinary, streaming, image, video, and speech paths.
+
 Offline generation discards non-fatal request-scoped errors whose requests
 are no longer registered, including queued errors from an aborted batch.
 Global errors and fatal errors still propagate, even when a fatal error

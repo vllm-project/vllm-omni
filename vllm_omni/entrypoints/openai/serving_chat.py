@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Se
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from http import HTTPStatus
 from io import BytesIO
 from typing import Any, Final, cast
 
@@ -157,7 +158,7 @@ from vllm_omni.entrypoints.openai.utils import (
     parse_lora_requests,
     resolve_diffusion_od_config,
 )
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniRequestError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
@@ -2602,6 +2603,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     server=raw_request.app.state.server,
                     engine=self.engine_client,
                 )
+        except OmniRequestError as e:
+            data = self.create_streaming_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=HTTPStatus(e.status_code),
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -2630,6 +2638,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_outputs.append(res)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        except OmniRequestError as e:
+            return self._create_error_response(e.message, err_type=e.error_type, status_code=e.status_code)
         except (ValueError, RetryableRequestError) as e:
             return self.create_error_response(e)
 
@@ -3869,8 +3879,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "[OmniOpenAIServingChat] Engine dead during streaming image edit, "
                     "but cannot terminate server (no raw_request context)."
                 )
-        except OmniClientError as exc:
-            logger.info("Client error during streaming image edit: %s", exc)
+        except OmniRequestError as exc:
+            logger.info("Request error during streaming image edit: %s", exc)
             client_error_chunk = ImageEditStreamError(
                 created=created,
                 model=model,
@@ -4269,8 +4279,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             return response
 
-        except OmniClientError as e:
-            logger.info("Client error during diffusion chat completion: %s", e)
+        except OmniRequestError as e:
+            logger.info("Request error during diffusion chat completion: %s", e)
             return self._create_error_response(
                 e.message,
                 err_type=e.error_type,

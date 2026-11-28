@@ -248,7 +248,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
     remove_route_from_app,
 )
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter, mark_serve_cli_args
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniRequestError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
@@ -2191,7 +2191,7 @@ async def run_stage(request: RunRequest, raw_request: Request):
         response = await serving.run(request, request_id=request_id)
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
-    except OmniClientError as exc:
+    except OmniRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except ValueError as exc:
         # Includes stage_input payloads that fail to decode.
@@ -2625,7 +2625,7 @@ async def generate_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
+    except OmniRequestError as e:
         logger.info("Client error during image generation: %s", e)
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
@@ -3001,7 +3001,7 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
+    except OmniRequestError as e:
         logger.info("Client error during image edit: %s", e)
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
@@ -3088,7 +3088,7 @@ async def segment_image(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
+    except OmniRequestError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -3160,7 +3160,7 @@ async def segment_video(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
+    except OmniRequestError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -3239,7 +3239,7 @@ async def estimate_video_depth(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
+    except OmniRequestError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -3394,7 +3394,7 @@ async def create_video_sync(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as exc:
+    except OmniRequestError as exc:
         logger.info("Client error during sync video generation: %s", exc)
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:

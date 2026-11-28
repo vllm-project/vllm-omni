@@ -98,6 +98,16 @@ def test_serve_parser_ulysses_a2a_backend_choices_match_config() -> None:
     assert tuple(action.choices) == ULYSSES_A2A_BACKENDS
 
 
+def test_serve_parser_accepts_positive_cfg_companion_timeout() -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--cfg-companion-timeout", "12.5"])
+
+    assert args.cfg_companion_timeout == 12.5
+    assert args.get_explicit_kwargs_dict()["cfg_companion_timeout"] == 12.5
+
+    with pytest.raises(SystemExit):
+        _parse_serve_args(["serve", "fake-model", "--omni", "--cfg-companion-timeout", "0"])
+
+
 def test_watermark_config_collision_uses_omni_validation(capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure an upstream watermark argument is extended without a duplicate flag."""
     parser = TrackingArgumentParser()

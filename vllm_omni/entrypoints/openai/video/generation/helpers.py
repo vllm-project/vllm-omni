@@ -78,7 +78,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_input_reference,
     validate_control_media_file,
 )
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniRequestError
 from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads, has_multiview_upload_indexes
 
 logger = init_logger(__name__)
@@ -348,7 +348,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
         message = str(exc.detail) if exc.detail else str(exc)
         return VideoError(code=exc.status_code, message=message)
 
-    if isinstance(exc, OmniClientError):
+    if isinstance(exc, OmniRequestError):
         return VideoError(code=exc.status_code, message=exc.message)
 
     if isinstance(exc, (EngineGenerateError, EngineDeadError)):
