@@ -35,7 +35,7 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
     set_forward_context_denoise_step_idx,
 )
-from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
+from vllm_omni.diffusion.lora.loader import QwenImage21LoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_21_MAX_INPUT_IMAGES
@@ -305,7 +305,7 @@ class QwenImage21Pipeline(
     QwenImage21CFGParallelMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
-    QwenImageLoraLoaderMixin,
+    QwenImage21LoraLoaderMixin,
 ):
     """Text-to-image and image-conditioned generation with Qwen-Image 2.1.
 

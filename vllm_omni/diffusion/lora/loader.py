@@ -500,6 +500,9 @@ class LoraLoaderMixin:
 
 
 class QwenImageLoraLoaderMixin(LoraLoaderMixin):
+    def _prepare_lora_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
+
     def load_lora_weights(
         self,
         pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor],
@@ -570,7 +573,7 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
                 }
 
         state_dict.update(converted)
-        state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
+        state_dict = self._prepare_lora_state_dict(state_dict)
 
         loaded_keys = self.load_lora_into_module(
             state_dict,
@@ -594,6 +597,34 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         self.unload_module_lora(state_dict, transformer, prefix=self.transformer_name)
 
         del self.lora_loaded[adapter_name]
+
+
+class QwenImage21LoraLoaderMixin(QwenImageLoraLoaderMixin):
+    def _prepare_lora_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        state_dict = super()._prepare_lora_state_dict(state_dict)
+        # Community adapters may store the two MLP projections as [gate; up].
+        # Split their global B rows before the regular loader shards either projection for TP.
+        suffix = ".img_mlp.gate_up."
+        mlps = {key.partition(suffix)[0] + ".img_mlp" for key in state_dict if suffix in key}
+        for mlp in sorted(mlps):
+            try:
+                gate = self.transformer.get_submodule(mlp.removeprefix("transformer.") + ".gate_layer")
+            except AttributeError:
+                # Leave unknown targets for the loader's existing unmatched-key warnings.
+                continue
+            a = state_dict.pop(f"{mlp}.gate_up.lora_A.weight", None)
+            b = state_dict.pop(f"{mlp}.gate_up.lora_B.weight", None)
+            if a is None or b is None:
+                raise ValueError(f"{mlp}.gate_up requires both lora_A and lora_B weights.")
+            width = gate.output_size  # global size of the column-parallel projection
+            if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] != gate.input_size or b.shape != (2 * width, a.shape[0]):
+                raise ValueError(f"Invalid {mlp}.gate_up LoRA shapes: A={tuple(a.shape)}, B={tuple(b.shape)}.")
+            for name, rows in zip(("gate_layer", "proj"), b.split(width), strict=True):
+                a_key, b_key = f"{mlp}.{name}.lora_A.weight", f"{mlp}.{name}.lora_B.weight"
+                if a_key in state_dict or b_key in state_dict:
+                    raise ValueError(f"Conflicting fused and split LoRA weights for {mlp}.{name}.")
+                state_dict[a_key], state_dict[b_key] = a, rows
+        return state_dict
 
 
 class WanLoraLoaderMixin(LoraLoaderMixin):
