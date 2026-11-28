@@ -21,6 +21,7 @@ from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
 bootstrap_vllm_layer_custom_op_modules()
 
 pytest_plugins = (
+    "tests.helpers.fixtures.ci_case_coverage",
     "tests.helpers.fixtures.config",
     "tests.helpers.fixtures.clean",
     "tests.helpers.fixtures.cpu_threads",

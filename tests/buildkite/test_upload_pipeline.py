@@ -1121,7 +1121,7 @@ def test_sensenova_weekly_runs_each_accuracy_case_once_and_preserves_failures(
     steps = [step for step in _iter_steps(rendered) if "SenseNova-U1" in step.get("label", "")]
     assert len(steps) == 1
     step = steps[0]
-    assert step["artifact_paths"] == ["sensenova-accuracy/**/*"]
+    assert step["artifact_paths"] == ["sensenova-accuracy/**/*", "artifacts/ci-case-coverage/*.jsonl"]
     calls_path = tmp_path / "pytest-calls.jsonl"
     # Run the actual weekly shell command with a lightweight pytest executable:
     # this checks failure propagation without importing vLLM or requiring a GPU.
@@ -1575,7 +1575,10 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     assert "--assert-baseline" in command
     assert "--test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json" in command
     assert "run_ci.sh" not in command
-    assert perf["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
+    expected_artifacts = ["tests/dfx/perf/results/*.json"]
+    if platform == "cuda":
+        expected_artifacts.append("artifacts/ci-case-coverage/*.jsonl")
+    assert perf["artifact_paths"] == expected_artifacts
     assert _gpu_limit(accuracy) == 2
     assert accuracy["agents"]["queue"] == "mithril-h100-pool"
     for job in jobs.values():
