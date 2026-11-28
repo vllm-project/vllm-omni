@@ -868,3 +868,26 @@ def test_rmsnorm_hip_uses_cuda_path_by_default(mocker: MockerFixture, monkeypatc
 
     assert RMSNorm(16).forward_hip(x) is sentinel
     cuda_forward.assert_called_once_with(x, None)
+
+
+@pytest.mark.cpu
+def test_layernorm_forward_npu_falls_back_to_native_on_cpu_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LayerNorm.forward_npu must fall back to forward_native for CPU tensors even when mindiesd is present."""
+    from vllm_omni.diffusion.layers import norm as norm_mod
+    from vllm_omni.diffusion.layers.norm import LayerNorm
+
+    fake_mindiesd = types.ModuleType("mindiesd")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("mindiesd.fast_layernorm must not be called on CPU tensors")
+
+    fake_mindiesd.fast_layernorm = _boom
+    monkeypatch.setattr(norm_mod, "_HAS_MINDIESD", True)
+    monkeypatch.setitem(sys.modules, "mindiesd", fake_mindiesd)
+
+    layer = LayerNorm(32, eps=1e-6)
+    x = torch.randn(2, 4, 32, dtype=torch.bfloat16)
+    out = layer.forward_npu(x)
+    expected = layer.forward_native(x)
+    torch.testing.assert_close(out, expected)
+    assert out.dtype == torch.bfloat16
