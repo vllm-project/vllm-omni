@@ -44,13 +44,11 @@ class ExpertFp8Config(Fp8Config):
             raise ValueError(f"{QUANTIZATION_METHOD} needs a 2-int weight_block_size, got {block!r}")
         return cls(weight_block_size=[int(b) for b in block])
 
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str, tid2eid: torch.Tensor | None = None
-    ) -> QuantizeMethodBase | None:
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         if current_platform.device_type == "npu":
             from vllm_omni.platforms.npu.quant.fish_omni import get_fish_omni_quant_method
 
-            return get_fish_omni_quant_method(self, layer, prefix, tid2eid)
+            return get_fish_omni_quant_method(self, layer, prefix)
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()
         return super().get_quant_method(layer, prefix)
