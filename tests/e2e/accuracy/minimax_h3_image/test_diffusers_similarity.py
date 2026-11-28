@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-import requests
 from huggingface_hub import constants
 from PIL import Image
 
@@ -25,6 +24,7 @@ from tests.e2e.accuracy.helpers import (
     write_accuracy_result,
     write_json_artifact,
 )
+from tests.helpers.client import OnlineOmniClient
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 from vllm_omni.platforms import current_omni_platform
@@ -156,20 +156,25 @@ def test_diffusers_similarity(accuracy_artifact_root):
     if device_type == "npu":
         args.append("--enforce-eager")
     with OmniServer(model, args, startup_timeout=startup_timeout) as server:
-        url = f"http://{server.host}:{server.port}/v1/images/"
+        client = OnlineOmniClient(host=server.host, port=server.port)
         for task, case in cases.items():
             request = {**common, **case}
             if task == "edit":
-                response = requests.post(
-                    url + "edits",
-                    data=request,
-                    files=[("image", ("reference1.png", reference_bytes, "image/png"))],
-                    timeout=IMAGE_REQUEST_TIMEOUT_S,
-                )
+                response = client.send_images_edits_http_request(
+                    {
+                        "data": request,
+                        "files": [("image", ("reference1.png", reference_bytes, "image/png"))],
+                        "timeout": IMAGE_REQUEST_TIMEOUT_S,
+                    }
+                )[0]
+                assert response.status_code == 200, response.error_message
             else:
-                response = requests.post(url + "generations", json=request, timeout=IMAGE_REQUEST_TIMEOUT_S)
-            response.raise_for_status()
-            images = response.json()["data"]
+                response = client.send_images_generations_http_request(
+                    {"json": request, "timeout": IMAGE_REQUEST_TIMEOUT_S}
+                )[0]
+            payload = response.json_body
+            assert isinstance(payload, dict), response.error_message
+            images = payload["data"]
             assert len(images) == 1
             with Image.open(io.BytesIO(base64.b64decode(images[0]["b64_json"], validate=True))) as image:
                 assert image.format == "PNG" and f"{image.width}x{image.height}" == case["size"]
