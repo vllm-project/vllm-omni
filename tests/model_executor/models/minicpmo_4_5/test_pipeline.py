@@ -303,8 +303,6 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["speculative_config"]["method"] == "ngram"
 
     def test_no_async_chunk_selects_full_payload_processor(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Resolve on a platform that runs this deploy (MRv2). XPU and MUSA are
-        # deferred and must raise; test_minicpmo_4_5_duplex_mrv2_deploy covers that.
         monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
         deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
         deploy.async_chunk = False

@@ -109,24 +109,15 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 
-def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches(monkeypatch) -> None:
+def test_personaplex_cuda_deploy_uses_valid_config_parameters(monkeypatch) -> None:
     import inspect
 
-    # This is explicitly the CUDA MRv2 profile. Keep the assertion independent
-    # of the host running the CPU suite, since non-CUDA platforms intentionally
-    # retain a rejecting V1 override and are covered in tests/config.
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    deploy = load_deploy_config(DEPLOY_PATH)
-    overrides = deploy.stages[0].engine_extras["hf_overrides"]
-
     # PersonaPlexConfig takes **kwargs, so a misspelled switch would be ignored silently.
-    assert set(overrides) <= set(inspect.signature(PersonaPlexConfig.__init__).parameters)
-    assert overrides["mimi_cuda_graphs"] is True
-    assert overrides["depformer_cuda_graphs"] is True
-
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
-    assert len(stages) == 2
-    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    parameters = inspect.signature(PersonaPlexConfig.__init__).parameters.keys()
+    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH))
+    for stage in stages:
+        assert stage.yaml_engine_args["hf_overrides"].keys() <= parameters
 
 
 def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_path: Path) -> None:

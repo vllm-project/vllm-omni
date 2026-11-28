@@ -21,8 +21,6 @@ tests/config/test_config_merge.py
 tests/config/test_joyai_mrv2_deploy.py
 tests/config/test_minicpmo_4_5_duplex_mrv2_deploy.py
 tests/config/test_omni_config.py
-tests/config/test_personaplex_duplex_mrv2_deploy.py
-tests/config/test_qwen3_omni_duplex_mrv2_deploy.py
 tests/core/sched/test_generation_scheduler_init.py
 tests/core/sched/test_omni_ar_scheduler_unified_decode_deferral.py
 tests/core/sched/test_talker_kstep_capacity_guard.py

@@ -1750,27 +1750,36 @@ stages:
         assert "async_chunk_batch_min_size" not in connector["extra"]
         assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
 
+    @pytest.mark.parametrize(
+        "filename,session_mode",
+        [("qwen3_omni_moe.yaml", "turn"), ("qwen3_omni_duplex.yaml", "duplex")],
+    )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_turn_and_duplex_use_v2_on_all_platforms(self, platform, monkeypatch):
+    def test_qwen3_omni_deploy_stage_settings(self, filename, session_mode, platform, monkeypatch):
         from vllm_omni import platforms
 
         monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
         pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         assert isinstance(pipeline, PipelineConfig)
-        deploy = _apply_platform_overrides(
-            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))),
-            platform=platform,
-        )
+        deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(filename)), platform=platform)
         stages = merge_pipeline_deploy(pipeline, deploy)
-        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
-        duplex = _apply_platform_overrides(
-            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
-            platform=platform,
-        )
-        stages = merge_pipeline_deploy(pipeline, duplex)
-        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert deploy.session_mode == session_mode
+        assert [stage.yaml_engine_args["session_mode"] for stage in stages] == [session_mode] * 3
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True] * 3
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True] * 3
+        assert all(stage.yaml_engine_args["async_chunk"] for stage in stages)
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
+        assert "limit_mm_per_prompt" not in stages[0].yaml_engine_args
+        assert deploy.connectors["connector_of_shared_memory"]["extra"]["talker_first_audio"] is True
+
+        if platform == "rocm":
+            assert deploy.stages[0].engine_extras["enable_prefix_caching"] is False
+            assert deploy.stages[2].enforce_eager is True
+            assert stages[2].yaml_engine_args["enforce_eager"] is True
+            assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
+            assert structured.stage_by_id(2).model_config.enforce_eager is True
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -3546,44 +3555,6 @@ class TestPlatformOverrides:
             assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
             assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
 
-    def test_qwen3_omni_rocm_uses_mrv2_with_eager_code2wav(self):
-        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
-        pipeline = resolve_pipeline_config(
-            "qwen3_omni_moe",
-            Q3_OMNI_ALL_STAGES_HF_CONFIG,
-        )
-        assert isinstance(pipeline, PipelineConfig)
-
-        rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
-        assert rocm.stages[0].engine_extras["enable_prefix_caching"] is False
-        assert rocm.stages[2].enforce_eager is True
-
-        legacy = merge_pipeline_deploy(pipeline, rocm)
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
-        assert legacy[0].yaml_engine_args["enable_prefix_caching"] is False
-        assert legacy[2].yaml_engine_args["enforce_eager"] is True
-
-        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=rocm)
-        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
-        assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
-        assert structured.stage_by_id(2).model_config.enforce_eager is True
-
-    def test_qwen3_omni_npu_uses_mrv2(self):
-        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
-        pipeline = resolve_pipeline_config(
-            "qwen3_omni_moe",
-            Q3_OMNI_ALL_STAGES_HF_CONFIG,
-        )
-        assert isinstance(pipeline, PipelineConfig)
-
-        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
-
-        legacy = merge_pipeline_deploy(pipeline, npu)
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
-
-        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
-        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
-
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3628,6 +3599,7 @@ class TestPlatformOverrides:
             ("moss_tts_nano.yaml", "moss_tts_nano"),
             ("moss_tts_realtime.yaml", "moss_tts_realtime"),
             ("minicpmo_4_5.yaml", "minicpmo_4_5"),
+            ("personaplex.yaml", "personaplex"),
             ("minimax_music3.yaml", "minimax_music3"),
             ("minimax_music3_2gpu.yaml", "minimax_music3"),
             ("higgs_multimodal_qwen3.yaml", "higgs_multimodal_qwen3"),

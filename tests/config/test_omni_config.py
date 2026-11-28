@@ -443,11 +443,21 @@ def test_serve_counts_diffusion_flag_after_alias_normalization() -> None:
         )
 
 
-def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
+def test_personaplex_cuda_duplex_stage_settings(monkeypatch) -> None:
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", "cuda")
     omni_config = _from_pipeline_key("personaplex")
+    talker, codec = omni_config.stage_configs
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
+    assert talker.scheduler_config.async_scheduling is False
+    assert codec.scheduler_config.async_scheduling is True
+    assert talker.scheduler_config.max_num_seqs == 8
+    assert codec.scheduler_config.max_num_seqs == 10
+    assert talker.model_config.hf_overrides["mimi_cuda_graphs"] is True
+    assert talker.model_config.hf_overrides["depformer_cuda_graphs"] is True
+    assert codec.model_config.hf_overrides["mimi_cuda_graphs"] is True
+    assert codec.model_config.hf_overrides["mimi_decode_tf32"] is True
 
 
 @pytest.mark.parametrize(
