@@ -144,6 +144,35 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
 
+    def test_fastvideo_vsa_sparsity_serialized(self):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_sparsity=0.9)
+        assert spec.backend_kwargs() == {"sparsity": 0.9}
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_fastvideo_vsa_sparsity_in_per_role_mapping(self, nested):
+        spec = {"backend": "FASTVIDEO_VSA", "fastvideo_vsa_sparsity": 0.9}
+        roles: dict[str, Any] = {"minimax_h3": {"main": spec}} if nested else {"minimax_h3.main": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["minimax_h3.main"].backend_kwargs() == {"sparsity": 0.9}
+
+    @pytest.mark.parametrize(
+        ("spec", "match"),
+        [
+            ({"backend": "TORCH_SDPA", "fastvideo_vsa_sparsity": 0.9}, "only supported by the FASTVIDEO_VSA"),
+            ({"backend": "FASTVIDEO_VSA", "fastvideo_vsa_sparsity": 0.0}, "in \\(0, 1\\)"),
+            ({"backend": "FASTVIDEO_VSA", "fastvideo_vsa_sparsity": 1.0}, "in \\(0, 1\\)"),
+            ({"backend": "FASTVIDEO_VSA", "fastvideo_vsa_sparsity": True}, "in \\(0, 1\\)"),
+            ({"backend": "FASTVIDEO_VSA", "fastvideo_vsa_sparsity": "0.9"}, "in \\(0, 1\\)"),
+            (
+                {"backend": "FASTVIDEO_VSA", "fastvideo_vsa_sparsity": 0.9, "fastvideo_vsa_topk": 64},
+                "mutually exclusive",
+            ),
+        ],
+    )
+    def test_fastvideo_vsa_sparsity_validation_rejects(self, spec, match):
+        with pytest.raises(ValueError, match=match):
+            AttentionSpec(**spec)
+
     def test_sparge_serialized_with_overrides(self):
         spec = AttentionSpec(
             backend="SPARGE_ATTN",

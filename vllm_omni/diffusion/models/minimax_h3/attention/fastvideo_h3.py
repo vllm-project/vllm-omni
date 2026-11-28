@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+from fractions import Fraction
 
 import torch
 from vllm.logger import init_logger
@@ -136,7 +137,7 @@ def _build_h3_region_block_map(
     scores: torch.Tensor,
     prefix_blocks: int,
     spans: tuple[tuple[int, int], ...],
-    keep_rates: tuple[float, ...],
+    keep_rates: tuple[float | Fraction, ...],
 ) -> torch.Tensor:
     """Dense prefix queries/keys, with an independent top-k budget per video."""
     mask = torch.zeros_like(scores, dtype=torch.bool)
@@ -153,6 +154,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
     """Apply release-specific H3 routing after parallel attention dispatch."""
 
     _supports_tile64_provider = True
+    _supports_sparsity_ratio = True
 
     def _forward_h3(
         self,
@@ -186,6 +188,12 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
 
         block_size = attn_metadata.extra.get("vsa_h3_tile_size", 64)
         sparsity = attn_metadata.extra.get("vsa_h3_sparsity")
+        configured_ratio = False
+        if sparsity is None and block_size == 64:
+            # An adapter pins no policy in its checkpoint, so the deployment may
+            # configure a ratio. A checkpoint-pinned sparsity always wins.
+            sparsity = self.sparsity
+            configured_ratio = sparsity is not None
         if block_size == 128:
             if attn_metadata.extra.get("vsa_h3_ref_policy") != "p2_multi_region":
                 raise ValueError("FastH3 Omni tile 128 requires p2_multi_region routing")
@@ -217,7 +225,18 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             block_map = build_prefix_dense_block_map(scores, prefix_blocks, video_blocks, self.topk)
             topk_by_region = (min(self.topk, video_blocks),)
         else:
-            target_rate = 1.0 - float(sparsity)
+            if configured_ratio:
+                # A configured ratio has to keep the number of tiles its decimal
+                # asks for. In binary floating point 1.0 - 0.95 is
+                # 0.050000000000000044, so ceil(that * 40) keeps 3 of 40 video
+                # tiles where 0.95 asks for 2 (likewise 2 of 20 and 4 of 60).
+                # repr round-trips, so str() recovers the decimal the deployment
+                # configured and Fraction makes the budget exact at the integer
+                # boundary. A checkpoint-pinned sparsity never reaches this
+                # branch, so a trained adapter keeps the rounding it shipped.
+                target_rate = 1 - Fraction(str(sparsity))
+            else:
+                target_rate = 1.0 - float(sparsity)
             ref_rate = attn_metadata.extra.get("vsa_h3_ref_keep_rate")
             # Match upstream's 1 - (1 - ref_keep_rate) rounding in ceil(topk).
             ref_rate = target_rate if ref_rate is None else 1.0 - (1.0 - float(ref_rate))
