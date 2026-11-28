@@ -152,7 +152,7 @@ selecting VSA does not turn a native checkpoint into a distilled model.
 
 ## Verify routing and fallback
 
-VSA is a CUDA-only, explicitly selected backend. The FastVideo provider requires
+VSA is a CUDA/XPU, explicitly selected backend. The FastVideo provider requires
 the `fastvideo-kernel` package and currently supports non-causal self-attention
 with equal query and key/value sequence lengths. Unsupported shapes, masks,
 dtypes, sequence-parallel execution, or kernel failures fall back to
@@ -175,12 +175,44 @@ For H3, check `FastH3 adapter active` at startup and
 `FASTVIDEO_VSA H3 routing` during DiT execution, as described in the
 [model recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3.md#vsa-adapter-variants).
 
-The Wan route requires CUDA tensors in FP16 or BF16, 256-token blocks,
-standard `head_size**-0.5` scaling, equal Q/K/V head counts, no attention mask,
-and no active sequence-parallel context. The MiniMax-H3 route uses 64-token
-`(4, 4, 4)` blocks and supports pure Ulysses. NPU and XPU paths do not execute
-the FastVideo VSA CUDA kernel. FastH3 Omni uses `(4, 4, 8)` logical blocks
-instead; see its recipe for the separate tile128 provider requirements.
+The Wan route requires CUDA tensors in FP16 or BF16 (or BF16 XPU tensors through
+the `xpu` provider), 256-token blocks, standard `head_size**-0.5` scaling, equal
+Q/K/V head counts, no attention mask, and no active sequence-parallel context. The MiniMax-H3 route uses 64-token
+`(4, 4, 4)` blocks and supports pure Ulysses. NPU paths do not execute the
+FastVideo VSA CUDA kernel. FastH3 Omni uses `(4, 4, 8)` logical blocks instead;
+see its recipe for the separate tile128 provider requirements.
+
+On XPU, FastH3 uses the `xpu` provider automatically (`auto` resolves to it).
+The provider executes through ARK's `block_sparse_sdpa` kernel:
+
+```yaml
+diffusion-attention-config:
+  default:
+    backend: FASTVIDEO_VSA
+```
+
+The XPU provider requires auto-round-lib with
+`auto_round_kernel.sparse_attention.block_sparse_sdpa`, BF16 inputs, and
+head dimension 128. FastH3 uses ARK's Q256 multirow path: each Q256 workgroup
+consumes four independent 64Q routing rows. Omni's logical tile128 selection is
+split into two 64Q query rows and two 64K key blocks; both query halves inherit
+the same selected 128-token K tiles. This preserves FastH3 routing without a
+Q128 kernel. Startup fails with an actionable error when the installed ARK
+build does not expose Q256 multirow support. Until ARK exposes per-K-block
+valid lengths, partial H3 edge blocks are executed with zero-padded keys and
+the backend logs a warning.
+
+Wan resolves to the `xpu` provider on XPU: tile256 block-sparse routing has no
+other provider, so the FastVideo selection is redirected. Wan's 256-token VSA tiles map
+directly onto ARK's native 256-query-block geometry, so each selected 256-token
+key tile is issued as four 64-token key blocks inside one attention reduction.
+Unlike the H3 route this does not need Q256 multirow support, and the backend
+does not fall back to dense SDPA when top-k selects a strict subset: an ARK
+execution fault propagates. On one Arc Pro B70 at sequence length 32768 with
+40 heads, keeping 16 of 512 key blocks, measured latency was 8.9 ms against
+252.9 ms for dense SDPA. Partial edge tiles still use ARK's zero-padded keys
+until `k_block_valid` is available, so broadcast-padded frames at the tail of a
+clip are computed against zero-filled keys rather than being skipped.
 
 ## Automatic provider selection
 
@@ -241,7 +273,9 @@ either `diffusion_attention_config.default` or a `per_role` entry alongside
 [H3 AdaLN offload](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#default-adaln-weight-offload)
 for its separate SM120 default and overrides.
 
-Set `fastvideo_vsa_provider` to `fastvideo`, `flashinfer`, `cudnn`, or `triton` to choose a fixed
-provider. Explicit FlashInfer selection requires compatible hardware and
-installed kernels. Logs show the selected provider and precision. GPU testing
-covers SM120; SM121 BF16 support follows the upstream kernel requirements.
+Set `fastvideo_vsa_provider` to `fastvideo`, `flashinfer`, `cudnn`, `triton`,
+or `xpu` to choose a fixed provider. Explicit FlashInfer selection requires
+compatible hardware and installed kernels. Logs show the selected provider and
+precision. GPU testing covers SM120; the B70 ARK BF16 kernel and synthetic H3
+routing are validated, with full-model qualification pending. SM121 BF16
+support follows the upstream kernel requirements.

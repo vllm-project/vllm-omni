@@ -256,3 +256,93 @@ def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
     assert baseline.shape == query.shape
     torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
     assert torch.count_nonzero(baseline[:, valid:]) == 0
+
+
+def test_xpu_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"topk": 1, "min_seq_len": 4096},
+    )
+    valid = 40
+    torch.manual_seed(0)
+    query = torch.randn(1, 64, 2, 8)
+    padding = PackedPaddingMetadata(
+        q_length=valid,
+        kv_length=valid,
+        cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+    )
+    monkeypatch.setattr(impl.sdpa_fallback, "forward", impl.sdpa_fallback.forward_cuda)
+
+    baseline = impl.forward_xpu(query, query, query, AttentionMetadata(packed_padding=padding, extra={}))
+    perturbed_input = query.clone()
+    perturbed_input[:, valid:] += 100.0
+    perturbed = impl.forward_xpu(
+        perturbed_input, perturbed_input, perturbed_input, AttentionMetadata(packed_padding=padding, extra={})
+    )
+
+    torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
+    assert torch.count_nonzero(baseline[:, valid:]) == 0
+
+
+def test_wan_xpu_uses_256q_64k_and_gate_branch(monkeypatch):
+    calls: dict[str, Any] = {}
+
+    def fake_block_sparse(
+        query,
+        key,
+        value,
+        block_map,
+        block_sizes,
+        softmax_scale,
+        *,
+        provider,
+        precision,
+        block_size,
+        key_block_size,
+    ):
+        calls.update(
+            q_shape=tuple(query.shape),
+            block_map=block_map.clone(),
+            block_sizes=block_sizes.tolist(),
+            provider=provider,
+            precision=precision,
+            block_size=block_size,
+            key_block_size=key_block_size,
+        )
+        return query
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.backends.fastvideo_vsa.block_sparse_attn_bshd",
+        fake_block_sparse,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.backends.fastvideo_vsa.resolve_block_sparse_provider",
+        lambda *args, **kwargs: "xpu",
+    )
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"topk": 1, "min_seq_len": 1, "disable_when_sp_active": False},
+    )
+    monkeypatch.setattr(impl, "_fallback_reason", lambda *args, **kwargs: None)
+    query = torch.randn(1, 300, 2, 8, dtype=torch.bfloat16)
+    gate = torch.ones_like(query)
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (3, 10, 10), "gate_compress": gate})
+
+    without_gate = impl.forward_xpu(query, query, query, AttentionMetadata(extra={"vsa_dit_seq_shape": (3, 10, 10)}))
+    with_gate = impl.forward_xpu(query, query, query, metadata)
+
+    assert without_gate.shape == query.shape
+    assert with_gate.shape == query.shape
+    assert not torch.allclose(without_gate, with_gate)
+    assert calls["provider"] == "xpu"
+    assert calls["precision"] == "bf16"
+    assert calls["block_size"] == 256
+    assert calls["key_block_size"] == 64
+    assert calls["q_shape"] == (1, 1024, 2, 8)
+    assert calls["block_map"].shape == (1, 2, 4, 16)
+    assert calls["block_sizes"] == [64, 64, 64, 0, 48, 0, 0, 0, 48, 0, 0, 0, 12, 0, 0, 0]
