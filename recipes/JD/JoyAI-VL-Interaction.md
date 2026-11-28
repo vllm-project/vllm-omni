@@ -14,11 +14,12 @@
 
 ## When to use this recipe
 
-Use this to stand up the streaming-interaction serving layer (`vllm_omni/experimental/fullduplex/`).
+Use this to stand up the streaming-interaction serving layer (`vllm_omni/entrypoints/joyvl/`).
 The model is served unchanged by `vllm serve`; this layer adds session state, 3-tier
-summary memory, the per-tick decision, and pluggable ASR / TTS / delegation. For the
-framework internals and how to add another full-duplex model, see
-[`vllm_omni/experimental/fullduplex/README.md`](../../vllm_omni/experimental/fullduplex/README.md).
+summary memory, the per-tick decision, and pluggable ASR / TTS / delegation. See the
+[standalone serving guide](../../docs/serving/standalone_servers.md) for its HTTP
+contract. New native full-duplex integrations use the
+[engine-resident model plugin](../../docs/design/fullduplex.md).
 
 ## Environment
 
@@ -199,7 +200,7 @@ vllm serve jdopensource/JoyAI-VL-Interaction-Preview \
   --limit-mm-per-prompt '{"image":256,"video":1}'
 
 # 2. Interaction orchestrator (OpenAI-compatible, :8070)
-python -m vllm_omni.experimental.fullduplex.joyvl.serving.server --port 8070 \
+python -m vllm_omni.entrypoints.joyvl.serving.server --port 8070 \
   --main-backend-url http://127.0.0.1:8061/v1 --main-model JoyAI-VL-Interaction-Preview
 ```
 
@@ -275,7 +276,7 @@ orchestrator hands it to a **background brain** — any OpenAI-compatible endpoi
 self-host. Enable it by pointing the orchestrator at one:
 
 ```bash
-python -m vllm_omni.experimental.fullduplex.joyvl.serving.server --port 8070 \
+python -m vllm_omni.entrypoints.joyvl.serving.server --port 8070 \
   --main-backend-url http://127.0.0.1:8061/v1 --main-model JoyAI-VL-Interaction-Preview \
   --delegation-backend-url <brain-endpoint>/v1 \
   --delegation-model <brain-model> --delegation-kind chat

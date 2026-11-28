@@ -168,7 +168,6 @@ x-duplex: &duplex
   - vllm_omni/entrypoints/duplex_omni.py
   - vllm_omni/protocol/
   - vllm_omni/clients/
-  - vllm_omni/experimental/fullduplex/
   - vllm_omni/entrypoints/openai/api_server.py
   - vllm_omni/entrypoints/openai/duplex_capability.py
 

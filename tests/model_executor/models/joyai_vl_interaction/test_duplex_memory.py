@@ -941,7 +941,7 @@ async def test_asr_uses_bounded_memory_and_preserves_initial_instruction(monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drop_oldest_visual", [False, True])
 async def test_asr_evicts_memory_blocks_before_rebudgeting_history(monkeypatch, drop_oldest_visual):
-    from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import VIDEO_HISTORY_HEADER
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import VIDEO_HISTORY_HEADER
 
     h = await open_joyai(asr=True, modalities=("text",))
     try:

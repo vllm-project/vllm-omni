@@ -48,15 +48,6 @@ from vllm_omni.engine.duplex.visual_memory import (
     VisualMemorySource,
     VisualSummary,
 )
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
-from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
-    LONG_TERM_COMPRESS_PROMPT,
-    MID_TERM_SUMMARY_PROMPT,
-    QA_QUERY_LABEL,
-    QA_RESPONSE_LABEL,
-    SILENT_SYSTEM_PROMPT,
-    USER_QUERY_HEADER,
-)
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import (
     JoyAIDataPlane,
     JoyAISessionState,
@@ -86,10 +77,19 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     TextSummaryLimit,
     TextSummaryProgress,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import Action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompt import (
     drop_oldest_visual_frame,
     interleave_history,
     visual_response_refs,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import (
+    LONG_TERM_COMPRESS_PROMPT,
+    MID_TERM_SUMMARY_PROMPT,
+    QA_QUERY_LABEL,
+    QA_RESPONSE_LABEL,
+    SILENT_SYSTEM_PROMPT,
+    USER_QUERY_HEADER,
 )
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,

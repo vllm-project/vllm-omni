@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import parse_action
-from vllm_omni.experimental.fullduplex.joyvl.memory.brain import InteractionBrain
+from vllm_omni.entrypoints.joyvl.memory.brain import InteractionBrain
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import parse_action
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,7 +30,7 @@ class _FakeDelegation:
         return "t1"
 
     async def poll(self, task_id):
-        from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import DelegationResult
+        from vllm_omni.entrypoints.joyvl.bridges.delegation import DelegationResult
 
         return DelegationResult(task_id, "ready", digest=f"answer to {self._ready[task_id]}")
 

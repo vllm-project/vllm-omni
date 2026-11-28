@@ -19,6 +19,13 @@ The public wire contract lives in
 [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md);
 this page describes how it is produced.
 
+Client-side camera-frame tiling lives in `vllm_omni.clients.video_stacking`.
+The benchmark wire probe in `vllm_omni.clients.realtime` reuses the public
+`EventCollector`; application sessions use `DuplexClient`. JoyAI's shared action
+parser and prompts live under its model's `duplex` package. Standalone JoyVL and
+Mage-VL services are owned by `entrypoints/joyvl` and `entrypoints/mage_vl`; see
+the [standalone serving guide](../serving/standalone_servers.md).
+
 ## Purpose
 
 A full-duplex model listens and speaks at the same time: audio streams into

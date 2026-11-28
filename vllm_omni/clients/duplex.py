@@ -846,7 +846,7 @@ class DuplexClientBase(ABC):
         close the unit yet.
 
         ``stacked_video_frames`` is the optional parallel track of composites
-        (see ``vllm_omni.experimental.fullduplex.video_stacking``): entry ``k``
+        (see ``vllm_omni.clients.video_stacking``): entry ``k``
         tiles the sub-frames captured *inside* unit ``k`` and rides the same
         append right after the base frame. ``None`` entries send the base
         frame alone.

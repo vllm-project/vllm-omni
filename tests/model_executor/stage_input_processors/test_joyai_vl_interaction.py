@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
-from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import (
     DEFAULT_SYSTEM_PROMPT,
     USER_QUERY_HEADER,
 )

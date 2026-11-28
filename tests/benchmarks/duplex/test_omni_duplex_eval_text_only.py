@@ -44,7 +44,7 @@ async def _generate(monkeypatch, tmp_path):
         return created[-1]
 
     _install_deadlines(monkeypatch)
-    monkeypatch.setattr(runner, "RealtimeDuplexClient", client_factory)
+    monkeypatch.setattr("vllm_omni.clients.realtime.RealtimeDuplexClient", client_factory)
     result = await runner.generate_sample(
         _sample(),
         url="ws://localhost:8000/v1/realtime",
@@ -79,7 +79,7 @@ def _incomplete_client(reason: str):
 
 async def _generate_with(monkeypatch, tmp_path, client_cls):
     _install_deadlines(monkeypatch)
-    monkeypatch.setattr(runner, "RealtimeDuplexClient", client_cls)
+    monkeypatch.setattr("vllm_omni.clients.realtime.RealtimeDuplexClient", client_cls)
     return await runner.generate_sample(
         _sample(),
         url="ws://localhost:8000/v1/realtime",

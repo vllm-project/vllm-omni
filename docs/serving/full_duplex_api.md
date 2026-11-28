@@ -171,8 +171,9 @@ and automatic responses. Append 1,280-sample (80 ms) input frames; when using
 `stream_pcm`, set `chunk_ms=80`. Pass `instructions` and optional `tools` to
 the preset before opening the session.
 
-JoyVL is a separate HTTP interaction orchestrator and does not use these
-WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).
+JoyAI's native pipeline uses these WebSocket endpoints. Its standalone JoyVL
+HTTP interaction orchestrator remains a separate service; see
+[Standalone Servers](standalone_servers.md).
 
 ## MiniCPM-o Quick Start
 

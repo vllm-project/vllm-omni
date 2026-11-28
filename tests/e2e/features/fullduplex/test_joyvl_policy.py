@@ -1,29 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import (
+from vllm_omni.entrypoints.joyvl.bridges.delegation import (
     DelegationResult,
     ImageEditDelegationBridge,
     ImageGenDelegationBridge,
     OpenAIDelegationBridge,
 )
-from vllm_omni.experimental.fullduplex.joyvl.decision.policy import JoyVLPolicy, sample_frames
+from vllm_omni.entrypoints.joyvl.decision.policy import JoyVLPolicy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_sample_frames_keeps_recent():
-    assert sample_frames(["a", "b"], 4) == ["a", "b"]
-    out = sample_frames([str(i) for i in range(10)], 4)
-    assert out[-1] == "9" and len(out) == 4
-
-
 def test_build_messages_stable_head_and_query():
-    p = JoyVLPolicy(num_frames=4)
+    p = JoyVLPolicy()
     p.tick(2)
     p.set_query("count the bottles")
     msgs, user = p.build_messages([{"type": "image_url", "image_url": {"url": "x"}}])
@@ -173,7 +167,7 @@ class _NamedBridge:
 
 @pytest.mark.asyncio
 async def test_routing_delegation_dispatches_by_request():
-    from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import RoutingDelegationBridge
+    from vllm_omni.entrypoints.joyvl.bridges.delegation import RoutingDelegationBridge
 
     chat, image, edit = _NamedBridge("chat"), _NamedBridge("image"), _NamedBridge("edit")
     r = RoutingDelegationBridge(chat=chat, image=image, edit=edit)
@@ -196,8 +190,8 @@ class _Delegation:
 
 
 def test_build_delegation_off_unless_backend_configured():
-    from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
-    from vllm_omni.experimental.fullduplex.joyvl.serving.server import SessionManager
+    from vllm_omni.entrypoints.joyvl.serving.config import InteractionConfig
+    from vllm_omni.entrypoints.joyvl.serving.server import SessionManager
 
     # No backend URL -> delegation disabled (None), NOT a silent stub that folds fake answers.
     assert SessionManager._build_delegation(InteractionConfig()) is None
@@ -211,7 +205,7 @@ def test_build_delegation_off_unless_backend_configured():
 
 @pytest.mark.asyncio
 async def test_delegation_cancel_drops_task():
-    from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import StubDelegationBridge
+    from vllm_omni.entrypoints.joyvl.bridges.delegation import StubDelegationBridge
 
     b = StubDelegationBridge(ready_after_ticks=1)
     task_id = await b.submit("q", "", [])
@@ -222,7 +216,7 @@ async def test_delegation_cancel_drops_task():
 
 @pytest.mark.asyncio
 async def test_delegation_aclose_clears_pending():
-    from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import StubDelegationBridge
+    from vllm_omni.entrypoints.joyvl.bridges.delegation import StubDelegationBridge
 
     b = StubDelegationBridge(ready_after_ticks=5)
     task_id = await b.submit("q", "", [])
@@ -232,8 +226,8 @@ async def test_delegation_aclose_clears_pending():
 
 @pytest.mark.asyncio
 async def test_session_reset_cancels_and_awaits_consolidation():
-    from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
-    from vllm_omni.experimental.fullduplex.joyvl.serving.session import InteractionSession
+    from vllm_omni.entrypoints.joyvl.serving.config import InteractionConfig
+    from vllm_omni.entrypoints.joyvl.serving.session import InteractionSession
 
     class _Backend:
         async def generate(self, *a, **k):
@@ -262,8 +256,8 @@ async def test_session_reset_cancels_and_awaits_consolidation():
 
 @pytest.mark.asyncio
 async def test_manager_aclose_closes_without_error():
-    from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
-    from vllm_omni.experimental.fullduplex.joyvl.serving.server import SessionManager
+    from vllm_omni.entrypoints.joyvl.serving.config import InteractionConfig
+    from vllm_omni.entrypoints.joyvl.serving.server import SessionManager
 
     mgr = SessionManager(InteractionConfig(enable_memory=False, enable_delegation=False))
     await mgr.aclose()

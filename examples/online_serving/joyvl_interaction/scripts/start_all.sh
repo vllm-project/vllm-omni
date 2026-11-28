@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # One-shot JoyVL demo: model -> interaction orchestrator -> JD webui.
 #
 # The model is the only fixed component; every external module is pluggable and
@@ -58,6 +61,7 @@ echo "Resetting ports ${MODEL_PORT} ${ORCH_PORT} ${WEBUI_PORT}…"
 for p in "$MODEL_PORT" "$ORCH_PORT" "$WEBUI_PORT"; do kill_port "$p"; done
 sleep 3
 
+# shellcheck source=/dev/null
 [ -f "$VENV/bin/activate" ] && source "$VENV/bin/activate"
 
 # detach into a new session so servers outlive this launcher
@@ -86,7 +90,7 @@ fi
 [ "$ENABLE_MEMORY" = "0" ] && ORCH_ARGS+=(--no-memory)
 [ -n "${SUMMARIZER_BACKEND_URL:-}" ] && ORCH_ARGS+=(--summarizer-backend-url "$SUMMARIZER_BACKEND_URL")
 [ -n "${SUMMARIZER_MODEL:-}" ] && ORCH_ARGS+=(--summarizer-model "$SUMMARIZER_MODEL")
-spawn "$LOG/orch.log" env PYTHONPATH="$CODE" python -m vllm_omni.experimental.fullduplex.joyvl.serving.server "${ORCH_ARGS[@]}"
+spawn "$LOG/orch.log" env PYTHONPATH="$CODE" python -m vllm_omni.entrypoints.joyvl.serving.server "${ORCH_ARGS[@]}"
 wait_http "http://127.0.0.1:${ORCH_PORT}/health" && echo "  up :${ORCH_PORT}"
 
 echo "[3/3] JD webui…"
