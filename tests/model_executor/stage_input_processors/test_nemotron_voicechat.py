@@ -83,6 +83,25 @@ def test_full_payload_replace_semantics_declared() -> None:
     assert "codes" in _FULL_PAYLOAD_REPLACE_KEYS
 
 
+def test_full_payload_reads_prompt_len_from_pooling_meta() -> None:
+    """The request info may not carry the prompt length; the talker output does.
+
+    Observed with the Nemotron offline example: ``request.additional_information``
+    arrives as a serialized payload object, so a dict-only lookup returns None,
+    while the talker's own output meta carries ``meta.nvc_logical_prompt_len``.
+    """
+    prompt_len, frames, q = 4, 10, 31
+    codes = torch.arange(frames * q, dtype=torch.long).reshape(frames, q) % 1024
+    request = SimpleNamespace(additional_information=None, additional_information_cpu=None)
+    pooling_output = {
+        "codes.audio": codes,
+        "meta.nvc_logical_prompt_len": torch.tensor([prompt_len], dtype=torch.long),
+    }
+    payload = talker2code2wav_full_payload(request=request, pooling_output=pooling_output, is_finished=True)
+    assert payload.codes.audio.shape == (frames - (prompt_len - 1), q)
+    assert torch.equal(payload.codes.audio, codes[prompt_len - 1 :])
+
+
 def test_full_payload_missing_prompt_len_fails_explicitly() -> None:
     codes = torch.zeros((5, 31), dtype=torch.long)
     request = SimpleNamespace(
