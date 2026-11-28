@@ -9,8 +9,9 @@ This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
 The endpoint requires a duplex plugin and a deployment with `session_mode: duplex`.
-See [supported models and deployments](full_duplex_api.md#enable-full-duplex)
-and the [runtime architecture](../design/fullduplex.md).
+See [supported models and deployments](full_duplex_api.md#enable-full-duplex),
+the [runtime architecture](../design/fullduplex.md), and the
+[Duplex-MPE multi-party selective participation benchmark](gh-file:benchmarks/duplex_mpe/README.md).
 
 ## Qwen3-Omni conversation history
 
@@ -658,6 +659,23 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
+On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
+old output. Its replacement re-prefills the accepted Thinker context before
+processing its first input, including the processed rows of an unfinished
+unit. If the first new input is unforced text or carries a delegated tool
+result, it can open a reply on that same unit. In `"off"` mode, if the
+full prefix and new input leave insufficient
+room to sample within the model context limit, the session ends with
+`context_length_exceeded`. The session keeps the snapshot
+on its Stage-0 replica until replacement or session cleanup. Model text can
+include speech the client has not played yet, and a new response can return to
+the interrupted topic. A replica failure still ends the session.
+
+An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
+and `"context"`: the same replica can offer completed units for 10 seconds
+from the abort, subject to a limit of 32 waiting windows. In `"off"` mode this
+deployment starts the replacement from the system turn and reference audio.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
@@ -1243,6 +1261,12 @@ remain accepted for client compatibility. Text replies commit the emitted text
 without playback ACKs even under `ack_only`; cancellation retains the emitted
 prefix and discards stale output. Whitespace-only replies are not stored as
 assistant turns; meaningful text retains its emitted whitespace verbatim.
+On text-only deployments, when a reply starts before its input commits,
+history places the owning input before that reply and subsequent input
+after it. A terminal native LISTEN uses the same history policy as normal
+completion, including when the continuation budget is exhausted;
+`conversation: "none"` keeps its text out of history and releases
+zero-audio response state without an ACK.
 The unconditional playback-policy bypass applies to deployments without audio
 output. On speech deployments, text replies with zero generated/sent audio and
 no audio-completion dependency commit without an ACK. Text that depends on

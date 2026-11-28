@@ -114,6 +114,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     _native_output_materializer: NativeOutputWorker | None
     model_state: OmniModelState
     _mm_rng_state: MMRequestRNGState | None = None
+    # Request IDs that opted into last-layer hidden-state return (RL teacher
+    # rollouts). Tracked in add_requests; only these rows pay the copy.
+    _hidden_state_req_ids: set[str] | None = None
     vocab_size: int
     # Speculative decoding state; the upstream __init__ sets the real values.
     use_aux_hidden_state_outputs: bool = False
@@ -271,6 +274,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         with self._staged_writes.activate():
             super().__init__(*args, **kwargs)
         self._validate_parallel_support()
+        self._hidden_state_req_ids = set()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -301,6 +305,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         static_staged_writes = (type(sampler) is Sampler or getattr(sampler, "omni_static_staged_writes", False)) and [
             type(p) for p in getattr(sampler, "logits_processors", ())
         ] == [LogitBiasState, PenaltiesState, BadWordsState]
+        hidden_state_req_ids = self._hidden_state_req_ids
+        if hidden_state_req_ids is None:
+            # object.__new__-constructed runners (unit-test doubles) skip __init__.
+            hidden_state_req_ids = self._hidden_state_req_ids = set()
+        for request_data in scheduler_output.scheduled_new_reqs:
+            if getattr(request_data, "return_hidden_states", False):
+                hidden_state_req_ids.add(request_data.req_id)
+        hidden_state_req_ids.difference_update(scheduler_output.finished_req_ids)
         if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
         if self._mm_rng_state is not None:
@@ -1344,6 +1356,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        # Scheduler decisions the model follows this step, before it frees finished requests' state.
+        on_scheduled = getattr(self.model, "on_scheduler_output", None)
+        if callable(on_scheduled):
+            on_scheduled(scheduler_output)
         if self._mm_rng_state is not None:
             for req_id in finished:
                 self._mm_rng_state.discard(req_id)

@@ -16,12 +16,13 @@ import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexOutputAction
+from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexOutputAction, duplex_resource_request_id
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
     MiniCPMO45Stage0DuplexRuntime,
     _MiniCPMO45Stage0SessionState,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import MiniCPMO45SchedulerWindowPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import default_prompt_wav
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.sage_interaction.duplex.delegation import (
@@ -420,6 +421,63 @@ def test_stage0_prefill_wraps_audio_markers_and_prepends_tool_tokens() -> None:
     assert state.pending_speech_context is True
 
 
+@pytest.mark.parametrize("mode", ["basic", "off"])
+def test_sage_window_preserves_append_boundaries_without_cross_epoch_replay(mode: str) -> None:
+    fence = DuplexFence(session_id="sage", epoch=0)
+    request_id = duplex_resource_request_id(fence, "stage0")
+    runtime = {
+        "duplex_first_append_context_tokens": 50,
+        "duplex_scheduler_token_id": 151683,
+        "duplex_boundary_token_ids": MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(_FakeSageTokenizer()),
+        "duplex_window_config": {
+            "sliding_window_mode": mode,
+            "basic_window_high_tokens": 75,
+            "basic_window_low_tokens": 65,
+        },
+    }
+
+    def append(request_id: str, fence: DuplexFence, seq: int):
+        prompt = build_sage_data_plane_prompt(
+            request_id=request_id,
+            fence=fence,
+            session_config={},
+            runtime_config=runtime,
+            seq=seq,
+            turn_seq=seq,
+            payload={"audio": _pcm_b64(16000), "format": "pcm_f32le", "sample_rate_hz": 16000},
+            final=False,
+        )
+        assert prompt["model_intermediate_buffer"]["duplex"]["session_window_replay"] is False
+        return SimpleNamespace(request_id=request_id, **prompt)
+
+    request = append(request_id, fence, 1)
+    request.num_prompt_tokens = len(request.prompt_token_ids)
+    update = append(request_id, fence, 2)
+    policy = MiniCPMO45SchedulerWindowPolicy()
+    assert policy.prepare_admission(request, max_prompt_len=100) is None
+    policy.observe_progress(request)
+    terminator = runtime["duplex_boundary_token_ids"]["listen_token_id"]
+    replacement = policy.prepare_append(
+        SimpleNamespace(), request, update, segment_output_ids=[], completed_terminator=terminator
+    )
+    duplex = update.model_intermediate_buffer["duplex"]
+    assert duplex["stage0_window"]["completed_terminator_token_id"] == terminator
+    assert "open_input_start" not in duplex
+    if mode == "basic":
+        assert replacement == 63
+        assert duplex["stage0_window"]["drop_units"] == 1
+    else:
+        assert replacement is None
+        assert not getattr(request, "_minicpmo45_window_units", None)
+
+    next_fence = DuplexFence(session_id=fence.session_id, epoch=1)
+    successor = append(duplex_resource_request_id(next_fence, "stage0"), next_fence, 1)
+    assert policy.superseded_by(successor, {request_id: request}) == []
+    assert policy.prepare_admission(successor, max_prompt_len=100) is None
+    assert "stage0_window" not in successor.model_intermediate_buffer["duplex"]
+    assert policy.carry is None
+
+
 def test_stage0_sampler_delegate_budget_and_interruption_isolation() -> None:
     model = object.__new__(MiniCPMO45OmniForConditionalGeneration)
     state_sage = _MiniCPMO45Stage0SessionState(
@@ -451,10 +509,14 @@ def test_stage0_sampler_delegate_budget_and_interruption_isolation() -> None:
         model._finalize_minicpmo45_native_duplex_sample(1, token_ids["listen_token_id"], token_ids)
         == token_ids["tts_bos_token_id"]
     )
+    model._record_minicpmo45_duplex_terminator(0, token_ids["listen_token_id"], token_ids)
+    assert state_sage.current_turn_ended
 
     # Recording <|delegate|> keeps turn ended and enters delegate unit mode.
     model._record_minicpmo45_duplex_terminator(0, token_ids["delegate_token_id"], token_ids)
     assert state_sage.in_delegate_unit is True
+    assert state_sage.current_turn_ended is True
+    model._record_minicpmo45_duplex_terminator(0, 200, token_ids)
     assert state_sage.current_turn_ended is True
 
     # At 25 tokens: delegate unit is NOT capped (budget 64), whereas speak unit on row 1 IS capped (budget 20).

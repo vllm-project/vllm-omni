@@ -825,6 +825,49 @@ steps:
       fi
       (exit "$$status")
 
+# MI300 owners for CUDA READY "Distributed Test · 1GPU" / "· 2GPU" (Mooncake
+# TCP/RDMA connector and native NIXL). The CUDA IPC weight-sharing tests in
+# those jobs stay CUDA-only: the feature itself requires NVIDIA CUDA, and its
+# modules skip at import on ROCm, so select omni_connectors/ only.
+# Blocking after five consecutive green READY runs each.
+- label: "ROCm · Distributed Test · 1-GPU"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  timeout_in_minutes: 30
+  env:
+    ROCM_DIFFUSION_RUN_LEVEL: core_model
+    # Mooncake's HIP transport cannot open an IPC handle exported by the same
+    # process (hipIpcOpenMemHandle: invalid device context), and these tests
+    # run producer and consumer in one process. Use the TCP path CUDA CI uses.
+    MC_DISABLE_HIP: "1"
+  artifact_paths:
+    - "artifacts/rocm-distributed-1gpu/**/*"
+  commands:
+    - >-
+      bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+      1 27 20m rocm-distributed-1gpu
+      tests/distributed/omni_connectors/
+      -m 'core_model and rocm and MI325 and not cards_2'
+
+- label: "ROCm · Distributed Test · 2-GPU"
+  agent_pool: mi300_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  timeout_in_minutes: 30
+  env:
+    ROCM_DIFFUSION_RUN_LEVEL: core_model
+  artifact_paths:
+    - "artifacts/rocm-distributed-2gpu/**/*"
+  commands:
+    - >-
+      bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+      2 8 20m rocm-distributed-2gpu
+      tests/distributed/omni_connectors/
+      -m 'core_model and rocm and MI325 and cards_2'
+
 - label: "ROCm · One-Card Worker GPU Test"
   agent_pool: mi300_1
   depends_on: amd-build

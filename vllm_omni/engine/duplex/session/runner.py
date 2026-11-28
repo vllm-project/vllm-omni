@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, TypeVar, cast
 import pybase64 as base64
 from vllm.logger import init_logger
 
+from vllm_omni.engine import CONTEXT_LENGTH_EXCEEDED
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
@@ -354,6 +355,7 @@ class DuplexSessionRunner:
             self.out,
             close_from_runtime=self._close_from_runtime,
             schedule_silence_continuation=self._schedule_silence_continuation,
+            silence_continuation_enabled=self._silence_continuation_enabled,
             abort_request=self._abort_request_background,
         )
         self.control = SessionControl(
@@ -789,10 +791,13 @@ class DuplexSessionRunner:
         session = self.session
         if session.state == DuplexSessionState.CLOSED:
             return
-        self._emit_error(
-            "runtime_data_plane_stream_failed",
-            f"Stage-{stage_id} input processor failed: {type(exc).__name__}: {exc}",
-        )
+        reason = str(exc)
+        if reason.partition(":")[0] == CONTEXT_LENGTH_EXCEEDED:
+            code = CONTEXT_LENGTH_EXCEEDED
+            self._emit_error(code, reason)
+        else:
+            code = "runtime_data_plane_stream_failed"
+            self._emit_error(code, f"Stage-{stage_id} input processor failed: {type(exc).__name__}: {exc}")
         draining_response_id = (
             session.response_id_for_request(request_id)
             if isinstance(request_id, str) and session.is_draining_request(request_id)
@@ -822,7 +827,7 @@ class DuplexSessionRunner:
                 "epoch": session.epoch,
                 "committed": False,
                 "status": "failed",
-                "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
+                "status_details": {"type": "failed", "reason": code},
                 "playback": playback,
             }
         )
@@ -1747,6 +1752,30 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         return True
 
+    def _drop_frame_on_fast_path(self) -> bool:
+        """Consume one client append without submitting it while the model decodes a tool call.
+
+        A fast-path append already supplies the model's next 80 ms frame, so a
+        real frame would queue a second unit for the same step. It is never
+        buffered, appended or replayed. Input-clocked sessions never enter
+        this path: their real input must drive every model step.
+        """
+        if (
+            not self.run.fast_path_active
+            or not self._silence_continuation_enabled()
+            or self.run.fast_path_config_generation != self.session.config_generation
+            or self.session.active_request_id is None
+        ):
+            self.run.fast_path_active = False
+            return False
+        self.run.fast_path_dropped_frames += 1
+        logger.debug(
+            "Duplex session %s: dropped client frame #%d while the model decodes a tool call",
+            self.session.session_id,
+            self.run.fast_path_dropped_frames,
+        )
+        return True
+
     async def _on_append_audio(
         self,
         event: dict[str, object],
@@ -1754,6 +1783,8 @@ class DuplexSessionRunner:
         release_queued_input: Callable[[], None] | None = None,
     ) -> None:
         """Prepare audio, then replace its admission charge with a PCM reservation."""
+        if self._drop_frame_on_fast_path():
+            return
         session = self.session
         session.mark_user_input_activity()
         audio = event.get("audio") or event.get("data")
@@ -2496,11 +2527,17 @@ class DuplexSessionRunner:
         response_owned: bool,
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
+        fast_path: bool = False,
     ) -> bool:
         session = self.session
         model_state = self.model_state
         if not self._silence_continuation_enabled():
             return False
+        if fast_path and (
+            not self.run.fast_path_active or self.run.fast_path_config_generation != session.config_generation
+        ):
+            return False
+        config_generation = session.config_generation
         # Captured before every await. A continuation that stores the slot
         # while this one waits is newer, even when both saw append_tail None
         # or the same already-finished task.
@@ -2524,7 +2561,7 @@ class DuplexSessionRunner:
             if pending_silence is not None and not pending_silence.done():
                 return False
         append_tail = self.tasks.append_tail
-        if (append_tail is None or append_tail.done()) and self._real_input_waiting():
+        if not fast_path and (append_tail is None or append_tail.done()) and self._real_input_waiting():
             self._defer_silence_continuation(
                 expected_epoch=expected_epoch,
                 expected_response_id=response_id,
@@ -2538,21 +2575,27 @@ class DuplexSessionRunner:
         # accepted between the snapshot and this continuation's submission
         # re-anchors the chain; _still_valid() then skips the stale unit.
         anchor = model_state.last_native_submit_monotonic
-        # Align the next silence unit to submission_time_N + chunk_period and
-        # sleep only the remaining budget. The deadline is stored by the
-        # acceptance callback when the append actually submits, so skipped or
-        # stale continuations never advance the clock.
-        delay_s, next_silence_deadline = compute_silence_continuation_deadline(
-            chunk_period_s=chunk_period_s,
-            now=time.monotonic(),
-            last_submit=anchor,
-            current_deadline=model_state.silence_deadline_monotonic,
-        )
+        if fast_path:
+            # The model is decoding back to back: nothing to wait for and no
+            # paced deadline to keep. The client frames this step replaces are
+            # dropped, so a real append cannot have moved the anchor either.
+            delay_s, next_silence_deadline = 0.0, 0.0
+        else:
+            # Align the next silence unit to submission_time_N + chunk_period and
+            # sleep only the remaining budget. The deadline is stored by the
+            # acceptance callback when the append actually submits, so skipped or
+            # stale continuations never advance the clock.
+            delay_s, next_silence_deadline = compute_silence_continuation_deadline(
+                chunk_period_s=chunk_period_s,
+                now=time.monotonic(),
+                last_submit=anchor,
+                current_deadline=model_state.silence_deadline_monotonic,
+            )
         if delay_s > 0:
             await asyncio.sleep(delay_s)
         # A session.update may have turned continuation off while this one waited.
         disabled = not self._silence_continuation_enabled()
-        waiting_for_input = (append_tail is None or append_tail.done()) and self._real_input_waiting()
+        waiting_for_input = not fast_path and (append_tail is None or append_tail.done()) and self._real_input_waiting()
         tail_moved = self.tasks.append_tail is not append_tail
         stale = self.model.silence_continuation_is_stale(
             request_id=request_id,
@@ -2580,33 +2623,41 @@ class DuplexSessionRunner:
             return False
 
         def _still_valid() -> bool:
-            return (
+            if fast_path and (not self.run.fast_path_active or session.config_generation != config_generation):
+                return False
+            if not self._silence_continuation_enabled():
                 # Still allowed: a session.update may have turned continuation off
                 # while this unit waited behind the append in flight.
-                self._silence_continuation_enabled()
+                return False
+            if not fast_path:
                 # The anchor changed (a real append was accepted) after this
-                # continuation was planned; the unit is outdated.
-                and model_state.last_native_submit_monotonic == anchor
-                and not self._real_input_waiting()
-                and not self.model.silence_continuation_is_stale(
-                    request_id=request_id,
-                    response_id=response_id,
-                    response_owned=response_owned,
-                    expected_epoch=expected_epoch,
-                    expected_model_turn_id=expected_model_turn_id,
-                )
+                # continuation was planned; the unit is outdated. A fast-path
+                # unit owns the frame, so its own append is the only claimant.
+                if model_state.last_native_submit_monotonic != anchor or self._real_input_waiting():
+                    return False
+            return not self.model.silence_continuation_is_stale(
+                request_id=request_id,
+                response_id=response_id,
+                response_owned=response_owned,
+                expected_epoch=expected_epoch,
+                expected_model_turn_id=expected_model_turn_id,
             )
 
+        append_accepted = False
+
         def _on_append_accepted(submit_time: float) -> None:
-            # Commit timing state once the runtime accepts the append. If the
-            # submission is more than one chunk period past the planned
-            # deadline, the schedule is stale: restart from the actual
-            # submission. Small delays keep the planned cadence so ordinary
-            # jitter does not accumulate as drift.
+            nonlocal append_accepted
+            append_accepted = True
+            # Commit timing state once the runtime accepts the append.
             model_state.last_native_submit_monotonic = submit_time
-            model_state.silence_deadline_monotonic = (
-                submit_time + chunk_period_s if submit_time > next_silence_deadline else next_silence_deadline
-            )
+            if not fast_path:
+                # If the submission is more than one chunk period past the
+                # planned deadline, the schedule is stale: restart from the
+                # actual submission. Small delays keep the planned cadence so
+                # ordinary jitter does not accumulate as drift.
+                model_state.silence_deadline_monotonic = (
+                    submit_time + chunk_period_s if submit_time > next_silence_deadline else next_silence_deadline
+                )
             # This unit is encoded outside the PCM buffer, so the buffer would
             # otherwise still treat the next speech as the 1035 ms first window.
             note_audio_window = getattr(model_state.audio_buffer, "note_audio_window_started", None)
@@ -2621,6 +2672,12 @@ class DuplexSessionRunner:
             on_append_accepted=_on_append_accepted,
             before_append=_still_valid,
         )
+        if fast_path:
+            # Creating a wire-order task is not acceptance: its validity guard
+            # or the preceding append can still refuse it. A refused fast unit
+            # must release client input instead of leaving the session dropping.
+            await task
+            return append_accepted
         return task is not None
 
     # ------------------------------------------------------------------ #
@@ -2868,6 +2925,10 @@ class DuplexSessionRunner:
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
+        # The model is no longer filling the call this cancel tears down, so
+        # client frames are appended again instead of dropped.
+        self.run.fast_path_active = False
+        self.run.fast_path_dropped_frames = 0
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(
             commit_text=should_commit,

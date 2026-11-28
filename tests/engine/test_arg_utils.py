@@ -288,6 +288,16 @@ def test_compute_hash_is_stable_across_launches(stage_id):
     assert first_hash == second_hash
 
 
+def test_scheduler_window_policy_preserves_the_model_compile_key():
+    config = OmniEngineArgs(worker_cls=AR_WORKER_CLS).create_engine_config()
+    assert "scheduler_window_policy" not in config.model_config.compile_factors()
+    original = hash_config(config)
+    config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert hash_config(config) == original
+
+
 def test_compute_hash_keeps_stage_connector_settings():
     """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
 
@@ -820,6 +830,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("enable_cpu_offload", True),
     ("enable_layerwise_offload", True),
     ("enable_distributed_layerwise_offload", True),
+    ("enable_submodule_offload", True),
     ("dlo_use_allgather", False),
     ("dlo_resident_layers", 2),
     ("host_weight_runtime_mode", "preferred"),
@@ -870,6 +881,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "enable_cuda_graph_decode": False,
         "enable_cfg_batching": True,
         "vae_encode_fast_path": "off",
+        "enable_submodule_offload": True,
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
     stage_cfg = StageConfigFactory.create_default_diffusion(
@@ -884,6 +896,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["enable_cuda_graph_decode"] is False
     assert resolved["enable_cfg_batching"] is True
     assert resolved["vae_encode_fast_path"] == "off"
+    assert resolved["enable_submodule_offload"] is True
 
 
 @pytest.mark.parametrize(
@@ -903,8 +916,8 @@ def test_native_mrv2_worker_provides_connector_without_legacy_mixin(worker_cls):
 DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
-    ("ulysses_a2a_permute", True),
     ("ulysses_overlap_chunks", 2),
+    ("ulysses_a2a_backend", "copy_engine"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -941,7 +954,7 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             factory_kwargs["hsdp_shard_size"] = 2048
         if knob == "ulysses_overlap_chunks":
             # The overlap runs on the copy-engine exchange.
-            factory_kwargs["ulysses_a2a_permute"] = True
+            factory_kwargs["ulysses_a2a_backend"] = "copy_engine"
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"
