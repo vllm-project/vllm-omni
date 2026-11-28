@@ -50,8 +50,10 @@ TRITON_NUM_WARPS = 4
 DEFAULT_MAX_UND_TOKENS = 4096 + 2
 
 # ``maskless`` is not a sparse kernel: it runs the same visibility rules as a
-# few unmasked varlen FlashAttention passes merged by log-sum-exp (see
-# ``multiview_maskless_attention``), so it has no block geometry.
+# few unmasked varlen passes merged by log-sum-exp (see
+# ``multiview_maskless_attention``), so it has no block geometry. The passes run
+# on vLLM-bundled FlashAttention on CUDA and on ``npu_fusion_attention`` (TND)
+# on Ascend; ``triton`` is the Triton FlexAttention fallback and is CUDA-only.
 MULTIVIEW_BACKENDS: tuple[str, ...] = ("maskless", "triton")
 
 
@@ -67,6 +69,15 @@ def validate_multiview_backend(backend: str) -> str:
             f"Cosmos3 multiview attention backend must be one of {list(MULTIVIEW_BACKENDS)}, got {backend!r}."
         )
     return backend
+
+
+def npu_available() -> bool:
+    """Whether this process runs on an Ascend NPU build of PyTorch.
+
+    ``torch.npu`` only exists in TorchNPU builds, so the attribute probe keeps
+    CUDA hosts from importing or touching the NPU backend.
+    """
+    return hasattr(torch, "npu") and torch.npu.is_available()
 
 
 @dataclass(frozen=True)

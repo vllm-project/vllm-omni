@@ -11,11 +11,13 @@ Pass-kernel contract (``PASS_KERNELS``): packed ``[total, H, D]`` queries and
 offsets, no causal masking, no dropout, no zero-length segment; returns the
 attention output in the query dtype and the per-row log-sum-exp as natural-log
 FP32 ``[total_q, H]``.  Only vLLM's bundled FlashAttention is registered for
-production; a pure-torch kernel serves CPU tests.
+production on CUDA; Ascend runs the same contract through
+``npu_fusion_attention`` (TND layout), and a pure-torch kernel serves CPU tests.
 """
 
 import logging
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import cache
@@ -24,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .multiview_flex_attention import MultiviewAttentionContext
+from .multiview_flex_attention import MultiviewAttentionContext, npu_available
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
@@ -137,14 +139,90 @@ def torch_reference_pass_kernel(
     return out, lse
 
 
+#: Expand KV heads to the query-head count before the fused op. Some CANN
+#: releases reject GQA shapes in TND varlen; the fallback costs extra K/V
+#: memory but keeps the contract identical.
+NPU_REPEAT_KV_ENV = "COSMOS3_MULTIVIEW_NPU_REPEAT_KV"
+
+
+def _make_npu_pass_kernel() -> PassKernel:
+    """Ascend pass kernel over ``torch_npu.npu_fusion_attention`` in TND layout.
+
+    CUDA's FlashAttention returns the per-row LSE directly; the Ascend fused op
+    instead returns per-block softmax statistics, so
+    ``lse = softmax_max + log(softmax_sum)`` recovers the same natural-log
+    quantity the merge consumes.
+    """
+
+    def kernel(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch_npu  # TorchNPU-only; CUDA workers never build this kernel.
+
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"Cosmos3 maskless on NPU requires fp16 or bf16 passes, got {q.dtype}.")
+        heads, head_dim = q.shape[1], q.shape[2]
+        scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+        kv_heads = k.shape[1]
+        if kv_heads != heads:
+            if heads % kv_heads:
+                raise ValueError(f"Cosmos3 maskless requires an integral GQA ratio, got {heads} vs {kv_heads}.")
+            if os.environ.get(NPU_REPEAT_KV_ENV) == "1":
+                k = k.repeat_interleave(heads // kv_heads, dim=1)
+                v = v.repeat_interleave(heads // kv_heads, dim=1)
+
+        # CANN wants cumulative end offsets (no leading zero) for TND varlen.
+        result = torch_npu.npu_fusion_attention(
+            q,
+            k,
+            v,
+            heads,
+            "TND",
+            scale=scale,
+            keep_prob=1.0,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            actual_seq_qlen=cu_seqlens_q[1:].tolist(),
+            actual_seq_kvlen=cu_seqlens_k[1:].tolist(),
+            sparse_mode=0,
+            return_softmax=True,
+        )
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            raise RuntimeError(
+                "Cosmos3 maskless on NPU needs the fused op's softmax statistics; "
+                "npu_fusion_attention returned no softmax_max/softmax_sum."
+            )
+        out, softmax_max, softmax_sum = result[0], result[1], result[2]
+        lse = softmax_max[..., 0] + torch.log(softmax_sum[..., 0])
+        return out, lse.float().contiguous()
+
+    return kernel
+
+
 for _version in (2, 3, 4):
     register_pass_kernel(f"fa{_version}", lambda version=_version: _make_vllm_flash_attn_kernel(version))
+register_pass_kernel("npu", lambda: _make_npu_pass_kernel())
 register_pass_kernel("torch", lambda: torch_reference_pass_kernel)
 
 
 @cache
 def resolve_maskless_kernel() -> str:
-    """Pin the worker's vLLM-bundled FlashAttention once and log the choice."""
+    """Pin one pass kernel per worker and log the choice."""
+    if npu_available():
+        logger.info(
+            "Cosmos3 maskless: device=NPU kernel=npu_fusion_attention merge=streaming-fp32 PyTorch=%s CANN=see npu-smi",
+            torch.__version__,
+        )
+        return "npu"
+
     from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
 
     fa_version = resolve_vllm_flash_attn_version()
