@@ -7,11 +7,11 @@ For CI levels (L1–L5) and triggers, see [Test System Overview](./test_system_o
 ## Run one CUDA or NPU job from a PR comment
 
 In the PR conversation, a commenter trusted by Buildkite can post
-`/bk-cuda Simple Test` or `/bk-npu ready-platforms-test`. Use the exact YAML
+`/ci-cuda Simple Test` or `/ci-npu ready-platforms-test`. Use the exact YAML
 `key` or `label` of a command step in CUDA ready, merge, nightly, or weekly,
 or in NPU ready or nightly. Use one command on one line. Matching is
 case-sensitive. If a label is shared across tiers, prefix it with the tier,
-as in `/bk-cuda ready/Omni · Qwen3-Omni Test`. Scheduled-only steps and steps
+as in `/ci-cuda ready/Omni · Qwen3-Omni Test`. Scheduled-only steps and steps
 that require other test jobs are rejected.
 
 The comment build runs the selected step for the PR commit, including its CI
@@ -23,7 +23,7 @@ selected job. Both pipelines continue to handle their regular triggers.
 
 In each existing pipeline's GitHub settings, use Code trigger mode and enable
 **Build on new pull request comment** with **contains** matching. Set the CUDA
-command word to `/bk-cuda` and the NPU command word to `/bk-npu` so a comment
+command word to `/ci-cuda` and the NPU command word to `/ci-npu` so a comment
 selects one platform.
 Enable **Issue comments** and **Pull requests** on the GitHub webhook. To allow
 multiple targeted runs on one PR head, disable **Skip when pull request has

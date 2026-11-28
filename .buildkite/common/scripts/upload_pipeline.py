@@ -967,7 +967,7 @@ def _comment_job_selector(platform: str) -> str:
     )
     payload = json.loads(webhook)
     body = payload["comment"]["body"].strip()
-    command = f"/bk-{platform}"
+    command = f"/ci-{platform}"
     match = re.fullmatch(rf"{command}[ \t]+([^\r\n]+)", body)
     if payload.get("action") != "created" or not match:
         raise ValueError(f"expected a new PR comment of the form {command} <step key or exact YAML label>")
