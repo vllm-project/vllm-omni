@@ -594,6 +594,7 @@ def test_manual_component_offload_wins_over_requested_model_offload(distributed)
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace(
         diffusion_offload_config=None,
         enable_cpu_offload=True,
@@ -622,6 +623,7 @@ def test_requested_model_offload_without_backend_uses_resident_components():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace(
         diffusion_offload_config=None,
         enable_cpu_offload=True,

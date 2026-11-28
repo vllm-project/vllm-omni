@@ -2406,6 +2406,7 @@ def test_no_offload_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -2427,6 +2428,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=True,
         enable_layerwise_offload=False,
@@ -2453,6 +2455,7 @@ def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         diffusion_offload_config=None,
         enable_cpu_offload=False,
@@ -2481,6 +2484,7 @@ def test_layerwise_encoder_selection_releases_text_encoder():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -2506,6 +2510,7 @@ def test_layerwise_dit_only_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
