@@ -143,8 +143,22 @@ def diffusion_facts(
         "lora": lora_names or None,
     }
     for key, value in reported.items():
-        facts.setdefault(key, _jsonable(value))
+        facts.setdefault(key, value)
     return facts
+
+
+def execution_facts(
+    request: OmniDiffusionRequest,
+    output: DiffusionOutput,
+    formatted_outputs: Sequence[Any] | None,
+    od_config: OmniDiffusionConfig,
+    engine_runtime: dict[str, Any] | None,
+    num_streamed_frames: int | None = None,
+) -> dict[str, Any]:
+    """The JSON-ready facts a diffusion stage attaches to a finished request's metrics."""
+    diffusion = diffusion_facts(request, output, formatted_outputs, od_config, num_streamed_frames)
+    runtime = {**(engine_runtime or {}), **(output.execution_runtime or {})}
+    return _jsonable({"diffusion": diffusion, "runtime": runtime or None})
 
 
 def _model_identity(model: Any) -> tuple[Any, str | None]:
@@ -177,9 +191,9 @@ def engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any] | None:
             "model_revision": od_config.revision or snapshot,
             "model_class_name": od_config.model_class_name,
             "configured_dtype": _dtype_name(od_config.dtype),
-            "quantization": _jsonable(quant.get_name() if hasattr(quant, "get_name") else quant),
+            "quantization": quant.get_name() if hasattr(quant, "get_name") else quant,
             "cache_backend": cache_backend,
-            "cache_config": _jsonable(od_config.cache_config) if cache_backend not in (None, "none") else None,
+            "cache_config": od_config.cache_config if cache_backend not in (None, "none") else None,
             "parallel_config": {f: getattr(parallel, f, None) for f in _PARALLEL_FIELDS} if parallel else None,
             "max_num_seqs": od_config.max_num_seqs,
         }
@@ -229,7 +243,7 @@ def worker_runtime(pipeline: torch.nn.Module | None) -> dict[str, Any] | None:
         }
         # Facts only the pipeline knows (e.g. compute precision, checkpoint-shipped quantization).
         if callable(report := getattr(pipeline, "execution_runtime_facts", None)):
-            facts.update(_jsonable(report()))
+            facts.update(report())
         return facts
     except Exception:
         logger.warning("Failed to collect the execution summary runtime", exc_info=True)
@@ -244,7 +258,7 @@ def stage_entry(stage_stats: Any, execution: Mapping[str, Any] | None) -> dict[s
         "batch_size": getattr(stage_stats, "batch_size", None),
     }
     if execution is not None:
-        entry.update(_jsonable(execution))
+        entry.update(execution)
     else:
         entry["num_tokens_in"] = getattr(stage_stats, "num_tokens_in", None)
         entry["num_tokens_out"] = getattr(stage_stats, "num_tokens_out", None)

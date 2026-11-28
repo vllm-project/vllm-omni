@@ -49,7 +49,6 @@ from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cancellation import check_request_cancellation, request_cancellation_scope
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError, OmniDiffusionConfig
-from vllm_omni.diffusion.denoise_progress import denoise_progress_scope
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
@@ -73,6 +72,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_interaction_apply,
     supports_step_execution,
 )
+from vllm_omni.diffusion.models.progress_bar import count_denoise_steps
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -1047,7 +1047,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     sigma_schedule,
                     from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
                 ),
-                denoise_progress_scope(enabled=self._execution_summary_enabled()) as denoise_progress,
+                count_denoise_steps(enabled=self._execution_summary_enabled()) as denoise_steps,
             ):
                 with record_function(record_name):
                     try:
@@ -1071,9 +1071,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             [req.request_id for req in reqs],
                         )
                         outputs = [DiffusionOutput(aborted=True, abort_message=str(exc)) for _ in reqs]
-                if denoise_progress is not None:
+                if denoise_steps is not None:
                     # One forward runs one denoising schedule for every request in the batch.
-                    completed = denoise_progress.result()
+                    completed = denoise_steps[0]
                     cached = cached_step_count(self.pipeline) if od_config.cache_backend == "cache_dit" else None
                     for output in outputs:
                         output.num_completed_steps = completed

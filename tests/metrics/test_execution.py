@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.denoise_progress import denoise_progress_scope
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -20,7 +19,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, count_denoise_steps
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics import execution, stats
@@ -193,7 +192,7 @@ def test_progress_bar_counts_each_completed_step_once(disable, mode, expected):
     pipeline = ProgressBarMixin()
     pipeline.set_progress_bar_config(disable=disable, mininterval=0, miniters=1, file=io.StringIO())
 
-    with denoise_progress_scope() as progress:
+    with count_denoise_steps() as steps:
         if mode == "update":
             with pipeline.progress_bar(total=4) as bar:
                 bar.update(2)
@@ -203,4 +202,4 @@ def test_progress_bar_counts_each_completed_step_once(disable, mode, expected):
                 if mode == "break" and index == 2:
                     break  # the third step's body did not finish
 
-    assert progress.result() == expected
+    assert steps[0] == expected

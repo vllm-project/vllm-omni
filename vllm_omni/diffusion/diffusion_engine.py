@@ -87,7 +87,7 @@ from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics.definitions import SCHEDULER_QUEUE_WAIT_MS
-from vllm_omni.metrics.execution import EXECUTION_METRICS_KEY, diffusion_facts, engine_runtime, num_tensor_frames
+from vllm_omni.metrics.execution import EXECUTION_METRICS_KEY, engine_runtime, execution_facts, num_tensor_frames
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
     extract_diffusion_denoise_ms,
@@ -643,9 +643,9 @@ class DiffusionEngine:
             if not output.finished:
                 return None, num_streamed_frames
             clip_frames = num_streamed_frames if output.chunk_index else None
-            runtime = {**(getattr(self, "_execution_runtime", None) or {}), **(output.execution_runtime or {})}
-            diffusion = diffusion_facts(request, output, formatted_outputs, self.od_config, clip_frames)
-            return {"diffusion": diffusion, "runtime": runtime or None}, num_streamed_frames
+            runtime = getattr(self, "_execution_runtime", None)
+            facts = execution_facts(request, output, formatted_outputs, self.od_config, runtime, clip_frames)
+            return facts, num_streamed_frames
         except Exception:
             logger.warning("Failed to build the execution summary for %s", request.request_id, exc_info=True)
             return None, num_streamed_frames

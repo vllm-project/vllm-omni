@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Progress bar mixin for diffusion pipelines.
 
@@ -7,38 +7,53 @@ Provides a diffusers-compatible progress_bar() method that wraps tqdm,
 automatically disabling output on non-zero ranks in distributed settings.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import torch
 from tqdm.auto import tqdm
 
-from vllm_omni.diffusion.denoise_progress import DenoiseProgress, active_denoise_progress
+_step_counter: ContextVar[list | None] = ContextVar("denoise_step_counter", default=None)
+
+
+@contextmanager
+def count_denoise_steps(enabled: bool = True) -> Iterator[list | None]:
+    """Count the steps denoising loops complete through ``progress_bar``; ``[None]`` if no loop uses one."""
+    if not enabled:
+        yield None
+        return
+    counter = [None]
+    token = _step_counter.set(counter)
+    try:
+        yield counter
+    finally:
+        _step_counter.reset(token)
 
 
 class _CountingTqdm(tqdm):
-    """tqdm that counts completed steps into the enclosing ``denoise_progress_scope``, also when disabled.
+    """Counts completed steps, also when disabled. Iteration counts an item once its body finishes;
+    ``update(n)`` counts only outside iteration, since an enabled tqdm calls it while iterating."""
 
-    Iteration counts an item once its loop body finishes; ``update(n)`` counts only outside iteration,
-    since an enabled tqdm calls it while iterating to refresh the display.
-    """
-
-    def __init__(self, *args, progress: DenoiseProgress, **kwargs):
-        self._denoise_iterating = False
+    def __init__(self, *args, counter: list, **kwargs):
+        self._iterating = False
         super().__init__(*args, **kwargs)
-        self._denoise_progress = progress
-        progress.num_loops += 1
+        self._counter = counter
+        counter[0] = counter[0] or 0
 
     def update(self, n=1):
-        if not self._denoise_iterating:
-            self._denoise_progress.num_completed_steps += n
+        if not self._iterating:
+            self._counter[0] += n
         return super().update(n)
 
     def __iter__(self):
-        self._denoise_iterating = True
+        self._iterating = True
         try:
             for obj in super().__iter__():
                 yield obj
-                self._denoise_progress.num_completed_steps += 1
+                self._counter[0] += 1
         finally:
-            self._denoise_iterating = False
+            self._iterating = False
 
 
 class ProgressBarMixin:
@@ -66,9 +81,9 @@ class ProgressBarMixin:
         if "disable" not in config:
             config["disable"] = not _is_rank_zero()
 
-        progress = active_denoise_progress()
-        if progress is not None and (iterable is not None or total is not None):
-            return _CountingTqdm(iterable, total=total, progress=progress, **config)
+        counter = _step_counter.get()
+        if counter is not None and (iterable is not None or total is not None):
+            return _CountingTqdm(iterable, total=total, counter=counter, **config)
         if iterable is not None:
             return tqdm(iterable, **config)
         elif total is not None:
