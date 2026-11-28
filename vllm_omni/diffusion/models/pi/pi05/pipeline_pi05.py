@@ -32,6 +32,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.graph import build_denoise_graph_runner
 from vllm_omni.diffusion.models.pi.common import inference_dtype
 from vllm_omni.diffusion.models.pi.common import pipeline as pipeline_helpers
 from vllm_omni.diffusion.models.pi.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
@@ -53,6 +54,17 @@ SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
 # The two lists guard different entry points — what the checkpoint declares
 # versus the dtype actually cast to — so they must not drift apart.
 assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
+
+
+def _graph_refusal(od_config: OmniDiffusionConfig) -> str | None:
+    """Why π0.5 must stay eager although the shared runner would accept the config, if it must.
+
+    ``diffusion_graph_release_after_denoise`` frees graph pools before a VAE decode;
+    π0.5 has no decode, so honoring it would only force a recapture per request.
+    """
+    if getattr(od_config, "diffusion_graph_release_after_denoise", False):
+        return "diffusion_graph_release_after_denoise frees graphs before decode, and π0.5 has no decode step"
+    return None
 
 
 def _checkpoint_declared_keys(model_dir: str) -> set[str]:
@@ -97,6 +109,11 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
+        # Opt-in (``diffusion_use_graph``): replays a request's prefix and whole
+        # Euler loop as one device graph per (batch, num_steps); None stays eager.
+        self._denoise_graph_runner = build_denoise_graph_runner(
+            od_config, self.model.actions_from_noise, "Pi05", refusal=_graph_refusal(od_config)
+        )
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
 
@@ -215,6 +232,8 @@ class Pi05Pipeline(nn.Module):
 
         images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
 
+        # Only an engaged runner is forwarded; eager keeps the plain call.
+        runner = getattr(self, "_denoise_graph_runner", None)
         actions = self.model.sample_actions(
             images=images,
             image_masks=image_masks,
@@ -222,6 +241,7 @@ class Pi05Pipeline(nn.Module):
             lang_masks=lang_masks,
             num_steps=num_steps,
             generator=req.sampling_params.generator,
+            **({"graph_runner": runner} if runner is not None else {}),
         )
 
         return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})

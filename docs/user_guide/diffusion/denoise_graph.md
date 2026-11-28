@@ -14,6 +14,12 @@ It is off by default.
 | ---------- | --------------------------- |
 | Wan2.1 / Wan2.2 (`Wan22Pipeline`) | `Wan DiT` |
 | Z-Image (`ZImagePipeline`) | `ZImage DiT` |
+| π0.5 (`Pi05Pipeline`) | `Pi05` |
+
+π0.5 records a request's whole action generation, the image and language
+prefix and all denoising steps, as one graph and replays it once per request;
+see [π0.5](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md#denoise-graphs) for how to enable
+it with the π0.5 deploy config, which is eager by default.
 
 Capture and replay use the platform's graphed-forward class
 (`current_omni_platform.get_graphed_forward_cls()`: CUDA graphs on CUDA, XPU

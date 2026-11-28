@@ -92,6 +92,9 @@ def test_resolve_device_falls_back_when_worker_context_is_absent(monkeypatch):
         raise RuntimeError("worker context unavailable")
 
     monkeypatch.setattr("vllm_omni.diffusion.distributed.utils.get_local_device", unavailable)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    expected = torch.device("cpu")
+    import vllm_omni.platforms as platforms_mod
 
-    assert pipeline.resolve_device() == torch.device("cpu")
+    monkeypatch.setattr(platforms_mod, "current_omni_platform", SimpleNamespace(get_torch_device=lambda: expected))
+
+    assert pipeline.resolve_device() == expected

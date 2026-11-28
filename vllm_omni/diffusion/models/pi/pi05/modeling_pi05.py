@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -105,35 +105,45 @@ class Pi05AdaRMSNorm(nn.Module):
         var = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         return x.float() * torch.rsqrt(var + self.eps)
 
+    def modulation(self, cond: torch.Tensor) -> torch.Tensor:
+        """``cond (N, cond_dim)`` → the ``(N, 3*dim)`` ``(scale, shift, gate)`` projection."""
+        if self.dense is None:
+            raise ValueError("Pi05AdaRMSNorm was built without cond_dim and has no modulation.")
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
+        return self.dense(cond.to(self.dense.weight.dtype))
+
     def forward(
         self,
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
+        modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return ``(normed, gate)``; ``gate`` is ``None`` in the unconditioned case."""
+        """Return ``(normed, gate)``; ``gate`` is ``None`` in the unconditioned case.
+
+        ``modulation`` is a precomputed :meth:`modulation` already shaped to
+        broadcast against ``x`` (e.g. ``(B, 1, 3*dim)``); it replaces ``cond``.
+        """
         dtype = x.dtype
         normed = self._norm(x)
         if self.dense is None:
             normed = normed * (1.0 + self.weight.float())
             return normed.to(dtype), None
 
-        if cond is None:
-            # A conditioned norm silently falling back to an unconditioned one
-            # would drop the entire timestep signal and still return a
-            # well-shaped, finite tensor.
-            raise ValueError(
-                "Pi05AdaRMSNorm was built with cond_dim="
-                f"{self.cond_dim} but called without an AdaRMS conditioning vector."
-            )
-
-        if cond.shape[-1] != self.cond_dim:
-            raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
-
-        modulation = self.dense(cond.to(self.dense.weight.dtype))
-        if x.ndim == 3:
-            # (B, 3*dim) → (B, 1, 3*dim), broadcast across the token axis: the
-            # timestep is a per-sample scalar, identical for every action token.
-            modulation = modulation.unsqueeze(1)
+        if modulation is None:
+            if cond is None:
+                # A conditioned norm silently falling back to an unconditioned one
+                # would drop the entire timestep signal and still return a
+                # well-shaped, finite tensor.
+                raise ValueError(
+                    "Pi05AdaRMSNorm was built with cond_dim="
+                    f"{self.cond_dim} but called without an AdaRMS conditioning vector."
+                )
+            modulation = self.modulation(cond)
+            if x.ndim == 3:
+                # (B, 3*dim) → (B, 1, 3*dim), broadcast across the token axis: the
+                # timestep is a per-sample scalar, identical for every action token.
+                modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
         normed = normed * (1.0 + scale.float()) + shift.float()
         return normed.to(dtype), gate.to(dtype)
@@ -156,17 +166,20 @@ def _compute_layer_suffix_only(
     position_ids,
     gemma_expert,
     adarms_cond,
+    modulations=(None, None),
 ):
     """Run one action-expert layer on the suffix with AdaRMS conditioning.
 
     This is where π0.5 diverges from π0. Both norms are
     :class:`Pi05AdaRMSNorm` and each returns a gate that scales its sublayer's
-    contribution to the residual stream.
+    contribution to the residual stream. ``modulations`` optionally carries the
+    two norms' precomputed modulations, replacing ``adarms_cond``.
     """
     layer = gemma_expert.model.layers[layer_idx]
+    input_modulation, post_attention_modulation = modulations
 
     residual = hidden_states
-    x, gate = layer.input_layernorm(hidden_states, adarms_cond)
+    x, gate = layer.input_layernorm(hidden_states, adarms_cond, input_modulation)
     x = inference_dtype.match_module_input_dtype(x, layer.self_attn.q_proj)
 
     hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
@@ -197,7 +210,7 @@ def _compute_layer_suffix_only(
     hidden_states = _gated_residual(residual, layer.self_attn.o_proj(att), gate)
 
     residual = hidden_states
-    x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond)
+    x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond, post_attention_modulation)
     x = inference_dtype.match_module_input_dtype(x, layer.mlp.up_proj)
     return _gated_residual(residual, layer.mlp(x), gate)
 
@@ -232,6 +245,22 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             layer.post_attention_layernorm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
         expert.norm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
 
+    def adarms_modulations(self, adarms_cond: torch.Tensor) -> list[torch.Tensor]:
+        """Every expert norm's modulation for ``adarms_cond (N, cond_dim)``.
+
+        Ordered ``[layer0 input, layer0 post-attention, layer1 input, ..., final]``,
+        each ``(N, 3*width)``. One projection per norm covers all ``N`` rows, so a
+        denoise loop passing its ``num_steps`` timesteps runs ``2*depth + 1``
+        GEMMs per request instead of per step.
+        """
+        expert = self.gemma_expert.model
+        mods = []
+        for layer in expert.layers:
+            mods.append(layer.input_layernorm.modulation(adarms_cond))
+            mods.append(layer.post_attention_layernorm.modulation(adarms_cond))
+        mods.append(expert.norm.modulation(adarms_cond))
+        return mods
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -240,9 +269,15 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool = False,
         adarms_cond: torch.Tensor | None = None,
+        adarms_modulations: list[torch.Tensor] | None = None,
     ):
         """Dispatch to prefix_only / suffix_only and return
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
+
+        Suffix-only calls take the timestep conditioning either as
+        ``adarms_cond`` or as precomputed ``adarms_modulations`` (the
+        :meth:`adarms_modulations` order, each shaped to broadcast against the
+        suffix, e.g. ``(B, 1, 3*width)``).
         """
         num_layers = self.paligemma.config.text_config.num_hidden_layers
         expert_lm = self.gemma_expert.model
@@ -274,6 +309,18 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             inputs_embeds[1],
             expert_lm.layers[0].self_attn.q_proj,
         )
+        mods = adarms_modulations
+        if mods is not None:
+            if len(mods) != 2 * num_layers + 1:
+                raise ValueError(f"Expected {2 * num_layers + 1} AdaRMS modulations, got {len(mods)}")
+            batch = inputs_embeds[1].shape[0]
+            # An unexpanded (N, 3*width) entry would broadcast row-wise when N == batch
+            # and condition sample i on step i: require the documented (B, 1, 3*width).
+            if any(m.ndim != 3 or m.shape[0] != batch for m in mods):
+                raise ValueError(
+                    "Each AdaRMS modulation must broadcast against the suffix "
+                    f"({batch}, 1, 3*width); got {[tuple(m.shape) for m in mods]}"
+                )
         for layer_idx in range(num_layers):
             hidden_states = _compute_layer_suffix_only(
                 layer_idx,
@@ -283,8 +330,9 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 position_ids,
                 gemma_expert=self.gemma_expert,
                 adarms_cond=adarms_cond,
+                modulations=(None, None) if mods is None else (mods[2 * layer_idx], mods[2 * layer_idx + 1]),
             )
-        hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond)
+        hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond, None if mods is None else mods[-1])
         return [None, hidden_states], None
 
 
@@ -361,33 +409,64 @@ class Pi05ForActionPrediction(nn.Module):
         time_cond = self.time_mlp_out(time_cond)
         return F.silu(time_cond)
 
-    def embed_suffix(
-        self,
-        noisy_actions: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the suffix: **action tokens only**, plus the AdaRMS condition.
+    def _embed_actions(self, noisy_actions: torch.Tensor) -> torch.Tensor:
+        """``(B, H, action_dim)`` → ``(B, H, W)`` action tokens."""
+        return self.action_in_proj(noisy_actions.to(dtype=self.action_in_proj.weight.dtype))
 
-        π0's suffix is ``[state_token, action_tokens×H]`` with an AR mask of
-        ``[1, 1, 0...]``. π0.5 has no state token, so the suffix is
-        ``[action_tokens×H]`` and the mask is ``[1] + [0]*(H-1)``: the first
-        action token opens a causal block and the rest attend bidirectionally
-        within it.
+    def _suffix_masks(self, bsize: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """Suffix padding (all valid) and AR markers ``[1] + [0]*(H-1)``, built on ``device``.
+
+        Device-side construction (no host list → device copy) keeps a denoise
+        step free of host transfers, so it can be captured in a device graph.
         """
-        model_dtype = self.action_in_proj.weight.dtype
-        noisy_actions = noisy_actions.to(dtype=model_dtype)
+        pad_masks = torch.ones(bsize, self.action_horizon, dtype=torch.bool, device=device)
+        att_masks = torch.zeros(bsize, self.action_horizon, dtype=dtype, device=device)
+        att_masks[:, 0] = 1
+        return pad_masks, att_masks
 
-        time_cond = self.embed_timestep(timestep)
-        action_emb = self.action_in_proj(noisy_actions)  # (B, H, W)
+    def _suffix_attention(self, prefix_pad_masks: torch.Tensor, dtype: torch.dtype):
+        """Additive 4-D suffix→(prefix, suffix) mask and the suffix position ids.
 
-        bsize, action_len = action_emb.shape[:2]
-        pad_masks = torch.ones(bsize, action_len, dtype=torch.bool, device=action_emb.device)
-        att_masks = torch.tensor(
-            [1] + [0] * (self.action_horizon - 1),
-            dtype=action_emb.dtype,
-            device=action_emb.device,
-        )[None, :].expand(bsize, -1)
-        return action_emb, pad_masks, att_masks, time_cond
+        Both depend only on the prefix padding, so a denoise loop builds them once.
+        """
+        batch_size, prefix_len = prefix_pad_masks.shape
+        suffix_pad_masks, suffix_att_masks = self._suffix_masks(batch_size, prefix_pad_masks.device, dtype)
+        suffix_len = suffix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        # Position IDs continue from where the prefix's last valid token left off.
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        return prepare_attention_masks_4d(full_att_2d_masks), position_ids
+
+    def _velocity(
+        self,
+        past_key_values,
+        x_t: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        adarms_cond: torch.Tensor | None = None,
+        adarms_modulations: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        suffix_embs = self._embed_actions(x_t)
+        outputs_embeds, _ = self.paligemma_with_expert.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=False,
+            adarms_cond=adarms_cond,
+            adarms_modulations=adarms_modulations,
+        )
+
+        # Every suffix token is an action token in π0.5 (no state token to drop).
+        suffix_out = outputs_embeds[1][:, -self.action_horizon :]
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+        return self.action_out_proj(suffix_out)
 
     # ── Denoising step ───────────────────────────────────────────────
     def denoise_step(
@@ -401,35 +480,46 @@ class Pi05ForActionPrediction(nn.Module):
 
         Signature differs from π0's by exactly one argument: no ``state``.
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, time_cond = self.embed_suffix(x_t, timestep)
-
-        batch_size = prefix_pad_masks.shape[0]
-        suffix_len = suffix_pad_masks.shape[1]
-        prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        # Position IDs continue from where the prefix's last valid token left off.
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
-
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=time_cond,
+        attention_mask, position_ids = self._suffix_attention(prefix_pad_masks, self.action_in_proj.weight.dtype)
+        return self._velocity(
+            past_key_values,
+            x_t,
+            attention_mask,
+            position_ids,
+            adarms_cond=self.embed_timestep(timestep),
         )
 
-        # Every suffix token is an action token in π0.5 (no state token to drop).
-        suffix_out = outputs_embeds[1][:, -self.action_horizon :]
-        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        return self.action_out_proj(suffix_out)
+    def denoise_loop(
+        self,
+        *,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
+        noise: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Euler integration from ``noise`` (t=1) to the action chunk (t=0).
+
+        Equivalent to calling :meth:`denoise_step` per step, with the
+        step-invariant work hoisted out of the loop: the suffix attention mask
+        and positions are built once, and the timestep conditioning of all
+        ``num_steps`` steps goes through the time MLP and each AdaRMS projection
+        in one batched call. Keyword-only tensors and ``num_steps``, with no host
+        transfers, so the whole loop can be replayed as one device graph.
+        """
+        bsize, device = noise.shape[0], noise.device
+        schedule = flow_matching.make_euler_schedule(num_steps)
+        # Filled on the device from Python floats: no host tensor to copy.
+        times = torch.stack([torch.full((), t, dtype=torch.float32, device=device) for t, _ in schedule])
+        step_mods = self.paligemma_with_expert.adarms_modulations(self.embed_timestep(times))
+        attention_mask, position_ids = self._suffix_attention(prefix_pad_masks, self.action_in_proj.weight.dtype)
+
+        x_t = noise
+        for step, (_, dt) in enumerate(schedule):
+            # (3*width,) → (B, 1, 3*width): one timestep for every sample and action token.
+            mods = [m[step].expand(bsize, 1, -1) for m in step_mods]
+            v_t = self._velocity(past_key_values, x_t, attention_mask, position_ids, adarms_modulations=mods)
+            x_t = flow_matching.euler_step(x_t, v_t, dt)
+        return x_t
 
     # ── Full action generation ───────────────────────────────────────
     @torch.no_grad()
@@ -442,6 +532,7 @@ class Pi05ForActionPrediction(nn.Module):
         noise: torch.Tensor | None = None,
         num_steps: int | None = None,
         generator: torch.Generator | list[torch.Generator] | None = None,
+        graph_runner: Callable[..., torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Generate an action chunk via iterative flow-matching denoising.
 
@@ -449,6 +540,9 @@ class Pi05ForActionPrediction(nn.Module):
         published π0 paper but matching both OpenPI and LeRobot.
 
         Takes no ``state``: π0.5's state rides inside ``lang_tokens``.
+        Noise is drawn here; ``graph_runner`` replaces :meth:`actions_from_noise`
+        (prefix and denoise loop) with the same keyword call, e.g. a device-graph
+        replay of it.
         """
         if num_steps is None:
             num_steps = self.num_inference_steps
@@ -472,6 +566,34 @@ class Pi05ForActionPrediction(nn.Module):
                     generator=generator,
                 )
 
+        inputs = {
+            "images": list(images),
+            "image_masks": list(image_masks),
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+            "noise": noise,
+            "num_steps": int(num_steps),
+        }
+        if graph_runner is not None:
+            return graph_runner(**inputs)
+        return self.actions_from_noise(**inputs)
+
+    def actions_from_noise(
+        self,
+        *,
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        noise: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Prefix (images + language) and denoise loop for given ``noise``.
+
+        Keyword-only tensors, lists of tensors and ``num_steps``, with no host
+        transfers or syncs, so a request's whole action generation can be replayed
+        as one device graph.
+        """
         # 1. Compose the ordered camera and language prefix. The deployed
         # π0.5 layout always retains max_cameras slots; missing cameras occupy
         # their slot with a false image mask. State is already in lang_tokens.
@@ -497,17 +619,12 @@ class Pi05ForActionPrediction(nn.Module):
         )
 
         # 3. Euler-integrated denoising from t=1 down to t=0.
-        x_t = noise
-        for t, dt in flow_matching.make_euler_schedule(num_steps):
-            time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
-            v_t = self.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=x_t,
-                timestep=time_tensor,
-            )
-            x_t = flow_matching.euler_step(x_t, v_t, dt)
-        return x_t
+        return self.denoise_loop(
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            noise=noise,
+            num_steps=num_steps,
+        )
 
     # ── Weight loading ───────────────────────────────────────────────
     def load_weights(
