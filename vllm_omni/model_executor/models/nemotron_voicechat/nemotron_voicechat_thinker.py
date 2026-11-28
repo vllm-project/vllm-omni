@@ -60,6 +60,11 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput as MRv2SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import decode_pcm_f32le
+from vllm_omni.model_executor.models.nemotron_voicechat.perception_cudagraph import (
+    PerceptionCudaGraph,
+    make_perception_graph,
+    perception_step,
+)
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
@@ -362,6 +367,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         streaming_preprocessor_cfg.dither = 0.0
         streaming_preprocessor_cfg.pad_to = 0
         self._streaming_preprocessor = self.perception.from_config_dict(streaming_preprocessor_cfg)
+        self._perception_graph: PerceptionCudaGraph | None = None
 
         # AddFusion weights (the checkpoint uses fuse_method="add" defaults;
         # the same duplex_*_weight keys double as the fusion weights).
@@ -814,17 +820,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             cache_time = torch.cat([frame.caches[1] for frame in frames], dim=1)
             cache_channel_len = torch.cat([frame.caches[2] for frame in frames], dim=0)
             mel = torch.cat(chunks, dim=0).to(next(encoder.parameters()).dtype)
-            encoded, encoded_len, channel, time, channel_len = encoder.cache_aware_stream_step(
-                processed_signal=mel,
-                processed_signal_length=torch.full((len(frames),), mel.shape[-1], device=device, dtype=torch.long),
-                cache_last_channel=cache_channel,
-                cache_last_time=cache_time,
-                cache_last_channel_len=cache_channel_len,
-                keep_all_outputs=True,
-                drop_extra_pre_encoded=drop,
-            )
-            encoded, encoded_len = self.perception.modality_adapter(audio_signal=encoded, length=encoded_len)
-            stable = self.perception.proj(encoded.transpose(1, 2)).to(self._dtype)
+            caches = cache_channel, cache_time, cache_channel_len
+            graph = self._perception_graph
+            if graph is None:
+                result = perception_step(self.perception, mel, caches, drop)
+            else:
+                result = graph.run(mel, caches, drop)
+            stable, encoded_len, channel, time, channel_len = result
+            stable = stable.to(self._dtype)
             if (
                 stable.shape[:2] != (len(frames), 1)
                 or encoded_len.numel() != len(frames)
@@ -1310,6 +1313,27 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     # ------------------------------------------------------------------
     # Weights.
     # ------------------------------------------------------------------
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture through OmniGPUWorkerBase profiling and compile/warmup hooks.
+
+        The worker also calls this when skipping main-model capture; the factory still checks eligibility.
+        """
+        if self._perception_graph is not None:
+            return
+        streaming = self.perception.encoder.streaming_cfg
+        phases = (
+            (_streaming_cfg_at(streaming.chunk_size, 0) + _streaming_cfg_at(streaming.pre_encode_cache_size, 0), 0),
+            (
+                _streaming_cfg_at(streaming.chunk_size, 1) + _streaming_cfg_at(streaming.pre_encode_cache_size, 1),
+                int(streaming.drop_extra_pre_encoded),
+            ),
+        )
+        self._perception_graph = make_perception_graph(self.perception, self.vllm_config, phases)
+
+    def release_auxiliary_graphs(self) -> None:
+        """Release outside active decoding, during worker profiling or weight loading."""
+        self._perception_graph = None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Route the unified checkpoint into the thinker's components.
 
@@ -1322,6 +1346,12 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         * ``stt_model.perception.*`` -> the vendored Conformer.
         * everything else (``rnnt_*``, ``tts_model.*``) is skipped lazily.
         """
+        if self._perception_graph is not None:
+            logger.warning_once(
+                "VoiceChat weight loading releases perception CUDA graphs; "
+                "call capture_auxiliary_graphs() after loading and processing weights to restore replay."
+            )
+        self.release_auxiliary_graphs()
         loaded: set[str] = set()
         lm_weights: list[tuple[str, torch.Tensor]] = []
         perception_state: dict[str, torch.Tensor] = {}
