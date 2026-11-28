@@ -35,7 +35,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     normalize_lingbot_request,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.schedulers import DMDStudentScheduler, FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -309,6 +309,67 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _select_lingbot_scheduler(
+    model: str,
+    model_config: dict[str, object],
+    *,
+    scheduler_subfolder: str,
+    local_files_only: bool,
+):
+    """Pick the LingBot-Video sampling scheduler (#11260).
+
+    A DMD-distilled student must be sampled with the geometry it was distilled
+    on (DDIM eta-ancestral above the warped-sigma threshold, Euler below).
+    Checkpoint declarations name FlowUniPC, which queries the student off its
+    training distribution, so the scheduler is selectable: ``"dmd_student"``
+    (the distilled recipe), ``"flow_unipc"`` (explicit legacy), or the default
+    ``"auto"`` that keeps the checkpoint declaration.
+    """
+    scheduler_kind = str(model_config.get("scheduler", "auto")).strip().lower()
+    if scheduler_kind == "dmd_student":
+        return DMDStudentScheduler(
+            num_train_timesteps=int(model_config.get("dmd_num_train_timesteps", 1000)),
+            flow_shift=float(model_config.get("dmd_flow_shift", 3.0)),
+            high_noise_threshold=float(model_config.get("dmd_high_noise_threshold", 0.5)),
+            ddim_eta=float(model_config.get("dmd_ddim_eta", 1.0)),
+        )
+    if scheduler_kind not in ("auto", "flow_unipc"):
+        raise ValueError(
+            f"Unknown LingBot-Video scheduler {scheduler_kind!r}; expected 'auto', 'dmd_student' or 'flow_unipc'."
+        )
+    return FlowUniPCMultistepScheduler.from_pretrained(
+        model,
+        subfolder=scheduler_subfolder,
+        local_files_only=local_files_only,
+    )
+
+
+def _lingbot_recipe_defaults(scheduler) -> tuple[int, float]:
+    """Unspecified-step/-guidance defaults for the selected scheduler (#11260).
+
+    The DMD student recipe is 8 steps at guidance 1.0 (teacher CFG is
+    distilled in; extra guidance double-applies it). FlowUniPC keeps the
+    historical 40 / 6.0 defaults.
+    """
+    if isinstance(scheduler, DMDStudentScheduler):
+        return 8, 1.0
+    return 40, 6.0
+
+
+def _lingbot_omitted_shift(scheduler) -> float:
+    """The grid warp an omitted request shift resolves to (#11260 review).
+
+    One source of truth for the DMD student: its sigma grid is built from the
+    configured ``dmd_flow_shift``, so an omitted request shift must keep
+    using it rather than the generic FlowUniPC default. An explicit
+    request-level ``shift`` still overrides. FlowUniPC keeps the historical
+    3.0 for direct calls (the request path adds ``od_config.flow_shift``).
+    """
+    if isinstance(scheduler, DMDStudentScheduler):
+        return float(scheduler.config.flow_shift)
+    return 3.0
+
+
 class LingBotVideoPipeline(
     nn.Module,
     SupportImageInput,
@@ -399,9 +460,10 @@ class LingBotVideoPipeline(
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
         ).to(load_device)
-        self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
+        self.scheduler = _select_lingbot_scheduler(
             model,
-            subfolder=scheduler_subfolder,
+            model_config,
+            scheduler_subfolder=scheduler_subfolder,
             local_files_only=local_files_only,
         )
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
@@ -600,9 +662,9 @@ class LingBotVideoPipeline(
         height: int = 480,
         width: int = 480,
         num_frames: int = 81,
-        num_inference_steps: int = 40,
-        guidance_scale: float = 6.0,
-        shift: float = 3.0,
+        num_inference_steps: int | None = None,
+        guidance_scale: float | None = None,
+        shift: float | None = None,
         generator: torch.Generator | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -619,6 +681,12 @@ class LingBotVideoPipeline(
         **extra_args,
     ) -> torch.Tensor:
         del extra_args
+        if num_inference_steps is None or guidance_scale is None:
+            default_steps, default_guidance = _lingbot_recipe_defaults(self.scheduler)
+            num_inference_steps = num_inference_steps if num_inference_steps is not None else default_steps
+            guidance_scale = guidance_scale if guidance_scale is not None else default_guidance
+        if shift is None:
+            shift = _lingbot_omitted_shift(self.scheduler)
         self.check_inputs(height, width, num_frames)
         device = self.device
         do_cfg = guidance_scale > 1.0
@@ -844,10 +912,18 @@ class LingBotVideoPipeline(
         sampling = request.sampling_params
         extra_args = dict(sampling.extra_args or {})
 
-        default_shift = getattr(self.od_config, "flow_shift", None) or 3.0
+        if isinstance(self.scheduler, DMDStudentScheduler):
+            # #11260 review: the configured dmd_flow_shift is the one source of
+            # truth for an omitted request shift; od_config.flow_shift is the
+            # generic FlowUniPC knob and must not silently re-warp the
+            # distilled grid. An explicit request-level shift still overrides.
+            default_shift = _lingbot_omitted_shift(self.scheduler)
+        else:
+            default_shift = getattr(self.od_config, "flow_shift", None) or 3.0
         default_output_type = getattr(self.od_config, "output_type", None) or "pt"
         if default_output_type not in {"pt", "np", "latent"}:
             default_output_type = "pt"
+        default_num_inference_steps, default_guidance_scale = _lingbot_recipe_defaults(self.scheduler)
         try:
             if sampling.num_outputs_per_prompt != 1:
                 raise ValueError(
@@ -859,6 +935,8 @@ class LingBotVideoPipeline(
                 default_image_negative_prompt=self.default_image_negative_prompt,
                 default_shift=default_shift,
                 default_output_type=default_output_type,
+                default_num_inference_steps=default_num_inference_steps,
+                default_guidance_scale=default_guidance_scale,
             )
         except (TypeError, ValueError) as exc:
             raise OmniClientError(str(exc)) from exc
