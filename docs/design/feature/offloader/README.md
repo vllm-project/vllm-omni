@@ -91,6 +91,26 @@ that owns its residency to its own block container. DiTs absent from the plan
 fall back to `_layerwise_offload_blocks_attrs` (including the deprecated
 singular-name compatibility path).
 
+Two component-agnostic declaration fields govern where a component's offloaded
+blocks live between GPU residency windows. `one_shot_component_paths` marks a
+component that runs one forward per prompt, so its weights only need to be
+streamed once in order; `component_backing` maps a component path to a
+`BackingKind` (`PINNED`, `CHECKPOINT_MMAP`, or the reserved `DISK`). The
+resolver intersects the declaration with the user configuration and the
+parallel / quantization constraints, and any disk-streaming backing a resolver
+cannot serve fails closed to `PINNED` with a `fallback_reason` before a backend
+touches the mmap path.
+
+The loader's host-weight plan expresses one runtime tensor per binding as either
+a single checkpoint entry (`TensorBinding`, optionally with a rank-local layout
+transform) or several entries fused while a bounded staging slot is packed
+(`FusedTensorBinding`, an ordered `checkpoint_keys`/`file_paths` pair plus a
+`fuse` callable). A component that fuses weights in its own loader — for
+example `q/k/v` into `qkv_proj` — declares those source suffixes through the
+direct-mmap adapter, so plan preflight can prove the fused runtime shape from
+tensor metadata alone and staging fuses exactly what the ordinary loader would
+have produced.
+
 An undeclared DiT submodule joins the plan only when it is large enough that
 keeping it resident would defeat streaming; its block container is then found
 by scanning well-known attribute names, which warns once per submodule class.

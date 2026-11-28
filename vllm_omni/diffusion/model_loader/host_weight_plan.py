@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
+FuseTransform = Callable[[Sequence[torch.Tensor]], torch.Tensor]
+SourceRemap = Callable[[str], str | None]
 
 
 @dataclass(frozen=True)
@@ -38,11 +40,26 @@ class TensorBinding:
 
 
 @dataclass(frozen=True)
+class FusedTensorBinding:
+    """One runtime tensor fused from several checkpoint slices during staging.
+
+    ``checkpoint_keys`` and ``file_paths`` are aligned and ordered the way
+    ``fuse`` consumes them. A fused runtime tensor has no single checkpoint
+    entry, so its slices are read from disk and combined while packing a
+    bounded staging slot instead of being realized as one mmap view.
+    """
+
+    checkpoint_keys: tuple[str, ...]
+    file_paths: tuple[str, ...]
+    fuse: FuseTransform | None = None
+
+
+@dataclass(frozen=True)
 class HostWeightPlan:
     """Complete, prevalidated host backing consumed by an offload backend."""
 
     backing_kind: str
-    bindings: dict[str, TensorBinding]
+    bindings: dict[str, TensorBinding | FusedTensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
     lease_carrier: HostWeightLeaseCarrier | None = None
 
@@ -103,25 +120,29 @@ def _resolve_source_root(source: object) -> str:
 
 
 def _record_binding(
-    model_to_ckpt: dict[str, tuple[str, str]],
+    model_to_ckpt: dict[str, list[tuple[str, str]]],
     model_name: str,
     checkpoint_key: str,
     file_path: str,
 ) -> None:
-    existing = model_to_ckpt.get(model_name)
+    """Accumulate every checkpoint entry that maps to one runtime tensor.
+
+    Multi-entry runtime names are legitimate for a component that fuses several
+    checkpoint slices at load time; the caller decides from the tensor's policy
+    whether that is a fused binding or an incompatible layout.
+    """
+    entries = model_to_ckpt.setdefault(model_name, [])
     candidate = (checkpoint_key, file_path)
-    if existing is not None and existing != candidate:
-        raise _PlanIncompatibleError(
-            f"multiple checkpoint entries map to runtime tensor {model_name!r}: {existing!r} and {candidate!r}"
-        )
-    model_to_ckpt[model_name] = candidate
+    if candidate in entries:
+        return
+    entries.append(candidate)
 
 
 def _add_safetensors_source(
     checkpoint_dir: str,
     prefix: str,
     remap_fn: Callable[[str], str | None] | None,
-    model_to_ckpt: dict[str, tuple[str, str]],
+    model_to_ckpt: dict[str, list[tuple[str, str]]],
 ) -> int:
     indexed_keys = 0
     index_files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors.index.json")))
@@ -153,20 +174,33 @@ def _add_safetensors_source(
     return indexed_keys
 
 
+def _remap_for_prefix(
+    prefix: str,
+    remap_fn: Callable[[str], str | None] | None,
+    component_remaps: dict[str, SourceRemap] | None,
+) -> Callable[[str], str | None] | None:
+    """Select the remapper that owns one component's weight source."""
+    if component_remaps and prefix.endswith(".") and prefix[:-1] in component_remaps:
+        return component_remaps[prefix[:-1]]
+    return remap_fn
+
+
 def _build_source_map(
     *,
     sources: Sequence[object],
     model_path: str | None,
     remap_fn: Callable[[str], str | None] | None,
-) -> dict[str, tuple[str, str]]:
-    model_to_ckpt: dict[str, tuple[str, str]] = {}
+    component_remaps: dict[str, SourceRemap] | None = None,
+) -> dict[str, list[tuple[str, str]]]:
+    model_to_ckpt: dict[str, list[tuple[str, str]]] = {}
     indexed_keys = 0
 
     for source in sources:
+        prefix = getattr(source, "prefix", "")
         indexed_keys += _add_safetensors_source(
             _resolve_source_root(source),
-            getattr(source, "prefix", ""),
-            remap_fn,
+            prefix,
+            _remap_for_prefix(prefix, remap_fn, component_remaps),
             model_to_ckpt,
         )
 
@@ -198,7 +232,7 @@ def _build_source_map(
             indexed_keys += _add_safetensors_source(
                 checkpoint_dir,
                 "",
-                remap_fn,
+                _remap_for_prefix("", remap_fn, component_remaps),
                 model_to_ckpt,
             )
 
@@ -218,44 +252,49 @@ def _is_persistent_buffer(module: nn.Module, local_name: str) -> bool:
     return parts[-1] not in owner._non_persistent_buffers_set
 
 
-def _collect_required_dit_tensors(
-    dit_modules: Sequence[tuple[str, nn.Module]],
+def _collect_required_component_tensors(
+    component_modules: Sequence[tuple[str, nn.Module]],
 ) -> dict[str, torch.Tensor]:
     required: dict[str, torch.Tensor] = {}
-    for dit_name, dit_module in dit_modules:
-        for local_name, tensor in dit_module.named_parameters():
-            required[f"{dit_name}.{local_name}"] = tensor
-        for local_name, tensor in dit_module.named_buffers():
-            if _is_persistent_buffer(dit_module, local_name):
-                required[f"{dit_name}.{local_name}"] = tensor
+    for component_name, component_module in component_modules:
+        for local_name, tensor in component_module.named_parameters():
+            required[f"{component_name}.{local_name}"] = tensor
+        for local_name, tensor in component_module.named_buffers():
+            if _is_persistent_buffer(component_module, local_name):
+                required[f"{component_name}.{local_name}"] = tensor
     return required
 
 
 def _planned_source_prefixes(
     sources: Sequence[object],
-    dit_modules: Sequence[tuple[str, nn.Module]],
+    component_modules: Sequence[tuple[str, nn.Module]],
 ) -> frozenset[str]:
-    """Identify component sources that the DiT-only plan owns completely."""
+    """Identify component sources that the checkpoint-mmap plan owns completely."""
     if not sources:
         return frozenset()
 
-    expected = frozenset(f"{dit_name}." for dit_name, _ in dit_modules)
+    expected = frozenset(f"{component_name}." for component_name, _ in component_modules)
     available = {getattr(source, "prefix", "") for source in sources}
     missing = sorted(expected - available)
     if missing:
         raise _PlanIncompatibleError(
-            f"direct mmap requires a dedicated component weight source for each DiT; missing prefixes: {missing}"
+            f"direct mmap requires a dedicated component weight source for each component; missing prefixes: {missing}"
         )
     return expected
 
 
 def _validate_source_metadata(
     required: dict[str, torch.Tensor],
-    bindings: dict[str, TensorBinding],
+    bindings: dict[str, TensorBinding | FusedTensorBinding],
 ) -> None:
+    fused: dict[str, tuple[torch.Tensor, FusedTensorBinding]] = {}
     by_file: dict[str, list[tuple[str, torch.Tensor, TensorBinding]]] = {}
     for runtime_name, target in required.items():
-        by_file.setdefault(bindings[runtime_name].file_path, []).append((runtime_name, target, bindings[runtime_name]))
+        binding = bindings[runtime_name]
+        if isinstance(binding, FusedTensorBinding):
+            fused[runtime_name] = (target, binding)
+            continue
+        by_file.setdefault(binding.file_path, []).append((runtime_name, target, binding))
 
     for file_path, entries in by_file.items():
         if not os.path.isfile(file_path):
@@ -312,6 +351,66 @@ def _validate_source_metadata(
                         f"transformed={runtime_dtype}, runtime={target.dtype}"
                     )
 
+    fused_sources: dict[str, dict[str, list[str]]] = {}
+    for runtime_name, (_target, binding) in fused.items():
+        for checkpoint_key, file_path in zip(binding.checkpoint_keys, binding.file_paths, strict=True):
+            fused_sources.setdefault(file_path, {}).setdefault(checkpoint_key, []).append(runtime_name)
+    # One header open and one key enumeration per file, matching the ordinary
+    # branch above, keeps startup linear in the shard's key count instead of
+    # quadratic in the number of fused source slices.
+    fused_slices: dict[tuple[str, str], torch.Tensor] = {}
+    for file_path, keys in fused_sources.items():
+        if not os.path.isfile(file_path):
+            raise _PlanIncompatibleError(f"checkpoint file does not exist: {file_path}")
+        with safe_open(file_path, framework="pt", device="cpu") as handle:
+            available = set(handle.keys())
+            for checkpoint_key, runtime_names in keys.items():
+                if checkpoint_key not in available:
+                    raise _PlanIncompatibleError(
+                        f"checkpoint key {checkpoint_key!r} for fused tensor "
+                        f"{runtime_names[0]!r} is missing from {file_path}"
+                    )
+                source = handle.get_slice(checkpoint_key)
+                source_dtype = _SAFETENSORS_DTYPES.get(source.get_dtype())
+                if source_dtype is None:
+                    first_target = fused[runtime_names[0]][0]
+                    raise _PlanIncompatibleError(
+                        f"dtype mismatch for fused tensor {runtime_names[0]!r}: "
+                        f"checkpoint={source.get_dtype()}, runtime={first_target.dtype}"
+                    )
+                fused_slices[(file_path, checkpoint_key)] = torch.empty(
+                    tuple(source.get_shape()), dtype=source_dtype, device="meta"
+                )
+
+    for runtime_name, (target, binding) in fused.items():
+        slices: list[torch.Tensor] = [
+            fused_slices[(file_path, checkpoint_key)]
+            for checkpoint_key, file_path in zip(binding.checkpoint_keys, binding.file_paths, strict=True)
+        ]
+        if binding.fuse is None:
+            raise _PlanIncompatibleError(
+                f"fused tensor {runtime_name!r} has no fusion callable; a multi-entry binding cannot be staged"
+            )
+        try:
+            fused_meta = binding.fuse(slices)
+        except (NotImplementedError, RuntimeError, TypeError, ValueError) as exc:
+            raise _PlanIncompatibleError(
+                f"checkpoint fusion for {runtime_name!r} cannot be validated on tensor metadata: {exc}"
+            ) from exc
+        if not isinstance(fused_meta, torch.Tensor):
+            raise _PlanIncompatibleError(
+                f"checkpoint fusion for {runtime_name!r} returned {type(fused_meta).__name__}, expected torch.Tensor"
+            )
+        if tuple(fused_meta.shape) != tuple(target.shape):
+            raise _PlanIncompatibleError(
+                f"shape mismatch for fused tensor {runtime_name!r}: fused={tuple(fused_meta.shape)}, "
+                f"runtime={tuple(target.shape)}"
+            )
+        if fused_meta.dtype != target.dtype:
+            raise _PlanIncompatibleError(
+                f"dtype mismatch for fused tensor {runtime_name!r}: fused={fused_meta.dtype}, runtime={target.dtype}"
+            )
+
 
 def build_checkpoint_binding_plan(
     pipeline: nn.Module,
@@ -323,6 +422,7 @@ def build_checkpoint_binding_plan(
     online_quantization: bool,
     use_pipeline_key_remap: bool = True,
     has_distilled_lora: bool = False,
+    encoder_modules: Sequence[tuple[str, nn.Module]] = (),
 ) -> HostWeightPlanResult:
     """Build a complete binding plan for the pre-sharded HSDP consumer."""
     if tensor_parallel_size != 1:
@@ -338,9 +438,11 @@ def build_checkpoint_binding_plan(
     if not callable(remap_fn):
         remap_fn = None
     adapter = get_direct_mmap_adapter(pipeline)
+    component_modules = tuple(dit_modules) + tuple(encoder_modules)
 
     try:
-        planned_source_prefixes = _planned_source_prefixes(sources, dit_modules)
+        component_remaps = _component_remaps(encoder_modules)
+        planned_source_prefixes = _planned_source_prefixes(sources, component_modules)
         planned_sources = tuple(
             source for source in sources if getattr(source, "prefix", "") in planned_source_prefixes
         )
@@ -348,18 +450,19 @@ def build_checkpoint_binding_plan(
             sources=planned_sources,
             model_path=model_path,
             remap_fn=remap_fn,
+            component_remaps=component_remaps,
         )
-        required = _collect_required_dit_tensors(dit_modules)
+        required = _collect_required_component_tensors(component_modules)
         if not required:
-            raise _PlanIncompatibleError("no DiT parameters or persistent buffers were discovered")
+            raise _PlanIncompatibleError("no component parameters or persistent buffers were discovered")
 
         missing = sorted(set(required) - set(model_to_ckpt))
         if missing:
             raise _PlanIncompatibleError(
-                f"{len(missing)} required DiT tensors have no checkpoint binding (first 5: {missing[:5]})"
+                f"{len(missing)} required component tensors have no checkpoint binding (first 5: {missing[:5]})"
             )
 
-        bindings: dict[str, TensorBinding] = {}
+        bindings: dict[str, TensorBinding | FusedTensorBinding] = {}
         for runtime_name, target in required.items():
             policy = adapter.policy_for(runtime_name, target) if adapter is not None else None
             has_custom_loader = callable(getattr(target, "weight_loader", None))
@@ -367,16 +470,53 @@ def build_checkpoint_binding_plan(
                 raise _PlanIncompatibleError(
                     f"{runtime_name!r} requires a custom weight_loader with no direct-mmap adapter"
                 )
-            checkpoint_key, file_path = model_to_ckpt[runtime_name]
-            bindings[runtime_name] = TensorBinding(
-                checkpoint_key=checkpoint_key,
-                file_path=file_path,
-                transform=policy.transform if policy is not None else None,
+            entries = model_to_ckpt[runtime_name]
+            if len(entries) == 1:
+                checkpoint_key, file_path = entries[0]
+                bindings[runtime_name] = TensorBinding(
+                    checkpoint_key=checkpoint_key,
+                    file_path=file_path,
+                    transform=policy.transform if policy is not None else None,
+                )
+                continue
+            fused_sources = policy.fused_sources if policy is not None else None
+            if fused_sources is None:
+                raise _PlanIncompatibleError(
+                    f"multiple checkpoint entries map to runtime tensor {runtime_name!r}: "
+                    f"{entries[0]!r} and {entries[1]!r}"
+                )
+            ordered = _order_fused_entries(runtime_name, entries, fused_sources)
+            bindings[runtime_name] = FusedTensorBinding(
+                checkpoint_keys=tuple(key for key, _ in ordered),
+                file_paths=tuple(path for _, path in ordered),
+                fuse=policy.fuse,
             )
 
         _validate_source_metadata(required, bindings)
     except (OSError, ValueError, _PlanIncompatibleError) as exc:
-        return HostWeightPlanResult(None, str(exc))
+        if not (encoder_modules and dit_modules):
+            return HostWeightPlanResult(None, str(exc))
+        # An encoder is planned only through its own source and name mapping,
+        # so a failure that disappears without it is encoder-specific, for
+        # example a TP-sharded runtime shape. The DiT must not fall back to the
+        # ordinary loader and materialize in full for that; plan it alone. The
+        # encoder then keeps its ordinary weight source like any unplanned one.
+        logger.info(
+            "Text encoder(s) %s cannot join the checkpoint-mmap plan (%s); planning the DiT alone",
+            [component_path for component_path, _module in encoder_modules],
+            exc,
+        )
+        dit_only = build_checkpoint_binding_plan(
+            pipeline,
+            dit_modules=dit_modules,
+            sources=sources,
+            model_path=model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            online_quantization=online_quantization,
+            use_pipeline_key_remap=use_pipeline_key_remap,
+            has_distilled_lora=has_distilled_lora,
+        )
+        return dit_only
 
     return HostWeightPlanResult(
         HostWeightPlan(
@@ -385,6 +525,57 @@ def build_checkpoint_binding_plan(
             planned_source_prefixes=planned_source_prefixes,
         )
     )
+
+
+def _component_remaps(
+    encoder_modules: Sequence[tuple[str, nn.Module]],
+) -> dict[str, SourceRemap]:
+    """Map each encoder component's checkpoint names onto its runtime names."""
+    remaps: dict[str, SourceRemap] = {}
+    for component_path, module in encoder_modules:
+        mapper = getattr(module, "map_checkpoint_weight_name", None)
+        if not callable(mapper):
+            raise _PlanIncompatibleError(
+                f"text encoder {component_path!r} cannot declare disk backing without a checkpoint-name mapping"
+            )
+        remaps[component_path] = _prefixed_remap(component_path, mapper)
+    return remaps
+
+
+def _prefixed_remap(component_path: str, mapper: Callable[[str], tuple[str, str | int | None] | None]) -> SourceRemap:
+    prefix_length = len(component_path) + 1
+
+    def remap(source_name: str) -> str | None:
+        mapped = mapper(source_name[prefix_length:])
+        if mapped is None:
+            return None
+        runtime_name, _shard_id = mapped
+        return f"{component_path}.{runtime_name}"
+
+    return remap
+
+
+def _order_fused_entries(
+    runtime_name: str,
+    entries: list[tuple[str, str]],
+    fused_sources: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    """Order a runtime tensor's checkpoint entries the way its loader fuses them."""
+    ordered: list[tuple[str, str]] = []
+    for source in fused_sources:
+        matches = [entry for entry in entries if f".{source}." in entry[0]]
+        if len(matches) != 1:
+            raise _PlanIncompatibleError(
+                f"fused runtime tensor {runtime_name!r} needs exactly one checkpoint entry for {source!r}, "
+                f"found {len(matches)}"
+            )
+        ordered.append(matches[0])
+    if len(ordered) != len(entries):
+        raise _PlanIncompatibleError(
+            f"fused runtime tensor {runtime_name!r} maps {len(entries)} checkpoint entries, "
+            f"but its fusion policy declares {len(fused_sources)}"
+        )
+    return ordered
 
 
 def build_checkpoint_mmap_plan(
@@ -397,6 +588,7 @@ def build_checkpoint_mmap_plan(
     use_hsdp: bool,
     online_quantization: bool,
     has_distilled_lora: bool = False,
+    encoder_modules: Sequence[tuple[str, nn.Module]] = (),
 ) -> HostWeightPlanResult:
     """Build the DLO mmap plan without changing its HSDP eligibility."""
     if use_hsdp:
@@ -410,10 +602,12 @@ def build_checkpoint_mmap_plan(
         online_quantization=online_quantization,
         use_pipeline_key_remap=False,
         has_distilled_lora=has_distilled_lora,
+        encoder_modules=encoder_modules,
     )
 
 
 __all__ = [
+    "FusedTensorBinding",
     "HostWeightPlan",
     "HostWeightPlanResult",
     "TensorBinding",

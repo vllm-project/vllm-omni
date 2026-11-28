@@ -10,11 +10,13 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import save_file
 from vllm.config.load import LoadConfig
 
@@ -28,10 +30,13 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlanResult,
     TensorBinding,
     build_checkpoint_binding_plan,
+    build_checkpoint_mmap_plan,
 )
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+from vllm_omni.diffusion.offloader.offload_plan import BackingKind, OffloadPlan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
@@ -2591,3 +2596,249 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
     else:
         assert result.plan is None
         assert "no checkpoint binding" in result.fallback_reason
+
+
+def _encoder_mmap_plan(backing: BackingKind) -> OffloadPlan:
+    return OffloadPlan(
+        encoder_component_types={"text_encoder": "text_encoder"},
+        one_shot_component_paths=frozenset({"text_encoder"}),
+        component_backing={"text_encoder": backing},
+    )
+
+
+def _encoder_modules(encoder: nn.Module) -> PipelineModules:
+    return PipelineModules(
+        dits=[],
+        dit_names=[],
+        encoders=[encoder],
+        encoder_names=["text_encoder"],
+        vaes=[],
+    )
+
+
+class _SplitQKVEncoder(nn.Module):
+    """An encoder whose checkpoint keeps Q, K and V as separate tensors."""
+
+    def __init__(self, *, is_loaded: bool = True, out_features: int = 2):
+        super().__init__()
+        # A USP rank that owns no encoder shard builds a stub with this False.
+        self.is_loaded = is_loaded
+        self.q = nn.Linear(2, out_features, bias=False)
+        self.k = nn.Linear(2, out_features, bias=False)
+        self.v = nn.Linear(2, out_features, bias=False)
+
+    @staticmethod
+    def map_checkpoint_weight_name(name, *args, **kwargs):
+        return name, None
+
+
+@pytest.mark.parametrize(
+    ("backing", "planned", "requested", "loaded"),
+    [
+        (
+            BackingKind.DISK,
+            frozenset({"transformer."}),
+            ["text_encoder."],
+            ["text_encoder.k.weight", "text_encoder.q.weight", "text_encoder.v.weight"],
+        ),
+        (BackingKind.CHECKPOINT_MMAP, frozenset({"transformer.", "text_encoder."}), [], []),
+    ],
+)
+def test_one_shot_encoder_joins_the_mmap_plan_only_with_a_served_backing(
+    monkeypatch, tmp_path: Path, backing, planned, requested, loaded
+):
+    """A one-shot DISK encoder with split Q/K/V keeps its ordinary weight source.
+
+    Only CHECKPOINT_MMAP is realized from the plan, so the DISK case must not
+    skip ordinary loading. The mmap case is the control that proves the
+    encoder is otherwise eligible to be planned.
+    """
+    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_mod
+
+    monkeypatch.setattr(plan_mod, "get_direct_mmap_adapter", lambda _model: None)
+
+    def checkpoint(directory: str, tensors: dict[str, torch.Tensor]) -> Path:
+        root = tmp_path / directory
+        root.mkdir()
+        save_file(tensors, str(root / "model.safetensors"))
+        return root
+
+    dit_root = checkpoint("transformer", {"weight": torch.ones(2, 2)})
+    encoder_root = checkpoint(
+        "text_encoder",
+        {
+            f"{name}.weight": torch.arange(4, dtype=torch.float32).view(2, 2) + offset
+            for offset, name in enumerate(("q", "k", "v"))
+        },
+    )
+
+    class Pipeline(nn.Module):
+        _dit_modules: ClassVar[list[str]] = ["transformer"]
+        _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+        _vae_modules: ClassVar[list[str]] = []
+        _resident_modules: ClassVar[list[str]] = []
+        _offload_plan = _encoder_mmap_plan(backing)
+
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Linear(2, 2, bias=False)
+            self.text_encoder = _SplitQKVEncoder()
+            self.weights_sources = (
+                DiffusersPipelineLoader.ComponentSource(str(dit_root), None, None, prefix="transformer."),
+                DiffusersPipelineLoader.ComponentSource(str(encoder_root), None, None, prefix="text_encoder."),
+            )
+            self.loaded_weight_names: list[str] = []
+
+        def load_weights(self, weights):
+            self.loaded_weight_names = [name for name, _ in weights]
+            return set(self.loaded_weight_names)
+
+    od_config = _loader_config(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
+        quantization_config=None,
+        diffusion_attention_schedule=None,
+        # Select the encoder for offload as well. The AllGather transfer keeps
+        # the DiT on the distributed backend; with one rank it is a no-op.
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+        },
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = Pipeline()
+    requested_prefixes: list[str] = []
+
+    def get_weights(source, model=None):
+        requested_prefixes.append(source.prefix)
+        with safe_open(Path(source.model_or_path) / "model.safetensors", framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                yield source.prefix + key, handle.get_tensor(key)
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader._get_weights_iterator = get_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+
+    assert loader.load_model(load_device="cpu") is model
+    plan = loader.take_host_weight_plan()
+    assert plan is not None
+    assert plan.planned_source_prefixes == planned
+    assert requested_prefixes == requested
+    assert sorted(model.loaded_weight_names) == loaded
+
+
+def test_encoder_stub_rank_is_excluded_and_keeps_the_dit_mmap_plan(tmp_path: Path, monkeypatch):
+    """A rank that owns no encoder shard must not invalidate the DiT plan."""
+    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_mod
+
+    monkeypatch.setattr(plan_mod, "get_direct_mmap_adapter", lambda _model: None)
+    (tmp_path / "transformer").mkdir()
+    save_file({"weight": torch.ones(2, 2)}, str(tmp_path / "transformer" / "model.safetensors"))
+    dit_source = SimpleNamespace(
+        model_or_path=str(tmp_path / "transformer"), subfolder=None, revision=None, prefix="transformer."
+    )
+
+    class Pipeline(nn.Module):
+        def __init__(self, is_loaded: bool):
+            super().__init__()
+            self.transformer = nn.Linear(2, 2, bias=False)
+            self.text_encoder = _SplitQKVEncoder(is_loaded=is_loaded)
+
+    def mmap_plan(is_loaded: bool):
+        model = Pipeline(is_loaded)
+        # A stub rank has no encoder weight source at all.
+        encoders = () if not is_loaded else (("text_encoder", model.text_encoder),)
+        return model, build_checkpoint_mmap_plan(
+            model,
+            dit_modules=(("transformer", model.transformer),),
+            sources=(dit_source,),
+            model_path=None,
+            tensor_parallel_size=1,
+            use_hsdp=False,
+            online_quantization=False,
+            encoder_modules=encoders,
+        )
+
+    def select(is_loaded: bool):
+        return DiffusersPipelineLoader._mmap_encoder_modules(
+            _encoder_modules(mmap_plan(is_loaded)[0].text_encoder),
+            _encoder_mmap_plan(BackingKind.CHECKPOINT_MMAP),
+            selected=True,
+            use_hsdp=False,
+            dp_size=2,
+            uses_allgather=False,
+        )
+
+    stub_model, stub_result = mmap_plan(is_loaded=False)
+    assert select(is_loaded=False) == ()
+    assert stub_result.plan is not None
+    assert stub_result.plan.planned_source_prefixes == frozenset({"transformer."})
+    assert set(stub_result.plan.bindings) == {"transformer.weight"}
+
+    _, loaded_result = mmap_plan(is_loaded=True)
+    assert [name for name, _encoder in select(is_loaded=True)] == ["text_encoder"]
+    # An encoder that is planned without a weight source is dropped from the
+    # plan instead of taking the DiT with it.
+    assert loaded_result.plan is not None
+    assert loaded_result.plan.planned_source_prefixes == frozenset({"transformer."})
+
+
+def test_encoder_incompatible_with_the_plan_keeps_the_dit_mmap_plan(tmp_path: Path, monkeypatch):
+    """An encoder failure must not send the DiT back to ordinary loading."""
+    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_mod
+
+    monkeypatch.setattr(plan_mod, "get_direct_mmap_adapter", lambda _model: None)
+    full = torch.arange(4, dtype=torch.float32).view(2, 2)
+    (tmp_path / "transformer").mkdir()
+    save_file({"weight": full}, str(tmp_path / "transformer" / "model.safetensors"))
+    (tmp_path / "text_encoder").mkdir()
+    save_file(
+        {f"{name}.weight": full + offset for offset, name in enumerate(("q", "k", "v"))},
+        str(tmp_path / "text_encoder" / "model.safetensors"),
+    )
+    sources = tuple(
+        SimpleNamespace(model_or_path=str(tmp_path / name), subfolder=None, revision=None, prefix=f"{name}.")
+        for name in ("transformer", "text_encoder")
+    )
+
+    class Pipeline(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Linear(2, 2, bias=False)
+            # TP=2 keeps half of every encoder output feature at runtime.
+            self.text_encoder = _SplitQKVEncoder(out_features=1)
+
+    model = Pipeline()
+    result = build_checkpoint_mmap_plan(
+        model,
+        dit_modules=(("transformer", model.transformer),),
+        sources=sources,
+        model_path=None,
+        tensor_parallel_size=1,
+        use_hsdp=False,
+        online_quantization=False,
+        encoder_modules=(("text_encoder", model.text_encoder),),
+    )
+
+    assert result.plan is not None
+    assert result.plan.planned_source_prefixes == frozenset({"transformer."})
+    assert set(result.plan.bindings) == {"transformer.weight"}
+
+    # The DiT alone must still be validated; a broken DiT keeps the fallback.
+    save_file({"other": full}, str(tmp_path / "transformer" / "model.safetensors"))
+    failed = build_checkpoint_mmap_plan(
+        model,
+        dit_modules=(("transformer", model.transformer),),
+        sources=sources,
+        model_path=None,
+        tensor_parallel_size=1,
+        use_hsdp=False,
+        online_quantization=False,
+        encoder_modules=(("text_encoder", model.text_encoder),),
+    )
+    assert failed.plan is None
+    assert failed.fallback_reason is not None
