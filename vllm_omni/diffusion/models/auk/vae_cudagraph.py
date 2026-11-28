@@ -36,8 +36,10 @@ that a destroyed graph released.
 
 from __future__ import annotations
 
+import gc
+import traceback
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -49,12 +51,56 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+
+def _clear_exception_tracebacks(exc: BaseException) -> None:
+    """Clear traceback frames across an exception chain so failed captures drop tensors."""
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if cur.__traceback__ is not None:
+            traceback.clear_frames(cur.__traceback__)
+        if cur.__cause__ is not None:
+            queue.append(cur.__cause__)
+        if cur.__context__ is not None:
+            queue.append(cur.__context__)
+
+
+def _is_oom_capture_error(exc: BaseException) -> bool:
+    """Return True when a capture failure is caused by CUDA out-of-memory."""
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, torch.cuda.OutOfMemoryError):
+            return True
+        if isinstance(cur, RuntimeError) and "out of memory" in str(cur).lower():
+            return True
+        if cur.__cause__ is not None:
+            queue.append(cur.__cause__)
+        if cur.__context__ is not None:
+            queue.append(cur.__context__)
+    return False
+
+
 # Latent-frame buckets for the compiled graphs, at 50 Hz: 2.56, 5.12 and
 # 10.24 s. Each bucket costs one Inductor compilation (tens of seconds) at
 # startup and one private CUDA graph pool; longer clips are tiled over the
 # largest one. Deployments override them with
 # ``model_config.auk_vae_compile_shapes`` on the diffusion stage.
 DEFAULT_COMPILE_SHAPES: tuple[int, ...] = (128, 256, 512)
+# Cap total latent frames decoded in a single BigVGAN pass (B * frames <= 2560,
+# i.e. B=16/8/4 for 160/320/640-frame buckets). BigVGAN upsamples 480x in fp32,
+# so unchunked B=64/128 x 640 graphs reserve 65-90 GiB in private CUDA pools and
+# OOM 80 GB GPUs alongside stage 0, whereas <=2560 frames saturates decode
+# bandwidth in ~3-4 GiB and keeps compiled shapes below dynamo's recompile_limit.
+DEFAULT_MAX_BATCH_FRAMES: int = 2560
 
 
 def plan_tiles(
@@ -100,7 +146,28 @@ class _GraphEntry:
 
 
 class AuKVAEDecodeGraph:
-    """Replay AuKVAE.decode for one clip per call."""
+    """Replay AuKVAE.decode for a batch of clips."""
+
+    _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+
+    @classmethod
+    def _batch_bucket(cls, batch_size: int) -> int:
+        """Find the smallest batch ladder step >= batch_size."""
+        for b in cls._BATCH_LADDER:
+            if batch_size <= b:
+                return b
+        return batch_size
+
+    def _max_batch_for_frames(self, frames: int) -> int:
+        """Return the largest ladder batch size that fits within ``max_batch_frames``."""
+        if self.max_batch_frames <= 0 or frames <= 0:
+            return 10**9
+        limit = max(1, self.max_batch_frames // frames)
+        best = 1
+        for b in self._BATCH_LADDER:
+            if b <= limit:
+                best = b
+        return best
 
     def __init__(
         self,
@@ -111,12 +178,14 @@ class AuKVAEDecodeGraph:
         max_graphs: int = 32,
         compile_shapes: Sequence[int] = DEFAULT_COMPILE_SHAPES,
         tile_frames: int | None = None,
+        max_batch_frames: int = DEFAULT_MAX_BATCH_FRAMES,
     ) -> None:
         """``tile_frames``: window for clips longer than it; None = the largest bucket, 0 = no tiling."""
         self.vae = vae
         self.enabled = bool(enabled)
         self.frame_alignment = max(1, int(frame_alignment))
         self.max_graphs = max(1, int(max_graphs))
+        self.max_batch_frames = max(0, int(max_batch_frames))
         self.compile_shapes = sorted({int(size) for size in compile_shapes if int(size) > 0})
         self.context_frames = vae.decode_context_frames()
         if tile_frames is None:
@@ -131,42 +200,59 @@ class AuKVAEDecodeGraph:
         self.tile_frames = max(0, int(tile_frames))
         if self.tile_frames and self.tile_frames <= sum(self.context_frames):
             raise ValueError(f"tile_frames={self.tile_frames} must exceed the decoder context {self.context_frames}")
-        # Plain graphs keyed by latent length. They all live in _plain_pool and
-        # are retired together (see _retire_plain_graphs).
-        self._cache: OrderedDict[int, _GraphEntry] = OrderedDict()
-        self._plain_pool = None
+        # Plain graphs keyed by (batch_size, latent_length). Each batch size uses
+        # its own private pool handle to prevent PyTorch pool conflicts.
+        self._cache: OrderedDict[tuple[int, int], _GraphEntry] = OrderedDict()
+        self._plain_pools: dict[int, object] = {}
         # Normalized latent that decodes to raw zero, per device; pads short windows.
         self._pad_latent: torch.Tensor | None = None
-        # Compiled graphs keyed by bucket, filled by warmup().
-        self._compiled: dict[int, _GraphEntry] = {}
+        # Startup captures are separate from the bounded runtime graph cache.
+        # Compiled graphs share one private pool; __call__ clones/copies each
+        # replay's static_wav before any subsequent graph in the pool replays.
+        self._compiled: dict[tuple[int, int], _GraphEntry] = {}
+        self._compiled_pool: object | None = None
         self._compiled_decode: Callable[[torch.Tensor], torch.Tensor] | None = None
+        self._uncapturable_compiled_shapes: set[tuple[int, int]] = set()
+        self._uncapturable_plain_shapes: set[tuple[int, int]] = set()
         # Which path served the last call: "compiled", "graph" or "eager".
         self.last_mode: str | None = None
 
     @torch.no_grad()
     def __call__(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode [1, frames, latent_dim] latents into a [1, frames * hop] waveform."""
+        """Decode [B, frames, latent_dim] latents into a [B, frames * hop] waveform."""
 
-        # Graphs are captured for one clip at a time. Anything else runs the
-        # plain eager decode, whole.
-        single_clip = latents.ndim == 3 and latents.shape[0] == 1
-        if not self.enabled or not single_clip:
+        if latents.ndim == 3:
+            B, frames, _ = latents.shape
+            will_tile = bool(self.enabled and self.tile_frames and frames > self.tile_frames)
+            window_frames = self.tile_frames if will_tile else frames
+            bucket = (self.compiled_bucket(window_frames) or window_frames) if self.enabled else window_frames
+            chunk_b = self._max_batch_for_frames(bucket)
+            if B > chunk_b:
+                first = self(latents[:chunk_b])
+                wav = first.new_empty((B, first.shape[1]))
+                wav[:chunk_b].copy_(first)
+                for start in range(chunk_b, B, chunk_b):
+                    end = min(B, start + chunk_b)
+                    wav[start:end].copy_(self(latents[start:end]))
+                return wav
+
+        if not self.enabled or latents.ndim != 3:
             self.last_mode = "eager"
             return self.vae.decode(latents)
 
-        frames = int(latents.shape[1])
+        B, frames, _ = latents.shape
         if not self.tile_frames or frames <= self.tile_frames:
             return self._decode_window(latents).clone()
 
         hop = self.vae.hop_size
-        wav = latents.new_empty((1, frames * hop))
+        wav = latents.new_empty((B, frames * hop))
         for emit_start, chunk in self.decode_tiles(latents):
             wav[:, emit_start * hop : emit_start * hop + chunk.shape[1]].copy_(chunk)
         self.last_mode = "tiled"
         return wav
 
     def decode_tiles(self, latents: torch.Tensor):
-        """Yield ``(emit_start_frame, waveform)`` per tile, in order, for a [1, frames, latent_dim] clip.
+        """Yield ``(emit_start_frame, waveform)`` per tile, in order, for a [B, frames, latent_dim] clip.
 
         The waveforms are views into graph buffers where a graph served the
         tile; copy before the next tile if they must outlive the iteration.
@@ -175,7 +261,9 @@ class AuKVAEDecodeGraph:
         tile = self.tile_frames or frames
         left, right = self.context_frames
         hop = self.vae.hop_size
-        for start, width, emit_start, emit_end in plan_tiles(frames, tile, left, right, self._compiled):
+        for start, width, emit_start, emit_end in plan_tiles(
+            frames, tile, left, right, sorted({size for _, size in self._compiled})
+        ):
             wav = self._decode_window(latents[:, start : start + width])
             yield emit_start, wav[:, (emit_start - start) * hop : (emit_end - start) * hop]
 
@@ -189,38 +277,153 @@ class AuKVAEDecodeGraph:
             self.last_mode = "eager"
             return self.vae.decode(latents)
 
+        B = int(latents.shape[0])
         frames = int(latents.shape[1])
         bucket = self.compiled_bucket(frames)
-        if bucket is not None:
-            entry = self._compiled[bucket]
-            self.last_mode = "compiled"
-        else:
+        if bucket is None:
             bucket = round_up(frames, self.frame_alignment)
-            entry = self._cache.get(bucket)
-            if entry is None:
-                if len(self._cache) >= self.max_graphs:
+        entry, mode = self._lookup_graph(B, bucket)
+        if entry is None:
+            target_b = self._batch_bucket(B)
+            if (target_b, bucket) in self._uncapturable_plain_shapes:
+                self.last_mode = "eager"
+                return self.vae.decode(latents)
+            if len(self._cache) >= self.max_graphs:
+                self._retire_plain_graphs()
+            pool = self._plain_pools.get(target_b)
+            if pool is None:
+                pool = torch.cuda.graph_pool_handle()
+                self._plain_pools[target_b] = pool
+            if (target_b, bucket) in self._uncapturable_compiled_shapes:
+                decode = self.vae.decode
+            elif target_b > 1 and self._compiled_decode is not None:
+                decode = self._compiled_decode
+            else:
+                decode = self.vae.decode
+            warm_iters = 5 if decode is self._compiled_decode else 2
+            retry_plain = False
+            fallback_eager = False
+            try:
+                entry = self._capture(
+                    bucket, latents.device, decode, warm_iters=warm_iters, pool=pool, batch_size=target_b
+                )
+            except Exception as exc:
+                if _is_oom_capture_error(exc):
                     self._retire_plain_graphs()
-                if self._plain_pool is None:
-                    self._plain_pool = torch.cuda.graph_pool_handle()
-                entry = self._capture(bucket, latents.device, self.vae.decode, warm_iters=2, pool=self._plain_pool)
-                self._cache[bucket] = entry
-            self.last_mode = "graph"
+                if decode is self._compiled_decode:
+                    logger.warning(
+                        "Compiled AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                        "falling back to plain CUDA graph with vae.decode",
+                        target_b,
+                        bucket,
+                        exc_info=True,
+                    )
+                    self._uncapturable_compiled_shapes.add((target_b, bucket))
+                    retry_plain = True
+                else:
+                    logger.warning(
+                        "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                        "falling back to eager vae.decode",
+                        target_b,
+                        bucket,
+                        exc_info=True,
+                    )
+                    self._uncapturable_plain_shapes.add((target_b, bucket))
+                    self._plain_pools.pop(target_b, None)
+                    fallback_eager = True
+                _clear_exception_tracebacks(exc)
 
-        if bucket == frames:
+            if retry_plain:
+                gc.collect()
+                if latents.is_cuda:
+                    torch.accelerator.empty_cache()
+                pool = torch.cuda.graph_pool_handle()
+                self._plain_pools[target_b] = pool
+                try:
+                    entry = self._capture(
+                        bucket, latents.device, self.vae.decode, warm_iters=2, pool=pool, batch_size=target_b
+                    )
+                except Exception as exc:
+                    if _is_oom_capture_error(exc):
+                        self._retire_plain_graphs()
+                    logger.warning(
+                        "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                        "falling back to eager vae.decode",
+                        target_b,
+                        bucket,
+                        exc_info=True,
+                    )
+                    self._uncapturable_plain_shapes.add((target_b, bucket))
+                    self._plain_pools.pop(target_b, None)
+                    _clear_exception_tracebacks(exc)
+                    fallback_eager = True
+
+            if fallback_eager:
+                gc.collect()
+                if latents.is_cuda:
+                    torch.accelerator.empty_cache()
+                self.last_mode = "eager"
+                return self.vae.decode(latents)
+
+            assert entry is not None
+            self._cache[(target_b, bucket)] = entry
+            mode = "graph"
+        self.last_mode = mode
+
+        graph_b = int(entry.static_latents.shape[0])
+        pad = None
+        if graph_b == B and bucket == frames:
             entry.static_latents.copy_(latents)
         else:
-            entry.static_latents[:, :frames].copy_(latents)
-            entry.static_latents[:, frames:].copy_(self._pad_for(latents.device).expand(1, bucket - frames, -1))
+            entry.static_latents[:B, :frames].copy_(latents)
+            if bucket > frames:
+                pad = self.pad_for(latents.device)
+                entry.static_latents[:B, frames:].copy_(pad.expand(B, bucket - frames, -1))
+            if graph_b > B:
+                pad = self.pad_for(latents.device) if pad is None else pad
+                entry.static_latents[B:].copy_(pad.expand(graph_b - B, bucket, -1))
         entry.graph.replay()
-        return entry.static_wav[:, : frames * self.vae.hop_size]
+        return entry.static_wav[:B, : frames * self.vae.hop_size]
+
+    def _lookup_graph(self, batch_size: int, bucket: int) -> tuple[_GraphEntry | None, str]:
+        """Pick a captured graph for this window: compiled first, then plain, then a slightly larger batch."""
+        key = (batch_size, bucket)
+        if key in self._compiled:
+            return self._compiled[key], "compiled"
+        if key in self._cache:
+            return self._cache[key], "graph"
+        return self._larger_batch_entry(batch_size, bucket)
+
+    def _larger_batch_entry(self, batch_size: int, bucket: int) -> tuple[_GraphEntry | None, str]:
+        """Reuse a warmed graph whose batch is only slightly larger than this window.
+
+        Padding 127 into a warmed 128 graph avoids a first-wave capture. Padding
+        1 into 128 would run 128x the work, so those misses still capture exact.
+        """
+        best: tuple[int, _GraphEntry, str] | None = None
+        for cached_b, cached_frames, entry, mode in self._iter_batch_graphs():
+            if cached_frames != bucket or cached_b < batch_size:
+                continue
+            if cached_b > batch_size * 2:
+                continue
+            if best is None or cached_b < best[0]:
+                best = (cached_b, entry, mode)
+        return (None, "graph") if best is None else (best[1], best[2])
+
+    def _iter_batch_graphs(self) -> Iterator[tuple[int, int, _GraphEntry, str]]:
+        """Yield ``(batch, frames, entry, mode)`` for every captured batch graph."""
+        for (cached_b, cached_frames), entry in self._compiled.items():
+            yield cached_b, cached_frames, entry, "compiled"
+        for (cached_b, cached_frames), entry in self._cache.items():
+            yield cached_b, cached_frames, entry, "graph"
 
     def _retire_plain_graphs(self) -> None:
-        """Drop every plain graph and their shared pool; the next capture starts a new one."""
+        """Drop every plain graph and their shared pools; the next capture starts a new one."""
         logger.info("AuK codec decode: retiring %d plain CUDA graphs", len(self._cache))
         self._cache.clear()
-        self._plain_pool = None
+        self._plain_pools.clear()
 
-    def _pad_for(self, device: torch.device) -> torch.Tensor:
+    def pad_for(self, device: torch.device) -> torch.Tensor:
         """The [latent_dim] normalized latent that AuKVAE.decode maps to raw zero."""
         pad = self._pad_latent
         if pad is None or pad.device != device:
@@ -230,22 +433,24 @@ class AuKVAEDecodeGraph:
             self._pad_latent = pad
         return pad
 
+    _pad_for = pad_for
+
     def compiled_bucket(self, frames: int) -> int | None:
-        """The smallest compiled bucket that holds frames latents, or None past the largest."""
+        """The smallest captured compile-bucket that holds frames latents, or None past the largest."""
         for size in self.compile_shapes:
-            if frames <= size and size in self._compiled:
+            if frames <= size and any(bucket == size for _, bucket in self._compiled):
                 return size
         return None
 
-    def warmup(self, device: torch.device | str) -> None:
-        """Compile the decode and capture every bucket in compile_shapes.
-
-        Meant for service startup, since each bucket costs one Inductor
-        compilation. A failure only logs a warning and the bucket is served
-        by a plain graph instead.
-        """
+    def warmup(
+        self,
+        device: torch.device | str,
+        *,
+        batch_sizes: Sequence[int] = (1,),
+    ) -> None:
+        """Compile decode and capture the configured frame and batch buckets at startup."""
         device = torch.device(device)
-        if not self.enabled or not self.compile_shapes or self._compiled:
+        if not self.enabled or not self.compile_shapes:
             return
         on_accelerator = current_omni_platform.is_cuda_alike() and device.type == current_omni_platform.device_type
         if not on_accelerator or torch.cuda.is_current_stream_capturing():
@@ -256,27 +461,51 @@ class AuKVAEDecodeGraph:
             if isinstance(module, SnakeBeta):
                 module.precompute_exp_cache()
 
-        try:
-            self._compiled_decode = torch.compile(self.vae.decode, mode="default", fullgraph=False, dynamic=False)
-        except Exception:
-            logger.warning("torch.compile of the AuK codec decode failed; using plain CUDA graphs", exc_info=True)
-            self._compiled_decode = None
-            return
-
-        # Inductor fuses the plain Snake formula with the ops around it.
-        for size in self.compile_shapes:
+        if self._compiled_decode is None:
             try:
-                self._compiled[size] = self._capture(size, device, self._compiled_decode, warm_iters=5)
-                logger.info("Compiled and captured AuK codec decode: latent_frames=%d", size)
+                self._compiled_decode = torch.compile(self.vae.decode, mode="default", fullgraph=False, dynamic=False)
             except Exception:
+                logger.warning("torch.compile of the AuK codec decode failed; using plain CUDA graphs", exc_info=True)
+                return
+
+        requested_batches = sorted({1, *(int(b) for b in batch_sizes if int(b) > 0)})
+        # Clamp each (batch_size, frame_bucket) pair to max_batch_frames and
+        # capture them in one shared compiled pool (largest shapes first so
+        # smaller captures reuse blocks from the same pool).
+        targets: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for size in reversed(self.compile_shapes):
+            max_b = self._max_batch_for_frames(size)
+            for req_b in reversed(requested_batches):
+                key = (min(req_b, max_b), size)
+                if key not in seen:
+                    seen.add(key)
+                    targets.append(key)
+
+        if self._compiled_pool is None:
+            self._compiled_pool = torch.cuda.graph_pool_handle()
+        for batch_size, size in targets:
+            key = (batch_size, size)
+            if key in self._compiled:
+                continue
+            failed = False
+            try:
+                self._compiled[key] = self._capture(
+                    size, device, self._compiled_decode, warm_iters=5, pool=self._compiled_pool, batch_size=batch_size
+                )
+            except RuntimeError as exc:
                 logger.warning(
-                    "Compiled AuK codec decode failed for latent_frames=%d; falling back to plain CUDA graphs",
+                    "Compiled AuK codec decode failed for batch_size=%d latent_frames=%d; "
+                    "the bucket will be captured on demand",
+                    batch_size,
                     size,
                     exc_info=True,
                 )
-        logger.info(
-            "AuK codec decode compile warmup done: %d/%d buckets", len(self._compiled), len(self.compile_shapes)
-        )
+                _clear_exception_tracebacks(exc)
+                failed = True
+            if failed:
+                gc.collect()
+                torch.accelerator.empty_cache()
 
     def _capture(
         self,
@@ -286,6 +515,7 @@ class AuKVAEDecodeGraph:
         *,
         warm_iters: int,
         pool=None,
+        batch_size: int = 1,
     ) -> _GraphEntry:
         """Capture one graph of decode on zero latents of bucket frames.
 
@@ -293,7 +523,7 @@ class AuKVAEDecodeGraph:
         compiled decode, Inductor finish tracing and autotuning before
         anything is recorded.
         """
-        static_latents = torch.zeros(1, bucket, self.vae.latent_dim, device=device, dtype=torch.float32)
+        static_latents = torch.zeros(batch_size, bucket, self.vae.latent_dim, device=device, dtype=torch.float32)
         with torch.inference_mode():
             self.vae.decode(static_latents)
             for _ in range(warm_iters):
@@ -304,8 +534,8 @@ class AuKVAEDecodeGraph:
                 pool = current_omni_platform.get_global_graph_pool()
             with torch.cuda.graph(graph, pool=pool):
                 static_wav = decode(static_latents)
-        logger.info("Captured AuK codec decode CUDA graph: latent_frames=%d", bucket)
+        logger.info("Captured AuK codec decode CUDA graph: batch_size=%d, latent_frames=%d", batch_size, bucket)
         return _GraphEntry(graph=graph, static_latents=static_latents, static_wav=static_wav)
 
 
-__all__ = ["DEFAULT_COMPILE_SHAPES", "AuKVAEDecodeGraph", "plan_tiles"]
+__all__ = ["DEFAULT_COMPILE_SHAPES", "DEFAULT_MAX_BATCH_FRAMES", "AuKVAEDecodeGraph", "plan_tiles"]
