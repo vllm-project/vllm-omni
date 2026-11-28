@@ -68,6 +68,71 @@ def test_registry_entry_requires_reason_when_not_supported():
         MergedLoRARegistryEntry(MergedLoRACapabilityStatus.RUNTIME_ONLY, "   ")
 
 
+def test_dotted_component_resolves_in_capability_and_manager(monkeypatch):
+    _set_tp1(monkeypatch)
+
+    class DottedPipeline(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.text_encoder = torch.nn.Module()
+            self.text_encoder.model = torch.nn.Module()
+            self.text_encoder.model.language_model = torch.nn.Module()
+            self.text_encoder.model.language_model.proj = linear.ReplicatedLinear(4, 4, bias=False)
+
+        def merged_lora_spec(self) -> MergedLoRASpec:
+            return MergedLoRASpec(components=("text_encoder.model.language_model",))
+
+    with set_current_vllm_config(VllmConfig()):
+        pipeline = DottedPipeline()
+        spec = resolve_merged_lora_spec(pipeline, stage="diffusion", require_protocol=True)
+        manager = LoRAManager(pipeline, torch.device("cpu"), torch.float32, lora_application="merged")
+        assert spec.components == ("text_encoder.model.language_model",)
+        assert list(manager._iter_lora_components()) == [
+            ("text_encoder.model.language_model", pipeline.text_encoder.model.language_model)
+        ]
+        manager.close()
+
+
+@pytest.mark.parametrize("component", ["", "transformer"])
+def test_root_and_simple_component_resolution_unchanged(monkeypatch, component):
+    _set_tp1(monkeypatch)
+
+    class Pipeline(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = torch.nn.Module()
+            self.transformer.proj = linear.ReplicatedLinear(4, 4, bias=False)
+
+        def merged_lora_spec(self) -> MergedLoRASpec:
+            return MergedLoRASpec(components=(component,))
+
+    with set_current_vllm_config(VllmConfig()):
+        pipeline = Pipeline()
+        assert resolve_merged_lora_spec(pipeline, stage="diffusion").components == (component,)
+        manager = LoRAManager(pipeline, torch.device("cpu"), torch.float32, lora_application="merged")
+        assert list(manager._iter_lora_components()) == [
+            (component, pipeline if not component else pipeline.transformer)
+        ]
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    "component,expected", [("missing.child", "missing component"), ("child.value", "expected torch.nn.Module")]
+)
+def test_dotted_component_fails_with_named_error(component, expected):
+    class Pipeline(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.child = torch.nn.Module()
+            self.child.value = 3
+
+        def merged_lora_spec(self) -> MergedLoRASpec:
+            return MergedLoRASpec(components=(component,))
+
+    with pytest.raises(MergedLoRACapabilityError, match=expected):
+        resolve_merged_lora_spec(Pipeline(), stage="diffusion")
+
+
 def test_migrated_families_implement_supports_merged_lora(monkeypatch):
     from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
     from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (

@@ -577,7 +577,7 @@ def test_loader_prepares_default_and_custom_pipelines(monkeypatch, load_format):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(2))
 
-    monkeypatch.setattr(diffusers_loader, "initialize_model", lambda config: Pipeline())
+    monkeypatch.setattr(diffusers_loader, "initialize_model", lambda config, *, model_init_kwargs=None: Pipeline())
     monkeypatch.setattr(diffusers_loader, "_resolve_custom_pipeline_cls", lambda name: Pipeline)
     loader = object.__new__(diffusers_loader.DiffusersPipelineLoader)
     loader.od_config = _reload_config()

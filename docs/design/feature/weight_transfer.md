@@ -49,6 +49,15 @@ transformer loaders already dispatch through each parameter's `weight_loader`.
 The worker constructs the receiving engine through `WeightTransferEngineFactory`.
 Dense updates use upstream IPC; merged adapter updates use `omni_lora_ipc`.
 
+LTX-2.3 one-stage enables reload preparation only for its explicitly configured
+merged text-encoder path (`lora_application="merged"`, `omni_lora_ipc`). Its HF
+language-model projections preserve dense storage and normal parameter loading;
+the pipeline continues to use `AutoWeightsLoader`. Other LTX recipes, versions
+and ordinary dense-backend configurations remain outside this opt-in capability.
+See [LTX text-encoder updates](lora.md#ltx-23-text-encoder-updates) for the exact
+component and adapter-name boundaries. The existing transport, paused-generation
+requirement and dense-session failure semantics remain unchanged.
+
 For IPC and NCCL, upstream reload saves the live tensors, restores the recorded
 loading layout, and wraps parameter loaders. Weights may arrive in several
 chunks. Upstream buffers incomplete layers, processes completed layers, and
