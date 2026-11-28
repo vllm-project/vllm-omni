@@ -271,7 +271,9 @@ For Qwen-Image 2.1 in BF16, overlap also supports cached denoise steps with a
 replicated K/V prefix and no prefix queries. Each rank takes the prefix heads
 it needs from its local cache and exchanges the target tokens. Prefix prefill
 and other joint attention calls use the standard path. The cached-prefix
-path requires `ulysses_overlap_int8=False`.
+path requires `ulysses_overlap_int8=False` and unquantized attention compute
+for the current layer and denoising step. Calls with active attention
+quantization use standard Ulysses to preserve the quantization scales.
 
 Add `ulysses_overlap_int8=True` (CLI: `--ulysses-overlap-int8`) to also send
 Q/K/V as int8 with one fp32 scale per token and head, which roughly halves the

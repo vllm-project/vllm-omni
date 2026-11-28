@@ -334,9 +334,14 @@ class DiffusionParallelConfig:
     Splits each rank's heads into this many chunks and exchanges them on a side
     CUDA stream, so one chunk's Q/K/V transfer and output return overlap the
     attention of the neighbouring chunks. Layers whose ``num_heads //
-    ulysses_degree`` it does not divide, or that use masks, joint tensors or
-    paged KV, keep the standard path. Requires CUDA, strict pure Ulysses
-    (ring and AllGather degrees 1) and ``ulysses_a2a_permute=False``.
+    ulysses_degree`` it does not divide, or that use masks or paged KV, keep
+    the standard path. Joint attention also uses the standard path except
+    for batch-one BF16 cached decode with replicated prefix K/V and no prefix
+    queries. This exception requires ``ulysses_overlap_int8=False`` and
+    unquantized attention for the current layer and denoising step.
+
+    Requires CUDA, strict pure Ulysses (ring and AllGather degrees 1) and
+    ``ulysses_a2a_permute=False``.
     """
 
     ulysses_overlap_int8: bool = False

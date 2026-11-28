@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from vllm_omni.diffusion.attention import layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -76,7 +78,10 @@ def _strategy(chunks=2, int8=False, ulysses=4, ring=1, permute=False, name="ulys
 
 
 def _gate(strategy, shape=(1, 16, 56, 128), metadata=None, *, paged=False, use_ring=False, cross=False, cuda=True):
-    attention = SimpleNamespace(use_ring=use_ring, _explicit_cross_contract=cross)
+    attention = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    attention.use_ring = use_ring
+    attention._explicit_cross_contract = cross
     q = _Shape(shape, is_cuda=cuda)
     return Attention._ulysses_overlap_chunks(attention, strategy, q, q, q, metadata, paged)
 
@@ -149,6 +154,47 @@ def test_gate_for_replicated_cached_prefix(overrides, int8, expected):
     }
     metadata = AttentionMetadata(**(tensors | overrides))
     assert _gate(_strategy(int8=int8), metadata=metadata) == expected
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("skip_layers", [None, {3}], ids=["fp8-layer", "skipped-layer"])
+def test_cached_prefix_dispatch_uses_effective_attention_quantization(skip_layers):
+    q = _Shape((1, 16, 56, 128))
+    prefix = _Shape((1, 12, 56, 128))
+    metadata = AttentionMetadata(
+        joint_query=_Shape((1, 0, 56, 128)),
+        joint_key=prefix,
+        joint_value=prefix,
+    )
+    strategy = _strategy()
+    strategy.pre_attention = Mock(return_value=(q, q, q, metadata, None))
+    strategy.post_attention = Mock(return_value=q)
+    attention = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    attention.use_ring = False
+    attention._explicit_cross_contract = False
+    attention._kv_cache_dtype = "fp8"
+    attention._kv_cache_skip_steps = {2}
+    attention._kv_cache_skip_layers = skip_layers
+    attention.layer_idx = 3
+    attention._get_active_parallel_strategy = Mock(return_value=strategy)
+    attention._forward_ulysses_overlap = Mock(return_value=q)
+    attention._run_local_attention = Mock(return_value=q)
+
+    # Cached steps reuse the same layer and metadata.
+    for step in (1, 2, 3):
+        with set_forward_context(denoise_step_idx=step):
+            attention._forward_impl(q, q, q, metadata)
+        if step == 2 or skip_layers is not None:
+            attention._forward_ulysses_overlap.assert_called_once_with(strategy, q, q, q, metadata, 2)
+            strategy.pre_attention.assert_not_called()
+        else:
+            attention._forward_ulysses_overlap.assert_not_called()
+            strategy.pre_attention.assert_called_once_with(q, q, q, metadata)
+            assert attention._run_local_attention.call_args.args[3].extra["kv_cache_dtype"] == "fp8"
+        attention._forward_ulysses_overlap.reset_mock()
+        strategy.pre_attention.reset_mock()
+        attention._run_local_attention.reset_mock()
 
 
 # --------------------------------------------------------------------------- int8 pack / unpack (1 GPU)

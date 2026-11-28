@@ -1259,6 +1259,9 @@ class Attention(nn.Module):
                     )
                 ):
                     return 0
+                # Head chunking can change dynamic attention quantization scales.
+                if self._effective_kv_cache_dtype() not in (None, "float"):
+                    return 0
         return chunks
 
     @torch.compiler.disable
