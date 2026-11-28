@@ -8,6 +8,8 @@ the pixel-latent passthrough used by the pipeline's ``output_type="latent"``
 path.
 """
 
+import weakref
+
 import pytest
 import torch
 
@@ -102,3 +104,51 @@ class TestImageVAENumerics:
         raw.load_state_dict(vae._model.state_dict(), strict=True)
         img = _image()
         assert torch.equal(vae.encode(img), raw.encode(img))
+
+
+# ---------------------------------------------------------------------------
+# Activation memory
+# ---------------------------------------------------------------------------
+
+
+class TestImageVAEEncoderMemory:
+    def test_encoder_frees_down_path_activations(self, vae):
+        # The encoder has no skip connections, so each down-path output must be
+        # released once the next module has consumed it: at every module entry
+        # the only earlier output still alive is that module's own input.
+        # Retaining them inflates peak memory on large conditioning images.
+        # Storage weakrefs also catch views or detached aliases; release relies
+        # on CPython reference counting.
+        enc = vae._model.encoder
+        down_path = [("conv_in", enc.conv_in)]
+        for i, level in enumerate(enc.down):
+            down_path.extend((f"down.{i}.block.{j}", block) for j, block in enumerate(level.block))
+            if hasattr(level, "downsample"):
+                down_path.append((f"down.{i}.downsample", level.downsample))
+        produced: list[weakref.ref] = []
+        leaks: list[tuple[str, int]] = []
+
+        def remember(_module, _inputs, output):
+            produced.append(weakref.ref(output.untyped_storage()))
+
+        def check_entry(name):
+            def hook(_module, inputs):
+                current = inputs[0].untyped_storage().data_ptr()
+                alive = [s for s in (ref() for ref in produced) if s is not None]
+                if produced:
+                    assert any(s.data_ptr() == current for s in alive), f"{name}: input storage not tracked"
+                leaks.extend((name, s.nbytes()) for s in alive if s.data_ptr() != current)
+
+            return hook
+
+        checked = down_path[1:] + [("mid.block_1", enc.mid.block_1)]
+        handles = [module.register_forward_hook(remember) for _, module in down_path]
+        handles += [module.register_forward_pre_hook(check_entry(name)) for name, module in checked]
+        try:
+            vae.encode(_image(64, 64))
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert len(produced) == len(down_path) == 1 + enc.num_resolutions * enc.num_res_blocks + enc.num_resolutions - 1
+        assert leaks == [], f"down-path activations still alive (module entry, bytes): {leaks}"
