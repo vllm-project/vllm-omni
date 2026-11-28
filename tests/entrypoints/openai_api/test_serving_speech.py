@@ -921,41 +921,22 @@ class TestSpeechAPI:
         assert response.headers["content-type"] == "audio/wav"
         assert len(response.content) > 0
 
+        assert response.headers["x-vllm-omni-input-tokens"] == "2"
+        assert response.headers["x-vllm-omni-output-tokens"] == "5"
+        assert response.headers["x-vllm-omni-total-tokens"] == "7"
+        assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
+        assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert response.headers["x-audio-duration-seconds"] == "1.000"
+        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+        assert "x-audio-duration-seconds" in exposed
+
     def test_create_speech_forwards_watermarking_opt_out(self, client):
         payload = {"input": "Hello world", "model": "tts-model", "voice": "alloy", "watermarking": False}
         response = client.post("/v1/audio/speech", json=payload)
         assert response.status_code == 200
         generate = client.app.state.openai_serving_speech.engine_client.generate
         assert generate.call_args.kwargs["watermarking"] is False
-
-    def test_create_speech_includes_token_usage_and_detail_headers(self, client):
-        payload = {
-            "input": "Hello world",
-            "model": "tts-model",
-            "voice": "alloy",
-            "response_format": "wav",
-        }
-        response = client.post("/v1/audio/speech", json=payload)
-        assert response.status_code == 200
-        assert response.headers["x-vllm-omni-input-tokens"] == "2"
-        assert response.headers["x-vllm-omni-output-tokens"] == "5"
-        assert response.headers["x-vllm-omni-total-tokens"] == "7"
-        assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
-        assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
-
-    def test_create_speech_includes_audio_duration_header(self, client):
-        payload = {
-            "input": "Hello world",
-            "model": "tts-model",
-            "voice": "alloy",
-            "response_format": "wav",
-        }
-        response = client.post("/v1/audio/speech", json=payload)
-        assert response.status_code == 200
-        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
-        assert response.headers["x-audio-duration-seconds"] == "1.000"
-        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
-        assert "x-audio-duration-seconds" in exposed
 
     def test_audio_format_headers_expose_duration_alongside_format(self):
         headers = _audio_format_headers({"sample_rate": 24000, "channels": 1}, 1.5)

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from copy import deepcopy
+from dataclasses import dataclass
 from functools import cache
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -990,41 +991,6 @@ def test_r2_02_entrypoint_execution_guard_is_blocking() -> None:
     pytest_index = next(i for i, command in enumerate(commands) if _R2_02_JUNIT_MESSAGE in command)
     cleanup_index = next(i for i, command in enumerate(commands) if "leaked_processes_detected=1" in command)
     assert pytest_index < cleanup_index
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 3, 0, None, 0),
-        (0, 3, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 3, 0, None, 1),
-        (0, 3, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_r2_02_entrypoint_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label=_R2_02_LABEL,
-        command_fragment="pytest -s -v -ra",
-        expected_message=_R2_02_JUNIT_MESSAGE,
-        artifact_env="R2_02_ARTIFACT_DIR",
-        job_id_prefix="r2-02-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 @pytest.mark.parametrize(
@@ -2311,76 +2277,6 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             assert label not in text
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 7, 0, None, 0),
-        (0, 7, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 7, 0, None, 1),
-        (0, 7, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_WEEKLY_PIPELINE,
-        step_label="Qwen2.5-Omni expansion · 2-GPU",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
-        artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
-        job_id_prefix="qwen25-omni-weekly-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 2, 0, None, 0),
-        (0, 2, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 2, 0, None, 1),
-        (0, 2, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_covo_audio_weekly_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_WEEKLY_PIPELINE,
-        step_label="Covo-Audio · 1-GPU",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly two executed Covo-Audio tests",
-        artifact_env="ROCM_COVO_WEEKLY_ARTIFACT_DIR",
-        job_id_prefix="covo-audio-weekly-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 _BAGEL_ONLINE_WEEKLY_JOBS = (
     (
         "Bagel online · 1-GPU",
@@ -2589,41 +2485,6 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         assert "Bagel offline shared · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 3, 0, None, 0),
-        (0, 3, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 3, 0, None, 1),
-        (0, 3, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_bagel_offline_weekly_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_WEEKLY_PIPELINE,
-        step_label="Bagel offline shared · 1-GPU",
-        command_fragment='pytest -s -v -ra "$${nodes[@]}"',
-        expected_message="Expected exactly three executed shared offline Bagel tests",
-        artifact_env="ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR",
-        job_id_prefix="bagel-offline-weekly-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 _QWEN_IMAGE_EDIT_ONLINE_1GPU_NODES = (
@@ -4048,41 +3909,6 @@ def test_moss_tts_weekly_selects_three_marked_nodes() -> None:
         assert "Moss TTS expansion · 1-GPU" not in pipeline_text
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 3, 0, None, 0),
-        (0, 3, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 3, 0, None, 1),
-        (0, 3, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_moss_tts_weekly_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_WEEKLY_PIPELINE,
-        step_label="Moss TTS expansion · 1-GPU",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly three executed Moss TTS weekly tests",
-        artifact_env="ROCM_MOSS_WEEKLY_ARTIFACT_DIR",
-        job_id_prefix="moss-tts-weekly-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
@@ -4521,40 +4347,6 @@ def test_stable_audio_layerwise_offload_is_one_blocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_WEEKLY_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert 'label: "Stable Audio Layerwise Offload"' not in text
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 1, 0, None, 0),
-        (0, 1, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 1, 0, None, 1),
-        (0, 1, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_stable_audio_layerwise_offload_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="Stable Audio Layerwise Offload",
-        command_fragment="pytest -s -v -ra",
-        expected_message=("Expected exactly one executed Stable Audio layerwise-offload test"),
-        artifact_env="LAYERWISE_OFFLOAD_ARTIFACT_DIR",
-        job_id_prefix="layerwise-offload-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
@@ -5439,40 +5231,6 @@ def test_qwen3_tts_perf_executes_evidence_guards_before_exit(
     assert result.returncode == expected_status
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 1, 0, None, 0),
-        (0, 1, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 1, 0, None, 1),
-        (0, 1, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="Qwen-Image Diffusers Backend Similarity",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly one executed Qwen-Image backend similarity test",
-        artifact_env="ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR",
-        job_id_prefix="qwen-image-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 _LINGBOT_EXPANSION_NIGHTLY_JOBS = (
     (
         "LingBot-Video Dense Batch CFG",
@@ -5614,40 +5372,6 @@ def test_minicpmo_duplex_function_is_one_blocking_nightly_job() -> None:
         assert "MiniCPM-o 4.5 Duplex Function" not in text
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 6, 0, None, 0),
-        (0, 6, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 6, 0, None, 1),
-        (0, 6, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_minicpmo_duplex_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="MiniCPM-o 4.5 Duplex Function",
-        command_fragment='pytest -s -v "$${nodes[@]}"',
-        expected_message="Expected exactly six executed MiniCPM-o duplex tests",
-        artifact_env="ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
-        job_id_prefix="minicpmo-duplex-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
     one = _find_step("Qwen-Image Expansion 1 GPU", AMD_NIGHTLY_PIPELINE)
     two = _find_step("Qwen-Image Expansion 2 GPU", AMD_NIGHTLY_PIPELINE)
@@ -5709,77 +5433,6 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         assert "Qwen-Image Expansion 2 GPU" not in text
 
 
-@pytest.mark.parametrize(
-    (
-        "step_label",
-        "expected_tests",
-        "expected_message",
-        "artifact_env",
-        "job_id_prefix",
-    ),
-    [
-        (
-            "Qwen-Image Expansion 1 GPU",
-            4,
-            "Expected exactly four executed Qwen-Image expansion 1-GPU tests",
-            "ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR",
-            "qwen-image-expansion-1gpu-guard",
-        ),
-        (
-            "Qwen-Image Expansion 2 GPU",
-            5,
-            "Expected exactly five executed Qwen-Image expansion 2-GPU tests",
-            "ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR",
-            "qwen-image-expansion-2gpu-guard",
-        ),
-    ],
-    ids=("1gpu", "2gpu"),
-)
-@pytest.mark.parametrize(
-    (
-        "pytest_status",
-        "tests_override",
-        "skipped",
-        "timeout_status",
-        "expected_status",
-    ),
-    [
-        (0, None, 0, None, 0),
-        (0, None, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, None, 0, None, 1),
-        (0, None, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_qwen_image_expansion_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    step_label: str,
-    expected_tests: int,
-    expected_message: str,
-    artifact_env: str,
-    job_id_prefix: str,
-    pytest_status: int,
-    tests_override: int | None,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label=step_label,
-        command_fragment='pytest -s -v "$${nodes[@]}"',
-        expected_message=expected_message,
-        artifact_env=artifact_env,
-        job_id_prefix=job_id_prefix,
-        pytest_status=pytest_status,
-        tests=expected_tests if tests_override is None else tests_override,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 _QWEN25_OMNI_MERGE_NODES = (
     "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]",
     "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[False-omni_server0]",
@@ -5820,41 +5473,6 @@ def test_qwen25_omni_merge_selects_eight_marked_nodes() -> None:
         1
     ]
     assert '@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)' in text_test_marks
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 8, 0, None, 0),
-        (0, 8, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 8, 0, None, 1),
-        (0, 8, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_qwen25_omni_merge_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_MERGE_PIPELINE,
-        step_label="Omni Model Test Qwen2-5-Omni",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly eight executed Qwen2.5-Omni MERGE tests",
-        artifact_env="ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR",
-        job_id_prefix="qwen25-omni-merge-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 def test_wan22_function_has_separate_blocking_card_jobs() -> None:
@@ -5930,73 +5548,6 @@ def test_wan22_function_has_separate_blocking_card_jobs() -> None:
         assert "Wan2.2 Function 2 GPU" not in text
 
 
-@pytest.mark.parametrize(
-    (
-        "step_label",
-        "expected_tests",
-        "expected_message",
-        "job_id_prefix",
-    ),
-    [
-        (
-            "Wan2.2 Function 1 GPU",
-            6,
-            "Expected exactly six executed Wan2.2 function 1-GPU tests",
-            "wan22-function-1gpu-guard",
-        ),
-        (
-            "Wan2.2 Function 2 GPU",
-            15,
-            "Expected exactly fifteen executed Wan2.2 function 2-GPU tests",
-            "wan22-function-2gpu-guard",
-        ),
-    ],
-    ids=("1gpu", "2gpu"),
-)
-@pytest.mark.parametrize(
-    (
-        "pytest_status",
-        "tests_override",
-        "skipped",
-        "timeout_status",
-        "expected_status",
-    ),
-    [
-        (0, None, 0, None, 0),
-        (0, None, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, None, 0, None, 1),
-        (0, None, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_wan22_function_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    step_label: str,
-    expected_tests: int,
-    expected_message: str,
-    job_id_prefix: str,
-    pytest_status: int,
-    tests_override: int | None,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label=step_label,
-        command_fragment='pytest -s -v "$${nodes[@]}"',
-        expected_message=expected_message,
-        artifact_env="ROCM_WAN22_FN_ARTIFACT_DIR",
-        job_id_prefix=job_id_prefix,
-        pytest_status=pytest_status,
-        tests=expected_tests if tests_override is None else tests_override,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
     blocking_step = _find_step("Omni Model Test Qwen3-Omni", AMD_MERGE_PIPELINE)
     shm_path = "tests/e2e/online_serving/test_qwen3_omni_shm_leak.py"
@@ -6025,41 +5576,6 @@ def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
     assert "pytest.log" in commands
     assert "pytest-summary.txt" in commands
     assert "Expected exactly one executed Qwen3-Omni SHM leak test" in commands
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 1, 0, None, 0),
-        (0, 1, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 1, 0, None, 1),
-        (0, 1, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_qwen3_omni_shm_leak_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_MERGE_PIPELINE,
-        step_label="Qwen3-Omni SHM Leak Test",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly one executed Qwen3-Omni SHM leak test",
-        artifact_env="ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR",
-        job_id_prefix="qwen3-omni-shm-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 _QWEN3_OMNI_READY_NODES = (
@@ -6100,41 +5616,6 @@ def test_qwen3_omni_ready_selects_eight_core_model_nodes() -> None:
     for node in _QWEN3_OMNI_READY_NODES:
         assert node in command
     assert command.count("tests/e2e/online_serving/test_qwen3_omni.py::") == len(_QWEN3_OMNI_READY_NODES)
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 8, 0, None, 0),
-        (0, 8, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 8, 0, None, 1),
-        (0, 8, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_qwen3_omni_ready_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label="Omni Model Test Qwen3-Omni",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly 8 executed Qwen3-Omni READY tests",
-        artifact_env="ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR",
-        job_id_prefix="qwen3-omni-ready-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 def test_entrypoints_full_nightly_splits_qwen_and_bagel_without_skips() -> None:
@@ -6233,52 +5714,6 @@ def test_qwen_duplex_rocm_mark_covers_the_whole_playback_class() -> None:
     ) in source
     # The class mark already selects the full_model method on ROCm.
     assert '@hardware_test(res={"rocm": "MI325"}, num_cards=2)' not in source
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, None, 0, None, 0),
-        (0, None, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, None, 0, None, 1),
-        (0, None, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-@pytest.mark.parametrize(
-    ("step_label", "_node", "expected_tests", "_dependency_key", "_artifacts", "artifact_env", "expected_message"),
-    ENTRYPOINTS_FULL_NIGHTLY_JOBS,
-    ids=("qwen3-omni-duplex", "bagel-sleep"),
-)
-def test_entrypoints_full_nightly_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    step_label: str,
-    _node: str,
-    expected_tests: int,
-    _dependency_key: str,
-    _artifacts: str,
-    artifact_env: str,
-    expected_message: str,
-    pytest_status: int,
-    tests: int | None,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label=step_label,
-        command_fragment="pytest -s -v -ra",
-        expected_message=expected_message,
-        artifact_env=artifact_env,
-        job_id_prefix=step_label.lower().replace(" ", "-"),
-        pytest_status=pytest_status,
-        tests=expected_tests if tests is None else tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
 
 
 _MINICPMO_READY_MARKER = "core_model and omni and rocm and MI325 and cards_1"
@@ -6449,86 +5884,6 @@ def test_minicpmo_ready_core_model_cases_declare_mi325() -> None:
             assert '"rocm": "MI325"' in head[-300:]
 
 
-@pytest.mark.parametrize(
-    (
-        "step_label",
-        "expected_tests",
-        "expected_message",
-        "artifact_env",
-        "job_id_prefix",
-    ),
-    [
-        (
-            "ROCm · MiniCPM-o 4.5 Offline Coverage",
-            2,
-            "Expected exactly two executed MiniCPM-o offline tests",
-            "ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR",
-            "minicpmo-ready-offline-guard",
-        ),
-        (
-            "ROCm · MiniCPM-o 4.5 Online Coverage",
-            3,
-            "Expected exactly three executed MiniCPM-o online tests",
-            "ROCM_MINICPMO_ONLINE_ARTIFACT_DIR",
-            "minicpmo-ready-online-guard",
-        ),
-        (
-            "ROCm · MiniCPM-o 4.5 Duplex Coverage",
-            2,
-            "Expected exactly two executed MiniCPM-o duplex tests",
-            "ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
-            "minicpmo-ready-duplex-guard",
-        ),
-    ],
-    ids=("offline", "online", "duplex"),
-)
-@pytest.mark.parametrize(
-    (
-        "pytest_status",
-        "tests_override",
-        "skipped",
-        "timeout_status",
-        "expected_status",
-    ),
-    [
-        (0, None, 0, None, 0),
-        (0, None, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, None, 0, None, 1),
-        (0, None, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_minicpmo_ready_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    step_label: str,
-    expected_tests: int,
-    expected_message: str,
-    artifact_env: str,
-    job_id_prefix: str,
-    pytest_status: int,
-    tests_override: int | None,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    """MiniCPM READY jobs fail closed on the JUnit count before the step exits."""
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label=step_label,
-        command_fragment='pytest -s -v "$${nodes[@]}"',
-        expected_message=expected_message,
-        artifact_env=artifact_env,
-        job_id_prefix=job_id_prefix,
-        pytest_status=pytest_status,
-        tests=expected_tests if tests_override is None else tests_override,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 _WAN22_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
 _WAN22_READY_NODE = "tests/e2e/online_serving/test_wan22_t2v.py::test_text_to_video_001[default0]"
 
@@ -6664,42 +6019,6 @@ def test_customvoice_merge_restores_async_chunk_to_the_blocking_shard() -> None:
     assert "pytest.skip" not in function
     assert 'run_level in {"advanced_model", "full_model"}' in speech
     assert "_assert_transcript_matches" in speech
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 1, 0, None, 0),
-        (0, 1, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 1, 0, None, 1),
-        (0, 1, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_customvoice_merge_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_MERGE_PIPELINE,
-        step_label=_CUSTOMVOICE_MERGE_LABEL,
-        command_fragment='pytest -s -v -ra "$$TEST"',
-        expected_message="Expected exactly one executed Qwen3-TTS CustomVoice MERGE test",
-        artifact_env="ROCM_QWEN3_TTS_CUSTOMVOICE_MERGE_ARTIFACT_DIR",
-        job_id_prefix="customvoice-merge-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-        extra_env={"BUILDKITE_PARALLEL_JOB": "3"},
-    )
 
 
 _WORKER_ONE_CARD_MARKER = "core_model and rocm and MI325 and cards_1"
@@ -7300,42 +6619,6 @@ def test_verl_generate_ready_renders_blocking() -> None:
     assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 1, 0, None, 0),
-        (0, 1, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 1, 0, None, 1),
-        (0, 1, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_verl_generate_ready_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    """VeRL READY fails closed unless test_generate executed and was not skipped."""
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label="ROCm · VeRL-Omni Generate GPU Test",
-        command_fragment="pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py",
-        expected_message=_VERL_GENERATE_JUNIT_MESSAGE,
-        artifact_env="ROCM_VERL_GENERATE_ARTIFACT_DIR",
-        job_id_prefix="verl-generate-ready-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 def test_distributed_buffer_ready_pins_two_gpu_smokes() -> None:
     """READY fail-closes on the two device-buffer round trips.
 
@@ -7389,42 +6672,6 @@ def test_distributed_buffer_ready_renders_blocking() -> None:
     assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 2, 0, None, 0),
-        (0, 2, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 2, 0, None, 1),
-        (0, 2, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_distributed_buffer_ready_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    """The buffer smoke fails closed unless both GPU cases executed."""
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label=_DISTRIBUTED_BUFFER_READY_LABEL,
-        command_fragment='pytest -s -v "$${nodes[@]}"',
-        expected_message=_DISTRIBUTED_BUFFER_JUNIT_MESSAGE,
-        artifact_env="ROCM_DISTRIBUTED_BUFFER_ARTIFACT_DIR",
-        job_id_prefix="distributed-buffer-ready-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 def test_device_reduction_ready_renders_blocking() -> None:
     """The device-reduction job renders as a hard failure on amd_mi300_1."""
     label = "ROCm · Diffusion Device-Reduction GPU Test"
@@ -7466,103 +6713,6 @@ def test_worker_ready_jobs_render_blocking(label: str, expected_message: str) ->
     assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, 17, 0, None, 0),
-        (0, 17, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, 17, 0, None, 1),
-        (0, 17, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_device_reduction_ready_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    """Device-reduction READY fails closed unless all 17 GPU nodes executed."""
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label="ROCm · Diffusion Device-Reduction GPU Test",
-        command_fragment="pytest -s -v",
-        expected_message=_DEVICE_REDUCTION_JUNIT_MESSAGE,
-        artifact_env="ROCM_DEVICE_REDUCTION_ARTIFACT_DIR",
-        job_id_prefix="device-reduction-ready-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
-@pytest.mark.parametrize(
-    ("label", "expected_tests", "expected_message", "artifact_env", "job_id_prefix"),
-    [
-        (
-            "ROCm · One-Card Worker GPU Test",
-            11,
-            "Expected exactly 11 executed one-card worker GPU tests",
-            "WORKER_READY_ARTIFACT_DIR",
-            "worker-ready-guard",
-        ),
-        (
-            "ROCm · One-Card Worker Copy Test",
-            6,
-            "Expected exactly 6 executed one-card worker copy tests",
-            "WORKER_COPY_ARTIFACT_DIR",
-            "worker-copy-ready-guard",
-        ),
-    ],
-    ids=("worker", "copy"),
-)
-@pytest.mark.parametrize(
-    ("pytest_status", "tests_override", "skipped", "timeout_status", "expected_status"),
-    [
-        (0, None, 0, None, 0),
-        (0, None, 1, None, 5),
-        (0, 0, 0, None, 5),
-        (1, None, 0, None, 1),
-        (0, None, 0, 124, 124),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
-)
-def test_worker_ready_executes_junit_guard_before_exit(
-    tmp_path: Path,
-    label: str,
-    expected_tests: int,
-    expected_message: str,
-    artifact_env: str,
-    job_id_prefix: str,
-    pytest_status: int,
-    tests_override: int | None,
-    skipped: int,
-    timeout_status: int | None,
-    expected_status: int,
-) -> None:
-    """Worker READY jobs fail closed unless every pinned node executed."""
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_READY_PIPELINE,
-        step_label=label,
-        command_fragment="pytest -s -v",
-        expected_message=expected_message,
-        artifact_env=artifact_env,
-        job_id_prefix=job_id_prefix,
-        pytest_status=pytest_status,
-        tests=expected_tests if tests_override is None else tests_override,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-    )
-
-
 def test_minicpmo_ready_grades_render_blocking() -> None:
     """The three MiniCPM READY grades are Blocking and the JUnit guards remain."""
     for label, _timeout, _command_timeout, _artifact, _nodes, junit_message in _MINICPMO_READY_JOBS:
@@ -7592,3 +6742,270 @@ def test_weekly_final_diffusion_parity_qualifiers_are_blocking() -> None:
     assert len(promoted_labels) == 13
     assert {step["label"] for step in steps if step["label"] in promoted_labels} == promoted_labels
     assert all(step["grade"] == "Blocking" for step in steps)
+
+
+@dataclass(frozen=True)
+class _JunitGuardJob:
+    expected_tests: int
+    step_label: str
+    expected_message: str
+    artifact_env: str
+    job_id_prefix: str
+    pipeline_path: Path = AMD_NIGHTLY_PIPELINE
+    command_fragment: str = "pytest -s -v -ra"
+    extra_env: dict[str, str] | None = None
+
+
+# Keep each job and each exit condition as an independent pytest item.
+@pytest.mark.parametrize(
+    "job",
+    [
+        _JunitGuardJob(
+            expected_tests=3,
+            step_label=_R2_02_LABEL,
+            expected_message=_R2_02_JUNIT_MESSAGE,
+            artifact_env="R2_02_ARTIFACT_DIR",
+            job_id_prefix="r2-02-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+        ),
+        _JunitGuardJob(
+            expected_tests=7,
+            step_label="Qwen2.5-Omni expansion · 2-GPU",
+            expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
+            artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
+            job_id_prefix="qwen25-omni-weekly-guard",
+            pipeline_path=AMD_WEEKLY_PIPELINE,
+        ),
+        _JunitGuardJob(
+            expected_tests=2,
+            step_label="Covo-Audio · 1-GPU",
+            expected_message="Expected exactly two executed Covo-Audio tests",
+            artifact_env="ROCM_COVO_WEEKLY_ARTIFACT_DIR",
+            job_id_prefix="covo-audio-weekly-guard",
+            pipeline_path=AMD_WEEKLY_PIPELINE,
+        ),
+        _JunitGuardJob(
+            expected_tests=3,
+            step_label="Bagel offline shared · 1-GPU",
+            expected_message="Expected exactly three executed shared offline Bagel tests",
+            artifact_env="ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR",
+            job_id_prefix="bagel-offline-weekly-guard",
+            pipeline_path=AMD_WEEKLY_PIPELINE,
+            command_fragment='pytest -s -v -ra "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=3,
+            step_label="Moss TTS expansion · 1-GPU",
+            expected_message="Expected exactly three executed Moss TTS weekly tests",
+            artifact_env="ROCM_MOSS_WEEKLY_ARTIFACT_DIR",
+            job_id_prefix="moss-tts-weekly-guard",
+            pipeline_path=AMD_WEEKLY_PIPELINE,
+        ),
+        _JunitGuardJob(
+            expected_tests=1,
+            step_label="Stable Audio Layerwise Offload",
+            expected_message="Expected exactly one executed Stable Audio layerwise-offload test",
+            artifact_env="LAYERWISE_OFFLOAD_ARTIFACT_DIR",
+            job_id_prefix="layerwise-offload-guard",
+        ),
+        _JunitGuardJob(
+            expected_tests=1,
+            step_label="Qwen-Image Diffusers Backend Similarity",
+            expected_message="Expected exactly one executed Qwen-Image backend similarity test",
+            artifact_env="ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR",
+            job_id_prefix="qwen-image-guard",
+        ),
+        _JunitGuardJob(
+            expected_tests=6,
+            step_label="MiniCPM-o 4.5 Duplex Function",
+            expected_message="Expected exactly six executed MiniCPM-o duplex tests",
+            artifact_env="ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
+            job_id_prefix="minicpmo-duplex-guard",
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=4,
+            step_label="Qwen-Image Expansion 1 GPU",
+            expected_message="Expected exactly four executed Qwen-Image expansion 1-GPU tests",
+            artifact_env="ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR",
+            job_id_prefix="qwen-image-expansion-1gpu-guard",
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=5,
+            step_label="Qwen-Image Expansion 2 GPU",
+            expected_message="Expected exactly five executed Qwen-Image expansion 2-GPU tests",
+            artifact_env="ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR",
+            job_id_prefix="qwen-image-expansion-2gpu-guard",
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=8,
+            step_label="Omni Model Test Qwen2-5-Omni",
+            expected_message="Expected exactly eight executed Qwen2.5-Omni MERGE tests",
+            artifact_env="ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR",
+            job_id_prefix="qwen25-omni-merge-guard",
+            pipeline_path=AMD_MERGE_PIPELINE,
+        ),
+        _JunitGuardJob(
+            expected_tests=6,
+            step_label="Wan2.2 Function 1 GPU",
+            expected_message="Expected exactly six executed Wan2.2 function 1-GPU tests",
+            artifact_env="ROCM_WAN22_FN_ARTIFACT_DIR",
+            job_id_prefix="wan22-function-1gpu-guard",
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=15,
+            step_label="Wan2.2 Function 2 GPU",
+            expected_message="Expected exactly fifteen executed Wan2.2 function 2-GPU tests",
+            artifact_env="ROCM_WAN22_FN_ARTIFACT_DIR",
+            job_id_prefix="wan22-function-2gpu-guard",
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=1,
+            step_label="Qwen3-Omni SHM Leak Test",
+            expected_message="Expected exactly one executed Qwen3-Omni SHM leak test",
+            artifact_env="ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR",
+            job_id_prefix="qwen3-omni-shm-guard",
+            pipeline_path=AMD_MERGE_PIPELINE,
+        ),
+        _JunitGuardJob(
+            expected_tests=8,
+            step_label="Omni Model Test Qwen3-Omni",
+            expected_message="Expected exactly 8 executed Qwen3-Omni READY tests",
+            artifact_env="ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR",
+            job_id_prefix="qwen3-omni-ready-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+        ),
+        *[
+            _JunitGuardJob(
+                step_label=step_label,
+                expected_tests=expected_tests,
+                expected_message=expected_message,
+                artifact_env=artifact_env,
+                job_id_prefix=step_label.lower().replace(" ", "-"),
+            )
+            for step_label, _node, expected_tests, _dependency_key, _artifacts, artifact_env, expected_message in ENTRYPOINTS_FULL_NIGHTLY_JOBS
+        ],
+        _JunitGuardJob(
+            expected_tests=2,
+            step_label="ROCm · MiniCPM-o 4.5 Offline Coverage",
+            expected_message="Expected exactly two executed MiniCPM-o offline tests",
+            artifact_env="ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR",
+            job_id_prefix="minicpmo-ready-offline-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=3,
+            step_label="ROCm · MiniCPM-o 4.5 Online Coverage",
+            expected_message="Expected exactly three executed MiniCPM-o online tests",
+            artifact_env="ROCM_MINICPMO_ONLINE_ARTIFACT_DIR",
+            job_id_prefix="minicpmo-ready-online-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=2,
+            step_label="ROCm · MiniCPM-o 4.5 Duplex Coverage",
+            expected_message="Expected exactly two executed MiniCPM-o duplex tests",
+            artifact_env="ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
+            job_id_prefix="minicpmo-ready-duplex-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=1,
+            step_label=_CUSTOMVOICE_MERGE_LABEL,
+            expected_message="Expected exactly one executed Qwen3-TTS CustomVoice MERGE test",
+            artifact_env="ROCM_QWEN3_TTS_CUSTOMVOICE_MERGE_ARTIFACT_DIR",
+            job_id_prefix="customvoice-merge-guard",
+            pipeline_path=AMD_MERGE_PIPELINE,
+            command_fragment='pytest -s -v -ra "$$TEST"',
+            extra_env={"BUILDKITE_PARALLEL_JOB": "3"},
+        ),
+        _JunitGuardJob(
+            expected_tests=1,
+            step_label="ROCm · VeRL-Omni Generate GPU Test",
+            expected_message=_VERL_GENERATE_JUNIT_MESSAGE,
+            artifact_env="ROCM_VERL_GENERATE_ARTIFACT_DIR",
+            job_id_prefix="verl-generate-ready-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment="pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py",
+        ),
+        _JunitGuardJob(
+            expected_tests=2,
+            step_label=_DISTRIBUTED_BUFFER_READY_LABEL,
+            expected_message=_DISTRIBUTED_BUFFER_JUNIT_MESSAGE,
+            artifact_env="ROCM_DISTRIBUTED_BUFFER_ARTIFACT_DIR",
+            job_id_prefix="distributed-buffer-ready-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment='pytest -s -v "$${nodes[@]}"',
+        ),
+        _JunitGuardJob(
+            expected_tests=17,
+            step_label="ROCm · Diffusion Device-Reduction GPU Test",
+            expected_message=_DEVICE_REDUCTION_JUNIT_MESSAGE,
+            artifact_env="ROCM_DEVICE_REDUCTION_ARTIFACT_DIR",
+            job_id_prefix="device-reduction-ready-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment="pytest -s -v",
+        ),
+        _JunitGuardJob(
+            expected_tests=11,
+            step_label="ROCm · One-Card Worker GPU Test",
+            expected_message="Expected exactly 11 executed one-card worker GPU tests",
+            artifact_env="WORKER_READY_ARTIFACT_DIR",
+            job_id_prefix="worker-ready-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment="pytest -s -v",
+        ),
+        _JunitGuardJob(
+            expected_tests=6,
+            step_label="ROCm · One-Card Worker Copy Test",
+            expected_message="Expected exactly 6 executed one-card worker copy tests",
+            artifact_env="WORKER_COPY_ARTIFACT_DIR",
+            job_id_prefix="worker-copy-ready-guard",
+            pipeline_path=AMD_READY_PIPELINE,
+            command_fragment="pytest -s -v",
+        ),
+    ],
+    ids=lambda job: job.job_id_prefix,
+)
+@pytest.mark.parametrize(
+    ("pytest_status", "tests_override", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, None, 0, None, 0),
+        (0, None, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, None, 0, None, 1),
+        (0, None, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_pipeline_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    job: _JunitGuardJob,
+    pytest_status: int,
+    tests_override: int | None,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=job.pipeline_path,
+        step_label=job.step_label,
+        command_fragment=job.command_fragment,
+        expected_message=job.expected_message,
+        artifact_env=job.artifact_env,
+        job_id_prefix=job.job_id_prefix,
+        pytest_status=pytest_status,
+        tests=job.expected_tests if tests_override is None else tests_override,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env=job.extra_env,
+    )

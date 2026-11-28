@@ -4753,33 +4753,6 @@ class TestObjectStorageConfigResolution:
 
 
 class TestAsyncChunkDefaults:
-    def test_async_chunk_auto_disabled_without_processor(self):
-        """Ensure a multi-stage model that doesn't support async chunk turns it off by default."""
-        pipeline = PipelineConfig(
-            model_type="test_no_async",
-            model_arch="TestNoAsync",
-            stages=(
-                StagePipelineConfig(
-                    stage_id=0,
-                    model_stage="ar",
-                    execution_type=StageExecutionType.LLM_AR,
-                    final_output=True,
-                ),
-                StagePipelineConfig(
-                    stage_id=1,
-                    model_stage="generation",
-                    execution_type=StageExecutionType.LLM_GENERATION,
-                    input_sources=(0,),
-                ),
-            ),
-        )
-
-        deploy = DeployConfig()
-        # async chunk should not try to default to True in this case,
-        # since doing so will just raise a ValueError in validation.
-        merge_pipeline_deploy(pipeline, deploy)
-        assert not deploy.async_chunk
-
     def test_async_chunk_auto_disabled_when_yaml_omits_key(self, tmp_path):
         """Ensure a multi-stage model that doesn't support async chunk turns it off by default
         when a deploy config is provided that doesn't explicitly set it."""

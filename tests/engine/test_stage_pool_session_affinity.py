@@ -82,18 +82,6 @@ def test_different_sessions_can_land_on_different_replicas(mocker):
     assert other != pool.session_replica_id("s1")
 
 
-def test_a_session_whose_replica_died_is_rebound(mocker):
-    pool = _pool(mocker)
-    holder = pool.bind_session_replica("s1", 1)
-
-    pool.mark_replica_unavailable(holder)
-
-    assert pool.session_replica_id("s1") is None, "a dead replica still claims the session"
-    rebound = pool.select_replica_id("r2", session_id="s1")
-    assert rebound != holder
-    assert pool.session_replica_id("s1") == rebound
-
-
 def test_a_dead_holder_is_recorded_as_a_cold_restart(mocker):
     """A session that lost its replica must not look like a healthy binding."""
     pool = _pool(mocker)

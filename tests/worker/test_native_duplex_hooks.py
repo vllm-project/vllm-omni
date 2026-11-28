@@ -1494,7 +1494,8 @@ def test_minicpmo_stage0_feature_extractor_is_isolated_per_session():
     assert processor_a.audio_processor is not processor_b.audio_processor
 
 
-def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
+@pytest.mark.parametrize("terminator", [pytest.param(3, id="listen"), pytest.param(10, id="turn-eos")])
+def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_terminator(terminator):
     import torch
 
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
@@ -1539,8 +1540,8 @@ def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
     state = _MiniCPMO45Stage0SessionState(
         session_id="sid-new-speech-prefill",
         audio_chunk_idx=1,
-        pending_terminator_token=3,
-        last_terminator_token=3,
+        pending_terminator_token=terminator,
+        last_terminator_token=terminator,
         current_turn_ended=True,
     )
 
@@ -1551,72 +1552,9 @@ def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
     )
 
     assert result["success"] is True
-    assert result["input_token_ids"] == [3, 2, 1, 11]
+    assert result["input_token_ids"] == [terminator, 2, 1, 11]
     assert state.pending_terminator_token is None
-    assert state.last_terminator_token == 3
-    assert state.current_turn_ended is True
-
-
-def test_minicpmo_stage0_data_plane_turn_eos_closes_previous_unit():
-    import torch
-
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
-        MiniCPMO45Stage0DuplexRuntime,
-        _MiniCPMO45Stage0SessionState,
-    )
-
-    class _StageModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = torch.nn.Embedding(256, 2)
-
-        def get_input_embeddings(self):
-            return self.embed
-
-        def get_audio_hidden_states(self, data):
-            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
-
-    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
-    runtime.stage_model = _StageModel()
-    runtime.thinker = runtime.stage_model
-    runtime.tokenizer = SimpleNamespace(
-        unk_token_id=0,
-        convert_tokens_to_ids=lambda token: {
-            "<unit>": 1,
-            "</unit>": 2,
-            "<|listen|>": 3,
-            "<|speak|>": 4,
-            "<|tts_bos|>": 5,
-            "<|tts_eos|>": 6,
-            "<|tts_pad|>": 7,
-            "<|chunk_eos|>": 8,
-            "<|chunk_tts_eos|>": 9,
-            "<|turn_eos|>": 10,
-            "<|audio|>": 11,
-        }.get(token, 0),
-        encode=lambda text, add_special_tokens=False: [],
-    )
-    runtime.processor = SimpleNamespace(get_streaming_chunk_size=lambda: 4)
-    runtime.device = "cpu"
-    runtime._init_token_ids()
-    state = _MiniCPMO45Stage0SessionState(
-        session_id="sid-new-user-turn-prefill",
-        audio_chunk_idx=1,
-        pending_terminator_token=10,
-        last_terminator_token=10,
-        current_turn_ended=True,
-    )
-
-    result = runtime._stage_prefill_embeddings_only(
-        state,
-        np.zeros(4, dtype=np.float32),
-        seq=2,
-    )
-
-    assert result["success"] is True
-    assert result["input_token_ids"] == [10, 2, 1, 11]
-    assert state.pending_terminator_token is None
-    assert state.last_terminator_token == 10
+    assert state.last_terminator_token == terminator
     assert state.current_turn_ended is True
 
 

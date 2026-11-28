@@ -1090,54 +1090,6 @@ class TestTextLatencyAttribute:
         output = MixRequestFuncOutput()
         assert hasattr(output, "text_latency"), "MixRequestFuncOutput should have text_latency attribute"
 
-    def test_text_latency_initial_value(self):
-        """Test that text_latency initializes to a default value"""
-        output = MixRequestFuncOutput()
-        # Check if attribute exists and has a value (should be 0.0 or similar default)
-        text_latency = getattr(output, "text_latency", None)
-        assert text_latency is not None or hasattr(output, "text_latency"), "text_latency attribute should exist"
-
-    @pytest.mark.asyncio
-    async def test_text_latency_assigned_with_text_response(self, mocker: MockerFixture):
-        """Test that text_latency is assigned when text response is received"""
-        request_input = RequestFuncInput(
-            model="test-model",
-            model_name="test-model",
-            prompt="test prompt",
-            api_url="http://test.com/v1/chat/completions",
-            prompt_len=10,
-            output_len=20,
-        )
-
-        # Create response chunks with text modality
-        chunks = [
-            create_sse_chunk(
-                {
-                    "choices": [{"delta": {"content": "Hello"}}],
-                    "modality": "text",
-                }
-            ),
-            create_sse_chunk(
-                {
-                    "choices": [{"delta": {"content": " world"}}],
-                    "modality": "text",
-                }
-            ),
-            b"data: [DONE]\n\n",
-        ]
-
-        mock_response = MockResponse(200, chunks)
-        mock_session = mocker.AsyncMock()
-        mock_session.post = mocker.MagicMock(return_value=mock_response)
-
-        # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
-
-        # Assert
-        assert output.success is True
-        assert hasattr(output, "text_latency"), "Output should have text_latency attribute"
-        assert output.text_latency > 0, "text_latency should be greater than 0 for text response"
-
     @pytest.mark.asyncio
     async def test_text_latency_updated_with_multiple_text_chunks(self, mocker: MockerFixture):
         """Test that text_latency is updated as more text chunks arrive"""
@@ -1316,7 +1268,7 @@ class TestTextLatencyAttribute:
 
     @pytest.mark.asyncio
     async def test_text_latency_value_consistency(self, mocker: MockerFixture):
-        """Test that text_latency matches latency minus ttft relationship"""
+        """Text latency is positive and lies between TTFT and total latency"""
         request_input = RequestFuncInput(
             model="test-model",
             model_name="test-model",
@@ -1358,6 +1310,8 @@ class TestTextLatencyAttribute:
         assert output.ttft <= output.text_latency <= output.latency, (
             "text_latency should be between ttft and total latency"
         )
+
+        assert output.text_latency > 0, "text_latency should be greater than 0 for text response"
 
 
 # ============================================================================

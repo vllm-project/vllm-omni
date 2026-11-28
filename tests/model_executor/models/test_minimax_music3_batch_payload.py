@@ -59,50 +59,24 @@ def _payload_for(output, row: int) -> dict:
     return {key: to_payload_element(value, row, 1, 1) for key, value in flat.items()}
 
 
-class TestBatchedMetadataPartitioning:
-    """Two requests in one batch must keep their own metadata."""
+def test_batched_metadata_stays_with_its_request() -> None:
+    """Partitioning keeps each request's seed, window, terminal flag and tensors together."""
+    infos = [
+        _info(seed=111, start=100, frames=3, last=False),
+        _info(seed=222, start=200, frames=5, last=True),
+    ]
+    talker = Talker.__new__(Talker)
+    output = talker.make_omni_output(torch.zeros(2, _WIDTH), model_intermediate_buffer=infos)
 
-    @staticmethod
-    def _two_request_batch():
-        infos = [
-            _info(seed=111, start=100, frames=3, last=False),
-            _info(seed=222, start=200, frames=5, last=True),
-        ]
-        talker = Talker.__new__(Talker)
-        return talker.make_omni_output(torch.zeros(2, _WIDTH), model_intermediate_buffer=infos)
-
-    def test_seeds_are_not_crossed(self) -> None:
-        """A song decoded with another request's seed is a different song."""
-        output = self._two_request_batch()
-        assert _payload_for(output, 0)["meta.audio_seed"] == 111
-        assert _payload_for(output, 1)["meta.audio_seed"] == 222
-
-    def test_window_offsets_stay_with_their_request(self) -> None:
-        """The start frame decides where a window lands in the song."""
-        output = self._two_request_batch()
-        assert _payload_for(output, 0)["meta.num_processed_tokens"] == 100
-        assert _payload_for(output, 1)["meta.num_processed_tokens"] == 200
-
-    def test_terminal_flag_does_not_leak_across_requests(self) -> None:
-        """One request finishing must not end another request's stream."""
-        output = self._two_request_batch()
-        assert _payload_for(output, 0)["meta.last_chunk"] is False
-        assert _payload_for(output, 1)["meta.last_chunk"] is True
-
-    def test_span_length_matches_its_own_latent(self) -> None:
-        output = self._two_request_batch()
-        for row, frames in ((0, 3), (1, 5)):
-            entry = _payload_for(output, row)
-            assert entry["meta.codec_chunk_frames"] == frames
-            assert entry["latent"].shape[0] == frames
-
-    def test_latent_and_codes_follow_the_same_row(self) -> None:
-        """The tensors were already per-request; pin that they stay aligned."""
-        output = self._two_request_batch()
-        for row, seed in ((0, 111), (1, 222)):
-            entry = _payload_for(output, row)
-            assert entry["latent"][0, 0].item() == pytest.approx(float(seed))
-            assert int(entry["codes.audio"][0, 0]) == seed
+    for row, (seed, start, frames, last) in enumerate([(111, 100, 3, False), (222, 200, 5, True)]):
+        entry = _payload_for(output, row)
+        assert entry["meta.audio_seed"] == seed
+        assert entry["meta.num_processed_tokens"] == start
+        assert entry["meta.last_chunk"] is last
+        assert entry["meta.codec_chunk_frames"] == frames
+        assert entry["latent"].shape[0] == frames
+        assert entry["latent"][0, 0].item() == pytest.approx(float(seed))
+        assert int(entry["codes.audio"][0, 0]) == seed
 
 
 class TestPartialBatches:
