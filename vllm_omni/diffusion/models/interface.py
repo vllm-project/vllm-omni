@@ -38,6 +38,29 @@ class ReferenceVideoDecodeSpec:
     keep: Literal["first", "last"] = "first"
 
 
+@dataclass(frozen=True)
+class ProxyStreamSpec:
+    """Model-declared live structural proxy video stream contract."""
+
+    width: int
+    height: int
+    fps: int
+    packet_frames: int
+    tail_frames: int
+    credit_frames: int
+    bootstrap_packets: int
+    modality: str
+    bootstrap_key: str
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return (self.width, self.height)
+
+    @property
+    def min_source_frames(self) -> int:
+        return self.bootstrap_packets * self.packet_frames + self.tail_frames
+
+
 @runtime_checkable
 class SupportAudioInput(Protocol):
     support_audio_input: ClassVar[bool] = True

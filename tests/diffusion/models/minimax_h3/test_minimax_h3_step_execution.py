@@ -1472,6 +1472,48 @@ def _small_dit(monkeypatch, baseline) -> h3.MiniMaxH3DiTModel:
     return model
 
 
+@pytest.mark.parametrize("use_reference_cache", [False, True])
+def test_dit_block_passes_reference_layer_only_with_cache(monkeypatch, use_reference_cache):
+    model = _small_dit(monkeypatch, SDPABackend)
+    block = model.blocks[0]
+    block.layer_index = 7
+    hidden = torch.zeros(2, model.arch.hidden_size)
+    modulation = torch.zeros_like(hidden[:1])
+    monkeypatch.setattr(block.adaln_proj, "forward", lambda _: (modulation,) * 6)
+    monkeypatch.setattr(block.mlp, "forward", torch.clone)
+    reference_state = object() if use_reference_cache else None
+    seen_layers = []
+
+    def attention(rows, *, reference_kv_layer_index, **kwargs):
+        assert kwargs["reference_kv_state"] is reference_state
+        seen_layers.append(reference_kv_layer_index)
+        return rows
+
+    monkeypatch.setattr(block.attn, "forward", attention)
+    block(
+        hidden,
+        t_emb=torch.zeros(1, model.arch.time_embed_dim),
+        combined_indices=torch.zeros(2, dtype=torch.long),
+        rope_table=torch.empty(0),
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        max_seqlen=2,
+        packed_total=2,
+        reference_kv_state=reference_state,
+    )
+    assert seen_layers == [7 if use_reference_cache else None]
+
+
+def test_token_refiner_accepts_continuation_without_text_rows(monkeypatch):
+    model = _small_dit(monkeypatch, SDPABackend)
+    empty = torch.empty(0, model.arch.hidden_size, dtype=torch.bfloat16)
+
+    def unexpected_attention(*args, **kwargs):
+        pytest.fail("Empty text must skip the attention block")
+
+    monkeypatch.setattr(model.token_refiner.blocks[0], "forward", unexpected_attention)
+    assert model.token_refiner(empty, cu_seqlens=torch.tensor([0, 0]), max_seqlen=0) is empty
+
+
 def _candidate_rejections(attention: layer.Attention, record) -> list[str]:
     return [reason for check in attention._schedule_candidate_checks if (reason := check(record)) is not None]
 

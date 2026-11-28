@@ -350,6 +350,24 @@ def test_segment_bounds_and_staging_are_in_admission_budget():
         replace(SPEC, max_pending_segments=0)
 
 
+def test_initial_staging_can_follow_the_models_combined_shape():
+    spec = replace(SPEC, initial_staging_tokens=72)
+    cache = make_cache(segmented=spec)
+    state = make_state(cache).segmented("main")
+    first = append(state, (12, 12), offset=3)
+    second = append(state, (12, 12), offset=9, retain=lambda new: first + new)
+    append(state, (16,), offset=15, retain=lambda new: first + second + new)
+
+    state.prepare_layer_views(8, 0)
+    key, value = state.assemble(0, rows(0), rows(0), rows(8, 21), -rows(8, 21))
+
+    assert cache.history_staging_tokens == spec.initial_staging_tokens
+    assert state._staging().capacity == spec.initial_staging_tokens
+    expected = torch.cat((rows(24, 3), rows(24, 9), rows(16, 15), rows(8, 21)))
+    torch.testing.assert_close(key, expected)
+    torch.testing.assert_close(value, -expected)
+
+
 def test_segments_larger_than_the_frame_window_keep_every_row():
     spec = replace(SPEC, max_retained_tokens=15000, max_pending_tokens=6000, initial_staging_tokens=22000)
     cache = make_cache(segmented=spec, available_bytes=1 << 24)

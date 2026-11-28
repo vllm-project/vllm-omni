@@ -77,8 +77,10 @@ class ARDiffusionSegmentedKVSpec:
         for name in self.__dataclass_fields__:
             if getattr(self, name) <= 0:
                 raise ValueError(f"AR-Diffusion segmented {name} must be positive, got {getattr(self, name)}")
-        if self.initial_staging_tokens < self.max_retained_tokens + self.max_pending_tokens:
-            raise ValueError("AR-Diffusion segmented staging must fit retained and pending tokens together")
+        # The page pool budgets retained and pending tokens separately.
+        # Size the initial staging buffer for the rows the model reads together.
+        if self.initial_staging_tokens < max(self.max_retained_tokens, self.max_pending_tokens):
+            raise ValueError("AR-Diffusion segmented staging must fit each retained or pending token bound")
 
     @staticmethod
     def _blocks(tokens: int, segments: int, block_size: int) -> int:

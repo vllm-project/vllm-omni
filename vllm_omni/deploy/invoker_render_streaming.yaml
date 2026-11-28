@@ -1,0 +1,5 @@
+base_config: invoker_render.yaml
+stages:
+  - stage_id: 0
+    step_execution: true
+    streaming_output: true

@@ -889,7 +889,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             reference_kv_state=reference_kv_state,
-            reference_kv_layer_index=self.layer_index,
+            reference_kv_layer_index=self.layer_index if reference_kv_state is not None else None,
             reference_kv_compact=reference_kv_compact,
             reference_isolation=reference_isolation,
             vdn_window=vdn_window,

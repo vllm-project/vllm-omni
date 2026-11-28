@@ -14,6 +14,7 @@
   let totalBytes = 0;
   let done = false;
   let objectUrl = null;
+  let retainSeconds = 0;
   let promptUpdateTimers = [];
 
   function el(id) {
@@ -55,6 +56,11 @@
   function pump() {
     if (!sourceBuffer || sourceBuffer.updating || queue.length === 0) return;
     try {
+      const before = el(playerId).currentTime - retainSeconds;
+      if (retainSeconds > 0 && sourceBuffer.buffered.length && before > sourceBuffer.buffered.start(0) + 1) {
+        sourceBuffer.remove(0, before);
+        return;
+      }
       sourceBuffer.appendBuffer(queue.shift());
     } catch (err) {
       done = true;
@@ -130,7 +136,7 @@
     objectUrl = null;
   }
 
-  window.vllmStreamingVideoStart = function (configJson) {
+  window.vllmStreamingVideoStart = function (configJson, hooks = {}) {
     stopCurrent();
     chunkCount = 0;
     totalBytes = 0;
@@ -146,6 +152,7 @@
       setStatus("Invalid request");
       setStartButton(false, "Restart");
       log("Invalid request config: " + err.message);
+      hooks.error?.(err.message);
       return configJson;
     }
 
@@ -154,20 +161,26 @@
       setStatus("MSE unsupported");
       setStartButton(false, "Restart");
       log("This browser does not support MP4 Media Source Extensions playback.");
+      hooks.error?.("This browser does not support MP4 Media Source Extensions playback.");
       return configJson;
     }
 
     const video = el(playerId);
     if (!video) return configJson;
-    mediaSource = new MediaSource();
-    objectUrl = URL.createObjectURL(mediaSource);
+    const sessionSource = new MediaSource();
+    mediaSource = sessionSource;
+    retainSeconds = Number.isFinite(config.retain_seconds) ? config.retain_seconds : 0;
+    objectUrl = URL.createObjectURL(sessionSource);
     video.src = objectUrl;
 
-    mediaSource.addEventListener("sourceopen", () => {
+    sessionSource.addEventListener("sourceopen", () => {
+      if (mediaSource !== sessionSource) return;
       try {
-        sourceBuffer = mediaSource.addSourceBuffer(mime);
+        const buffer = sessionSource.addSourceBuffer(mime);
+        sourceBuffer = buffer;
         sourceBuffer.mode = "segments";
         sourceBuffer.addEventListener("updateend", () => {
+          if (sourceBuffer !== buffer) return;
           pump();
           if (done) finishStream();
         });
@@ -175,19 +188,24 @@
         setStatus("SourceBuffer error");
         setStartButton(false, "Restart");
         log("SourceBuffer error: " + err.message);
+        hooks.error?.(err.message);
         return;
       }
 
-      ws = new WebSocket(config.url);
+      const connection = new WebSocket(config.url);
+      ws = connection;
       ws.binaryType = "arraybuffer";
       ws.onopen = () => {
+        if (ws !== connection) return;
         setStatus("Streaming...");
         setStartButton(true, "Streaming...");
         log("Connected: " + config.url);
         ws.send(JSON.stringify(config.payload));
+        hooks.open?.(connection);
         log("Sent session.start: " + JSON.stringify(config.payload));
       };
       ws.onmessage = (event) => {
+        if (ws !== connection) return;
         if (typeof event.data === "string") {
           const msg = JSON.parse(event.data);
           if (msg.type === "video.start") {
@@ -212,10 +230,12 @@
           } else {
             log("Control message: " + JSON.stringify(msg));
           }
+          hooks.control?.(msg, connection);
           return;
         }
 
         const data = event.data;
+        if (data.byteLength === 0) return;
         queue.push(data);
         chunkCount += 1;
         totalBytes += data.byteLength;
@@ -223,18 +243,22 @@
         pump();
       };
       ws.onerror = () => {
+        if (ws !== connection) return;
         done = true;
         setStatus("Error");
         setStartButton(false, "Restart");
         log("ERROR: WebSocket error");
+        hooks.error?.("WebSocket connection failed");
         finishStream();
       };
       ws.onclose = () => {
+        if (ws !== connection) return;
         if (!done) {
           done = true;
           setStatus("Closed");
           setStartButton(false, "Restart");
           log("WebSocket closed before session.done");
+          hooks.error?.("WebSocket closed before session.done");
           finishStream();
         }
       };

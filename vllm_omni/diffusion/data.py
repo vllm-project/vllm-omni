@@ -1847,6 +1847,7 @@ class OmniDiffusionConfig:
         from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
             _looks_like_flux3,
+            _looks_like_invoker_render,
             get_diffusion_model_index,
             resolve_native_diffusion_model_class,
         )
@@ -1920,6 +1921,12 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
+                if self.model_class_name in (None, "InvokerRenderPipeline") and _looks_like_invoker_render(self.model):
+                    self.model_class_name = "InvokerRenderPipeline"
+                    if not self._load_component_transformer_config():
+                        raise ValueError("Invoker-Render bundle requires transformer/config.json")
+                    self.update_multimodal_support()
+                    return
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     native_model_class = resolve_native_diffusion_model_class(self.model)
@@ -2152,7 +2159,7 @@ class DiffusionOutput:
     # Streaming info (the defaults should make sense for non-streaming mode)
     finished: bool = True
     chunk_index: int = 0
-    total_chunks: int = 1
+    total_chunks: int | None = 1
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)

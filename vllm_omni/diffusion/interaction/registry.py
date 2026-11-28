@@ -19,8 +19,10 @@ from vllm_omni.diffusion.models.hy_nomas.interaction import (
     HyNomasCameraInteractionHandler,
     HyNomasPromptInteractionHandler,
 )
+from vllm_omni.diffusion.models.invoker_render.interaction import InvokerProxyInteraction
 
 STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
+    "InvokerRenderPipeline": {InvokerProxyInteraction.modality: InvokerProxyInteraction},
     "HyNomasPipeline": {
         "prompt": HyNomasPromptInteractionHandler,
         "camera": HyNomasCameraInteractionHandler,
