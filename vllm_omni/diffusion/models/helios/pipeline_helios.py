@@ -110,6 +110,16 @@ def _block_noise_cholesky_factor(
     return factor.to(device=device, dtype=torch.float32)
 
 
+def resolve_vae_dtype(vae_dtype: str | None, default: torch.dtype = torch.float32) -> torch.dtype:
+    """Map the ``vae_dtype`` config value (a torch dtype name) to a dtype."""
+    if vae_dtype is None:
+        return default
+    resolved = getattr(torch, vae_dtype, None)
+    if resolved not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"Invalid vae_dtype {vae_dtype!r}; expected float32, float16, or bfloat16")
+    return resolved
+
+
 def load_json_config(model_path: str, subfolder: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
@@ -258,7 +268,10 @@ class HeliosPipeline(
             model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = AutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model,
+            subfolder="vae",
+            torch_dtype=resolve_vae_dtype(getattr(od_config, "vae_dtype", None)),
+            local_files_only=local_files_only,
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)

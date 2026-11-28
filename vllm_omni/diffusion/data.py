@@ -1119,6 +1119,8 @@ class OmniDiffusionConfig:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_stack_tiles: bool = True
+    # Optional VAE weight dtype for pipelines that support it.
+    vae_dtype: str | None = None
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
