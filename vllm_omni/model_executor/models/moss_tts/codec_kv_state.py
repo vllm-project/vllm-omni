@@ -93,8 +93,18 @@ def commit_cache(
         # Invalid rows all address the final pool slot. Every duplicate write
         # copies its unchanged values, without dynamic-shape boolean indexing.
         rows = torch.where(valid[None, :, None, None, None], rows, cache[:, -1:])
-        indexes = slots.view(1, -1, 1, 1, 1).expand_as(rows)
-        cache.scatter_(1, indexes, rows)
+        if cache.device.type == "npu":
+            import torch_npu
+
+            # K/V planes are contiguous. Update whole selected slot slices
+            # without lowering a five-dimensional scatter along the pool axis.
+            # Preserve the masked null-slot values, including duplicate padding.
+            slot_indexes = slots.reshape(-1, 1)
+            torch_npu.npu_scatter_nd_update_(cache[0], slot_indexes, rows[0])
+            torch_npu.npu_scatter_nd_update_(cache[1], slot_indexes, rows[1])
+        else:
+            indexes = slots.view(1, -1, 1, 1, 1).expand_as(rows)
+            cache.scatter_(1, indexes, rows)
 
 
 @triton.jit
