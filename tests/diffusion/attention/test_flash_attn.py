@@ -20,7 +20,7 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.backends.flash_attn import FA4SparseAdapter, FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
 from vllm_omni.diffusion.attention.capabilities import CompilationMode, ExecutionContext, SupportStatus
@@ -34,6 +34,32 @@ flash_attn_func = fa.flash_attn_func  # noqa: N813
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Block sparsity requires sparse_block_size[1]=64 to match tile_n=128.",
+        "mask_block_cnt and mask_block_idx must be provided for block sparsity.",
+    ],
+)
+def test_sparse_fa4_value_error_preserves_cause_and_configuration(monkeypatch, message):
+    original = ValueError(message)
+    kernel = Mock(side_effect=original)
+    monkeypatch.setattr(FA4SparseAdapter, "_load_api", staticmethod(lambda: (kernel, dict, "4.0.0b33")))
+    q = torch.zeros(1, 1, 1, 8)
+    indices = torch.zeros(1, 1, 1, 1, dtype=torch.int32)
+    counts = torch.ones(1, 1, 1, dtype=torch.int32)
+
+    with pytest.raises(ValueError) as caught:
+        FA4SparseAdapter._run(q, q, q, indices, 1.0, (64, 64), counts)
+
+    assert str(caught.value) == (
+        "FA4 sparse attention rejected the request with block_size=[64, 64]. "
+        f"Check the attention configuration. FA4 reported: {message}"
+    )
+    assert caught.value.__cause__ is original
+    kernel.assert_called_once()
+
+
 def test_fa4_dense_dispatch_is_opaque_to_compile(monkeypatch):
     calls = []
 

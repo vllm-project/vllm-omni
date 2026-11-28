@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.schedule import (
     AttentionScheduleRange,
     InvalidAttentionScheduleError,
@@ -33,7 +34,7 @@ from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_s
 from vllm_omni.diffusion.sampler import SamplingState
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
 _ResultT = TypeVar("_ResultT")
@@ -96,6 +97,7 @@ def _encoder_prompt(text: str = "test") -> dict[str, Any]:
 
 @pytest.mark.parametrize("field", ["hidden_states", "token_tags"])
 @pytest.mark.parametrize("invalid", ["dtype", "strides", "sparse"])
+@pytest.mark.cpu
 def test_unified_encoder_preserves_main_text_validation(field, invalid):
     from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderConditioning
 
@@ -120,6 +122,7 @@ def test_unified_encoder_preserves_main_text_validation(field, invalid):
 
 
 @pytest.mark.parametrize("column_tags", [False, True])
+@pytest.mark.cpu
 def test_unified_encoder_roundtrips_all_conditioning(column_tags):
     from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderConditioning
 
@@ -151,6 +154,7 @@ def test_unified_encoder_roundtrips_all_conditioning(column_tags):
 
 @pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
 @pytest.mark.parametrize("text_key", [None, "encoder_output", "text_encoder_output"])
+@pytest.mark.cpu
 def test_local_encoder_modes_preserve_validated_text_and_unified_handoff(task, text_key):
     from PIL import Image
 
@@ -198,6 +202,7 @@ def test_local_encoder_modes_preserve_validated_text_and_unified_handoff(task, t
 
 
 @pytest.mark.parametrize("decode_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.cpu
 def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
@@ -278,6 +283,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
 
 
 @pytest.mark.parametrize("fail_video_load", [False, True])
+@pytest.mark.cpu
 def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failure(monkeypatch, fail_video_load):
     """Ready audio should start muxing even when video loading has not begun."""
     import threading
@@ -340,6 +346,7 @@ def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failu
     assert not [thread for thread in threading.enumerate() if thread not in before and thread.name == "chunked-mp4"]
 
 
+@pytest.mark.cpu
 def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
     """A client's encoder options must survive the worker-side pre-encode path."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -411,6 +418,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     ],
 )
 @pytest.mark.parametrize("batch_extra, batch_frames", [({}, 17), ({"preencode_batch_frames": 5}, 5)])
+@pytest.mark.cpu
 def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expected, batch_extra, batch_frames):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -451,6 +459,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     assert pipeline.decode_to_mp4.call_args.kwargs["batch_frames"] == batch_frames
 
 
+@pytest.mark.cpu
 def test_video_codec_options_are_normalized_for_the_encoder():
     from vllm_omni.diffusion.utils.media_utils import normalize_video_codec_options
 
@@ -463,6 +472,7 @@ def test_video_codec_options_are_normalized_for_the_encoder():
         normalize_video_codec_options("preset=ultrafast")
 
 
+@pytest.mark.cpu
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -528,6 +538,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     assert output.output[1] is decoded_audio
 
 
+@pytest.mark.cpu
 def test_pipeline_import_registry_and_component_discovery():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.registry import (
@@ -550,6 +561,7 @@ def test_pipeline_import_registry_and_component_discovery():
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
 
 
+@pytest.mark.cpu
 def test_diffusion_stage_has_only_dit_and_decoder_vaes_during_discovery():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
@@ -570,6 +582,7 @@ def test_diffusion_stage_has_only_dit_and_decoder_vaes_during_discovery():
     assert discovered.vae_names == ["video_vae", "audio_vae"]
 
 
+@pytest.mark.cpu
 def test_diffusion_stage_requires_the_encoder_payload():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.errors import OmniClientError
@@ -578,6 +591,7 @@ def test_diffusion_stage_requires_the_encoder_payload():
         MiniMaxH3Pipeline._extract_encoder_conditioning(None)
 
 
+@pytest.mark.cpu
 def test_encoder_free_stage_skips_missing_component_during_dlo_registration():
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 
@@ -610,6 +624,7 @@ def _write_partition_index(path, *, partition, tasks):
 
 
 @pytest.mark.skip(reason="upstream utility was removed from this branch")
+@pytest.mark.cpu
 def test_modular_diffusers_index_is_resolved_generically(tmp_path):
     from vllm_omni.config.resolver import resolve_omni_config
     from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
@@ -656,12 +671,14 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
         ("ref2va", "ref2va"),
     ],
 )
+@pytest.mark.cpu
 def test_startup_task_selects_weight_partition(task_type, partition):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
 
     assert _minimax_h3_partition_for_task(task_type) == partition
 
 
+@pytest.mark.cpu
 def test_startup_auto_task_uses_explicit_local_partition(tmp_path):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
 
@@ -676,6 +693,7 @@ def test_startup_auto_task_uses_explicit_local_partition(tmp_path):
         assert _minimax_h3_partition_for_task("combined", str(model_path)) == "combined"
 
 
+@pytest.mark.cpu
 def test_startup_task_rejects_unsupported_value():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
 
@@ -683,6 +701,7 @@ def test_startup_task_rejects_unsupported_value():
         _minimax_h3_partition_for_task("unsupported")
 
 
+@pytest.mark.cpu
 def test_encoder_task_validation_and_transformer_routing():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.errors import OmniClientError
@@ -763,6 +782,7 @@ def test_encoder_task_validation_and_transformer_routing():
 @pytest.mark.parametrize("load_text_encoder", [None, True, False])
 @pytest.mark.parametrize("trust_remote_code", [False, True])
 @pytest.mark.parametrize("custom_transformer", [False, True])
+@pytest.mark.cpu
 def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     monkeypatch,
     tmp_path,
@@ -965,6 +985,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     ]
 
 
+@pytest.mark.cpu
 def test_combined_weight_loader_routes_each_contiguous_partition():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -1004,6 +1025,7 @@ def test_combined_weight_loader_routes_each_contiguous_partition():
     assert loaded == {"transformer.a", "transformer.b", "transformers_ref.a"}
 
 
+@pytest.mark.cpu
 def test_dlo_offload_plan_includes_token_refiner():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -1015,6 +1037,7 @@ def test_dlo_offload_plan_includes_token_refiner():
     }
 
 
+@pytest.mark.cpu
 def test_joint_postprocess_is_multiprocessing_picklable():
     from vllm_omni.diffusion.models.minimax_h3 import (
         get_minimax_h3_post_process_func,
@@ -1037,6 +1060,7 @@ def test_joint_postprocess_is_multiprocessing_picklable():
     assert result["fps"] == 24
 
 
+@pytest.mark.cpu
 def test_preencoded_output_survives_process_queue_pickling():
     from multiprocessing.reduction import ForkingPickler
 
@@ -1052,6 +1076,7 @@ def test_preencoded_output_survives_process_queue_pickling():
     assert _minimax_h3_post_process(restored)["metadata"]["video"]["frame_counts"] == [7]
 
 
+@pytest.mark.cpu
 def test_preencoded_frame_counts_survive_registered_postprocess():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _MiniMaxH3EncodedOutput,
@@ -1073,6 +1098,7 @@ def test_preencoded_frame_counts_survive_registered_postprocess():
 
 
 @pytest.mark.parametrize("frame_counts", [[], [7, 9], [0], [-1], [True], ["7"], 7])
+@pytest.mark.cpu
 def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _minimax_h3_post_process,
@@ -1087,6 +1113,7 @@ def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts
     assert "metadata" not in result
 
 
+@pytest.mark.cpu
 def test_untyped_four_tuple_is_not_treated_as_encoded_frame_counts():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_post_process
 
@@ -1095,6 +1122,7 @@ def test_untyped_four_tuple_is_not_treated_as_encoded_frame_counts():
 
 
 @pytest.mark.parametrize("num_outputs", [1, 2])
+@pytest.mark.cpu
 def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_outputs):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import MiniMaxH3DecoderPipeline
 
@@ -1126,6 +1154,7 @@ def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_output
     assert formatted["metadata"]["video"]["frame_counts"] == [7, 9][:num_outputs]
 
 
+@pytest.mark.cpu
 def test_joint_video_output_is_quantized_before_transfer():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _minimax_h3_post_process,
@@ -1146,6 +1175,7 @@ def test_joint_video_output_is_quantized_before_transfer():
     np.testing.assert_array_equal(result["video"][0], expected[0].numpy())
 
 
+@pytest.mark.cpu
 def test_cfg_parallel_is_rejected_for_distilled_checkpoint():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -1156,6 +1186,7 @@ def test_cfg_parallel_is_rejected_for_distilled_checkpoint():
         MiniMaxH3Pipeline(od_config=od_config)
 
 
+@pytest.mark.cpu
 def test_shape_contract_matches_three_reference_tasks():
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         MINIMAX_H3_SHAPE_PLANNER,
@@ -1171,6 +1202,7 @@ def test_shape_contract_matches_three_reference_tasks():
     assert MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(62) == 209
 
 
+@pytest.mark.cpu
 def test_shifted_sigma_schedule_matches_reference_values():
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         minimax_h3_time_shift_sigmas,
@@ -1186,6 +1218,7 @@ def test_shifted_sigma_schedule_matches_reference_values():
 
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
 @pytest.mark.parametrize("shift_scale", [3.0, 12.0])
+@pytest.mark.cpu
 def test_uniform_sigma_schedule_has_one_interval_per_requested_step(num_steps, shift_scale):
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
@@ -1207,6 +1240,7 @@ def test_shifted_sigmas_stay_in_0_1_so_the_sampler_accepts_them(shift_scale):
     SamplingState((torch.zeros(1),), (sigmas,))  # the sampler rejects sigmas outside [0, 1]
 
 
+@pytest.mark.cpu
 def test_base_schedule_overrides_the_uniform_sigma_positions():
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         minimax_h3_time_shift_sigmas,
@@ -1245,6 +1279,7 @@ def test_base_schedule_overrides_the_uniform_sigma_positions():
         [1.0, float("inf"), 0.4, 0.0],
     ],
 )
+@pytest.mark.cpu
 def test_base_schedule_rejects_malformed_positions(base_schedule):
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         minimax_h3_time_shift_sigmas,
@@ -1323,6 +1358,7 @@ def _t2va_batch(
     )
 
 
+@pytest.mark.cpu
 def test_base_schedule_is_scoped_to_the_serving_partition():
     """A distilled FL2VA must not drag a regular Ref2VA onto its step count."""
     distilled = [1.0, 0.7, 0.4, 0.15, 0.0]
@@ -1333,6 +1369,7 @@ def test_base_schedule_is_scoped_to_the_serving_partition():
     assert pipeline._base_schedule_for_task("ref2va") is None
 
 
+@pytest.mark.cpu
 def test_partially_constructed_pipeline_falls_back_to_the_uniform_schedule():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -1341,6 +1378,7 @@ def test_partially_constructed_pipeline_falls_back_to_the_uniform_schedule():
     assert pipeline._base_schedule_for_task("t2va") is None
 
 
+@pytest.mark.cpu
 def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
     diffuse_calls: list[dict[str, Any]] = []
     base_schedule = [1.0, 0.7, 0.4, 0.15, 0.0]
@@ -1358,6 +1396,7 @@ def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
     )
 
 
+@pytest.mark.cpu
 def test_distilled_forward_accepts_the_matching_explicit_step_count():
     diffuse_calls: list[dict[str, Any]] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
@@ -1367,6 +1406,7 @@ def test_distilled_forward_accepts_the_matching_explicit_step_count():
     assert diffuse_calls[0]["num_steps"] == 4
 
 
+@pytest.mark.cpu
 def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
     from vllm_omni.errors import OmniClientError
 
@@ -1545,6 +1585,7 @@ def test_forward_rejects_an_attention_schedule_with_latent_refine(
     assert diffuse_calls == []
 
 
+@pytest.mark.cpu
 def test_absent_base_schedule_key_differs_from_an_empty_list():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _read_base_schedule,
@@ -1556,6 +1597,7 @@ def test_absent_base_schedule_key_differs_from_an_empty_list():
         _read_base_schedule({"base_schedule": []})
 
 
+@pytest.mark.cpu
 def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
@@ -1607,6 +1649,7 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     assert metadata.extra["valid_kv_length"] == 5
 
 
+@pytest.mark.cpu
 def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     from vllm_omni.diffusion.attention.backends.abstract import (
         VideoTokenLayout,
@@ -1676,6 +1719,7 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     assert packed_padding.cu_seqlens_k.tolist() == [0, 5]
 
 
+@pytest.mark.cpu
 def test_packed_attention_keeps_padding_mask_for_other_backends():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
@@ -1724,6 +1768,7 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
+@pytest.mark.cpu
 def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
     attention = _fake_packed_attention("CUDNN_ATTN")
     attention.attention.use_ring = True
@@ -1743,6 +1788,7 @@ def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
     assert metadata.extra["valid_kv_length"] == 5
 
 
+@pytest.mark.cpu
 def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks
 
@@ -1827,6 +1873,7 @@ def _fake_packed_attention(
     return attention
 
 
+@pytest.mark.cpu
 def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
     """A batch's valid rows are block-diagonal, so no prefix can describe them."""
     attention = _fake_packed_attention("FLASH_ATTN", supports_multi_doc=True)
@@ -1848,6 +1895,7 @@ def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
 
 
 @pytest.mark.parametrize("backend_name", ["TORCH_SDPA", "FLASH_ATTN"])
+@pytest.mark.cpu
 def test_packed_attention_rejects_backends_without_multi_doc_capability(backend_name):
     """Backend names alone must not allow cross-request attention."""
     attention = _fake_packed_attention(backend_name, supports_multi_doc=False)
@@ -1865,6 +1913,7 @@ def test_packed_attention_rejects_backends_without_multi_doc_capability(backend_
         )
 
 
+@pytest.mark.cpu
 def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
     """Regression for the #5543 follow-up crash fixed in #7235.
 
@@ -2071,6 +2120,7 @@ def test_packed_batch_isolation_is_checked_on_the_scheduled_candidate():
         ((648, 392), (640, 384)),
     ],
 )
+@pytest.mark.cpu
 def test_reference_image_resize_contract(size, expected):
     from PIL import Image
 
@@ -2081,6 +2131,7 @@ def test_reference_image_resize_contract(size, expected):
     assert resolve_minimax_h3_reference_image_shape(Image.new("RGB", size)) == expected
 
 
+@pytest.mark.cpu
 def test_reference_image_resize_rejects_invalid_input():
     from PIL import Image
 
@@ -2094,6 +2145,7 @@ def test_reference_image_resize_rejects_invalid_input():
         resolve_minimax_h3_reference_image_shape(Image.new("RGB", (128, 128)))
 
 
+@pytest.mark.cpu
 def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
         _resolve_fl2va_keyframe_indices,
@@ -2107,6 +2159,7 @@ def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
         _resolve_fl2va_keyframe_indices({"frame_indices": [0, 1]}, 2)
 
 
+@pytest.mark.cpu
 def test_minimax_h3_uses_the_official_output_canvas_policy():
     from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
         resolve_minimax_h3_output_canvas,
@@ -2119,6 +2172,7 @@ def test_minimax_h3_uses_the_official_output_canvas_policy():
         resolve_minimax_h3_output_canvas(16 / 9, 720)
 
 
+@pytest.mark.cpu
 def test_minimax_h3_accepts_sglang_auto_aspect_ratio_alias():
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
 
@@ -2133,6 +2187,7 @@ def test_minimax_h3_accepts_sglang_auto_aspect_ratio_alias():
     assert (height, width) == (768, 1344)
 
 
+@pytest.mark.cpu
 def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
@@ -2140,6 +2195,7 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").supports_latent_mask_editing
 
 
+@pytest.mark.cpu
 def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
 
@@ -2193,6 +2249,7 @@ def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
     assert output.shape == hidden_states.shape
 
 
+@pytest.mark.cpu
 def test_text_attention_sdpa_helper_preserves_expanded_kv_fallback(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
 
@@ -2214,6 +2271,7 @@ def test_text_attention_sdpa_helper_preserves_expanded_kv_fallback(monkeypatch):
     assert output.shape == (1, 4, 3, 8)
 
 
+@pytest.mark.cpu
 def test_encoder_forward_uses_hook_compatible_encode_entrypoint():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
@@ -2241,6 +2299,7 @@ def test_encoder_forward_uses_hook_compatible_encode_entrypoint():
     )
 
 
+@pytest.mark.cpu
 def test_encoder_forward_forwards_video_inputs():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
@@ -2284,6 +2343,7 @@ def test_encoder_forward_forwards_video_inputs():
         ((2048, 2048), (768, 768)),
     ],
 )
+@pytest.mark.cpu
 def test_reference_video_shape_caps_large_inputs_without_enlarging_small_inputs(size, expected):
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         _reference_video_shape,
@@ -2292,6 +2352,7 @@ def test_reference_video_shape_caps_large_inputs_without_enlarging_small_inputs(
     assert _reference_video_shape(*size) == expected
 
 
+@pytest.mark.cpu
 def test_text_encoder_stub_constructs_without_group_or_weights():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
@@ -2335,6 +2396,7 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
         )
 
 
+@pytest.mark.cpu
 def test_global_quant_config_is_shared_by_dit_and_encoder():
     from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
 
@@ -2344,6 +2406,7 @@ def test_global_quant_config_is_shared_by_dit_and_encoder():
     assert resolve_component_quant_config(global_config, "text_encoder") is global_config
 
 
+@pytest.mark.cpu
 def test_minimax_h3_fp8_component_selection():
     from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
 
@@ -2356,6 +2419,7 @@ def test_minimax_h3_fp8_component_selection():
     assert resolve_component_quant_config(encoder_only, "text_encoder").get_name() == "fp8"
 
 
+@pytest.mark.cpu
 def test_text_encoder_rejects_serialized_fp8():
     from vllm_omni.diffusion.models.minimax_h3.encoder import _validate_encoder_quant_config
 
@@ -2367,6 +2431,7 @@ def test_text_encoder_rejects_serialized_fp8():
         _validate_encoder_quant_config(config)
 
 
+@pytest.mark.cpu
 def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -2401,6 +2466,7 @@ def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
     quant_config.get_quant_method.assert_called_once_with(linear, prefix)
 
 
+@pytest.mark.cpu
 def test_no_offload_keeps_text_encoder_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2422,6 +2488,7 @@ def test_no_offload_keeps_text_encoder_resident():
     pipeline.text_encoder.offload_to_cpu.assert_not_called()
 
 
+@pytest.mark.cpu
 def test_model_offload_uses_hooked_text_encoder_call():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2448,6 +2515,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     ("enable_layerwise", "enable_distributed"),
     [(True, False), (False, True)],
 )
+@pytest.mark.cpu
 def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise, enable_distributed):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2476,6 +2544,7 @@ def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise
     vae.offload_to_cpu.assert_called_once_with()
 
 
+@pytest.mark.cpu
 def test_layerwise_encoder_selection_releases_text_encoder():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2501,6 +2570,7 @@ def test_layerwise_encoder_selection_releases_text_encoder():
     pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
 
 
+@pytest.mark.cpu
 def test_layerwise_dit_only_keeps_text_encoder_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2523,6 +2593,7 @@ def test_layerwise_dit_only_keeps_text_encoder_resident():
     pipeline.text_encoder.offload_to_cpu.assert_not_called()
 
 
+@pytest.mark.cpu
 def test_dit_encoder_selection_keeps_vae_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2546,6 +2617,7 @@ def test_dit_encoder_selection_keeps_vae_resident():
     component.offload_to_cpu.assert_not_called()
 
 
+@pytest.mark.cpu
 def test_distributed_layerwise_resident_blocks_are_stage_scoped():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2561,6 +2633,7 @@ def test_distributed_layerwise_resident_blocks_are_stage_scoped():
     controller.offload_resident_layers.assert_called_once_with()
 
 
+@pytest.mark.cpu
 def test_distributed_layerwise_resident_blocks_release_on_failure():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2577,6 +2650,7 @@ def test_distributed_layerwise_resident_blocks_release_on_failure():
     controller.offload_resident_layers.assert_called_once_with()
 
 
+@pytest.mark.cpu
 def test_distributed_layerwise_resident_blocks_can_be_skipped():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -2593,6 +2667,7 @@ def test_distributed_layerwise_resident_blocks_can_be_skipped():
 
 
 @pytest.mark.skip(reason="encoder layerwise API is not part of this branch")
+@pytest.mark.cpu
 def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
@@ -2644,6 +2719,7 @@ def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
     assert all(hook.device == torch.device("cpu") for hook in hooks)
 
 
+@pytest.mark.cpu
 def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -2758,6 +2834,7 @@ def test_encode_only_does_not_open_lightvae_checkpoint(monkeypatch):
 
 
 @pytest.mark.parametrize("fail_encode", [False, True])
+@pytest.mark.cpu
 def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
     from PIL import Image
 
@@ -2811,6 +2888,7 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
     assert video_vae.model.parallel_tiling
 
 
+@pytest.mark.cpu
 def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -2844,6 +2922,7 @@ def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     assert video_vae._device_target.type == "meta"
 
 
+@pytest.mark.cpu
 def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -2887,6 +2966,7 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
     stager.offload.assert_called_once_with()
 
 
+@pytest.mark.cpu
 def test_remote_component_refuses_untrusted_checkpoint_code(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -2908,6 +2988,7 @@ def test_remote_component_refuses_untrusted_checkpoint_code(monkeypatch):
     assert loaded == []
 
 
+@pytest.mark.cpu
 def test_remote_component_resolves_checkpoint_code_when_trusted(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -2939,6 +3020,7 @@ def test_remote_component_resolves_checkpoint_code_when_trusted(monkeypatch):
 
 @pytest.mark.parametrize("vae_cls_name", ["MiniMaxH3VideoVAE", "MiniMaxH3AudioVAE"])
 @pytest.mark.parametrize("trusted", [True, False])
+@pytest.mark.cpu
 def test_vae_forwards_trust_remote_code_to_loader(monkeypatch, vae_cls_name, trusted):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -2976,6 +3058,7 @@ def test_vae_forwards_trust_remote_code_to_loader(monkeypatch, vae_cls_name, tru
 
 
 @pytest.mark.parametrize("vae_cls_name", ["MiniMaxH3VideoVAE", "MiniMaxH3AudioVAE"])
+@pytest.mark.cpu
 def test_vae_defaults_to_refusing_checkpoint_code(monkeypatch, vae_cls_name):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -3004,6 +3087,7 @@ def test_vae_defaults_to_refusing_checkpoint_code(monkeypatch, vae_cls_name):
     assert forwarded == [False]
 
 
+@pytest.mark.cpu
 def test_video_vae_encode_uses_configured_parallel_tiling():
     from vllm_omni.diffusion.models.minimax_h3.vae import (
         MiniMaxH3VideoVAE,
@@ -3045,6 +3129,7 @@ def test_video_vae_encode_uses_configured_parallel_tiling():
         ("F2", {"frame_indices": [0, -1]}, 2, [0, -1]),
     ],
 )
+@pytest.mark.cpu
 def test_f1_f2_official_fl2va_keyframe_matrix(case, extra, image_count, expected):
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
         _resolve_fl2va_keyframe_indices,
@@ -3065,6 +3150,7 @@ def test_f1_f2_official_fl2va_keyframe_matrix(case, extra, image_count, expected
         ("R6", (1, 0, 2)),
     ],
 )
+@pytest.mark.cpu
 def test_r1_r6_ref2va_reference_count_matrix(case, counts):
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
         _validate_ref2va_reference_counts,
@@ -3074,6 +3160,7 @@ def test_r1_r6_ref2va_reference_count_matrix(case, counts):
     _validate_ref2va_reference_counts(*counts)
 
 
+@pytest.mark.cpu
 def test_ref2va_reference_count_validation_preserves_client_error_metadata():
     from vllm_omni.errors import OmniClientError
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
@@ -3091,6 +3178,7 @@ def test_ref2va_reference_count_validation_preserves_client_error_metadata():
         ("R8", 4.0, 6.0, (640, 384), (640, 384)),
     ],
 )
+@pytest.mark.cpu
 def test_r7_r8_ref2va_video_segment_matrix(
     monkeypatch, tmp_path, case, start_time, expected_duration, input_size, expected_size
 ):
@@ -3133,6 +3221,7 @@ def test_r7_r8_ref2va_video_segment_matrix(
     assert (transcode_calls[0][1]["target_width"], transcode_calls[0][1]["target_height"]) == expected_size
 
 
+@pytest.mark.cpu
 def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3158,6 +3247,7 @@ def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_p
     assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
+@pytest.mark.cpu
 def test_prepared_reference_video_descriptor_round_trip(tmp_path):
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         deserialize_prepared_reference_videos,
@@ -3180,6 +3270,7 @@ def test_prepared_reference_video_descriptor_round_trip(tmp_path):
     assert deserialize_prepared_reference_videos(descriptor) == (str(tmp_path), [item])
 
 
+@pytest.mark.cpu
 def test_prepared_reference_video_descriptor_rejects_unknown_fields():
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         deserialize_prepared_reference_videos,
@@ -3189,6 +3280,7 @@ def test_prepared_reference_video_descriptor_rejects_unknown_fields():
         deserialize_prepared_reference_videos('{"artifact_dir":"/tmp","videos":[{"path":"x"}]}')
 
 
+@pytest.mark.cpu
 def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3231,6 +3323,7 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     ("indices", "frame_count"),
     [([0, 12], 25), (None, 2)],
 )
+@pytest.mark.cpu
 def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame_count):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3267,6 +3360,7 @@ def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame
     }
 
 
+@pytest.mark.cpu
 def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3314,6 +3408,7 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
         ),
     ],
 )
+@pytest.mark.cpu
 def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
@@ -3322,6 +3417,7 @@ def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
         reference_video_module._decode_video_frames_ffmpeg("prepared.mp4", **kwargs)
 
 
+@pytest.mark.cpu
 def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3358,6 +3454,7 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     assert calls[0][1]["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
+@pytest.mark.cpu
 def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3396,6 +3493,7 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     assert all(call[1]["stdin"] is reference_video_module.subprocess.DEVNULL for call in calls)
 
 
+@pytest.mark.cpu
 def test_ref2va_audio_probe_runs_noninteractively(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3421,6 +3519,7 @@ def test_ref2va_audio_probe_runs_noninteractively(monkeypatch):
     assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
+@pytest.mark.cpu
 def test_ref2va_audio_ffmpeg_fallback_runs_noninteractively(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3446,6 +3545,7 @@ def test_ref2va_audio_ffmpeg_fallback_runs_noninteractively(monkeypatch):
     assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
+@pytest.mark.cpu
 def test_ref2va_video_audio_ffmpeg_runs_noninteractively(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3464,6 +3564,7 @@ def test_ref2va_video_audio_ffmpeg_runs_noninteractively(monkeypatch):
     assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
+@pytest.mark.cpu
 def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
@@ -3483,6 +3584,7 @@ def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
         )
 
 
+@pytest.mark.cpu
 def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
@@ -3537,6 +3639,7 @@ def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_p
     assert transcode_calls[1][1]["duration_seconds"] == pytest.approx(4.958333)
 
 
+@pytest.mark.cpu
 def test_ref2va_two_video_recipe_rejects_real_duration_overflow(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
@@ -3581,6 +3684,7 @@ def test_ref2va_two_video_recipe_rejects_real_duration_overflow(monkeypatch, tmp
 
 
 @pytest.mark.parametrize("duration", [4.0, 15.0])
+@pytest.mark.cpu
 def test_g2_output_duration_accepts_official_boundaries(duration):
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
 
@@ -3597,6 +3701,7 @@ def test_g2_output_duration_accepts_official_boundaries(duration):
 
 
 @pytest.mark.parametrize("duration", [3.99, 15.01, float("nan"), "not-a-duration"])
+@pytest.mark.cpu
 def test_g2_output_duration_rejects_out_of_contract_values(duration):
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
 
@@ -3611,6 +3716,7 @@ def test_g2_output_duration_rejects_out_of_contract_values(duration):
         resolve_minimax_h3_shape("ref2va", sampling, None)
 
 
+@pytest.mark.cpu
 def test_g1_fanout_uses_incrementing_output_seeds():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _minimax_h3_output_seeds,
@@ -3623,6 +3729,7 @@ def test_g1_fanout_uses_incrementing_output_seeds():
         _resolve_minimax_h3_num_outputs(11)
 
 
+@pytest.mark.cpu
 def test_g3_task_specific_aspect_ratio_policy():
     from PIL import Image
 
@@ -3640,6 +3747,7 @@ def test_g3_task_specific_aspect_ratio_policy():
         resolve_minimax_h3_aspect_ratio("t2va", "2:1", None)
 
 
+@pytest.mark.cpu
 def test_g3_t2va_shape_requires_a_named_ratio_and_fl2va_ignores_override():
     from PIL import Image
 
@@ -3666,6 +3774,7 @@ def test_g3_t2va_shape_requires_a_named_ratio_and_fl2va_ignores_override():
     assert (height, width) == (768, 1344)
 
 
+@pytest.mark.cpu
 def test_g4_reference_image_boundaries_and_aspect_ratio():
     from PIL import Image
 
@@ -3681,6 +3790,7 @@ def test_g4_reference_image_boundaries_and_aspect_ratio():
         _validate_reference_image(Image.new("RGB", (256, 641)))
 
 
+@pytest.mark.cpu
 def test_g4_reference_image_file_format_and_size_contract(tmp_path):
     from PIL import Image
 
@@ -3699,6 +3809,7 @@ def test_g4_reference_image_file_format_and_size_contract(tmp_path):
     assert str(exc_info.value) == "MiniMax H3 reference image must use JPG, JPEG, PNG, or WEBP, got BMP"
 
 
+@pytest.mark.cpu
 def test_g4_standalone_audio_duration_and_total_duration_contract():
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         validate_reference_audio_waveforms,
@@ -3722,6 +3833,7 @@ def test_g4_standalone_audio_duration_and_total_duration_contract():
         )
 
 
+@pytest.mark.cpu
 def test_ref2va_video_soundtrack_does_not_consume_standalone_audio_budget():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -3776,6 +3888,7 @@ def test_ref2va_video_soundtrack_does_not_consume_standalone_audio_budget():
     torch.testing.assert_close(context["audio_condition"], torch.cat([embedded, standalone]))
 
 
+@pytest.mark.cpu
 def test_ref2va_audio_duration_validation_precedes_rank_branch():
     from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
@@ -3797,6 +3910,7 @@ def test_ref2va_audio_duration_validation_precedes_rank_branch():
         )
 
 
+@pytest.mark.cpu
 def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
     from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
@@ -3842,6 +3956,7 @@ def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
         ("file_size", 50 * 1024 * 1024 + 1, "size"),
     ],
 )
+@pytest.mark.cpu
 def test_g4_reference_video_metadata_validation(field, value, message, tmp_path):
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         _validate_reference_video_metadata,
@@ -3967,6 +4082,7 @@ def _write_text_encoder_checkpoint(path, *, omit=()):
         ),
     ],
 )
+@pytest.mark.cpu
 def test_encoder_load_reports_missing_fused_source_shards(
     tmp_path, omitted_sources, expected_detail, unreported_target
 ):
@@ -3981,6 +4097,7 @@ def test_encoder_load_reports_missing_fused_source_shards(
     assert unreported_target not in message
 
 
+@pytest.mark.cpu
 def test_encoder_load_rejects_unloaded_plain_param(tmp_path):
     encoder = _one_layer_text_encoder()
     weights = _write_text_encoder_checkpoint(tmp_path, omit=("input_layernorm.weight",))
@@ -3989,6 +4106,7 @@ def test_encoder_load_rejects_unloaded_plain_param(tmp_path):
         encoder.load_weights(weights.items())
 
 
+@pytest.mark.cpu
 def test_encoder_load_places_every_source_in_its_own_rows(tmp_path):
     encoder = _one_layer_text_encoder()
     weights = _write_text_encoder_checkpoint(tmp_path)
@@ -4042,6 +4160,7 @@ def _pad_seq_len_batch(pad_seq_len):
 
 
 @pytest.mark.parametrize("pinned, expected", [(None, None), (54080, 54080)])
+@pytest.mark.cpu
 def test_pad_seq_len_reaches_diffuse_from_extra_args(pinned, expected):
     """The request field must arrive at ``diffuse``, not stop at validation."""
     diffuse_calls: list[dict[str, Any]] = []
@@ -4053,6 +4172,7 @@ def test_pad_seq_len_reaches_diffuse_from_extra_args(pinned, expected):
 
 
 @pytest.mark.parametrize("task", ["t2va", "ref2va"])
+@pytest.mark.cpu
 def test_pad_seq_len_reaches_the_packer_for_every_task_family(task, monkeypatch):
     """``diffuse`` must hand the pin to whichever packer the task uses."""
     import vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 as module
@@ -4098,6 +4218,7 @@ def test_pad_seq_len_reaches_the_packer_for_every_task_family(task, monkeypatch)
 
 
 @pytest.mark.parametrize("value", [0, -64, 100, "128", True, 1.5, (1 << 20) + 64])
+@pytest.mark.cpu
 def test_pad_seq_len_request_validation_rejects_bad_values(value):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_pad_seq_len,
@@ -4108,6 +4229,7 @@ def test_pad_seq_len_request_validation_rejects_bad_values(value):
         _resolve_pad_seq_len(value)
 
 
+@pytest.mark.cpu
 def test_pad_seq_len_request_validation_accepts_aligned_values():
     from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
         MINIMAX_H3_MAX_PAD_SEQ_LEN,
@@ -4127,6 +4249,7 @@ def test_pad_seq_len_request_validation_accepts_aligned_values():
 )
 @pytest.mark.parametrize("initial_tf32", [False, True])
 @pytest.mark.parametrize("fail_encode", [False, True])
+@pytest.mark.cpu
 def test_keyframe_encode_pins_and_restores_cudnn_settings(
     monkeypatch, capability, allow_tf32, initial_tf32, fail_encode
 ):
@@ -4161,6 +4284,7 @@ def test_keyframe_encode_pins_and_restores_cudnn_settings(
         assert cudnn.allow_tf32 is initial_tf32
 
 
+@pytest.mark.cpu
 def test_keyframe_encode_cpu_keeps_cudnn_settings(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.vae import (
         _minimax_h3_keyframe_encode_context,
@@ -4180,6 +4304,7 @@ def test_keyframe_encode_cpu_keeps_cudnn_settings(monkeypatch):
             assert not cudnn.allow_tf32
 
 
+@pytest.mark.cpu
 def test_keyframe_encode_rocm_does_not_require_deterministic_miopen(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.vae import (
         _minimax_h3_keyframe_encode_context,
@@ -4240,6 +4365,7 @@ def _peer_rank_preencode_pipeline(monkeypatch):
     return pipeline
 
 
+@pytest.mark.cpu
 def test_peer_vae_rank_returns_no_preencoded_output_instead_of_failing(monkeypatch):
     """A rank that owns no output must not turn its silence into a request error."""
     pipeline = _peer_rank_preencode_pipeline(monkeypatch)
@@ -4249,6 +4375,7 @@ def test_peer_vae_rank_returns_no_preencoded_output_instead_of_failing(monkeypat
     assert output == b""
 
 
+@pytest.mark.cpu
 def test_peer_vae_rank_post_decode_reaches_post_processing(monkeypatch):
     """The real H3 post_decode chain, not just the shared consumer, tolerates a peer rank."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -4281,6 +4408,7 @@ def test_peer_vae_rank_post_decode_reaches_post_processing(monkeypatch):
 
 
 @pytest.mark.parametrize("duration", [60, 75])
+@pytest.mark.cpu
 def test_long_video_shape_requires_explicit_opt_in(duration):
     from vllm_omni.errors import OmniClientError
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -4298,6 +4426,7 @@ def test_long_video_shape_requires_explicit_opt_in(duration):
 
 @pytest.mark.parametrize("preencode", [False, True])
 @pytest.mark.parametrize("cancel_phase", ["before_prepare", "prepare", "diffuse"])
+@pytest.mark.cpu
 def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel_phase, monkeypatch):
     from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
     from vllm_omni.diffusion.data import DiffusionRequestAbortedError
@@ -4339,3 +4468,187 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
         pipeline.decode_to_mp4.assert_not_called()
     finally:
         registry.close()
+
+
+@torch.inference_mode()
+@pytest.mark.cpu
+def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention import selector as selector_mod
+    from vllm_omni.diffusion.attention.backends import sage_attn
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as transformer
+
+    config = AttentionConfig(
+        default={"backend": "TORCH_SDPA"},
+        per_role={"minimax_h3.token_refiner": {"backend": "SAGE_ATTN"}},
+    )
+    arch = transformer.MiniMaxH3DiTArchConfig(
+        num_layers=1, token_refiner_num_layers=1, hidden_size=64, num_attention_heads=2, attention_head_dim=32
+    )
+    # No distributed process group or optional Sage kernel is needed to check
+    # model-owned metadata and dispatch through the real Sage implementation.
+    monkeypatch.setattr(transformer, "QKVParallelLinear", lambda **kwargs: SimpleNamespace(num_heads=2, num_kv_heads=2))
+    monkeypatch.setattr(transformer, "RowParallelLinear", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+
+    # The kernel is mocked, so backend lookup must not depend on the host GPU
+    # or optional package availability. Keep role resolution and Sage dispatch real.
+    def resolve_backend(backend_name, head_size):
+        assert backend_name == "SAGE_ATTN" and head_size == 32
+        return sage_attn.SageAttentionBackend
+
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", resolve_backend)
+    calls = []
+
+    def sage_kernel(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=kwargs["sm_scale"]
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(sage_attn, "sageattn", sage_kernel)
+    # The custom-op boundary imports the optional package at execution time.
+    # Replace that package too, so this CPU dispatch test needs no Sage install.
+    monkeypatch.setitem(sys.modules, "sageattention", SimpleNamespace(sageattn=sage_kernel))
+    cfg = SimpleNamespace(
+        diffusion_attention_config=config,
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        attn = transformer.MiniMaxH3Attention(
+            arch,
+            None,
+            prefix="token_refiner.blocks.0.attn",
+            role="minimax_h3.token_refiner",
+            role_category="self",
+            skip_sequence_parallel=True,
+        )
+    assert attn.attention.attn_backend is sage_attn.SageAttentionBackend
+    # Call CUDA dispatch on CPU tensors with only the external kernel replaced.
+    monkeypatch.setattr(attn.attention.attention, "forward", attn.attention.attention.forward_cuda)
+    q, k, v = (torch.randn(7, 2, 32) for _ in range(3))
+    cu = torch.tensor([0, 7], dtype=torch.int32)
+    output = attn._run_packed_attention(q, k, v, cu_seqlens=cu, max_seqlen=7, packed_total=7)
+    assert output.shape == q.shape and len(calls) == 1
+    # Padded and multi-request layouts still receive their existing runtime rejection.
+    with pytest.raises(ValueError, match="does not support attn_mask"):
+        attn._run_packed_attention(q, k, v, cu_seqlens=cu, max_seqlen=6, packed_total=7)
+    with pytest.raises(ValueError, match="does not isolate multi-document"):
+        attn._run_packed_attention(q, k, v, cu_seqlens=cu, max_seqlen=7, packed_total=7, num_requests=2)
+    assert len(calls) == 1
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@torch.inference_mode()
+def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
+    from pathlib import Path
+
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    from tests.helpers.block_sparse import selected_attention_reference
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.block_sparse import BlockSparseAttention, BlockSparseBackend
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as transformer
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import _attention_isolates_packed_requests
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires Hopper SM90 and FA4")
+    pytest.importorskip("flash_attn.cute")
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(transformer, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    recipe = json.loads(
+        (Path(__file__).resolve().parents[4] / "recipes/attention/minimax-h3-fa4-subblock.json").read_text()
+    )
+    cfg = SimpleNamespace(
+        tf_model_config={
+            "num_layers": 1,
+            "token_refiner_num_layers": 1,
+            "hidden_size": 256,
+            "num_attention_heads": 2,
+            "attention_head_dim": 128,
+            "ffn_hidden_size": 512,
+            "latents_dim": 2,
+            "audio_latents_dim": 2,
+            "patch_size": (1, 1, 1),
+            "text_dim": 256,
+            "timestep_input_dim": 32,
+            "time_embed_hidden_size": 64,
+            "time_embed_dim": 128,
+            "adaln_out_features": 18 * 256,
+            "final_adaln_out_features": 2 * 256,
+            "rope_inv_freq_len": 16,
+        },
+        diffusion_attention_config=AttentionConfig(**recipe),
+        parallel_config=SimpleNamespace(ring_degree=1, ulysses_degree=1),
+        dtype=torch.bfloat16,
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        model = transformer.MiniMaxH3DiTModel(cfg).to(device="cuda")
+    # Real model construction and projections, with initialized tiny weights;
+    # no checkpoint, kernel substitute or hand-assigned attention role.
+    for weight in model.parameters():
+        weight.fill_(1) if weight.ndim == 1 else weight.normal_(std=0.02)
+    dit = model.blocks[0].attn
+    refiner = model.token_refiner.blocks[0].attn
+    assert dit.attention.role == "minimax_h3.dit" and dit.attention.role_category == "self"
+    assert refiner.attention.role == "minimax_h3.token_refiner" and refiner.attention.role_category == "self"
+    assert isinstance(dit.attention.attention, BlockSparseAttention)
+    assert dit.attention.attn_backend is BlockSparseBackend
+    assert not isinstance(refiner.attention.attention, BlockSparseAttention)
+    assert refiner.attention.attn_backend.get_name() == "FLASH_ATTN"
+    assert not _attention_isolates_packed_requests(dit.attention)
+    calls = []
+    real_length = 1089
+
+    def check_sparse_dispatch(layer, args, output):
+        q, k, v, metadata = args
+        calls.append(layer.role)
+        assert metadata.attn_mask is None
+        assert metadata.packed_padding.q_length == metadata.packed_padding.kv_length == real_length
+        assert metadata.extra["cu_seqlens_q"].shape == (3,)
+        assert metadata.extra["protected_kv_prefix"] == 0
+        impl = layer.attention
+        real = (q[:, :real_length], k[:, :real_length], v[:, :real_length])
+        selection = impl.selector.select(real[0], real[1], impl.scale, 0)
+        assert selection.indices.shape[-1] < (real_length + 63) // 64
+        reference = selected_attention_reference(*real, selection, impl.scale, impl.block_size)
+        torch.testing.assert_close(output[:, :real_length].float(), reference, atol=0.004, rtol=0.02)
+        assert torch.count_nonzero(output[:, real_length:]) == 0 and output.is_contiguous()
+
+    dit.attention.register_forward_hook(check_sparse_dispatch)
+    refiner.attention.register_forward_hook(lambda layer, args, output: calls.append(layer.role))
+    text = torch.randn(97, 256, device="cuda", dtype=cfg.dtype)
+    refined = model.token_refiner(
+        text,
+        cu_seqlens=torch.tensor([0, 97], device=text.device, dtype=torch.int32),
+        max_seqlen=97,
+    )
+    assert refined.shape == text.shape and calls == ["minimax_h3.token_refiner"]
+    hidden = torch.randn(1152, 256, device="cuda", dtype=cfg.dtype)
+    hidden[real_length:] = float("nan")
+    cu = torch.tensor([0, real_length, hidden.shape[0]], device=hidden.device, dtype=torch.int32)
+    calls.clear()
+    actual = dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length)
+    assert calls == ["minimax_h3.dit"] and actual.shape == hidden.shape
+    hidden[real_length:] = 10000
+    repeated = dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length)
+    torch.testing.assert_close(repeated[:real_length], actual[:real_length], atol=0, rtol=0)
+    with pytest.raises(ValueError, match="does not isolate multi-document"):
+        dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length, num_requests=2)

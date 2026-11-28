@@ -92,10 +92,14 @@ def collect_calibration_specs(
     non-active profiles, otherwise a profile the service default never references keeps an
     undetected calibration gap. Without a schedule this returns exactly the baseline specs.
     """
+    from vllm_omni.diffusion.data import AttentionSpec
+
     configs = [attention_config] if attention_config is not None else []
     if schedule is not None:
         configs.extend(schedule.profiles[name] for name in sorted(schedule.profiles))
-    return [spec for cfg in configs for spec in (cfg.default, *cfg.per_role.values()) if spec is not None]
+    return [
+        spec for cfg in configs for spec in (cfg.default, *cfg.per_role.values()) if isinstance(spec, AttentionSpec)
+    ]
 
 
 def layer_calibration_is_ignored(module_name: str, calibration: dict | None) -> bool:
