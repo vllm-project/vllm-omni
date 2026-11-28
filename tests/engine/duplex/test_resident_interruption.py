@@ -340,6 +340,67 @@ async def test_control_uses_producer_turn_when_snapshot_includes_cancelled_units
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("interruptions", [1, 2])
+@pytest.mark.parametrize("submit_inflight", [False, True])
+async def test_explicit_audio_commit_keeps_response_across_control_completion(interruptions, submit_inflight):
+    h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id))
+        await h.run(commands.CancelResponse())
+        for _ in range(1, interruptions):
+            await h.run(commands.BargeIn())
+        assert h.runner.run.pending_interruptions == interruptions
+        start = len(h.events)
+        await h.run(append_audio(samples=3200, is_speech=True))
+        if submit_inflight:
+            h.port.submit_gate = asyncio.Event()
+            h.port.submit_started.clear()
+            h.submit(commands.Commit(create_response=True))
+            await asyncio.wait_for(h.port.submit_started.wait(), 2)
+            events = await h.settle(timeout_s=0.1)
+        else:
+            events = await h.run(commands.Commit(create_response=True))
+        created = find(events, "response.created")
+        assert created.response_id == h.session.active_response_id
+
+        for turn in range(interruptions):
+            control = _stage0(request_id, [LISTEN], "", stop=True)
+            control.multimodal_output[INTERRUPTION_KEY] = True
+            events = await h.deliver_and_settle(control, stage_id=0, segment_finished=True, model_turn_id=turn)
+            assert "response.done" not in types(events)
+        if submit_inflight:
+            h.port.submit_gate.set()
+            await h.settle()
+        final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert final_append["final"] is True
+        assert final_append["payload"]["_native_explicit_reply"] is True
+
+        events = await h.deliver_and_settle(
+            tts_output(request_id, samples=48000, text="new answer", turn_id=interruptions)
+        )
+        assert find(events, "response.output_audio.delta").response_id == created.response_id
+        assert find(events, "response.output_audio_transcript.delta").delta == "new answer"
+        assert h.session.active_response_turn_id == interruptions
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=48000, text="new answer", turn_id=interruptions, turn_end=True)
+        )
+        followup_events = h.events[start:]
+        assert types(followup_events).count("response.created") == 1
+        assert types(followup_events).count("response.done") == 1
+        done = find(followup_events, "response.done")
+        assert done.response_id == created.response_id
+        assert done.status == "completed"
+        assert h.session.epoch == 0
+        assert not h.port.aborts and not h.port.cleanups
+    finally:
+        if h.port.submit_gate is not None:
+            h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_overlap_barge_in_queues_control_before_user_audio():
     h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
     try:

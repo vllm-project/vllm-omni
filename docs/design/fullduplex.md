@@ -1040,7 +1040,11 @@ for queue updates and the final validity check before delivery.
   handoff starts its normal new-turn state. The session advances its output
   turn without invalidating input reservations already inside `submit`.
   Repeated interruptions retain their order relative to intervening inputs;
-  output stays suppressed until all queued controls finish. Input-clocked
+  output stays suppressed until all queued controls finish. A response explicitly
+  created during suppression keeps its ID and response options; the last control
+  completion binds it to the confirmed next model turn before output resumes.
+  It must not complete empty merely because admission captured the cancelled
+  turn. Input-clocked
   sessions keep accounting for submitted units; the control carries zero input
   duration. Pending audio awaiting transcript belongs to its model turn;
   control completion discards cancelled turns' pending audio so it cannot
