@@ -101,6 +101,10 @@ class OmniSchedulingCoordinator:
         # detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
 
+    def parked_running_requests(self) -> tuple[Any, ...]:
+        """Running requests parked in the chunk layer for the current step."""
+        return tuple(self._waiting_for_chunk_running)
+
     @property
     def receives_chunks(self) -> bool:
         """Whether this coordinator receives streamed input from upstream."""
