@@ -18,6 +18,7 @@ from torch import nn
 from transformers import AutoConfig, ByT5Tokenizer, Qwen2_5_VLTextModel, Qwen2Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cache.cachedit import set_separate_cfg
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan_video_15 import (
     DistributedAutoencoderKLHunyuanVideo15,
@@ -447,6 +448,7 @@ class HunyuanVideo15Pipeline(
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=do_cfg,
         )
+        do_true_cfg = do_cfg and negative_prompt_embeds is not None
 
         batch_size = prompt_embeds.shape[0]
 
@@ -479,6 +481,9 @@ class HunyuanVideo15Pipeline(
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
+        # Cache-DiT must use the same CFG decision as the denoising loop.
+        set_separate_cfg(self.transformer, do_true_cfg)
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 self._current_timestep = t
@@ -507,7 +512,7 @@ class HunyuanVideo15Pipeline(
                 }
 
                 negative_kwargs = None
-                if do_cfg and negative_prompt_embeds is not None:
+                if do_true_cfg:
                     negative_kwargs = {
                         "hidden_states": latent_model_input,
                         "timestep": timestep,
@@ -521,7 +526,7 @@ class HunyuanVideo15Pipeline(
                     }
 
                 noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_cfg and negative_kwargs is not None,
+                    do_true_cfg=do_true_cfg,
                     true_cfg_scale=guidance_scale,
                     positive_kwargs=positive_kwargs,
                     negative_kwargs=negative_kwargs,
@@ -532,7 +537,7 @@ class HunyuanVideo15Pipeline(
                     noise_pred,
                     t,
                     latents,
-                    do_true_cfg=do_cfg and negative_kwargs is not None,
+                    do_true_cfg=do_true_cfg,
                 )
 
                 pbar.update()
