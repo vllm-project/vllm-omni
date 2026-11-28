@@ -289,6 +289,13 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             from vllm_omni.platforms.npu._310p.patch.attention import apply_attention_patches
 
             apply_attention_patches()
+            # ``dist.broadcast`` is a silent no-op on 310P3 HCCL, so the
+            # distributed VAE publishes its result with an all_reduce. Applied
+            # here rather than with the platform patches: importing the VAE
+            # executor during platform setup hits the parallel_state cycle.
+            from vllm_omni.platforms.npu._310p.patch.distributed_vae import apply_patch as apply_distributed_vae_patch
+
+            apply_distributed_vae_patch()
             # 310P matmul is FP16-only: BF16 falls back to the vector unit and
             # runs ~100x slower. Serve the BF16 checkpoint in FP16 instead.
             if od_config.dtype == torch.bfloat16:
