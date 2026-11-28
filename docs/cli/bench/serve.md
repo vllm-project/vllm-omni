@@ -844,16 +844,19 @@ afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The
 runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
 (`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to
 the process). After the subset finishes it scores All Global IA-QTF1 through that
-local judge and writes a `result_acc_*.json` next to the performance JSON
-(`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). Accuracy is published only in
-those `result_acc_*.json` files; the perf `result_test_*.json` keeps generation
-and latency metrics but no `omniinteract.accuracy` block. This is
-protocol-compatible with the paper metric, not a GPT-4o paper-table score. Run
-it from the repository root with two visible GPUs:
+local judge and writes a `result_acc_*.json` under `ACC_BENCH_RESULT_DIR`. The
+MiniCPM-o 4.5 local JSON sets that to `tests/e2e/accuracy/omniinteract/results`
+via `benchmark_env`; if the env is unset, OmniInteract still falls back to
+`BENCHMARK_DIR`. Accuracy is published only in those `result_acc_*.json` files;
+the perf `result_test_*.json` keeps generation and latency metrics but no
+`omniinteract.accuracy` block. This is protocol-compatible with the paper metric,
+not a GPT-4o paper-table score. Run it from the repository root with two visible
+GPUs:
 
 ```bash
 export HF_HOME=/path/to/persistent/huggingface-cache
 export BENCHMARK_DIR=tests/dfx/perf/results
+export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omniinteract/results
 bash tools/nightly/run_nightly_jobs.sh \
   --test-type local \
   --model-type omni \

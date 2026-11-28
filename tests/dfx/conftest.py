@@ -762,6 +762,80 @@ def _cli_int_argument(args: list[str], name: str) -> int | None:
     return int(args[args.index(name) + 1])
 
 
+def _prefixed_accuracy_metrics(result: Mapping[str, object], prefix: str) -> dict[str, object]:
+    return {key: value for key, value in result.items() if isinstance(key, str) and key.startswith(prefix)}
+
+
+def _without_prefixed_keys(result: Mapping[str, object], prefix: str) -> Mapping[str, object]:
+    """Drop ``prefix*`` keys from the persisted perf JSON only; callers keep ``result``."""
+    if not any(isinstance(key, str) and key.startswith(prefix) for key in result):
+        return result
+    return {key: value for key, value in result.items() if not (isinstance(key, str) and key.startswith(prefix))}
+
+
+def _write_chat_accuracy_result(
+    result: Mapping[str, object],
+    *,
+    args: list[str],
+    test_name: str,
+    dataset_name: str,
+    suite: str,
+    metric_prefix: str,
+    default_acc_dir: Path,
+    num_prompt: int,
+    returncode: int,
+    started_at: datetime,
+    current_dt: str,
+    benchmark_params_name: str | None,
+    accuracy_baseline: Mapping[str, object] | None,
+) -> Path | None:
+    """Copy Daily-Omni / Seed-TTS scores into ``result_acc_*.json`` when CI opts in.
+
+    Opt-in is ``ACC_BENCH_RESULT_DIR``. Unset jobs keep scores only in the perf JSON.
+    When set, the persist path also strips those prefixed keys from the written
+    perf JSON and leaves them on the in-memory result for quality assertions.
+    """
+    if not os.environ.get("ACC_BENCH_RESULT_DIR"):
+        return None
+    from tests.e2e.accuracy.helpers import (
+        _acc_result_filename,
+        dfx_accuracy_result_dir,
+        write_dfx_accuracy_result,
+    )
+
+    model_id = result.get("model_id") or _cli_argument(args, "--model")
+    accuracy_path = dfx_accuracy_result_dir(default_acc_dir) / _acc_result_filename(
+        str(model_id),
+        suite,
+        when=started_at,
+    )
+    accuracy = _prefixed_accuracy_metrics(result, metric_prefix)
+    if not accuracy:
+        accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+    write_dfx_accuracy_result(
+        accuracy_path,
+        test_name=test_name,
+        name=benchmark_params_name,
+        model_id=str(model_id),
+        dataset=suite,
+        dataset_path=_cli_argument(args, "--dataset-path", dataset_name),
+        date=str(result.get("date") or current_dt),
+        hardware=str(result["Hardware"]),
+        baseline=accuracy_baseline or {},
+        branch=str(result["branch"]),
+        num_prompts=num_prompt,
+        max_concurrency=_cli_int_argument(args, "--max-concurrency"),
+        benchmark_exit_code=returncode,
+        generation={
+            "completed": result.get("completed", 0),
+            "failed": result.get("failed", 0),
+        },
+        accuracy=accuracy,
+    )
+    print(f"Accuracy result saved to {accuracy_path}")
+    return accuracy_path
+
+
 def _write_omniinteract_accuracy_result(
     result: dict[str, Any],
     *,
@@ -1108,6 +1182,15 @@ def run_benchmark(
             **result,
             "omniinteract": {key: value for key, value in omniinteract_summary.items() if key != "accuracy"},
         }
+    # Daily-Omni / Seed-TTS follow the same persist split when CI sets
+    # ``ACC_BENCH_RESULT_DIR``: prefixed scores live only in ``result_acc_*.json``.
+    if os.environ.get("ACC_BENCH_RESULT_DIR") and (
+        dataset_name == "daily-omni" or (dataset_name == "seed-tts" and "--seed-tts-wer-eval" in args)
+    ):
+        from tests.e2e.accuracy.helpers import _DAILY_OMNI_METRIC_PREFIX, _SEED_TTS_METRIC_PREFIX
+
+        prefix = _DAILY_OMNI_METRIC_PREFIX if dataset_name == "daily-omni" else _SEED_TTS_METRIC_PREFIX
+        persisted = _without_prefixed_keys(persisted, prefix)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
     # Evaluated scores must be published even when no quality baseline is configured.
@@ -1158,6 +1241,34 @@ def run_benchmark(
             # exception, independent of publishing record-only evaluated scores.
             allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
             assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
+    if dataset_name == "daily-omni" or (dataset_name == "seed-tts" and "--seed-tts-wer-eval" in args):
+        from tests.e2e.accuracy.helpers import (
+            _DAILY_OMNI_DATASET,
+            _DAILY_OMNI_DEFAULT_ACC_DIR,
+            _DAILY_OMNI_METRIC_PREFIX,
+            _SEED_TTS_DATASET,
+            _SEED_TTS_DEFAULT_ACC_DIR,
+            _SEED_TTS_METRIC_PREFIX,
+        )
+
+        chat_suite = _DAILY_OMNI_DATASET if dataset_name == "daily-omni" else _SEED_TTS_DATASET
+        chat_prefix = _DAILY_OMNI_METRIC_PREFIX if dataset_name == "daily-omni" else _SEED_TTS_METRIC_PREFIX
+        chat_dir = _DAILY_OMNI_DEFAULT_ACC_DIR if dataset_name == "daily-omni" else _SEED_TTS_DEFAULT_ACC_DIR
+        _write_chat_accuracy_result(
+            result,
+            args=args,
+            test_name=test_name,
+            dataset_name=dataset_name,
+            suite=chat_suite,
+            metric_prefix=chat_prefix,
+            default_acc_dir=chat_dir,
+            num_prompt=num_prompt,
+            returncode=returncode,
+            started_at=started_at,
+            current_dt=current_dt,
+            benchmark_params_name=benchmark_params_name,
+            accuracy_baseline=accuracy_baseline,
+        )
     if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args:
         _write_omniinteract_accuracy_result(
             result,

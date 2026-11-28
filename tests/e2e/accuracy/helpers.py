@@ -649,6 +649,12 @@ _OMNIINTERACT_DATASET = "omniinteract"
 _OMNIINTERACT_AGGREGATE_SUITE = "omniinteract_aggregate"
 _OMNIINTERACT_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omniinteract/results")
 _DUPLEX_EVAL_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omni_duplex_eval/results")
+_DAILY_OMNI_DATASET = "daily_omni"
+_SEED_TTS_DATASET = "seed_tts"
+_DAILY_OMNI_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/daily_omni/results")
+_SEED_TTS_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/seed_tts/results")
+_DAILY_OMNI_METRIC_PREFIX = "daily_omni_"
+_SEED_TTS_METRIC_PREFIX = "seed_tts_"
 _OMNIINTERACT_ALL_GLOBAL_METRICS = (
     "IA_QTF1",
     "Precision",
