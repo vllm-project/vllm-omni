@@ -49,6 +49,10 @@ def _cases():
     ]
 
 
+@pytest.mark.skipif(
+    torch.version.cuda is not None,
+    reason="Temporarily skipped on CUDA pending https://github.com/SHI-Labs/NATTEN/issues/356",
+)
 @pytest.mark.parametrize(("omni_server", "num_inference_steps"), _cases(), indirect=["omni_server"])
 def test_ltx25_pipeline_entries(
     omni_server: OmniServer,
