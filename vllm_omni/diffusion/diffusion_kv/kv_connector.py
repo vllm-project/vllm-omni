@@ -58,7 +58,7 @@ def native_prefetch_enabled(od_config: OmniDiffusionConfig) -> bool:
         or config.kv_role != "kv_consumer"
         or extra.get("mooncake_protocol", "rdma") != "tcp"
         or od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER
-        or od_config.max_num_seqs != 1
+        or od_config.resolved_max_num_seqs() != 1
         or getattr(od_config, "cfg_kv_collect_func", None) is not None
     ):
         raise ValueError(

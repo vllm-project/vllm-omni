@@ -84,7 +84,7 @@ class InlineStageDiffusionClient(StageClientBase):
             "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (max_num_seqs=%d)",
             self.stage_id,
             self.replica_id,
-            self.od_config.max_num_seqs,
+            self.od_config.resolved_max_num_seqs(),
         )
 
     def _enrich_config(self) -> None:

@@ -230,7 +230,7 @@ def _validate_mixed_precision_runtime(
     # The policy resolver validates serialized ModelOpt FP8/NVFP4 configs,
     # including hybrid modelopt_mixed configs. A16 uses each linear's
     # local weight partition; Column/RowParallelLinear owns TP communication.
-    if int(getattr(od_config, "max_num_seqs", 1)) != 1:
+    if od_config.resolved_max_num_seqs() != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
     if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
         raise ValueError(

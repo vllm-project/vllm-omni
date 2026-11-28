@@ -312,7 +312,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_minimax_h3_qwen3vl_patch()
         apply_minimax_h3_qwen3vl_sdpa_patch()
         apply_minimax_h3_qwen3vl_swiglu_patch()
-        set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
+        set_mc2_tokens_capacity(vllm_config, od_config.resolved_max_num_seqs(), 1)
         set_mc2_mask(vllm_config, device)
 
     @classmethod

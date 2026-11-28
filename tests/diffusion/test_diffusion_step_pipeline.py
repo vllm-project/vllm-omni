@@ -529,6 +529,7 @@ def _make_runner(
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner._warmup_profile_records = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -556,6 +557,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner._warmup_profile_records = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )

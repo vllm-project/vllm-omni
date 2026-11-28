@@ -1005,6 +1005,31 @@ class OmniServeCommand(CLISubcommand):
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
         omni_config_group.add_argument(
+            "--diffusion-batching-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON config for the diffusion continuous-batching policy, e.g. "
+                '\'{"drr_alpha":1.0,"drr_beta":1.0}\'. The DRR admission budget is set with '
+                "--max-num-batched-tokens in packed patch tokens, not here; the removed "
+                "compute_unit_budget key is rejected with a migration error. Unknown keys are "
+                "rejected."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-batching-policy",
+            choices=["auto", "fixed", "compute_budget", "profile"],
+            default=None,
+            help=(
+                "Diffusion batching policy. 'auto' (default) enables DRR admission "
+                "(compute_budget) whenever MixFusion is on and uses fixed FIFO otherwise; "
+                "'compute_budget' (DRR admission, requires MixFusion) admits waiting requests "
+                "under a packed-patch-token budget (--max-num-batched-tokens, default 16384); "
+                "'fixed' disables DRR even with MixFusion; "
+                "'profile' ramps batch size and logs data for profiling."
+            ),
+        )
+        omni_config_group.add_argument(
             "--step-execution",
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",

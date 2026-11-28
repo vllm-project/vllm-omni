@@ -12,7 +12,8 @@ import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from types import AsyncGeneratorType
@@ -70,6 +71,7 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.request_streaming import RequestStreamState
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
+from vllm_omni.diffusion.sched.batching_policy import FixedDiffusionBatchingPolicy
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionRequestStatus,
@@ -83,6 +85,15 @@ from vllm_omni.diffusion.utils.pipeline_utils import (
     supports_pre_tokenized_prompt_ids,
 )
 from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
+from vllm_omni.diffusion.warmup_batch_profile import (
+    aggregate_step_records,
+    build_profile_cache_key,
+    choose_sweet_spot_batch,
+    generate_sparse_ladder,
+    load_cached_profile,
+    save_cached_profile,
+    should_stop_early,
+)
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -169,13 +180,6 @@ def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     return pipeline_supports(od_config, "supports_request_batch")
 
 
-def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
-    try:
-        return max(1, int(getattr(od_config, "max_num_seqs", 1)))
-    except (TypeError, ValueError):
-        return 1
-
-
 def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
     """Whether the local pipeline checks cooperative cancellation boundaries."""
     model_cls = resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
@@ -210,6 +214,7 @@ class _RpcTask:
     kwargs: dict | None
     deadline: float | None
     unique_reply_rank: int | None
+    exec_all_ranks: bool = False
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
     interaction_state: SchedulerRequestState | None = None
 
@@ -347,6 +352,7 @@ class DiffusionEngine:
                 )
             self._init_runtime_state()
             self._init_execute_fn()
+            self._run_warmup_calibration()
             self._log_execution_mode(od_config)
         except Exception:
             # close() cannot be used because runtime synchronization state may not exist yet.
@@ -386,6 +392,17 @@ class DiffusionEngine:
                 "conditioning and output ownership are not request-local."
             )
         mixfusion_needs_steps = validate_mixfusion_config(od_config, supported=supports_mixfusion)
+        # DRR admission (policy="compute_budget") is coupled to MixFusion:
+        # cost-normalized aging only pays off when heterogeneous resolutions
+        # can share a batch, so fail fast instead of silently degrading.
+        batching_config = getattr(od_config, "diffusion_batching_config", None)
+        if getattr(batching_config, "uses_compute_budget", False) and not bool(
+            getattr(od_config, "enable_mixfusion", False)
+        ):
+            raise ValueError(
+                "diffusion_batching_config policy='compute_budget' (DRR admission) requires "
+                "enable_mixfusion=True. Enable MixFusion, or use policy='fixed' to disable DRR."
+            )
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if mixfusion_needs_steps and not self.step_execution:
@@ -418,7 +435,7 @@ class DiffusionEngine:
         self.supports_request_batch = supports_request_batch(od_config)
         if (
             not self.supports_request_batch
-            and _max_num_seqs(od_config) > 1
+            and od_config.resolved_max_num_seqs() > 1
             and not uses_rank_local_dp_concurrency(od_config)
         ):
             raise ValueError(
@@ -530,9 +547,73 @@ class DiffusionEngine:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
             logger.info(
                 "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
-                getattr(od_config, "max_num_seqs", None),
+                od_config.resolved_max_num_seqs(),
                 getattr(od_config, "request_batch_max_wait_ms", None),
             )
+
+    def _run_warmup_calibration(self) -> None:
+        """Startup calibration phase that measures the DRR sweet-spot batch.
+
+        This is an explicit phase of engine startup, not a side effect of
+        logging: it runs right after the executor and scheduler exist because
+        calibration needs a real forward. The calibrated value is applied
+        through ``scheduler.apply_token_budget``, which clamps it to the
+        mode-defined token capacity (the paged KV block table), so capacity
+        always wins over calibration. Dense mode has no token-counted
+        admission capacity and applies the value unclamped.
+
+        It runs only with step execution enabled, DRR as the resolved policy,
+        ``warmup_auto_calibrate`` opted in, and ``max_num_batched_tokens``
+        unset -- an explicit budget is the user's decision and already defines
+        the DRR budget. Skips after the opt-in are logged at INFO.
+        """
+        batching_config = getattr(self.scheduler, "batching_config", None)
+        if batching_config is None or not getattr(batching_config, "warmup_auto_calibrate", False):
+            return
+        if not getattr(batching_config, "uses_compute_budget", False):
+            logger.info("Warmup batch profile skipped: DRR (compute_budget) policy is not enabled.")
+            return
+        if not self.step_execution:
+            logger.info("Warmup batch profile skipped: requires step_execution.")
+            return
+        explicit_budget = self.od_config.max_num_batched_tokens
+        if explicit_budget is not None:
+            logger.info(
+                "Warmup batch profile skipped: explicit max_num_batched_tokens=%s already defines the DRR budget.",
+                explicit_budget,
+            )
+            return
+        try:
+            self.run_warmup_batch_profile()
+        except Exception as e:
+            logger.warning("Warmup batch profile skipped: %s", e, exc_info=True)
+
+    @contextmanager
+    def _calibration_overrides(self, b_max: int) -> Iterator[None]:
+        """Pin admission to the sweep ladder, then always restore startup state.
+
+        The ladder measures full ladder batches, so a ``fixed`` policy keeps
+        DRR from trimming or reordering them, and the count cap is raised
+        because an unset ``max_num_seqs`` leaves the count cap unset. Both
+        are restored on exit, including when the sweep fails, and worker
+        recording is always stopped -- a live recorder adds a device sync to
+        every later denoise step.
+        """
+        saved_policy = self.scheduler.batching_policy
+        saved_max_num_reqs = int(getattr(self.scheduler, "max_num_running_reqs", 1))
+        try:
+            # A fixed policy consumes no token budget, so the temporary count
+            # cap alone bounds each ladder batch.
+            self.scheduler.batching_policy = FixedDiffusionBatchingPolicy()
+            self.scheduler.max_num_running_reqs = b_max
+            yield
+        finally:
+            try:
+                self.collective_rpc("stop_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
+            except Exception:
+                logger.warning("Failed to stop warmup batch profile recording on workers.", exc_info=True)
+            self.scheduler.max_num_running_reqs = saved_max_num_reqs
+            self.scheduler.batching_policy = saved_policy
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -1207,6 +1288,7 @@ class DiffusionEngine:
                     args=task.args,
                     kwargs=task.kwargs,
                     unique_reply_rank=task.unique_reply_rank,
+                    exec_all_ranks=task.exec_all_ranks,
                 )
         except BaseException as exc:  # noqa: BLE001 - propagate to caller
             # The future may have been cancelled (e.g. by a sync timeout
@@ -1650,7 +1732,7 @@ class DiffusionEngine:
             if (
                 not self.od_config.streaming_output
                 or self.execution_mode != DiffusionExecutionMode.STEP_BATCH
-                or self.od_config.max_num_seqs != 1
+                or self.od_config.resolved_max_num_seqs() != 1
                 or not request.use_step_execution
             ):
                 raise ValueError("playback feedback requires step execution, streaming_output=True and max_num_seqs=1")
@@ -1803,77 +1885,103 @@ class DiffusionEngine:
             raise RuntimeError("Diffusion execution completed without an output.")
         return final_output
 
+    def _drive_sync_requests(
+        self,
+        target_ids: list[str],
+        *,
+        expect_single_result: bool = False,
+    ) -> dict[str, DiffusionOutput]:
+        """Drive synchronous target requests to completion, keyed by request id.
+
+        Shared loop behind :meth:`add_req_and_wait_for_response` and
+        :meth:`_add_requests_and_wait`: schedule, prepare KV, execute, poll,
+        update, and finalize until every target request has finished.
+        ``expect_single_result`` keeps the single-request contract of
+        :meth:`add_req_and_wait_for_response`, whose only caller is the
+        synchronous dummy run and therefore expects one scheduled result per
+        step.
+        """
+        target_set = set(target_ids)
+        outputs: dict[str, DiffusionOutput] = {}
+        while target_set:
+            self._process_aborts_queue()
+            try:
+                sched_output = self.scheduler.schedule()
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
+            if sched_output.is_empty:
+                finished_here = target_set & sched_output.finished_req_ids
+                for rid in finished_here:
+                    self._remove_diffusion_kv_requests([rid])
+                    outputs[rid] = self._finalize_finished_request(rid)
+                target_set -= finished_here
+                # Every target finished in this wave, so the loop is done; only
+                # targets still waiting on a scheduler that has nothing left to
+                # run are a dead end.
+                if target_set and not self.scheduler.has_requests():
+                    raise RuntimeError("Diffusion scheduler has no runnable requests.")
+                continue
+
+            scheduled = set(sched_output.scheduled_request_ids)
+            try:
+                self._prepare_kv_for_forward(sched_output)
+                runner_output: BaseRunnerOutput = (
+                    self.execute_fn(sched_output) if scheduled else BatchRunnerOutput.from_list([])
+                )
+                self._poll_native_kv()
+            except EngineDeadError:
+                raise
+            except Exception as exc:
+                if self._closed:
+                    raise
+                logger.error("Execution failed for diffusion requests %s", sorted(scheduled), exc_info=True)
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id=request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for request_id in sorted(scheduled)
+                    ]
+                )
+
+            self._process_aborts_queue()
+            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+
+            if (
+                expect_single_result
+                and scheduled
+                and isinstance(runner_output, BatchRunnerOutput)
+                and len(runner_output) != 1
+            ):
+                raise ValueError("Sync func should receive one result at one time")
+
+            for rid in target_set & finished_req_ids:
+                self._remove_diffusion_kv_requests([rid])
+                output = self._finalize_finished_request(
+                    rid,
+                    runner_output=runner_output.get_request_output(rid),
+                    missing_result_error="Diffusion execution finished without a final output.",
+                )
+                if output.async_output_id:
+                    fut = self.executor.wait_output_ready(output.async_output_id)
+                    output = fut.result(timeout=_async_output_timeout())
+                outputs[rid] = output
+            target_set -= finished_req_ids
+
+        return outputs
+
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             target_request_id = self.scheduler.add_request(request)
-
-            # keep scheduling and executing until the target request is finished
-            while True:
-                self._process_aborts_queue()
-                try:
-                    sched_output = self.scheduler.schedule()
-                except Exception as exc:
-                    self._fail_engine(exc)
-                    raise
-                if sched_output.is_empty:
-                    state = self.scheduler.get_request_state(target_request_id)
-                    if target_request_id in sched_output.finished_req_ids and state is not None and state.is_finished():
-                        self._remove_diffusion_kv_requests([target_request_id])
-                        return self._finalize_finished_request(target_request_id)
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
-
-                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
-                # within _dummy_run, only one request will be scheduled
-                request_id = target_request_id
-                try:
-                    self._prepare_kv_for_forward(sched_output)
-                    runner_output: BaseRunnerOutput = (
-                        self.execute_fn(sched_output)
-                        if sched_output.scheduled_request_ids
-                        else BatchRunnerOutput.from_list([])
-                    )
-                    self._poll_native_kv()
-                except EngineDeadError:
-                    raise
-                except Exception as exc:
-                    if self._closed:
-                        raise
-                    logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        request_id=request_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput.from_exception(exc),
-                    )
-
-                self._process_aborts_queue()
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-
-                # sync func should receive one result
-                if (
-                    sched_output.scheduled_request_ids
-                    and isinstance(runner_output, BatchRunnerOutput)
-                    and len(runner_output) != 1
-                ):
-                    raise ValueError("Sync func should receive one result at one time")
-                if target_request_id in finished_req_ids:
-                    self._remove_diffusion_kv_requests([target_request_id])
-                    req_output = runner_output.get_request_output(target_request_id)
-                    output = self._finalize_finished_request(
-                        target_request_id,
-                        runner_output=req_output,
-                        missing_result_error="Diffusion execution finished without a final output.",
-                    )
-                    if output.async_output_id:
-                        fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_async_output_timeout())
-                    return output
+            outputs = self._drive_sync_requests([target_request_id], expect_single_result=True)
+            return outputs[target_request_id]
 
     def profile(
         self,
@@ -2042,7 +2150,7 @@ class DiffusionEngine:
             self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH
             and uses_rank_local_dp_concurrency(self.od_config)
         )
-        profile_batch_size = 1 if rank_local_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_batch_size = 1 if rank_local_dp_request_mode else self.od_config.resolved_max_num_seqs()
         profile_requests: list[OmniDiffusionRequest] = []
         for index in range(profile_batch_size):
             profile_request = copy.copy(request)
@@ -2076,6 +2184,226 @@ class DiffusionEngine:
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 
+    def _make_warmup_profile_request(self, index: int, height: int, width: int, num_steps: int) -> OmniDiffusionRequest:
+        """Build a synthetic request for the warmup batch-profile ladder."""
+        prompt: OmniTextPrompt = {"prompt": "warmup batch profile"}
+        supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+        if supports_image_input:
+            color_format = image_color_format(self.od_config.model_class_name)
+            dummy_image = PIL.Image.new(color_format, (width, height))
+            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+        if supports_audio_input:
+            audio_sr = 16000
+            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
+            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+
+        return OmniDiffusionRequest(
+            prompt=prompt,
+            request_id=f"warmup_profile_{index}",
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_steps,
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+            ),
+        )
+
+    def _add_requests_and_wait(self, requests: list[OmniDiffusionRequest]) -> list[DiffusionOutput]:
+        """Synchronously drive multiple requests to completion."""
+        requests = [self._prepare_request_for_admission(req) for req in requests]
+        with self._rpc_lock:
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            target_ids = [self.scheduler.add_request(req) for req in requests]
+            outputs = self._drive_sync_requests(target_ids)
+            return [outputs[rid] for rid in target_ids]
+
+    def run_warmup_batch_profile(self) -> None:
+        """Sweep a ladder of batch sizes and apply the sweet-spot token budget.
+
+        The startup preconditions (step execution, DRR policy, opt-in, no
+        explicit budget) live in ``_run_warmup_calibration``; this method
+        assumes they hold. ``_calibration_overrides`` pins the fixed policy
+        and count cap that make each ladder batch measurable, and restores
+        startup state plus stops worker recording on every exit path. The
+        sweet-spot batch is applied as ``token_budget = ref_tokens * B*``
+        through ``scheduler.apply_token_budget``, which clamps it to the
+        mode-defined token capacity. A failure propagates to the startup
+        phase, which logs it and lets startup continue.
+        """
+        batching_config = self.scheduler.batching_config
+
+        start_wall = time.perf_counter()
+        deadline = time.monotonic() + float(batching_config.warmup_profile_timeout_s)
+        b_max = max(2, int(batching_config.warmup_profile_max_batch))
+        levels = generate_sparse_ladder(b_max)
+        ref_h = int(batching_config.warmup_reference_height)
+        ref_w = int(batching_config.warmup_reference_width)
+        num_steps = int(batching_config.warmup_profile_num_steps)
+        discard_steps = int(batching_config.warmup_profile_discard_steps)
+        max_step_ms = batching_config.warmup_profile_max_step_ms
+        min_gain = float(batching_config.warmup_profile_min_marginal_gain)
+
+        cache_dir = os.path.expanduser(
+            getattr(batching_config, "warmup_profile_cache_dir", None) or "~/.cache/vllm_omni/warmup_batch_profile"
+        )
+        # Parallel layout changes how one request is sharded across ranks,
+        # hence the per-step cost of a batch and the sweet-spot B*. Without
+        # these fields a profile measured at TP=1 would be silently reused
+        # for TP=2/4 (same GPU -> same key), yielding a too-small budget.
+        # DP is excluded: replicas calibrate independently. Note the sizes
+        # live on od_config.parallel_config, not on od_config itself.
+        pconf = getattr(self.od_config, "parallel_config", None)
+        cache_fields = {
+            "model": self.od_config.model,
+            "model_class": self.od_config.model_class_name,
+            "gpu": torch.cuda.get_device_name(),
+            "capability": ".".join(str(x) for x in torch.cuda.get_device_capability()),
+            "gpu_memory": torch.cuda.get_device_properties(torch.accelerator.current_device_index()).total_memory,
+            "tp": int(getattr(pconf, "tensor_parallel_size", 1) or 1),
+            "pp": int(getattr(pconf, "pipeline_parallel_size", 1) or 1),
+            "sp": int(getattr(pconf, "sequence_parallel_size", 1) or 1),
+            "cfg": int(getattr(pconf, "cfg_parallel_size", 1) or 1),
+            "ref": f"{ref_h}x{ref_w}",
+            "num_steps": num_steps,
+            "b_max": b_max,
+            "max_step_ms": max_step_ms,
+            "min_gain": min_gain,
+        }
+        cache_key = build_profile_cache_key(cache_fields)
+        cache_enabled = bool(getattr(batching_config, "warmup_profile_cache", True)) and not bool(
+            getattr(batching_config, "warmup_profile_refresh", False)
+        )
+        if cache_enabled:
+            cached = load_cached_profile(
+                cache_dir,
+                cache_key,
+                float(getattr(batching_config, "warmup_profile_cache_ttl_s", 0.0)),
+            )
+            if cached is not None:
+                b_star = int(cached["b_star"])
+                ref_tokens = batching_config.spatial_tokens(ref_h, ref_w)
+                new_budget = int(ref_tokens * b_star)
+                old_budget = int(self.scheduler.token_budget or 0)
+                self.scheduler.apply_token_budget(new_budget)
+                logger.info(
+                    "[WarmupBatchProfile] cache hit key=%s: B*=%s old_budget=%s new_budget=%s capacity=%s "
+                    "(sweep skipped; set warmup_profile_refresh=True to recalibrate)",
+                    cache_key,
+                    b_star,
+                    old_budget,
+                    new_budget,
+                    self.scheduler.token_budget_capacity,
+                )
+                return
+
+        points: list[dict[str, float]] = []
+        stop_reason: str | None = None
+        warmup_request_ids: list[str] = []
+        try:
+            with self._calibration_overrides(b_max):
+                for batch in levels:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"Warmup batch profile timed out after {batching_config.warmup_profile_timeout_s}s."
+                        )
+
+                    self.collective_rpc("start_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
+                    requests = [self._make_warmup_profile_request(i, ref_h, ref_w, num_steps) for i in range(batch)]
+                    warmup_request_ids.extend(req.request_id for req in requests)
+                    outputs = self._add_requests_and_wait(requests)
+                    for output in outputs:
+                        if output.error:
+                            raise RuntimeError(f"Warmup profile request failed: {output.error}")
+                    records = self.collective_rpc(
+                        "collect_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True
+                    )
+                    records = records or []
+                    agg = aggregate_step_records(records, discard_steps)
+                    if not agg:
+                        logger.warning("Warmup batch profile: no valid records at batch=%s.", batch)
+                        continue
+
+                    # Prefer the ladder batch itself; fall back to largest measured.
+                    b_actual = batch if batch in agg else max(agg)
+                    t_ms = agg[b_actual]
+                    thr = b_actual / t_ms if t_ms > 0 else 0.0
+                    point = {"b": float(b_actual), "t": t_ms, "thr": thr}
+                    points.append(point)
+
+                    prev = points[-2] if len(points) >= 2 else None
+                    stop, reason = should_stop_early(prev, point, max_step_ms, min_gain)
+                    if stop:
+                        stop_reason = reason
+                        break
+
+                if not points:
+                    raise RuntimeError("Warmup batch profile collected no valid points.")
+
+                b_star, analysis = choose_sweet_spot_batch(points, max_step_ms, min_gain)
+                if analysis["method"] == "fallback_min_batch":
+                    logger.warning(
+                        "Warmup batch profile: no ladder point within warmup_profile_max_step_ms=%s; "
+                        "falling back to the smallest batch B*=%s.",
+                        max_step_ms,
+                        b_star,
+                    )
+                ref_tokens = batching_config.spatial_tokens(ref_h, ref_w)
+                new_budget = int(ref_tokens * b_star)
+                old_budget = int(self.scheduler.token_budget or 0)
+
+                self.scheduler.apply_token_budget(new_budget)
+
+                logger.info(
+                    "[WarmupBatchProfile] ladder=%s points=%s stop_reason=%s B*=%s method=%s "
+                    "old_budget=%s new_budget=%s capacity=%s elapsed=%.2fs",
+                    levels,
+                    analysis["throughput"],
+                    stop_reason,
+                    b_star,
+                    analysis["method"],
+                    old_budget,
+                    new_budget,
+                    self.scheduler.token_budget_capacity,
+                    time.perf_counter() - start_wall,
+                )
+
+                if cache_enabled:
+                    saved_path = save_cached_profile(
+                        cache_dir,
+                        cache_key,
+                        {
+                            "b_star": b_star,
+                            "budget": new_budget,
+                            "method": analysis["method"],
+                            "stop_reason": stop_reason,
+                            "points": analysis["points"],
+                            "throughput": analysis["throughput"],
+                            "fields": cache_fields,
+                        },
+                    )
+                    if saved_path:
+                        logger.info("[WarmupBatchProfile] cached profile to %s (key=%s)", saved_path, cache_key)
+                    else:
+                        logger.warning("[WarmupBatchProfile] failed to write profile cache under %s.", cache_dir)
+        finally:
+            # Never leak warmup requests into the scheduler: a residual request
+            # in _running/_waiting with popped state poisons every later
+            # schedule() call (KeyError) and kills server startup.
+            try:
+                residual = [rid for rid in warmup_request_ids if self.scheduler.get_request_state(rid) is not None]
+                if residual:
+                    logger.warning("Cleaning up %s residual warmup request(s): %s", len(residual), residual)
+                    self.scheduler.finish_requests(residual, DiffusionRequestStatus.FINISHED_ABORTED)
+                    for rid in residual:
+                        if self._request_cancellations is not None:
+                            self._request_cancellations.finish(rid)
+                        self.scheduler.pop_request_state(rid)
+            except Exception:
+                logger.error("Failed to clean up residual warmup requests.", exc_info=True)
+
     def _submit_rpc(
         self,
         method: str,
@@ -2083,6 +2411,7 @@ class DiffusionEngine:
         args: tuple,
         kwargs: dict | None,
         unique_reply_rank: int | None,
+        exec_all_ranks: bool = False,
     ) -> _RpcTask:
         assert isinstance(method, str), "Only string method names are supported for now"
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -2092,6 +2421,7 @@ class DiffusionEngine:
             kwargs=kwargs,
             deadline=deadline,
             unique_reply_rank=unique_reply_rank,
+            exec_all_ranks=exec_all_ranks,
         )
         with self._cv:
             if method == "submit_interaction":
@@ -2127,6 +2457,7 @@ class DiffusionEngine:
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
 
@@ -2140,6 +2471,8 @@ class DiffusionEngine:
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
             unique_reply_rank: If set, only get reply from this rank
+            exec_all_ranks: If True, run the method on every rank (used for
+                state-sync RPCs); otherwise only the reply rank runs it.
 
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
@@ -2172,9 +2505,10 @@ class DiffusionEngine:
                         args=args,
                         kwargs=kwargs,
                         unique_reply_rank=unique_reply_rank,
+                        exec_all_ranks=exec_all_ranks,
                     )
 
-        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks)
         try:
             return task.future.result(timeout=timeout)
         except concurrent.futures.TimeoutError as exc:
