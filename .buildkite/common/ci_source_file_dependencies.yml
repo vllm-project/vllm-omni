@@ -833,6 +833,12 @@ source_file_dependencies:
     - vllm_omni/worker_v2/streaming_audio.py
     - vllm_omni/worker_v2/warmup.py
 
+  npu_ar_hidden_states:
+    - vllm_omni/worker_v2/omni_ar_model_runner.py
+    - tests/worker_v2/test_omni_ar_model_runner_hidden_states_npu.py
+    - tests/helpers/mark.py
+    - .buildkite/npu/test-npu-ready.yml
+
   # Reusable platform dependencies, composed explicitly by each model job.
   ci_cuda:
     - *gpu_v1_workers
