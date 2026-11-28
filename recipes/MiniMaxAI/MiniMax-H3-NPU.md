@@ -23,6 +23,11 @@ environments. Differences from the GPU path:
   automatically falls back to soundfile / ffmpeg for wav/mp3/m4a/mp4 audio
   inputs.
 
+When references require audio resampling, the encoder leader prepares CPU
+waveforms during visual encoding. Cropping, resampling and channel order are
+preserved, with no waveform or resampling-filter cache across requests.
+Audio-only, native-rate and CPU-autocast requests keep the synchronous path.
+
 For the four-card Ascend 950PR / 950DT route, see
 [MiniMax-H3-NPU-950PR.md](MiniMax-H3-NPU-950PR.md).
 
