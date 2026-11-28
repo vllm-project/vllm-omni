@@ -17,10 +17,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.layers.swiglu7 import SwiGLU7
+from vllm_omni.platforms import current_omni_platform
 
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
 
-_swiglu7_op = SwiGLU7()
+
+def _swiglu7_operator() -> SwiGLU7:
+    """MAGI-2's own activation operator, so the shared layer never reads a MAGI-2 switch."""
+
+    if current_omni_platform.is_npu():
+        from .swiglu7_npu import Magi2SwiGLU7
+
+        return Magi2SwiGLU7()
+    return SwiGLU7()
+
+
+_swiglu7_op = _swiglu7_operator()
 
 
 def swiglu7(

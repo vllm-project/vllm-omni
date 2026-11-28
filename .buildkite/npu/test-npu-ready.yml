@@ -70,6 +70,8 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/models/magi2/test_npu_moe.py
+            tests/diffusion/models/magi2/test_npu_swiglu7.py
             -m 'core_model and npu and A2'
             --run-level 'core_model'
 
