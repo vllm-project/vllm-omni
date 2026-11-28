@@ -42,7 +42,7 @@ placing Code2Wav on the device; its batched backend owns the active caches.
 
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
-  --stage-configs-path vllm_omni/deploy/minicpmo_4_5_turn.yaml
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_turn.yaml
 ```
 
 See the [performance contract](../../docs/design/minicpm_o45_mrv2_performance.md#seed-tts-experimental-optimization-bundle)
