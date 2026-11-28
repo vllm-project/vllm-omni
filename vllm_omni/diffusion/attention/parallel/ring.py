@@ -16,6 +16,7 @@ from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
     HAS_FA3,
     HAS_FA4,
     HAS_FLASH_ATTN,
+    HAS_PPU_FA3,
     bundled_flash_attn_version,
 )
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
@@ -240,9 +241,10 @@ class RingParallelAttention:
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
 
-        # Prefer vLLM's maintained dispatcher. It selects a compatible bundled
-        # FA2/FA3/FA4 kernel for the current CUDA device.
-        if can_use_vllm_fa:
+        # SAIL ships its own FA3 kernel. On CUDA, prefer vLLM's bundled dispatcher.
+        if can_use_fa3 and HAS_PPU_FA3:
+            attn_type = AttnType.FA3
+        elif can_use_vllm_fa:
             attn_type = AttnType.VLLM_FA
         elif can_use_fa4:
             attn_type = AttnType.FA4

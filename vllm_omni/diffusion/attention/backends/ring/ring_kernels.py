@@ -16,6 +16,7 @@ from .ring_globals import (
     HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
+    SAIL_FA3_USES_TUPLE_WINDOW,
     bundled_flash_attn_version,
     fa3_fwd_func,
     fa4_attn_func,
@@ -242,25 +243,56 @@ def flash_attn_forward(
 def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
     """FA3 forward pass for inference.
 
-    This optional source-built FA3 fallback supports Hopper GPUs. Dropout is
-    ignored since FA3 is inference-only. Its low-level API
+    This optional source-built FA3 path supports Hopper and SAIL PPU.
+    Dropout is ignored since FA3 is inference-only. Its low-level API
     (``_flash_attn_forward``) always returns the softmax LSE required for Ring
     Attention's correct accumulation.
     """
     assert HAS_FA3, "FA3 is not available"
     assert fa3_fwd_func is not None, "FA3 low-level API (fa3_fwd_func) not available"
 
-    # Low-level API always returns (out, softmax_lse, S_dmask, rng_state)
-    out, softmax_lse, *_ = fa3_fwd_func(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size[0] if window_size else -1,
-        window_size_right=window_size[1] if window_size else -1,
-        softcap=softcap if softcap else 0.0,
-    )
+    window_left, window_right = window_size or (-1, -1)
+    if SAIL_FA3_USES_TUPLE_WINDOW:
+        out, softmax_lse, *_ = fa3_fwd_func(
+            q=q,
+            k=k,
+            v=v,
+            k_new=None,
+            v_new=None,
+            qv=None,
+            out=None,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            cu_seqlens_k_new=None,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            page_table=None,
+            kv_batch_idx=None,
+            leftpad_k=None,
+            rotary_cos=None,
+            rotary_sin=None,
+            seqlens_rotary=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=(window_left, window_right),
+            softcap=softcap or 0.0,
+        )
+    else:
+        out, softmax_lse, *_ = fa3_fwd_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_left,
+            window_size_right=window_right,
+            softcap=softcap or 0.0,
+        )
 
     # FA3 softmax_lse is (B, H, S).
     return out, softmax_lse

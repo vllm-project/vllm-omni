@@ -3,9 +3,11 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+import inspect
 import logging
 
 import torch
+from vllm.platforms import current_platform
 
 # test if flash_attn (FA2) is available
 try:
@@ -46,6 +48,8 @@ fa3_fwd_func = None  # Low-level forward function (_flash_attn_forward)
 fa3_attn_func = None  # High-level attention function (flash_attn_func)
 # ``None`` means that the extension does not publish an architecture contract.
 FA3_SUPPORTED_CUDA_MAJORS: frozenset[int] | None = None
+HAS_PPU_FA3 = False
+SAIL_FA3_USES_TUPLE_WINDOW = False
 
 # FA4 detection. The CuTe API returns LSE directly, so it can participate in
 # Ring Attention's numerically stable block-wise output accumulation.
@@ -69,9 +73,14 @@ try:
     fa3_fwd_func = _fa3_fwd_func
     fa3_attn_func = _fa3_attn_func
     HAS_FA3 = True
-    # The source-build FA3 interface is the Hopper implementation. Importing
-    # its Python module on Blackwell does not imply that an SM10x kernel exists.
-    FA3_SUPPORTED_CUDA_MAJORS = frozenset({9})
+    is_ppu = getattr(current_platform, "is_ppu", None)
+    HAS_PPU_FA3 = callable(is_ppu) and is_ppu()
+    if HAS_PPU_FA3:
+        # SAIL wheels expose either the tuple-window API or the Hopper-style API.
+        SAIL_FA3_USES_TUPLE_WINDOW = "window_size" in inspect.signature(_fa3_fwd_func).parameters
+    else:
+        # The NVIDIA source build is for Hopper, even if it imports on Blackwell.
+        FA3_SUPPORTED_CUDA_MAJORS = frozenset({9})
 except (ImportError, ModuleNotFoundError):
     pass
 
