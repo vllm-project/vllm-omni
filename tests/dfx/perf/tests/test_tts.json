@@ -1109,8 +1109,7 @@
         ],
         "seed_tts_locale": "en",
         "extra_body": {
-          "voice": "default",
-          "seed": 42
+          "voice": "default"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
@@ -1167,8 +1166,7 @@
         ],
         "seed_tts_locale": "en",
         "extra_body": {
-          "voice": "default",
-          "seed": 42
+          "voice": "default"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "request_rate": [
@@ -1237,9 +1235,6 @@
         ],
         "seed_tts_locale": "en",
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "extra_body": {
-          "seed": 42
-        },
         "hf_output_len": 1000,
         "baseline": {
           "H100": {
@@ -1420,8 +1415,7 @@
         ],
         "seed_tts_locale": "en",
         "extra_body": {
-          "voice": "default",
-          "seed": 42
+          "voice": "default"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
@@ -1478,8 +1472,7 @@
         ],
         "seed_tts_locale": "en",
         "extra_body": {
-          "voice": "default",
-          "seed": 42
+          "voice": "default"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "request_rate": [
@@ -1548,9 +1541,6 @@
         ],
         "seed_tts_locale": "en",
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "extra_body": {
-          "seed": 42
-        },
         "hf_output_len": 1000,
         "baseline": {
           "H100": {
