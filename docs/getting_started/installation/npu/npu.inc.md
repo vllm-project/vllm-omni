@@ -4,6 +4,10 @@
 
 For detailed hardware and software requirements, please refer to the [vLLM-Ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
+Look up your vLLM release in the [NPU version compatibility table](https://github.com/vllm-project/vllm-omni/issues/2223#issuecomment-4705062827).
+To install a released combination, choose a row marked `released` and use the vLLM-Ascend and vLLM-Omni revisions listed there.
+For versions before v0.19.0, see the [earlier compatibility table](https://github.com/vllm-project/vllm-omni/issues/886).
+
 # --8<-- [end:requirements]
 
 # --8<-- [start:installation-release]
@@ -67,8 +71,6 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 The default workdir is `/workspace`, with vLLM, vLLM-Ascend and vLLM-Omni code placed in `/vllm-workspace` installed in development mode.
 
 For other installation methods (pip installation, building from source, custom Docker builds), please refer to the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
-
-We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) up to date with the aligned versions of vLLM, vLLM-Ascend, and vLLM-Omni, and also outlining the Q1 roadmap there.
 
 # --8<-- [end:installation-release]
 
