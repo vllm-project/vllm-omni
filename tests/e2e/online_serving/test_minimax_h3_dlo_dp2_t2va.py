@@ -9,6 +9,7 @@ import concurrent.futures
 import io
 import json
 import os
+import shutil
 
 import av
 import pytest
@@ -28,6 +29,7 @@ NUM_INFERENCE_STEPS = 4
 REQUEST_TIMEOUT_SECONDS = 1800
 TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 MI300_FOUR_CARD_MARKS = hardware_marks(res={"rocm": "MI325"}, num_cards=4)
+pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
 
 SERVER_ARGS = [
     "--trust-remote-code",
@@ -114,6 +116,7 @@ def _run_t2va_request(client: OpenAIClientHandler, seed: int) -> bytes:
                 "duration": 4.0,
                 "aspect_ratio": "16:9",
                 "audio_flow_shift": 3.0,
+                "video_encoder_backend": "ffmpeg",
             },
             separators=(",", ":"),
         ),

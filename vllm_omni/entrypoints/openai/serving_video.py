@@ -141,6 +141,7 @@ class VideoGenerationArtifacts:
     video_frame_counts: list[int] | None = None
     lidar: DiffusionPayloadValue | None = None
     lidar_metadata: dict[str, Any] = field(default_factory=dict)
+    video_encoder_backend: str = "pyav"
 
 
 @dataclass
@@ -630,16 +631,29 @@ class OmniOpenAIServingVideo:
             # A regenerate job is refined at 2K, off the base canvas, and is never cached.
             gen_params.extra_args["latent_cache_key"] = reference_id
 
+        video_encoder_backend = gen_params.extra_args.get("video_encoder_backend", "pyav")
+        if video_encoder_backend not in ("pyav", "ffmpeg"):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Unsupported video encoder backend: {video_encoder_backend}",
+            )
+
         default_fps = self.preencode_mp4_default_fps
         if (
             default_fps is not None
             and "preencode_mp4" not in gen_params.extra_args
+            and video_encoder_backend == "pyav"
             # The worker muxes at the model's native rate and never hands frames to interpolation.
             and not gen_params.enable_frame_interpolation
             and (not fps_provided or vp.fps == default_fps)
         ):
             gen_params.extra_args["preencode_mp4"] = True
         if gen_params.extra_args.get("preencode_mp4"):
+            if video_encoder_backend == "ffmpeg":
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="preencode_mp4 cannot be combined with video_encoder_backend=ffmpeg.",
+                )
             if gen_params.enable_frame_interpolation:
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
@@ -700,6 +714,7 @@ class OmniOpenAIServingVideo:
             lidar=lidar,
             lidar_metadata=dict(lidar_metadata),
             video_frame_counts=list(frame_counts) if frame_counts is not None else None,
+            video_encoder_backend=video_encoder_backend,
         )
 
     async def generate_videos(
@@ -739,6 +754,7 @@ class OmniOpenAIServingVideo:
                 audio_sample_rate=artifacts.audio_sample_rate,
                 video_codec_options=video_codec_options,
                 frame_converter=self._video_frame_converter,
+                backend=artifacts.video_encoder_backend,
                 **encoding_options,
             )
 
@@ -820,6 +836,7 @@ class OmniOpenAIServingVideo:
                 fps=artifacts.output_fps,
                 video_codec_options=video_codec_options,
                 frame_converter=self._video_frame_converter,
+                backend=artifacts.video_encoder_backend,
                 **encoding_options,
             )
             _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000

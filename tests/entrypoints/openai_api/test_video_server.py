@@ -319,6 +319,93 @@ def test_h3_default_preencode_skips_frame_interpolation_requests(mocker: MockerF
         handler.shutdown()
 
 
+@pytest.mark.parametrize("method", ["generate_video_bytes", "generate_videos"])
+def test_h3_ffmpeg_backend_skips_default_preencode(mocker: MockerFixture, method):
+    encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video."
+        + ("_encode_video_bytes" if method == "generate_video_bytes" else "encode_video_base64"),
+        return_value=b"fake-video" if method == "generate_video_bytes" else "fake-video",
+    )
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"video_encoder_backend": "ffmpeg"})
+    try:
+        asyncio.run(getattr(handler, method)(request, "ffmpeg"))
+        assert engine.captured_sampling_params_list is not None
+        assert not engine.captured_sampling_params_list[0].extra_args.get("preencode_mp4")
+        assert encoder.call_args.kwargs["backend"] == "ffmpeg"
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("method", ["generate_video_bytes", "generate_videos"])
+@pytest.mark.parametrize(
+    ("defaults", "extra_params"),
+    [
+        ({}, {"preencode_mp4": True, "video_encoder_backend": "ffmpeg"}),
+        ({"preencode_mp4": True}, {"video_encoder_backend": "ffmpeg"}),
+        ({"preencode_mp4": True, "video_encoder_backend": "ffmpeg"}, {}),
+    ],
+)
+def test_preencode_rejects_ffmpeg_backend_before_generation(method, defaults, extra_params):
+    engine = FakeAsyncOmni()
+    engine.default_sampling_params_list[0].extra_args.update(defaults)
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params=extra_params)
+    try:
+        with pytest.raises(HTTPException, match="preencode_mp4 cannot be combined") as exc:
+            asyncio.run(getattr(handler, method)(request, "conflicting-encoder"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("method", ["generate_video_bytes", "generate_videos"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_rejects_invalid_video_encoder_backend_before_generation(method, inherited):
+    engine = FakeAsyncOmni()
+    extra_params = {"video_encoder_backend": "bogus"}
+    if inherited:
+        engine.default_sampling_params_list[0].extra_args.update(extra_params)
+        extra_params = {}
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params=extra_params)
+    try:
+        with pytest.raises(HTTPException, match="Unsupported video encoder backend") as exc:
+            asyncio.run(getattr(handler, method)(request, "invalid-encoder"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("method", ["generate_video_bytes", "generate_videos"])
+@pytest.mark.parametrize("backend", ["pyav", "ffmpeg"])
+def test_video_encoder_backend_uses_merged_defaults(mocker: MockerFixture, method, backend):
+    encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video."
+        + ("_encode_video_bytes" if method == "generate_video_bytes" else "encode_video_base64"),
+        return_value=b"fake-video" if method == "generate_video_bytes" else "fake-video",
+    )
+    engine = FakeAsyncOmni()
+    engine.default_sampling_params_list[0].extra_args.update(preencode_mp4=True, video_encoder_backend="ffmpeg")
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    # A request may opt out of worker encoding and override the deployment's backend.
+    extra_params: dict[str, bool | str] = {"preencode_mp4": False}
+    if backend == "pyav":
+        extra_params["video_encoder_backend"] = backend
+    request = VideoGenerationRequest(prompt="test", extra_params=extra_params)
+    try:
+        asyncio.run(getattr(handler, method)(request, "inherited-encoder"))
+        assert engine.captured_sampling_params_list is not None
+        assert engine.captured_sampling_params_list[0].extra_args["preencode_mp4"] is False
+        assert encoder.call_args.kwargs["backend"] == backend
+    finally:
+        handler.shutdown()
+
+
 def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 
@@ -2539,8 +2626,9 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio_sample_rate=None,
         video_codec_options=None,
         frame_converter=None,
+        backend="pyav",
     ):
-        del video, fps, audio, video_codec_options, frame_converter
+        del video, fps, audio, video_codec_options, frame_converter, backend
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 
