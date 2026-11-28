@@ -28,10 +28,11 @@ establish duplex latency or interruption behavior.
 
 First-frame delivery requires `talker_first_audio: true` in connector extra,
 a one-frame initial codec chunk, CUDA, a local single-rank Talker and Talker prefix caching disabled.
-The launcher must resolve both stages to the same model, subdirectory, revision and configured dtype.
-Separately launched stages and stages configured for independent weight updates
-use Code2Wav for the entire stream. When CUDA graph memory estimation is enabled,
-the worker measures the Talker's first-frame graph pools before sizing the KV cache.
+The launcher checks that Talker and Code2Wav share a local GPU, weight source,
+Hugging Face configuration, dtype and codec kernel settings. Separately launched
+stages and stages configured for independent weight updates use Code2Wav for the
+entire stream. Graph memory estimation includes the Talker's first-frame pools.
+The extensible KV cache measures available memory with the serving graphs resident.
 Other deployments retain the regular Code2Wav path.
 Set `talker_first_audio: false` (or `VLLM_OMNI_TALKER_FIRST_AUDIO=0`) to disable
 first-frame delivery. To restore the previous codec defaults, also set
@@ -74,7 +75,8 @@ startup; `enforce_eager: true` on stage 2 disables inner graphs. NPU audio uses 
 host materialization path before the native data plane publishes output and
 releases each chunk slot. CUDA retains its asynchronous output path. This
 adaptation alone does not establish a performance or audio-quality gain.
-The duplex profile remains on MRv1.
+The NPU duplex profile also selects MRv2. Duplex audio and interruption behavior
+still need separate validation on Ascend hardware.
 
 Non-streaming NPU Code2Wav uses longer windows: 300 codec frames for the
 first chunk and 325 for subsequent chunks including left context. It caps

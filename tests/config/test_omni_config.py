@@ -1625,12 +1625,18 @@ def test_mooncake_turn_acceptance_overrides_resolve(tmp_path, mooncake):
         ("/alternate", {}, False, False),
         (None, {"stage_2_model_subdir": "alternate"}, False, False),
         (None, {"stage_2_dtype": "float32"}, False, False),
+        (None, {"stage_2_hf_overrides": {"code2wav_config": {"rms_norm_eps": 0.001}}}, False, False),
+        (None, {"hf_overrides": {"code2wav_config": {"rms_norm_eps": 0.001}}}, False, True),
+        (None, {"stage_2_hf_config_path": "/alternate-config"}, False, False),
+        (None, {"stage_2_trust_remote_code": False}, False, False),
+        (None, {"stage_2_quantization": "fp8"}, False, False),
+        (None, {"stage_2_devices": "3"}, False, False),
         (None, {"load_format": "dummy"}, False, False),
         (None, {"stage_2_weight_transfer_config": {"backend": "nccl"}}, False, False),
         (None, {}, True, False),
     ],
 )
-def test_qwen3_omni_first_frame_requires_matching_codec_weights(tmp_path, talker_model, overrides, headless, enabled):
+def test_qwen3_omni_first_frame_requires_matching_codec(tmp_path, talker_model, overrides, headless, enabled):
     from vllm_omni.engine.stage_init_utils import get_stage_connector_spec, load_omni_transfer_config_for_model
 
     model = "/checkpoint"
@@ -1656,6 +1662,34 @@ def test_qwen3_omni_first_frame_requires_matching_codec_weights(tmp_path, talker
     )
     assert spec["extra"]["talker_first_audio"] is enabled
     assert spec["extra"]["codec_chunk_ramp"][0] == 1
+
+
+@pytest.mark.parametrize(
+    "codec_options, enabled",
+    [
+        ({"codec_cudnn_fp32_fallback": False}, False),
+        ({"codec_cudnn_benchmark": True}, False),
+        ({"codec_fused_snake": False}, False),
+        ({"codec_cudnn_fp32_fallback": True, "codec_graph_batch_sizes": [4]}, True),
+    ],
+)
+def test_qwen3_omni_first_frame_checks_the_codec_incoming_connector(tmp_path, codec_options, enabled):
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec, load_omni_transfer_config_for_model
+
+    deploy = tmp_path / "separate-connectors.yaml"
+    deploy.write_text(
+        f"base_config: {_DEPLOY_DIR / 'qwen3_omni_moe.yaml'}\n"
+        "connectors:\n  codec_edge:\n    name: SharedMemoryConnector\n"
+        f"    extra: {json.dumps({'codec_fused_snake': True, **codec_options})}\n"
+        "stages:\n  - stage_id: 2\n    input_connectors:\n      from_stage_1: codec_edge\n"
+    )
+    config = VllmOmniConfig.from_pipeline_config(_qwen3_omni_pipeline(), deploy_config_path=str(deploy))
+    transfer = load_omni_transfer_config_for_model("/checkpoint", str(deploy))
+    talker = config.stage_by_id(1)
+    spec = get_stage_connector_spec(
+        transfer, 1, async_chunk=True, stage_config=talker, local_stages=config.stage_configs
+    )
+    assert spec["extra"]["talker_first_audio"] is enabled
 
 
 def test_qwen3_tts_b2_retunes_do_not_change_base_profile():

@@ -63,6 +63,8 @@ def test_warmup_hook_captures_nothing_without_loaded_code2wav_weights(enable, co
 
 @pytest.mark.parametrize("eager", [False, True])
 def test_talker_first_frame_graphs_are_budgeted_released_and_recaptured(monkeypatch, eager):
+    import vllm.v1.worker.gpu_worker as gpu_worker
+
     from vllm_omni.model_executor.models.qwen3_omni.first_frame_decoder import Qwen3OmniFirstFrameDecoder
     from vllm_omni.worker.base import OmniGPUWorkerBase
 
@@ -76,11 +78,48 @@ def test_talker_first_frame_graphs_are_budgeted_released_and_recaptured(monkeypa
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: (1000 - 100 * len(decoder._graphs), 1000))
     worker = object.__new__(OmniGPUWorkerBase)
-    worker.model_runner = SimpleNamespace(model=model)
+    worker.model_runner = MagicMock(model=model, adaptive_verification=None)
 
     assert worker._profile_auxiliary_graph_memory() == (0 if eager else 400)
     assert not decoder._graphs
-    worker._capture_auxiliary_graphs()
+
+    # Keep vLLM's real warmup, sizing and extension call order. Replace device
+    # operations and distributed collectives at their boundaries.
+    worker.device = torch.device("cpu")
+    worker.compilation_config = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE, compilation_time=0.0, encoder_compilation_time=0.0
+    )
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=worker.compilation_config, kernel_config=SimpleNamespace(enable_jit_warmup=False)
+    )
+    worker.model_config = SimpleNamespace(enforce_eager=eager, seed=0)
+    worker.parallel_config = SimpleNamespace(data_parallel_index=0)
+    worker.cache_config = SimpleNamespace(enable_extensible_kv_cache=True, kv_cache_memory_bytes=None)
+    worker.init_snapshot = SimpleNamespace(free_memory=1000)
+    worker.requested_memory = 1000
+    worker.profiler = MagicMock()
+    worker._kv_cache_config = object()
+    for name in (
+        "kernel_warmup",
+        "warmup_kernels",
+        "run_kv_cache_sizing_warmup",
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+    ):
+        monkeypatch.setattr(gpu_worker, name, MagicMock())
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", MagicMock())
+    monkeypatch.setattr(gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False))
+    monkeypatch.setattr(gpu_worker, "_min_across_ranks", lambda blocks: blocks)
+    monkeypatch.setattr(
+        gpu_worker, "measure_kv_cache_blocks", lambda *a, **kw: torch.accelerator.get_memory_info()[0] // 100
+    )
+    extend = MagicMock()
+    monkeypatch.setattr(gpu_worker, "extend_kv_cache", extend)
+    times = worker.compile_or_warm_up_model()
+    worker.extend_kv_cache(times.num_kv_blocks)
+    extend.assert_called_once_with(worker.model_runner, worker._kv_cache_config, 10 if eager else 6)
     assert len(decoder._graphs) == (0 if eager else 4)
     assert capture.call_count == (0 if eager else 2)
 

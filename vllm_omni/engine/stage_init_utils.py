@@ -2087,6 +2087,8 @@ def get_stage_connector_spec(
     if model_arch != "Qwen3OmniMoeForConditionalGeneration" or role != "talker":
         return spec
 
+    from vllm_omni.model_executor.models.qwen3_omni.codec_config import first_frame_decoders_match
+
     # The Talker loads code2wav.* from its own checkpoint. A separately
     # launched or independently updated codec must render the entire stream.
     codec = next(
@@ -2097,20 +2099,15 @@ def get_stage_connector_spec(
         ),
         None,
     )
-    if not (
+    if (
         isinstance(stage_config, BaseVllmOmniStageConfig)
         and codec is not None
-        and stage_config.weight_transfer_config is None
-        and codec.weight_transfer_config is None
-        and stage_config.model_config.model == codec.model_config.model
-        and stage_config.model_config.model_subdir == codec.model_config.model_subdir
-        and stage_config.model_config.revision == codec.model_config.revision
-        and stage_config.model_config.dtype == codec.model_config.dtype
-        and model_arch == codec.model_config.model_arch
-        and stage_config.load_config.load_format == codec.load_config.load_format != "dummy"
-        and stage_config.load_config.model_loader_extra_config == codec.load_config.model_loader_extra_config
+        and first_frame_decoders_match(
+            stage_config, codec, spec, _get_stage_edge_spec(omni_transfer_config, codec.stage_id)
+        )
     ):
-        spec["extra"] = {**spec.get("extra", {}), "talker_first_audio": False}
+        return spec
+    spec["extra"] = {**spec.get("extra", {}), "talker_first_audio": False}
     return spec
 
 

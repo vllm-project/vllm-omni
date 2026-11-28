@@ -67,11 +67,11 @@ connectors:
       codec_cudnn_fp32_fallback: false
 ```
 
-Use the MRv2 deployment as `base_config` if that is your existing profile.
 The bundled profiles share this connector definition, so the setting reaches
 both the Code2Wav stage and the Talker's optional decoder copy. For custom
 profiles with different connectors, set it on the incoming connector used by
-each of those stages. Disabling the fallback can reintroduce the reported
+each of those stages. If the two settings differ, Code2Wav decodes the entire
+stream, including the first frame. Disabling the fallback can reintroduce the reported
 audio corruption; only do so after validating your stack and decode windows.
 
 FP32 increases Code2Wav memory use; latency depends on the selected kernels.
