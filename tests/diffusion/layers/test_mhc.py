@@ -9,6 +9,7 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers import mhc
 from vllm_omni.diffusion.models.magi2 import layers as model_layers
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
@@ -186,6 +187,19 @@ def spy(monkeypatch, name):
     return launches
 
 
+def post_residual_kernel_name(device_name):
+    """Only native CUDA uses the bit-exact kernel; other backends keep tile."""
+    if device_name == "cuda" and mhc._POST_RESIDUAL_BITEXACT:
+        return "_mhc_post_residual_kernel"
+    return "_mhc_post_residual_tile_kernel"
+
+
+@pytest.mark.cpu
+def test_bitexact_post_residual_targets_only_native_cuda():
+    """ROCm also uses the CUDA device type, so it must not select the PTX path."""
+    assert mhc._POST_RESIDUAL_BITEXACT == current_omni_platform.is_cuda()
+
+
 @pytest.mark.parametrize("device_name", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens,iterations", [(0, 20), (1, 0), (17, 20)])
@@ -197,10 +211,12 @@ def test_coefficients_gpu(monkeypatch, device_name, dtype, tokens, iterations):
     packed[:, 4:8] = args[0].to(dev)
     packed[:, 8:] = args[1].reshape(tokens, 16).to(dev)
     args = (packed[:, 4:8], packed[:, 8:].view(tokens, 4, 4), *(x.to(dev) for x in args[2:]))
-    launches = spy(monkeypatch, "_mhc_post_residual_kernel")
+    launches = spy(monkeypatch, post_residual_kernel_name(device_name))
     actual = mhc.MHCPostResidual()(*args, scale=0.125, iterations=iterations, out_dtype=dtype)
     getattr(torch, device_name).synchronize()
     assert len(launches) == bool(tokens)
+    # Spy records before the launch; also reject a cached launch failure.
+    assert not mhc._FAILED_MHC_KERNELS
     tolerance = {torch.float32: 1e-5, torch.float16: 2e-3, torch.bfloat16: 1.6e-2}[dtype]
     for a, b in zip(actual, reference(args, iterations=iterations, out_dtype=dtype)):
         torch.testing.assert_close(a, b, rtol=tolerance, atol=1e-6)
@@ -276,6 +292,7 @@ def test_gpu_unsupported_layout_falls_back(monkeypatch, device_name):
             pytest.fail("unsupported layouts must not launch the kernel")
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", Forbidden())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", Forbidden())
     monkeypatch.setattr(mhc, "_mhc_mix_kernel", Forbidden())
     args = tuple(x.to(dev) for x in coefficients(streams=3))
     actual = mhc.MHCPostResidual()(*args, scale=0.125, out_dtype=torch.float32)
@@ -330,6 +347,7 @@ def test_kernel_failure_is_cached_and_falls_back(monkeypatch):
             return launch
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", Broken())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", Broken())
     args = tuple(x.contiguous() for x in coefficients(tokens=2))
     op = mhc.MHCPostResidual()
     expected = reference(args)
@@ -355,6 +373,7 @@ def test_kernel_oom_is_propagated_without_caching(monkeypatch):
             return launch
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", OutOfMemory())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", OutOfMemory())
     args = tuple(x.contiguous() for x in coefficients(tokens=2))
     with pytest.raises(RuntimeError, match="out of memory"):
         mhc.MHCPostResidual().forward_cuda(*args, scale=0.125, out_dtype=torch.float32)
@@ -370,6 +389,7 @@ def test_gpu_compiled_parameters_do_not_get_cached(monkeypatch, device_name):
             pytest.fail("compilation must retain the native expression")
 
     monkeypatch.setattr(mhc, "_mhc_post_residual_kernel", Forbidden())
+    monkeypatch.setattr(mhc, "_mhc_post_residual_tile_kernel", Forbidden())
     op = torch.compile(mhc.MHCPostResidual(), backend="eager", fullgraph=True)
     args = list(x.to(dev) for x in coefficients())
     for bias in (0.0, 2.0, -1.0):
