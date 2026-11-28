@@ -859,6 +859,29 @@ def test_forward_returns_each_requests_new_audio_and_rate(stage: ChatterboxS3Gen
     stage.on_requests_finished({"live"})
 
 
+@pytest.mark.parametrize(("rocm", "expected"), [(True, False), (False, True)], ids=["rocm", "cuda"])
+def test_forward_decodes_without_miopen_on_rocm(
+    stage: ChatterboxS3Gen, monkeypatch: pytest.MonkeyPatch, rocm: bool, expected: bool
+) -> None:
+    """MIOpen searches every new convolution shape; ROCm decodes with native convolutions and restores the flag."""
+    from vllm_omni.model_executor.models.chatterbox import chatterbox_s3gen
+
+    monkeypatch.setattr(chatterbox_s3gen.current_omni_platform, "is_rocm", lambda: rocm)
+    seen = []
+
+    def decode_step(*args: object) -> list[torch.Tensor]:
+        seen.append(torch.backends.cudnn.enabled)
+        return []
+
+    monkeypatch.setattr(stage, "decode_step", decode_step)
+    before = torch.backends.cudnn.enabled
+
+    stage(torch.zeros(0, dtype=torch.long), torch.zeros(0), seq_token_counts=[], model_intermediate_buffer=[])
+
+    assert seen == [expected and before]
+    assert torch.backends.cudnn.enabled == before
+
+
 def test_load_weights_fills_every_parameter_and_skips_the_reference_encoders(tmp_path: Path) -> None:
     """The checkpoint also holds the tokenizer and speaker encoder, which run in the API process.
 
