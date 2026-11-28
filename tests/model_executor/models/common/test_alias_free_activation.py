@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.common import alias_free_activation as fir
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 ENV = "VLLM_OMNI_NPU_ANTIALIAS_MAX_CONV_LENGTH"
@@ -199,3 +200,63 @@ def test_alias_free_activation_state_dict_roundtrip(monkeypatch):
     restored.upsample._max_conv_length = 32
     x = torch.randn(2, 3, 129)
     torch.testing.assert_close(restored(x), module(x), rtol=1e-5, atol=1e-6)
+
+
+def test_cpu_input_never_dispatches(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("CPU input must not reach the fused kernel")
+
+    monkeypatch.setattr(fir, "alias_free_snake", unexpected)
+    module = fir.AliasFreeActivation1d(SnakeBeta(3))
+    assert module._fused_eligible  # eligible geometry; only the device holds it back
+    x = torch.randn(2, 3, 129)
+    with torch.no_grad():
+        out = module(x)
+    assert out.shape == x.shape
+
+
+def test_npu_platform_never_dispatches(monkeypatch):
+    module = fir.AliasFreeActivation1d(SnakeBeta(3))
+    x = torch.randn(2, 3, 129)
+    with torch.no_grad():
+        expected = module(x)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("NPU platform must not reach the fused kernel")
+
+    monkeypatch.setattr(fir, "alias_free_snake", unexpected)
+    monkeypatch.setattr(fir.current_omni_platform, "is_npu", lambda: True)
+    with torch.no_grad():
+        out = module(x)
+    torch.testing.assert_close(out, expected)
+
+
+def test_triton_unavailable_stays_usable(monkeypatch):
+    monkeypatch.setattr(fir, "HAS_TRITON", False)
+    module = fir.AliasFreeActivation1d(SnakeBeta(3))
+    x = torch.randn(2, 3, 129)
+    with torch.no_grad():
+        out = module(x)
+    assert out.shape == x.shape
+
+
+def test_dispatch_preserves_state_dict_surface():
+    module = fir.AliasFreeActivation1d(SnakeBeta(3))
+    assert set(module.state_dict()) == {"act.alpha", "act.beta"}
+    restored = fir.AliasFreeActivation1d(SnakeBeta(3))
+    restored.load_state_dict(module.state_dict(), strict=True)
+    assert restored._fused_eligible == module._fused_eligible
+
+
+def test_dispatch_adds_no_parameters_or_buffers():
+    module = fir.AliasFreeActivation1d(SnakeBeta(3))
+    assert set(dict(module.named_parameters())) == {"act.alpha", "act.beta"}
+    assert set(dict(module.named_buffers())) == {"upsample.filter", "downsample.filter"}
+    with torch.no_grad():
+        module.act.precompute_exp_cache()
+    assert set(dict(module.named_buffers())) == {
+        "upsample.filter",
+        "downsample.filter",
+        "act._exp_alpha",
+        "act._inv_beta",
+    }
