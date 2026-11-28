@@ -19,7 +19,9 @@ import pytest
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import PreparedSample
-from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, RealtimeEventCollector
+from vllm_omni.clients import duplex as duplex_client
+from vllm_omni.clients.duplex import PCM16_SAMPLE_RATE
+from vllm_omni.clients.realtime import RealtimeDuplexClient, RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -164,7 +166,7 @@ async def test_padding_works_against_the_real_client() -> None:
     first = sent[0]
     assert first["type"] == "input_audio_buffer.append"
     assert first["input_audio_format"] == "pcm16"
-    assert first["sample_rate_hz"] == runner.PCM16_SAMPLE_RATE
+    assert first["sample_rate_hz"] == PCM16_SAMPLE_RATE
     assert first["duration_ms"] == 20
     assert first["audio_end_ms"] == 20
     assert base64.b64decode(first["audio"]) == bytes(640)  # 20 ms of zeroed PCM16
@@ -179,8 +181,8 @@ async def test_sample_pads_only_after_its_commit(monkeypatch, tmp_path) -> None:
         created.append(client)
         return client
 
-    monkeypatch.setattr(runner, "RealtimeDuplexClient", client_factory)
-    monkeypatch.setattr(runner, "wait_for", _instant_wait)
+    monkeypatch.setattr("vllm_omni.clients.realtime.RealtimeDuplexClient", client_factory)
+    monkeypatch.setattr(duplex_client, "wait_for_condition", _instant_wait)
 
     await runner.generate_sample(
         _sample(),
@@ -195,7 +197,7 @@ async def test_sample_pads_only_after_its_commit(monkeypatch, tmp_path) -> None:
     assert calls[0] == ("commit", None)
     # The padding period comes from the session's negotiated chunk period,
     # not from the test: only its shape is pinned here.
-    assert calls[1:] and all(call[0] == "append_silence" and call[1] > 0 for call in calls[1:])
+    assert calls[1:] and all(call[0] == "append_silence" and call[1] is not None and call[1] > 0 for call in calls[1:])
 
 
 async def test_padding_stops_when_the_drain_finishes() -> None:
@@ -263,8 +265,8 @@ async def test_stalled_input_is_bounded_and_the_sample_still_lands(monkeypatch, 
         created.append(client)
         return client
 
-    monkeypatch.setattr(runner, "RealtimeDuplexClient", client_factory)
-    monkeypatch.setattr(runner, "wait_for", _instant_wait)
+    monkeypatch.setattr("vllm_omni.clients.realtime.RealtimeDuplexClient", client_factory)
+    monkeypatch.setattr(duplex_client, "wait_for_condition", _instant_wait)
 
     result = await asyncio.wait_for(
         runner.generate_sample(

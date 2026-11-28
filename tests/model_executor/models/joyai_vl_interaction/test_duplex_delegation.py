@@ -15,9 +15,9 @@ from dataclasses import dataclass
 import pytest
 
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex import delegation
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAIDataPlane, advance_chunk
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import Action, ParsedAction, parse_action
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -51,7 +51,7 @@ def _stage0(text: str, *, finished: bool = False) -> _Stage0Output:
 
 
 def _delegation_calls(events: list[dict[str, object]]) -> list[dict[str, object]]:
-    return [event["joyai_function_call"] for event in events if isinstance(event.get("joyai_function_call"), dict)]
+    return [call for event in events if isinstance(call := event.get("joyai_function_call"), dict)]
 
 
 def accepted(*, call_id: str = "call_1", output: str = "It is smoking.", runtime=None):
@@ -126,7 +126,9 @@ def test_streaming_delegation_waits_until_generation_completes(partial):
     assert all(not event.get("abort_data_plane_request") for event in prefix + at_marker)
     finished = list(plane.project({"data_plane_outputs": [_stage0(DELEGATED, finished=True)]}, context=context))
     [call] = _delegation_calls(finished)
-    assert json.loads(call["arguments"]) == {"note": "Checking the pot.", "question": "Is the pot overheated?"}
+    arguments = call["arguments"]
+    assert isinstance(arguments, str)
+    assert json.loads(arguments) == {"note": "Checking the pot.", "question": "Is the pot overheated?"}
     spoken = "".join(event.get("text") or "" for event in prefix + at_marker + finished)
     assert spoken == "Checking the pot."
     assert "Is the pot overheated?" not in spoken
@@ -152,7 +154,9 @@ def test_streamed_note_still_emits_lifecycle_when_the_question_completes():
     assert "Checking the pot." == "".join(event.get("text") or "" for event in streamed)
     finished = list(plane.project({"data_plane_outputs": [_stage0(DELEGATED, finished=True)]}, context=context))
     [call] = _delegation_calls(finished)
-    assert json.loads(call["arguments"]) == {"note": "Checking the pot.", "question": "Is the pot overheated?"}
+    arguments = call["arguments"]
+    assert isinstance(arguments, str)
+    assert json.loads(arguments) == {"note": "Checking the pot.", "question": "Is the pot overheated?"}
     [lifecycle] = _note_lifecycle(finished)
     assert lifecycle.get("text") == ""
     assert lifecycle.get("end_of_turn") is True
@@ -244,7 +248,7 @@ def test_result_is_cut_to_the_digest_limit():
 
 
 def test_oldest_result_is_evicted_at_the_capacity():
-    runtime = {}
+    runtime: dict[str, object] = {}
     for index in range(delegation.MAX_DELEGATION_RESULTS + 2):
         runtime = accepted(call_id=f"call_{index}", runtime=runtime)
     kept = [record["call_id"] for record in delegation.result_records(runtime)]

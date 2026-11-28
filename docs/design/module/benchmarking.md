@@ -52,6 +52,17 @@ when an enabled workload requires `server_vad`. This CPU preflight uses the
 effective deploy configuration, including inherited VAD model paths. It does
 not create the model engine or a duplex session.
 
+The Realtime benchmark probe lives in `vllm_omni.clients.realtime` and reuses
+the public duplex event collector. Benchmark modules import client libraries
+only when executing a workload, keeping the server CLI import graph free of
+client code. Metrics consume the collected events directly without a replay
+copy.
+
+The probe's PCM/video streaming uses the public client's native unit boundaries:
+the first frame accompanies the 1000 ms reservation, then each subsequent
+1000 ms reservation. MiniCPM-o supplies the first mel window's padding inside
+Stage 0; clients do not delay the first camera frame to 1030 ms.
+
 The Realtime benchmark client treats `server_vad_unavailable` and
 `semantic_vad_unavailable` as terminal backend configuration errors. It stops
 streaming and waiting while preserving the protocol error code and message.

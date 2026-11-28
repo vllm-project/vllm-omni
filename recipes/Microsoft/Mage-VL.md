@@ -9,14 +9,14 @@
 - Task: Image understanding, video understanding, codec-native video understanding,
   and event-gated streaming commentary
 - Mode: Full-duplex WebSocket server and session adapter in
-  `vllm_omni/experimental/fullduplex/mage_vl`
+  `vllm_omni/entrypoints/mage_vl`
 - Maintainer: Community
 
 ## Status
 
-This experimental integration provides the Mage-VL adapter contract: bounded causal
+This standalone integration provides the Mage-VL adapter contract: bounded causal
 visual windows, codec-window input, rolling gate evaluation, explicit query handling,
-per-session state isolation, and stale-output cancellation through the shared
+per-session state isolation, and stale-output cancellation through its standalone
 full-duplex runtime.
 
 The production transport exposes `WebSocket /v1/mage-vl/duplex`, with bearer-token
@@ -33,7 +33,7 @@ startup fails with an actionable error when `cv-preinfer` is unavailable; use
 ## Serving
 
 ```bash
-python -m vllm_omni.experimental.fullduplex.mage_vl.serving.server \
+python -m vllm_omni.entrypoints.mage_vl.serving.server \
   --model microsoft/Mage-VL --host 0.0.0.0 --port 8090 \
   --auth-token "$MAGE_VL_API_KEY" --max-sessions 32 \
   --video-backend frames --num-frames 8 --target-fps 1 \
@@ -63,8 +63,8 @@ including:
 ## Adapter Shape
 
 ```python
-from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
-from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter, MageVLDuplexRuntime
+from vllm_omni.entrypoints.mage_vl.core.session import DuplexSession, DuplexSessionConfig
+from vllm_omni.entrypoints.mage_vl import MageVLDuplexAdapter, MageVLDuplexRuntime
 
 
 adapter = MageVLDuplexAdapter(gate=run_mage_gate, generate=run_mage_decoder)
@@ -80,7 +80,7 @@ runtime = MageVLDuplexRuntime(session, adapter)
 await runtime.run(input_events, emit_event)
 ```
 
-Input events use the shared full-duplex protocol. For decoded video/image, pass the frame
+Input events use the Mage-VL standalone full-duplex protocol. For decoded video/image, pass the frame
 payload directly. For codec-native streaming, pass `modality="codec_window"` and include
 fields such as `segment_id`, `pts_ms`, `duration_ms`, `codec`, and `metadata`.
 

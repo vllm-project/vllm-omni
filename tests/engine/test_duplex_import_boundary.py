@@ -164,8 +164,12 @@ import vllm_omni  # the package __init__ loads its own baseline graph
 baseline = set(sys.modules)
 
 from vllm_omni.clients.duplex import EventCollector
+from vllm_omni.clients.realtime import RealtimeDuplexClient
+from vllm_omni.clients.video_stacking import unit_subframe_offsets
 
-collector = EventCollector()
+assert unit_subframe_offsets(1) == []
+collector = RealtimeDuplexClient("ws://unused").events
+assert isinstance(collector, EventCollector)
 chunk = base64.b64encode(b"\\x00\\x00" * 2400).decode("ascii")
 collector.add({"type": "response.created", "response_id": "r1"}, received_at_s=1.0)
 collector.add({"type": "response.output_audio.delta", "response_id": "r1", "delta": chunk}, received_at_s=1.1)

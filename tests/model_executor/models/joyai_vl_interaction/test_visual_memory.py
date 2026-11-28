@@ -13,8 +13,8 @@ from vllm_omni.engine.duplex.visual_memory import (
     VisualMemory,
     VisualMemoryCapacityError,
 )
-from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary, Summarizer
-from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
+from vllm_omni.entrypoints.joyvl.memory.memory import MidTermSummary, Summarizer
+from vllm_omni.entrypoints.joyvl.serving.config import InteractionConfig
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
