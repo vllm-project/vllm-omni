@@ -1229,8 +1229,22 @@ class DuplexSessionRunner:
                 if not await self._submit_buffered_media():
                     return
                 session.mark_user_input_activity()
+                payload: dict[str, object] = {
+                    "type": "text",
+                    "text": command.text,
+                    "force_listen": command.force_listen is True,
+                }
+                if (
+                    command.force_listen is not True
+                    and session.active_response_id is None
+                    and (
+                        self.run.interruption_pending
+                        or self.run.interrupted_through_turn == (session.epoch, session.turn_id - 1)
+                    )
+                ):
+                    payload["opens_after_interruption"] = True
                 task = await self._start_append(
-                    {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
+                    payload,
                     final=False,
                     precreate_response=command.force_listen is not True,
                 )

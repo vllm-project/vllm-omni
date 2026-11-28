@@ -640,6 +640,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         video_frames: list[Image.Image] | None = None,
         encoded_frames: list[list[torch.Tensor]] | None = None,
         input_text_token_ids: list[int] | None = None,
+        text_before_unit: bool = False,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
@@ -695,6 +696,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         if interruption:
             input_text_token_ids = [self.turn_eos_token_id]
         has_text = bool(input_text_token_ids)
+        if text_before_unit and input_text_token_ids:
+            # The explicit user turn precedes its assistant unit. Embed the unit
+            # opener with the text so it occupies exactly one scheduler row.
+            input_text_token_ids = [*input_text_token_ids, self.unit_token_id]
         vision_only = audio_waveform is None or len(audio_waveform) == 0
         if vision_only and not num_frames and not has_text:
             return self._stage_prefill_result(False, start_time, "empty audio")
@@ -820,8 +825,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 for prepend_token_id in prepend_text_token_ids:
                     embed_parts.append(self._embed_token(prepend_token_id))
                     token_ids.append(int(prepend_token_id))
-            embed_parts.append(self._embed_token(self.unit_token_id))
-            token_ids.append(self.unit_token_id)
+            if not text_before_unit:
+                embed_parts.append(self._embed_token(self.unit_token_id))
+                token_ids.append(self.unit_token_id)
             if frame_blocks:
                 # Official order inside a unit: every frame_list entry as
                 # <image> + 64 embeds + </image>, then any HD patches as
@@ -857,8 +863,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                         [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
                     )
             if input_text_token_ids and units_built == 0 and not close_interrupted_unit:
-                # Match native streaming_prefill(text_list=...): raw text after
-                # this unit's media, without a new chat template or audio clock.
+                # Ordinary text appends follow the unit's media in native streaming_prefill order.
                 text_ids = torch.tensor(input_text_token_ids, dtype=torch.long, device=self._model_device())
                 embed_parts.append(self._token_embedder()(text_ids))
                 token_ids.extend(input_text_token_ids)

@@ -3,6 +3,7 @@
 """Real-weight duplex concurrency guard for CUDA and ROCm MRv2 defaults."""
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     resolve_ref_audio,
     validated_input_wav,
 )
-from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import DemoState
+from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import DemoState, _write_wav
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import run_multi_session
 from tests.e2e.online_serving.test_minicpmo_4_5_duplex import _run_seeded_text_to_audio
 from tests.helpers.mark import hardware_test
@@ -35,33 +36,45 @@ _SERVER = OmniServerParams(
 
 
 async def _run_interrupted_recall(
-    *, url: str, model: str, cancel: str, secret: str, event_path: Path, interruptions: int = 1
+    *,
+    url: str,
+    model: str,
+    cancel: str,
+    secret: str,
+    event_path: Path,
+    interruptions: int = 1,
+    text_only: bool = False,
+    check_clear: bool = False,
 ):
     """Send the follow-up immediately after cancel, without playback ACKs or filler inputs."""
-    events = []
+    state = DemoState()
+    events = state.events
+    commands = []
     try:
         async with websockets.connect(build_realtime_url(url, model, autostart=False), max_size=None) as ws:
 
             async def send(event):
+                commands.append({"after_received_events": len(events), **event})
                 await ws.send(json.dumps(event))
 
-            async def receive_until(predicate):
+            async def receive_until(predicate, *, timeout=60):
                 async def receive():
                     while True:
                         event = json.loads(await ws.recv())
-                        events.append(event)
+                        event.pop("resume_token", None)
+                        state.add(event)
                         assert event.get("type") != "error", event
                         if predicate(event):
                             return event
 
-                return await asyncio.wait_for(receive(), timeout=60)
+                return await asyncio.wait_for(receive(), timeout=timeout)
 
             await send(
                 {
                     "type": "session.update",
                     "session": {
                         "model": model,
-                        "modalities": ["text", "audio"],
+                        "modalities": ["text"] if text_only else ["text", "audio"],
                         "temperature": 0.0,
                         "extra_body": {"auto_response": True, "force_listen_count": 0},
                         "turn_detection": None,
@@ -71,24 +84,45 @@ async def _run_interrupted_recall(
                 }
             )
             await receive_until(lambda e: e.get("type") == "session.updated")
+            remember = f"Remember the secret word {secret}. Do not say it unless asked."
+            question = "What is the secret word I asked you to remember? Say only that word."
+            if text_only:
+                remember = f"Remember my secret word {secret}. Do not say it unless asked."
+                question = "What was my secret word? Say only that word in English."
             await send(
                 {
                     "type": "input.text.append",
-                    "text": f"Remember the secret word {secret}. Do not say it unless asked.",
+                    "text": remember,
                     "force_listen": True,
                 }
             )
             audio_types = {"response.output_audio.delta", "response.audio.delta"}
+            count_prompt = "Count slowly out loud from one to fifty in English. Say each number. Start now."
+            if text_only:
+                count_prompt = (
+                    "Count slowly from one to one thousand, spelling out every number in English, "
+                    "one at a time. Start now."
+                )
             for index in range(interruptions):
                 # Exercise the reported back-to-back inputs without a LISTEN barrier.
                 await send(
                     {
                         "type": "input.text.append",
-                        "text": "Count slowly out loud from one to fifty in English. Say each number. Start now.",
+                        "text": count_prompt,
                     }
                 )
-                audio = await receive_until(lambda e: e.get("type") in audio_types and e.get("delta"))
-                old_id = audio["response_id"]
+                if text_only:
+                    # Cross a speech-unit boundary before cancelling. On the failing head
+                    # the next answer continued counting even though its ID was fresh.
+                    output = await receive_until(
+                        lambda e: e.get("type") == "response.output_text.delta"
+                        and ("five" in e["delta"].casefold() or e["delta"].strip() == "5"),
+                        # The first silence unit can compile the audio encoder on a cold server.
+                        timeout=120,
+                    )
+                else:
+                    output = await receive_until(lambda e: e.get("type") in audio_types and e.get("delta"))
+                old_id = output["response_id"]
                 assert not any(
                     e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id for e in events
                 ), "The counting response must still be active when interrupted"
@@ -97,7 +131,7 @@ async def _run_interrupted_recall(
                     await send(
                         {
                             "type": "input.text.append",
-                            "text": "What is the secret word I asked you to remember? Say only that word.",
+                            "text": question,
                         }
                     )
                 cancelled = await receive_until(
@@ -121,15 +155,46 @@ async def _run_interrupted_recall(
                 e.get("delta", "") for e in tail if e.get("type") in transcript_types and e.get("response_id") == new_id
             )
             packets = [e for e in tail if e.get("type") in audio_types and e.get("delta")]
+            if check_clear:
+                samples = 0
+                for packet, pcm in zip(packets, state.response_audio_deltas[new_id], strict=True):
+                    samples += len(pcm) // 2
+                    sent_ms = packet["metadata"]["playback"]["sent_ms"]
+                    assert abs(samples * 1000 / packet["sample_rate_hz"] - sent_ms) <= 1, packet["metadata"]
+                played_ms = done["response"]["metadata"]["playback"]["sent_ms"]
+                await send({"type": "playback.ack", "response_id": new_id, "played_ms": played_ms})
+                await receive_until(lambda e: e["type"] == "playback.acknowledged")
+                await send({"type": "output_audio_buffer.clear"})
+                await receive_until(lambda e: e["type"] == "output_audio_buffer.cleared")
+                # Send a whole silent input unit and immediately clear again.
+                await send({"type": "input_audio_buffer.append", "audio": base64.b64encode(bytes(32000)).decode()})
+                await send({"type": "output_audio_buffer.clear"})
+                await receive_until(lambda e: e["type"] == "output_audio_buffer.cleared")
             await send({"type": "session.close"})
             await receive_until(lambda e: e.get("type") == "session.closed")
-            assert DemoState(events=events).stale_audio_delta_count() == 0, "Received audio for a cancelled response"
+            if check_clear:
+                assert sum(e["type"] == "output_audio_buffer.cleared" for e in events) == 2
+            assert state.stale_audio_delta_count() == 0, "Received audio for a cancelled response"
             assert done["response"]["status"] == "completed", done
-            assert packets, tail
-            assert all(e["response_id"] == done["response"]["id"] for e in packets), tail
+            if text_only:
+                assert not packets, tail
+                assert all(e["response_id"] == new_id for e in tail if e["type"] == "response.output_text.delta"), tail
+            else:
+                assert packets and all(e["response_id"] == new_id for e in packets), tail
             return transcript
     finally:
         event_path.write_text(json.dumps(events, ensure_ascii=False, indent=2))
+        event_path.with_suffix(".commands.json").write_text(json.dumps(commands, ensure_ascii=False, indent=2))
+        transcripts = [
+            f"{e['response_id']}  {e.get('transcript', e.get('text', ''))}"
+            for e in events
+            if e["type"] in {"response.output_audio_transcript.done", "response.output_text.done"}
+        ]
+        event_path.with_suffix(".txt").write_text("\n".join(transcripts) + "\n")
+        for response_id, chunks in state.response_audio_deltas.items():
+            _write_wav(
+                event_path.with_name(f"{response_id}.wav"), b"".join(chunks), sample_rate_hz=state.output_sample_rate_hz
+            )
 
 
 def _recalls_own_secret(transcript: str, secret: str, session_secrets: tuple[str, ...]) -> bool:
@@ -170,6 +235,7 @@ def test_mrv2_duplex_immediate_recall_after_interrupt(
                     secret=secret,
                     event_path=tmp_path / f"{secret}.json",
                     interruptions=interruptions,
+                    check_clear=sessions == 1 and interruptions == 1,
                 )
                 for secret in secrets
             )
@@ -177,6 +243,33 @@ def test_mrv2_duplex_immediate_recall_after_interrupt(
 
     for secret, transcript in zip(secrets, asyncio.run(recall()), strict=True):
         assert _recalls_own_secret(transcript, secret, secrets), (secret, transcript)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("minicpmo_4_5_duplex_thinker_only.yaml"),
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        )
+    ],
+    indirect=True,
+)
+def test_thinker_only_recall_after_interrupted_continuation(omni_server, tmp_path: Path):
+    transcript = asyncio.run(
+        _run_interrupted_recall(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            cancel="response.cancel",
+            secret="robin",
+            event_path=tmp_path / "robin.json",
+            text_only=True,
+        )
+    )
+    assert _recalls_own_secret(transcript, "robin", ("robin",)), transcript
 
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.

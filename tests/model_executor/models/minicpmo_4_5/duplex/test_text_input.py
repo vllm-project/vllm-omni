@@ -23,7 +23,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("mode", ["basic", "context"])
-def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_in_sync(mode):
+@pytest.mark.parametrize("text_before_unit", [False, True])
+def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_in_sync(mode, text_before_unit):
     runtime = stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="window-interrupt", window_enabled=True)
     state.context_token_ids = state.context_prefix_token_ids = [200, 201]
@@ -83,6 +84,7 @@ def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_
             state,
             None,
             input_text_token_ids=text_ids,
+            text_before_unit=text_before_unit and not interrupted,
             interruption=interrupted,
             force_listen=interrupted,
             epoch=0,
@@ -105,7 +107,11 @@ def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_
         else:
             assert replaced
             assert result["num_input_tokens"] == len(update.prompt_token_ids)
-            assert state.pending_window_unit.token_ids == [runtime.unit_token_id, 23]
+            expected = [23, runtime.unit_token_id] if text_before_unit else [runtime.unit_token_id, 23]
+            assert state.pending_window_unit.token_ids == expected
+            torch.testing.assert_close(
+                result["inputs_embeds"][-2:], torch.cat([runtime._embed_token(i).reshape(1, -1) for i in expected])
+            )
 
 
 @pytest.mark.parametrize(

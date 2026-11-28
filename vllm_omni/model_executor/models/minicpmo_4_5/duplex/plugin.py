@@ -811,6 +811,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             text = payload.get("text")
             if not isinstance(text, str) or not text:
                 raise ValueError("Text append requires non-empty text")
+            if self.data_plane.thinker_only and payload.get("opens_after_interruption") is True:
+                # After multiple speech units BOS alone can continue the cancelled answer.
+                # Use the same user/assistant boundary as a seeded text turn in resident KV.
+                text = MiniCPMO45DuplexPolicy.user_turn_text(text)
+                payload = {**payload, "text_before_unit": True}
             text_ids = await asyncio.to_thread(tokenizer.encode, text, add_special_tokens=False)
             payload = {**payload, "text_token_ids": text_ids}
         return self.plan_append(

@@ -236,6 +236,26 @@ async def test_control_uses_producer_turn_when_snapshot_includes_cancelled_units
     assert not h.runner.run.interruption_pending
 
 
+@pytest.mark.parametrize("h", [{"thinker_only": True, "stages": 1}, {"stages": 3}], indirect=True)
+@pytest.mark.parametrize("control_confirmed", [False, True])
+async def test_only_new_thinker_text_response_after_interrupt_gets_a_user_turn(h, control_confirmed):
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    await h.run(commands.BargeIn())
+    if control_confirmed:
+        await h.deliver_and_settle(_control(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+
+    for text, forced in (("context", True), ("new question", False), ("continuation", False)):
+        await h.run(commands.AppendText(text=text, force_listen=forced))
+        payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        framed = h.runner.plugin.data_plane.thinker_only and text == "new question"
+        assert bool(payload.get("text_before_unit")) is framed
+        expected = f"\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n" if framed else text
+        tokenizer = next(iter(h.runner.plugin._tokenizers.values()))
+        assert payload["text_token_ids"] == tokenizer.encode(expected, add_special_tokens=False)
+    assert not h.port.aborts and all(s.context.request_id == request_id for s in h.port.submissions)
+
+
 @pytest.mark.parametrize("early_listen_step", [True, False])
 @pytest.mark.parametrize("capped_at_turn_eos", [True, False])
 async def test_cancelled_thinker_length_stop_preserves_the_followup(capped_at_turn_eos, early_listen_step):

@@ -1065,6 +1065,11 @@ for queue updates and the final validity check before delivery.
   if the previous turn sent payloads, and rejects late older-turn callbacks.
   If no payload was sent, the next turn still owns the initial reference-audio
   payload. Normal turn ends advance the cache epoch only once.
+  In Thinker-only mode the first unforced text append that opens a response
+  after interruption uses the seeded user/assistant role delimiters. Its
+  user text follows the closed control unit and precedes the new assistant
+  `<unit>`. This boundary distinguishes the question from speech already in KV
+  if the cancelled reply spanned multiple units.
   The first unforced text reply after interruption starts with `<|tts_bos|>`:
   the text API requests an answer, rather than a continuation of the old speech
   or an empty turn. Forced-listen inputs retain this restart until a reply;

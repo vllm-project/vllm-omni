@@ -854,6 +854,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
             "input_text_token_ids": payload.get("text_token_ids"),
+            "text_before_unit": payload.get("text_before_unit") is True,
             "force_listen": payload.get("force_listen") is True,
             "interruption": payload.get(INTERRUPTION_KEY) is True,
             "stage0_window": window if isinstance(window, dict) else None,

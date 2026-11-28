@@ -222,6 +222,10 @@ class MiniCPMO45DuplexPolicy:
         return cnn_frames // 5
 
     @staticmethod
+    def user_turn_text(text: str) -> str:
+        return f"\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+    @staticmethod
     def session_context_texts(
         instructions: object,
         has_ref_audio: bool,
@@ -237,7 +241,7 @@ class MiniCPMO45DuplexPolicy:
             prefix += "\n<|audio_start|>"
             suffix = "<|audio_end|>" + suffix
         if isinstance(initial_user_text, str) and initial_user_text:
-            suffix += f"\n<|im_start|>user\n{initial_user_text}<|im_end|>\n<|im_start|>assistant\n"
+            suffix += MiniCPMO45DuplexPolicy.user_turn_text(initial_user_text)
         return prefix, suffix
 
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {
