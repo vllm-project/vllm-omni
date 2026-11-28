@@ -148,6 +148,53 @@ def test_function_state_follows_request_identity_when_sampling_rows_move():
     assert model._sessions["one"]["function_call_active"] is False
 
 
+def published_fast_paths(envelope, requests: tuple[str, ...] = ("one",)) -> list[int] | None:
+    """The per-request fast-path flags this wire payload publishes, if any."""
+    flags = envelope.multimodal_outputs.get("nvc_function_fast_path")
+    if flags is None:
+        return None
+    assert len(flags) == len(requests)
+    return [int(flag.reshape(-1)[0]) if hasattr(flag, "reshape") else int(flag) for flag in flags]
+
+
+def publish_then_sample(model, functions, requests=("one",)):
+    """MRv2 publishes the current forward output before sampling commits state."""
+    hidden = torch.nn.functional.one_hot(torch.tensor(functions), num_classes=32).to(torch.float32)
+    envelope = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": name} for name in requests],
+        request_token_spans=[(index, index + 1) for index in range(len(requests))],
+    )
+    sample_frame(model, functions, requests)
+    return envelope
+
+
+def test_fast_path_flag_is_on_exactly_inside_the_published_call():
+    model = sampler_shell()
+    flags = []
+    for raw in (SOTC, 7, EOTC, 7):
+        # Outside a call the thinker publishes no flag at all, so the engine
+        # reads absence as "pace this frame with the client clock again".
+        published = published_fast_paths(publish_then_sample(model, [raw]))
+        flags.append(0 if published is None else published[0])
+    assert flags == [1, 1, 0, 0]
+
+
+def test_fast_path_flag_is_published_per_request():
+    model = sampler_shell()
+    envelope = publish_then_sample(model, [SOTC, 7], ("one", "two"))
+    assert published_fast_paths(envelope, ("one", "two")) == [1, 0]
+    # The other request enters while the first leaves: the flags follow identity.
+    envelope = publish_then_sample(model, [EOTC, SOTC], ("two", "one"))
+    assert published_fast_paths(envelope, ("two", "one")) == [0, 1]
+
+
+def test_fast_path_flag_is_absent_while_no_call_is_open():
+    model = sampler_shell()
+    envelope = publish_then_sample(model, [7])
+    assert published_fast_paths(envelope) is None
+
+
 @pytest.mark.parametrize("failure", ["missing_request", "duplicate_request", "missing_decisions"])
 def test_invalid_sampling_batch_changes_no_request_policy(failure):
     model = sampler_shell()
@@ -245,6 +292,7 @@ def test_padded_forward_and_selected_sampling_rows_make_the_same_function_decisi
     envelope = model.make_omni_output(
         hidden, model_intermediate_buffer=[{"request_id": "one"}], request_token_spans=[(0, scheduled_rows)]
     )
+    assert published_fast_paths(envelope) == [1]
     logits = model.compute_logits(hidden[scheduled_rows - 1 : scheduled_rows])
     model.prepare_duplex_sampling(
         logits, None, (DuplexSamplingRow(0, "one", session_id=None, seq=None, payload=None, max_tokens=None),)
@@ -320,15 +368,15 @@ def _mrv2_sampler(model, monkeypatch):
 def _mrv2_frame(model, runner, functions, requests=("one",), *, partial=False):
     hidden = torch.nn.functional.one_hot(torch.tensor(functions), num_classes=32).float()
     infos = [{"request_id": name} for name in requests]
-    # V2 runs postprocess before sampling. A forced response must still be
-    # visible to both this frame's wire projection and its policy decision.
-    for i, info in enumerate(infos):
-        model.postprocess(hidden[i : i + 1], **info)
+    # Match sample_tokens: make_omni_output, then per-request postprocess,
+    # then native sampling. The published payload cannot read sampled state.
     wire = model.make_omni_output(
         hidden,
         model_intermediate_buffer=infos,
         request_token_spans=[(i, i + 1) for i in range(len(requests))],
     )
+    for i, info in enumerate(infos):
+        model.postprocess(hidden[i : i + 1], **info, multimodal_outputs=wire.multimodal_outputs)
     batch = SimpleNamespace(
         req_ids=list(requests),
         num_reqs=len(requests),
@@ -380,6 +428,7 @@ def test_mrv2_duplex_function_feedback_stays_on_the_same_request_and_frame(monke
     model._sessions["one"].update(forced_function_token=30, forced_function_tokens=[30, 31])
     output, wire = _mrv2_frame(model, runner, [EOTC, SOTC], ("one", "two"))
     assert output.sampled_token_ids.tolist() == [[PAD], [PAD]]
+    assert published_fast_paths(wire, ("one", "two")) == [0, 1]
     assert [int(t) for t in wire.multimodal_outputs["nvc_function_token"]] == [30, SOTC]
     assert [model._sessions[r]["func_token"] for r in ("one", "two")] == [30, SOTC]
     assert model._sessions["one"]["forced_function_tokens"] == [31]
@@ -387,6 +436,7 @@ def test_mrv2_duplex_function_feedback_stays_on_the_same_request_and_frame(monke
     model._sessions["one"]["forced_function_token"] = 31
     output, wire = _mrv2_frame(model, runner, [EOTC, SOTC], ("two", "one"))
     assert output.sampled_token_ids.tolist() == [[TEXT], [PAD]]
+    assert published_fast_paths(wire, ("two", "one")) is None
     assert [int(t) for t in wire.multimodal_outputs["nvc_function_token"]] == [EOTC, 31]
     assert model._sessions["one"]["forced_function_tokens"] == []
     assert model._duplex_previous_text_tokens == {"one": PAD, "two": TEXT}
@@ -400,6 +450,21 @@ def test_mrv2_duplex_function_feedback_stays_on_the_same_request_and_frame(monke
     assert output.num_sampled.tolist() == [0] and output.num_rejected.tolist() == [0]
     assert session["func_token"] == 31 and session["forced_function_tokens"] == [29]
     assert model._duplex_previous_text_tokens["one"] == PAD
+    assert fallback == []
+
+
+def test_mrv2_publishes_current_call_boundaries_before_sampling(monkeypatch):
+    model = sampler_shell()
+    runner, fallback = _mrv2_sampler(model, monkeypatch)
+    for functions, requests, expected in (
+        ([SOTC, 7], ("one", "two"), [1, 0]),
+        ([SOTC, 7], ("two", "one"), [1, 1]),
+        ([EOTC, 7], ("one", "two"), [0, 1]),
+        ([7, EOTC], ("one", "two"), [0, 0]),
+        ([7, 7], ("two", "one"), [0, 0]),
+    ):
+        _, wire = _mrv2_frame(model, runner, functions, requests)
+        assert (published_fast_paths(wire, requests) or [0, 0]) == expected
     assert fallback == []
 
 

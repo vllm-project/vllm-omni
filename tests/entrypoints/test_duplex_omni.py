@@ -134,7 +134,7 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
 def _make_omni(monkeypatch: pytest.MonkeyPatch) -> tuple[DuplexOmni, FakeDuplexEngine]:
     engine = FakeDuplexEngine()
     monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni.DuplexOmniEngine", lambda *args, **kwargs: engine)
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model, *, revision=None: model)
     return DuplexOmni("dummy-model"), engine
 
 

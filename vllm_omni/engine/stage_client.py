@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
 
     from vllm_omni.engine import PayloadSenderInfo
+    from vllm_omni.engine.messages import TextInputUpdate
     from vllm_omni.inputs.data import (
         OmniDiffusionSamplingParams,
         OmniInteractionPrompt,
@@ -39,6 +40,7 @@ class StageClient(Protocol):
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams
+    mrv2_unsupported_sampling_params: tuple[str, ...]
     prompt_transform_func: Any | None
     prompt_expand_func: Any | None
     requires_multimodal_data: bool
@@ -80,6 +82,7 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None: ...
 
+    async def append_text_async(self, update: TextInputUpdate) -> None: ...
     async def get_output_async(self) -> EngineCoreOutputs: ...
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None: ...

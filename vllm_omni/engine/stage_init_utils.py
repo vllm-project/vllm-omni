@@ -22,7 +22,7 @@ import time
 import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -581,6 +581,9 @@ class StageMetadata:
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
     async_chunk_prewarm_payload_func: Callable | None = None
+    # Sampling keys that the stage's MRV2 sampler cannot honor. The frontend
+    # uses this declaration to reject active values before queue admission.
+    mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -673,6 +676,11 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
 
     model_stage = engine_args.get("model_stage")
+    mrv2_unsupported_sampling_params = (
+        tuple(_get_attr_or_item(stage_config, "mrv2_unsupported_sampling_params", ()))
+        if _get_attr_or_item(engine_args, "use_v2_model_runner", False)
+        else ()
+    )
 
     if stage_type == "diffusion":
         return StageMetadata(
@@ -690,6 +698,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             runtime_cfg=runtime_cfg,
             prompt_transform_func=prompt_transform_func,
             cfg_kv_collect_func=cfg_kv_collect_func,
+            mrv2_unsupported_sampling_params=mrv2_unsupported_sampling_params,
         )
 
     engine_output_type = engine_args.get("engine_output_type")
@@ -712,6 +721,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
         async_chunk_prewarm_payload_func=async_chunk_prewarm_payload_func,
+        mrv2_unsupported_sampling_params=mrv2_unsupported_sampling_params,
     )
 
 
@@ -758,6 +768,11 @@ def extract_stage_metadata_from_omni_stage_config(
             runtime_cfg=stage_config.runtime_config,
             prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
             cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
+            mrv2_unsupported_sampling_params=(
+                tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params)
+                if stage_config.model_config.use_v2_model_runner
+                else ()
+            ),
         )
 
     return StageMetadata(
@@ -776,6 +791,11 @@ def extract_stage_metadata_from_omni_stage_config(
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
         async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
+        mrv2_unsupported_sampling_params=(
+            tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params)
+            if stage_config.model_config.use_v2_model_runner
+            else ()
+        ),
     )
 
 
@@ -1228,6 +1248,8 @@ def _project_omni_stage_engine_args(
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
     # Preserve the legacy adapter key even when the topology leaves it unset.
     engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
+    if stage_config.model_config.scheduler_window_policy is not None:
+        engine_args["scheduler_window_policy"] = stage_config.model_config.scheduler_window_policy
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
         moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),
@@ -1655,7 +1677,9 @@ def build_vllm_config(
     # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
     upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
     if upgraded is not vllm_config.quant_config:
-        vllm_config = replace(vllm_config, quant_config=upgraded)
+        # VllmConfig is mutable. Reconstructing it replays runtime-added fields
+        # through Pydantic validation, which can reject otherwise valid configs.
+        vllm_config.quant_config = upgraded
 
     custom_voice_dir = engine_args_dict.get("custom_voice_dir")
     if custom_voice_dir:
@@ -2018,7 +2042,11 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
-def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
+def load_omni_transfer_config_for_model(
+    model: str,
+    config_path: str | None,
+    deployment_scope: str | None = None,
+) -> Any:
     """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
@@ -2033,7 +2061,7 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
         resolved_dict = resolve_deploy_yaml(config_path)
-        return load_omni_transfer_config(config_dict=resolved_dict)
+        return load_omni_transfer_config(config_dict=resolved_dict, deployment_scope=deployment_scope)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
         return None
@@ -2081,6 +2109,10 @@ def get_stage_connector_spec(
                 extra["from_stage"] = int(from_stage)
                 extra["to_stage"] = int(to_stage)
             return {"name": spec.name, "extra": extra}
+    if getattr(omni_transfer_config, "connectors", None):
+        # Other stages in this pipeline use explicit connectors, so this stage
+        # is orchestrator-only and must neither wait for nor send connector chunks.
+        return {"extra": {"role": "none"}}
     return {}
 
 

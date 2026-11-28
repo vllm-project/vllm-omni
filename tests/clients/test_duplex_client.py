@@ -35,6 +35,7 @@ from vllm_omni.clients.duplex import (
     SessionConfig,
     SessionResumed,
     SessionUpdated,
+    acknowledge_collected_playback,
     build_realtime_url,
     chunk_period_ms,
     duplex_unit_boundary_ms,
@@ -262,6 +263,11 @@ def test_session_config_payload_defaults():
     assert "ref_audio" not in payload
 
 
+def test_session_config_payload_omits_unset_modalities():
+    payload = SessionConfig(modalities=None).to_session_payload(model="m")
+    assert "modalities" not in payload
+
+
 def test_session_config_payload_carries_preset_rates():
     config = SessionConfig(
         input_audio=AudioFormat("pcm_f32le", 24_000),
@@ -465,6 +471,25 @@ async def test_resync_required_drops_resume_credential():
 
 # ---------------------------------------------------------------------------
 # Input events (websocket wire shape)
+
+
+@pytest.mark.asyncio
+async def test_append_text_interleaves_with_audio_without_advancing_audio_clock():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        await client.append_audio(b"\x00\x10" * 1600)
+        await client.append_text("hello", force_listen=True)
+        await client.append_audio(b"\x00\x10" * 1600)
+        await client.append_text("world")
+        appends = [e for e in sock.sent if e.get("type") in {"input.text.append", "input_audio_buffer.append"}]
+        assert [e.get("audio_end_ms") for e in appends] == [100, None, 200, None]
+        assert appends[1]["text"] == "hello" and appends[1]["force_listen"] is True
+        assert appends[3]["text"] == "world" and appends[3]["force_listen"] is False
+        with pytest.raises(ValueError, match="non-empty"):
+            await client.append_text("")
+        sock.feed(SESSION_CLOSED)
 
 
 @pytest.mark.asyncio
@@ -1937,3 +1962,91 @@ def test_timing_summary_omits_stage_metrics_when_the_server_sent_none():
 
     assert "stage_metrics" not in timing
     assert "stage0_tokens" not in timing
+
+
+def _text_only_collector(*, server_ttft_ms: float | None = None) -> EventCollector:
+    collector = EventCollector()
+    created: dict[str, object] = {"type": "response.created", "response": {"id": "resp-a"}}
+    if server_ttft_ms is not None:
+        created["response_request_metrics"] = {
+            "source": "server_monotonic_request_start",
+            "measurement_origin": {"ttft": "native request start to first text output"},
+            "ttft_ms": server_ttft_ms,
+        }
+    collector.add(created, received_at_s=10.1)
+    for received_at_s, delta in ((10.3, "Hello"), (11.3, " there"), (12.5, ".")):
+        collector.add(
+            {"type": "response.output_text.delta", "response_id": "resp-a", "delta": delta},
+            received_at_s=received_at_s,
+        )
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=12.6)
+    return collector
+
+
+def test_text_only_response_reports_text_timing_without_audio_fields():
+    timing = _text_only_collector().timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert "audio_output" not in timing
+    assert timing["request_metrics"] == {
+        "source": "client_monotonic_receive",
+        "output_modality": "text",
+        "measurement_origin": {"ttft": "response.created client receive to first non-empty text delta"},
+        "ttft_ms": 200.0,
+    }
+
+
+def test_text_only_response_prefers_server_ttft():
+    timing = _text_only_collector(server_ttft_ms=420.0).timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["request_metrics"]["source"] == "server_request_start_and_client_receive"
+    assert timing["request_metrics"]["ttft_ms"] == 420.0
+    assert timing["request_metrics"]["measurement_origin"]["ttft"] == "native request start to first text output"
+    assert "ttfp_ms" not in timing["request_metrics"]
+
+
+@pytest.mark.parametrize(
+    ("response", "output_modality"),
+    [
+        ({"output_modalities": ["text"]}, "text"),
+        ({"modalities": ["text"]}, "text"),
+        ({"modalities": ["text", "audio"]}, None),
+        ({}, None),
+    ],
+)
+def test_textless_response_modality_comes_from_response_created(response, output_modality):
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a", **response}}, received_at_s=10.1)
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=10.2)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing.get("output_modality") == output_modality
+
+
+def test_session_summary_counts_text_turns_apart_from_audio_turns():
+    summary = summarize_session_request_metrics(
+        [{"ttft_ms": 100.0, "output_modality": "text"}, {"ttft_ms": 300.0, "ttfp_ms": 400.0, "rtf": 0.5}],
+        session_id="sess-1",
+    )
+
+    assert (summary["audio_turn_count"], summary["text_turn_count"]) == (1, 1)
+    assert summary["ttft_ms"]["count"] == 2
+    assert summary["ttfp_ms"]["count"] == 1
+
+
+@pytest.mark.parametrize("supports_playback_ack", [True, False])
+def test_collected_playback_ack_follows_session_capability(supports_playback_ack):
+    sent: list[float] = []
+
+    class _Client:
+        session_info = {"capabilities": {"supports_playback_ack": supports_playback_ack}}
+
+        async def ack_playback(self, played_ms, **_):
+            sent.append(played_ms)
+
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=1.0)
+
+    asyncio.run(acknowledge_collected_playback(_Client(), collector))
+
+    assert sent == ([0] if supports_playback_ack else [])

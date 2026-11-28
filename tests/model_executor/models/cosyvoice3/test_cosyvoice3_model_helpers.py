@@ -947,7 +947,7 @@ def test_dit_compile_selection_controls_only_the_flow_trt_swap(monkeypatch, comp
     else:
         assert decoder.estimator is wrapper
         resolver.assert_called_once_with()
-        builder.assert_called_once_with("flow.decoder.estimator.fp32.onnx", device="cuda")
+        builder.assert_called_once_with("flow.decoder.estimator.fp32.onnx", device="cuda", max_cfg_batch=None)
 
 
 def test_standard_sampling_preserves_parameters_and_excludes_prompt_penalties(monkeypatch):

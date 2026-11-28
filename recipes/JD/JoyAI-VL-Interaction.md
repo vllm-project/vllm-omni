@@ -14,11 +14,12 @@
 
 ## When to use this recipe
 
-Use this to stand up the streaming-interaction serving layer (`vllm_omni/experimental/fullduplex/`).
+Use this to stand up the streaming-interaction serving layer (`vllm_omni/entrypoints/joyvl/`).
 The model is served unchanged by `vllm serve`; this layer adds session state, 3-tier
-summary memory, the per-tick decision, and pluggable ASR / TTS / delegation. For the
-framework internals and how to add another full-duplex model, see
-[`vllm_omni/experimental/fullduplex/README.md`](../../vllm_omni/experimental/fullduplex/README.md).
+summary memory, the per-tick decision, and pluggable ASR / TTS / delegation. See the
+[standalone serving guide](../../docs/serving/standalone_servers.md) for its HTTP
+contract. New native full-duplex integrations use the
+[engine-resident model plugin](../../docs/design/fullduplex.md).
 
 ## Environment
 
@@ -36,9 +37,13 @@ client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeli
 
 The native turn and duplex profiles use Model Runner V2 for every stage on CUDA,
 including Qwen3-ASR in the speech-input profile. Other platforms retain Model
-Runner V1. Text/video duplex streams Talker codec chunks into Code2Wav; the ASR
-profiles pass complete stage outputs. Session memory and tool delegation use the
-same JoyAI plugin with either runner. To compare against V1 on CUDA, set
+Runner V1. The visual duplex profile (`joyai_vl_interaction_duplex.yaml`)
+streams JoyAI text, per-sentence Talker handoffs, and Talker codec chunks into
+Code2Wav. The ASR duplex profile keeps `async_chunk: false` and passes complete
+stage outputs so cancelling an in-flight spoken response and reconnecting
+cannot resume stale speech from the preceding observation; the turn profiles
+also pass complete outputs. Session memory and tool delegation use the same
+JoyAI plugin with either runner. To compare against V1 on CUDA, set
 `model_runner: v1` on each stage in a deploy override.
 
 The Talker follows Qwen3-TTS's `recompute_preemption: fail` policy: a request
@@ -105,7 +110,11 @@ added to the matching user history item, so later camera observations retain the
 spoken task. Text/video-only turns bypass ASR on this deployment. The final
 expanded prompt is checked against JoyAI's context budget after transcription.
 
-Speech output on this profile remains all-sync. Summary memory is a separate follow-up tracked by
+Speech output on this profile uses complete stage outputs (`async_chunk: false`)
+for both spoken (ASR → JoyAI) and bypassed text/video observations. This trades
+first-packet streaming for a fail-closed cancellation and reconnect boundary;
+use the visual duplex profile when chunked output is required without ASR.
+Summary memory is a separate follow-up tracked by
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
 ### Tool delegation
@@ -191,7 +200,7 @@ vllm serve jdopensource/JoyAI-VL-Interaction-Preview \
   --limit-mm-per-prompt '{"image":256,"video":1}'
 
 # 2. Interaction orchestrator (OpenAI-compatible, :8070)
-python -m vllm_omni.experimental.fullduplex.joyvl.serving.server --port 8070 \
+python -m vllm_omni.entrypoints.joyvl.serving.server --port 8070 \
   --main-backend-url http://127.0.0.1:8061/v1 --main-model JoyAI-VL-Interaction-Preview
 ```
 
@@ -267,7 +276,7 @@ orchestrator hands it to a **background brain** — any OpenAI-compatible endpoi
 self-host. Enable it by pointing the orchestrator at one:
 
 ```bash
-python -m vllm_omni.experimental.fullduplex.joyvl.serving.server --port 8070 \
+python -m vllm_omni.entrypoints.joyvl.serving.server --port 8070 \
   --main-backend-url http://127.0.0.1:8061/v1 --main-model JoyAI-VL-Interaction-Preview \
   --delegation-backend-url <brain-endpoint>/v1 \
   --delegation-model <brain-model> --delegation-kind chat

@@ -4,14 +4,13 @@
 import base64
 from pathlib import Path
 
-from vllm_omni.experimental.fullduplex.client import (
+from vllm_omni.clients.duplex import read_pcm16_wav, wait_for_condition
+from vllm_omni.clients.realtime import (
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
     RealtimeDuplexClient,
     RealtimeEventCollector,
     build_realtime_url,
-    read_pcm16_wav,
-    wait_for,
 )
 
 
@@ -25,7 +24,7 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
     client = RealtimeDuplexClient(build_realtime_url(args.url, args.model, autostart=False))
 
     async def until(predicate, label: str) -> None:
-        await wait_for(predicate, timeout_s=args.timeout_s, label=label)
+        await wait_for_condition(predicate, timeout_s=args.timeout_s, label=label)
 
     try:
         await client.__aenter__()

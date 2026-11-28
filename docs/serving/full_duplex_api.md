@@ -152,12 +152,13 @@ WebSocket query parameters cannot switch engines.
     `session.created.session.capabilities` is present before treating the
     connection as full duplex.
 
-**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`), **Qwen3-Omni**
-(`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
+**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`),
+**Realtime-Venus Omni** (`vllm_omni/deploy/realtime_venus_omni.yaml`, the default), **Qwen3-Omni**
+(`vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml`), and **Nemotron VoiceChat**
 (`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
-over this endpoint today. CUDA Qwen3-Omni deployments can use
-`vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` to run the same duplex session
-on Model Runner V2; non-CUDA platforms in that profile stay on V1. PersonaPlex
+over this endpoint today. The Qwen3-Omni deployment selects Model Runner V2
+on CUDA, ROCm and XPU. Its NPU and MUSA V1 overrides are unsupported with
+vLLM 0.34. PersonaPlex
 carries its pre-framework duplex code: its pipeline declares no `duplex_plugin`,
 so it runs turn-based until the
 follow-up PR ports it to the plugin contract
@@ -170,8 +171,9 @@ and automatic responses. Append 1,280-sample (80 ms) input frames; when using
 `stream_pcm`, set `chunk_ms=80`. Pass `instructions` and optional `tools` to
 the preset before opening the session.
 
-JoyVL is a separate HTTP interaction orchestrator and does not use these
-WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).
+JoyAI's native pipeline uses these WebSocket endpoints. Its standalone JoyVL
+HTTP interaction orchestrator remains a separate service; see
+[Standalone Servers](standalone_servers.md).
 
 ## MiniCPM-o Quick Start
 

@@ -101,6 +101,10 @@ class NemotronVoiceChatClientRuntimeConfigError(DuplexRuntimeConfigError):
 #: queue and drain at one forced token per 80 ms frame.
 _MAX_PENDING_FUNCTION_RESPONSE_BATCHES = 8
 
+#: Back-to-back silence frames one tool call may decode, like NVIDIA's
+#: ``MAX_TOOL_TOKENS``. Past it the call finishes at the client frame rate again.
+_FAST_PATH_MAX_STEPS = 512
+
 
 def _stt_config(model_config: Any) -> dict[str, Any]:
     hf_config = getattr(model_config, "hf_config", None)
@@ -261,6 +265,8 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         # once per tokenizer ref, off the orchestrator loop.
         self._tokenizers: dict[str, Any] = {}
         self._tokenizer_lock = asyncio.Lock()
+        # Fast-path steps already issued per request, reset when its call ends.
+        self._fast_path_steps: dict[str, int] = {}
 
     # ---- engine policy (the frame-locked resumable Stage-0 request) ----
 
@@ -354,6 +360,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_finished, output
         if stage_id != 0:
@@ -369,6 +376,36 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             metadata=metadata,
             final_output_type="text",
         )
+
+    def fast_path_active(self, request_id: str, output_metadata: Mapping[str, object]) -> bool:
+        """Decode back to back on silence frames while the function head is inside a tool call.
+
+        The thinker publishes ``nvc_function_fast_path`` as the call state the
+        frame was decoded in, so the first frame inside the call opens the
+        stretch and the frame that decodes ``EOTC`` closes it. One call may
+        issue at most ``_FAST_PATH_MAX_STEPS`` such frames: a model that never
+        leaves the call degrades to one token per client frame again instead of
+        spinning unbounded. The count is per request and resets when the flag
+        drops, which is also the frame that ends the stretch.
+        """
+        flag = output_metadata.get("nvc_function_fast_path")
+        if isinstance(flag, list | tuple):
+            flag = flag[-1] if flag else 0
+        item = getattr(flag, "item", None)
+        if callable(item):
+            flag = item()
+        try:
+            active = int(flag) == 1
+        except (TypeError, ValueError):
+            active = False
+        if not active:
+            self._fast_path_steps.pop(request_id, None)
+            return False
+        steps = self._fast_path_steps.get(request_id, 0)
+        if steps >= _FAST_PATH_MAX_STEPS:
+            return False
+        self._fast_path_steps[request_id] = steps + 1
+        return True
 
     # ---- session policy ----
 

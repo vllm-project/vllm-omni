@@ -23,6 +23,8 @@ from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_serving as adapter
 from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs
 from vllm_omni.benchmarks.patch import patch
+from vllm_omni.clients import duplex as duplex_client
+from vllm_omni.clients import realtime as realtime_client
 from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
@@ -724,12 +726,12 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
     sample = _samples(tmp_path)[0]
     tail_done = asyncio.Event()
     closed_before_tail = False
-    original_wait = runner.wait_for
+    original_wait = duplex_client.wait_for_condition
 
     async def bounded_wait(predicate, **kwargs):
         await original_wait(predicate, timeout_s=0.2, label=kwargs["label"])
 
-    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+    monkeypatch.setattr(duplex_client, "wait_for_condition", bounded_wait)
     monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
 
     async def handler(socket):
@@ -824,12 +826,12 @@ async def test_padding_listens_do_not_reset_the_drain_quiet_window(tmp_path, pre
     """
     sample = _samples(tmp_path)[0]
     monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.15)
-    original_wait = runner.wait_for
+    original_wait = duplex_client.wait_for_condition
 
     async def bounded_wait(predicate, **kwargs):
         await original_wait(predicate, timeout_s=0.5, label=kwargs["label"])
 
-    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+    monkeypatch.setattr(duplex_client, "wait_for_condition", bounded_wait)
 
     sent_listens: list[dict] = []
 
@@ -890,12 +892,12 @@ async def test_drain_settles_when_the_committed_clip_gets_only_a_listen(tmp_path
     """
     sample = _samples(tmp_path)[0]
     monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.15)
-    original_wait = runner.wait_for
+    original_wait = duplex_client.wait_for_condition
 
     async def bounded_wait(predicate, **kwargs):
         await original_wait(predicate, timeout_s=0.8, label=kwargs["label"])
 
-    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+    monkeypatch.setattr(duplex_client, "wait_for_condition", bounded_wait)
 
     async def handler(socket):
         async for raw in socket:
@@ -933,7 +935,7 @@ async def test_a_padding_coding_error_surfaces_through_the_sample(tmp_path, prep
     async def broken_append_silence(self, duration_ms):
         raise AttributeError("append_silence is broken")
 
-    monkeypatch.setattr(runner.RealtimeDuplexClient, "append_silence", broken_append_silence)
+    monkeypatch.setattr(realtime_client.RealtimeDuplexClient, "append_silence", broken_append_silence)
 
     async def handler(socket):
         async for raw in socket:

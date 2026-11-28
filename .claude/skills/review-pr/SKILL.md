@@ -102,6 +102,7 @@ If docs and live code disagree, verify the code/tests and report the drift.
 | --- | --- |
 | [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, pipeline config, or deploy config is added. |
 | [perf-verification.md](references/checks/perf-verification.md) | The PR makes a latency, throughput, memory, or quality claim. |
+| [review-score.md](references/checks/review-score.md) | The user requests a numerical score for the reviewed revision. |
 | [test-quality-evaluation.md](references/checks/test-quality-evaluation.md) | Tests change, are absent for risky code, or may not exercise production behavior. |
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |
 | [verification.md](references/checks/verification.md) | Hardware, a server, or a runnable affected path is available for active verification. |
@@ -234,7 +235,8 @@ direct and brief. For consolidated replies with multiple actions, use its short
 contributor-owned checklist; omit routine process and maintainer CI narration.
 Each finding must include an exact `path:line`, trigger or call path, current
 behavior, impact, and smallest fix direction. If there are no findings, say so
-briefly and name material validation gaps.
+briefly and name material validation gaps. When a score is requested, add the
+[advisory score](references/checks/review-score.md) after the findings.
 
 Keep the review read-only unless the user explicitly authorizes posting. Do not
 submit `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`, add labels, edit code, or push

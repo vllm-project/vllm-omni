@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
-import ast
 import copy
 import json
 import os
@@ -310,7 +309,6 @@ def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
         "h100_2",
         "h100_3",
         "h100_4",
-        "h100_weight_sharing_tp4",
         "b200_1",
         "b200_2",
         "b200_3",
@@ -812,20 +810,6 @@ def test_sensenova_accuracy_is_not_in_daily_pipelines(pipeline: str, monkeypatch
     assert not any("SenseNova-U1" in step.get("label", "") for step in _iter_steps(rendered))
 
 
-@pytest.mark.parametrize("mode", ["text2img", "img2img"])
-def test_sensenova_accuracy_uses_weekly_mark(mode: str) -> None:
-    path = Path(f"tests/e2e/offline_inference/test_sensenova_u1_{mode}_expansion.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    case = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == f"test_sensenova_u1_{mode}_pixel_accuracy"
-    )
-    marks = {ast.unparse(mark) for mark in case.decorator_list}
-    assert "pytest.mark.slow" in marks
-    assert not marks & {"pytest.mark.core_model", "pytest.mark.advanced_model", "pytest.mark.full_model"}
-
-
 def test_voxcpm2_voxtral_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
@@ -928,19 +912,19 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
             "dependency": "tts_ming_weekly",
             "files": ("tests/e2e/offline_inference/test_ming_tts_expansion.py",),
             "retired_files": ("tests/e2e/online_serving/test_ming_tts_expansion.py",),
-            "env": {},
+            "env": {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
         "TTS · GLM Offline · L4": {
             "dependency": "tts_glm_weekly",
             "files": ("tests/e2e/offline_inference/test_glm_tts_expansion.py",),
             "retired_files": ("tests/e2e/online_serving/test_glm_tts_expansion.py",),
-            "env": {},
+            "env": {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
         "TTS · Breeze TTS 2 · L4": {
             "dependency": "tts_breeze_tts2_weekly",
             "extra_dependencies": ("tts_breeze_tts2_mrv2_weekly",),
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
-            "env": {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"},
+            "env": {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
     }
     retired = {
@@ -996,7 +980,7 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert step["source_file_dependencies"] == [
         "tts_qwen3_tts_function",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
     assert "VLLM_OMNI_CI_MODEL_RUNNER" not in command
     assert "failed=0" in command
@@ -1082,7 +1066,7 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tts_minimax_music3_weekly",
         "tts_yue2_weekly",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
     explicit_files = (
         "tests/e2e/offline_inference/test_audex_s2s.py",

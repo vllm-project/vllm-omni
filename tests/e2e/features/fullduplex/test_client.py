@@ -9,13 +9,13 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.client import (
+from vllm_omni.clients.duplex import read_pcm16_wav
+from vllm_omni.clients.realtime import (
     RealtimeDuplexClient,
     RealtimeEventCollector,
     build_realtime_url,
-    read_pcm16_wav,
 )
-from vllm_omni.experimental.fullduplex.video_stacking import (
+from vllm_omni.clients.video_stacking import (
     concat_frames,
     unit_subframe_offsets,
 )
@@ -85,6 +85,28 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
     assert session["idle_timeout_s"] == 900
     assert "session_id" not in session
     assert session["extra_body"] == {"auto_response": True, "force_listen_count": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supports_playback_ack", [True, False])
+async def test_realtime_client_acks_only_when_the_deployment_accepts_acks(supports_playback_ack):
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    client = Client()
+    client.events.add(
+        {"type": "session.created", "session": {"capabilities": {"supports_playback_ack": supports_playback_ack}}}
+    )
+    client.events.add({"type": "response.created", "response_id": "resp_1"})
+
+    await client.acknowledge_playback()
+
+    assert [event["type"] for event in client.sent] == (["playback.ack"] if supports_playback_ack else [])
 
 
 @pytest.mark.asyncio
@@ -465,14 +487,20 @@ def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
 
     # A composite belongs to the unit it was captured in, so it rides the same
     # append as that unit's base frame; a unit without one sends the base alone.
-    assert [event["video_frames"] for event in sent if "video_frames" in event] == [["f0", "s0"], ["f1"]]
+    # Match the native reservation's 1000 ms boundary, including the first unit,
+    # and hold the last video frame when the audio outlives the clip.
+    assert [(event["audio_end_ms"], event["video_frames"]) for event in sent if "video_frames" in event] == [
+        (1000, ["f0", "s0"]),
+        (2000, ["f1"]),
+        (3000, ["f1"]),
+    ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("unit_ms", [32, 1000])
 @pytest.mark.parametrize("send_cost_s", [0.001, 0.040])
 async def test_stream_av_units_pacing_absorbs_send_frame_cost_and_sleep_overshoot(monkeypatch, unit_ms, send_cost_s):
-    from vllm_omni.experimental.fullduplex import client as client_module
+    from vllm_omni.clients import realtime as client_module
 
     class Clock:
         now = 7.0

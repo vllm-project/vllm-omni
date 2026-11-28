@@ -226,12 +226,12 @@ the other protocol.
 | Release and restore stage memory | `POST /v1/omni/sleep`, `POST /v1/omni/wakeup` | [Sleep Mode](../features/sleep_mode.md) |
 | Run one stage per call (experimental) | `POST /v1/run` | [Independent Stage Execution](../features/independent_stage_execution.md) |
 
-## Standalone Experimental Servers
+## Standalone Servers
 
-JoyVL provides a stateful interaction orchestrator in front of another model
-server. It is a separate process with its own routes; they are not additional
-paths on every `vllm serve --omni` instance. See [Standalone Experimental
-Servers](standalone_servers.md) before deploying it.
+JoyVL provides a stateful HTTP interaction orchestrator in front of another
+model server. Mage-VL provides a WebSocket service backed by Transformers.
+Both run as separate processes with their own routes. See
+[Standalone Servers](standalone_servers.md) for deployment and module locations.
 
 ## Compatibility Notes
 

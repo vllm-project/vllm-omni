@@ -483,6 +483,7 @@ class MiniMaxH3ImagePipeline(
                 None,
                 ["model_index.json", "pdd_*", "tokenizer/*", "processor/*", "vae/*"],
                 revision=revision,
+                require_all=True,
             )
         )
 
