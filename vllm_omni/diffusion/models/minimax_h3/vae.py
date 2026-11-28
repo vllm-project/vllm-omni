@@ -438,13 +438,15 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         if not self.decode_only:
-            options = additional_config or {}
-            self.encode_tile_batch_size = options.get("video_vae_encode_tile_batch_size", 1)
+            encode_options = (additional_config or {}).get("video_vae_encode", {})
+            if not isinstance(encode_options, Mapping):
+                raise ValueError("video_vae_encode must be an object")
+            self.encode_tile_batch_size = encode_options.get("tile_batch_size", 1)
             self.encode_tile_geometry = configure_video_encode_tiling(
                 self.remote.model,
                 batch_size=self.encode_tile_batch_size,
-                tile_size=options.get("video_vae_encode_tile_size"),
-                tile_overlap=options.get("video_vae_encode_tile_overlap"),
+                tile_size=encode_options.get("tile_size"),
+                tile_overlap=encode_options.get("tile_min_overlap"),
             )
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps

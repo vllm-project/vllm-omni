@@ -145,7 +145,7 @@ def configure_video_encode_tiling(
 ) -> tuple[int, int] | None:
     """Validate video-only geometry and install the bounded encode task runner."""
     if type(batch_size) is not int or batch_size < 1:
-        raise ValueError("video_vae_encode_tile_batch_size must be a positive integer")
+        raise ValueError("video_vae_encode.tile_batch_size must be a positive integer")
     geometry = None
     if tile_size is not None or tile_overlap is not None:
         size = model.tile_size if tile_size is None else tile_size

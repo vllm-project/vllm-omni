@@ -681,14 +681,14 @@ logs. A successful HTTP response alone does not prove the cache was used.
 
 ## Video VAE encoder tiles
 
-For reference video encoding, merge these parameters into the server's
-`--additional-config` JSON (sizes and overlap are in pixels):
+For reference video encoding, add a `video_vae_encode` object to the server's
+`--additional-config` JSON (tile size and minimum overlap are in pixels):
 
 ```bash
---additional-config '{"video_vae_encode_tile_batch_size":4,"video_vae_encode_tile_size":288,"video_vae_encode_tile_overlap":16}'
+--additional-config '{"video_vae_encode":{"tile_batch_size":4,"tile_size":288,"tile_min_overlap":16}}'
 ```
 
-The default batch size is `1`; omitted geometry uses the checkpoint values.
+The default `tile_batch_size` is `1`; omitted geometry uses the checkpoint values.
 A batch size above `1` lets equal-length reference-video clips share a tile
 forward as independent samples. With VAE tile parallelism enabled, Ascend
 workers distribute `(clip, spatial tile)` pairs across the VAE group. This can

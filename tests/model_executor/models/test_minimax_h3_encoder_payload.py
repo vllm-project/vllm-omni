@@ -210,9 +210,7 @@ def test_encoder_uses_tp_patch_and_leader_on_the_same_rank_set(
     root = _component_root(tmp_path)
     config = _encoder_config(root, trust_remote_code=trust_remote_code)
     config.additional_config = {
-        "video_vae_encode_tile_batch_size": 4,
-        "video_vae_encode_tile_size": 288,
-        "video_vae_encode_tile_overlap": 16,
+        "video_vae_encode": {"tile_batch_size": 4, "tile_size": 288, "tile_min_overlap": 16},
     }
 
     model = encoder_module.MiniMaxH3Encoder(vllm_config=config)
