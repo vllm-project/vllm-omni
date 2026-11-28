@@ -277,11 +277,14 @@ class TestMapMooncakeConfig:
         with pytest.raises(ValueError, match="either"):
             _map_offload_config(args)
 
-    def test_rejects_local_prefix_cache(self):
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_preserves_explicit_local_prefix_cache(self, enabled):
         args = self._args()
-        args.enable_prefix_caching = True
-        with pytest.raises(ValueError, match="enable_prefix_caching=false"):
-            _map_offload_config(args)
+        args.enable_prefix_caching = enabled
+        _map_offload_config(args)
+        assert args.enable_prefix_caching is enabled
+        assert args.kv_transfer_config.kv_connector == "OmniMooncakeStoreConnector"
+        assert args.kv_transfer_config.kv_load_failure_policy == "recompute"
 
     def test_rejects_explicit_transfer_config(self):
         args = self._args()

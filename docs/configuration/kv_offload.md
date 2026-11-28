@@ -123,10 +123,12 @@ outputs and does not add prefix reuse.
 
 This implements milestone M1 (turn serving) of
 [RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908) and adds
-duplex sessions from milestone M2. It is a Mooncake-only external cache: local
-Thinker prefix caching is disabled, so the two caches do not cooperate. The
+duplex sessions from milestone M2. Set `enable_prefix_caching: true` on the
+Thinker stage to combine local GPU KV reuse with Mooncake. Leaving it unset or
+setting it to `false` retains the Mooncake-only mode. Without `mooncake_config`,
+local prefix caching behaves as before. The
 [design document](../design/feature/mooncake_kv_hs_cache.md) describes the
-request lifecycle and the deferred two-level mode.
+request lifecycle and two-level cooperation.
 
 The original adapter integration used vLLM `0.33.0` at source revision
 `4ba787ec9959e566d3b587a796dff07673324da5` and Mooncake `0.3.12.post1`.
@@ -150,7 +152,7 @@ settings. Set this on the Thinker stage:
 stages:
   - stage_id: 0
     model_runner: v2
-    enable_prefix_caching: false
+    enable_prefix_caching: true
     omni_kv_config:
       kv_store_config:
         mooncake_config:
@@ -163,8 +165,8 @@ stages:
 ```
 
 Keep the multimodal processor cache enabled (vLLM's default,
-`mm_processor_cache_gb: 4`); startup rejects `mm_processor_cache_gb: 0`. With
-that cache and local prefix caching both off, vLLM names audio and images by a
+`mm_processor_cache_gb: 4`); startup rejects `mm_processor_cache_gb: 0` when
+local prefix caching is also off. With both disabled, vLLM names audio and images by a
 per-process counter instead of their content. The names repeat after a
 restart, so stored prefixes could be matched to different media.
 
@@ -190,8 +192,12 @@ each prefix lookup and each HS load, and sets the KV-readiness polling budget
 after HS writes finish. It does not bound the duration of blocking Store calls.
 Lookups run asynchronously; one that
 exceeds the deadline is treated as a miss, and later requests skip lookup until
-the stalled reply returns. Account for GPU KV, temporary worker buffers, and
-Mooncake KV/HS/metadata storage separately.
+the stalled reply returns. Account for GPU KV, the local CPU hidden-state
+pool, temporary worker buffers, and Mooncake KV/HS/metadata storage separately.
+The local pool scales with the number of GPU blocks; `max_hs_bytes` does not
+bound it. Full local hits bypass external lookup and restoration. Mixed hits
+load only the suffix beyond the local block boundary, and promote its captures
+into the local pool before those KV blocks can serve another local hit.
 The output tensors handed to Talker are accounted separately from transfer
 staging. A timed-out or cancelled HS read can drain in the background,
 retaining its staging reservation until it finishes. Native KV copies must
@@ -203,8 +209,8 @@ The configuration bridge selects `OmniMooncakeStoreConnector` through vLLM's
 connector extension mechanism and explicitly sets
 `kv_load_failure_policy="recompute"`. Upstream's default is `"fail"`, which
 terminates the request; it does not provide recomputation. Selecting Mooncake
-together with LMCache, a separate `kv_transfer_config`, local Thinker prefix
-caching, or a producer-only/consumer-only role is rejected. Keep Talker prefix
+together with LMCache, a separate `kv_transfer_config`, or a
+producer-only/consumer-only role is rejected. Keep Talker prefix
 caching disabled when comparing Thinker cache behavior.
 
 Online connector reset is not supported: `reset_prefix_cache(reset_connector=True)`
@@ -218,13 +224,17 @@ changing weights, restart with a new namespace or `model_revision`.
 
 The connector adds its operations to the native Mooncake telemetry, exported
 as the `vllm:mooncake_store_operation_*` Prometheus families, labelled by
-`operation` and `status`. At this revision Omni servers export only the
-records of steps that also emit scheduler statistics, at most one step per
-second, so these counts are lower bounds (see the design document).
+`operation` and `status`. Connector records accumulate across throttled
+scheduler steps and are exported at the next statistics emission.
 
 - `joint_load`: one record per load attempt. `ok` restored its blocks (keys);
-  `hs_error`, `kv_error`, `timeout`, and `rejected` recomputed them (failed
-  keys). Restored tokens are keys times the block size.
+  `hs_error`, `kv_error`, `timeout`, `rejected`, and `promotion_error` leave
+  those blocks to recompute (failed keys). Restored tokens are keys times the
+  block size.
+- `prefix_tokens`: token counts in `num_keys`, with statuses `local`,
+  `external`, and `recomputed`. External tokens count only after a successful
+  load reaches an output step; a failed load contributes recomputed tokens
+  when its retry runs.
 - `joint_lookup` and `lookup_wait`: lookups, the blocks found without usable
   HS, and how long requests waited; a `timeout` or `skipped` wait was a miss
   without the cache.
@@ -256,10 +266,36 @@ every field.
   an HS read still accesses them. A late completion must never publish output
   for a cancelled attempt.
 
+### Validation
+
 Validation must cover first writes, confirmed full/partial hits, block-boundary
 and chunked-prefill cases, corrupted/missing objects, failure recovery, and
 request cleanup. Confirm the restored row positions and resulting Talker inputs
 as well as text/audio output; matching text alone cannot validate HS restoration.
+
+The vLLM `0.34.0` scheduler passes a request list to the save hook. The CPU
+regression below exercises the real `build_connector_meta()` entry point with
+both a local hit and an external hit. It checks that only the newly computed
+complete blocks are scheduled for saving, including a case with no new block:
+
+```bash
+python -m pytest tests/distributed/test_mooncake_connector.py \
+  -k test_build_connector_meta_saves_only_new_blocks_after_mixed_hit \
+  -v --run-level core_model
+```
+
+With a running Mooncake master, separately check native Store publication and
+read validation:
+
+```bash
+MOONCAKE_CONFIG_PATH=/path/to/mooncake-store.json \
+  python -m pytest tests/distributed/test_mooncake_hs_store.py \
+    -v --run-level core_model
+```
+
+These native tests use host-memory KV sentinels. They do not transfer model KV
+on a GPU. Both native Store and GPU acceptance tests skip when
+`MOONCAKE_CONFIG_PATH` is unset; a skipped run supplies no acceptance evidence.
 
 The opt-in full-pipeline acceptance tests require two H100-class GPUs and a
 running Store. `tests/engine/test_mooncake_duplex_consistency_qwen3.py` runs
@@ -290,3 +326,15 @@ directory. The test requires exact baseline reproducibility; if that fails,
 establish baseline-derived tolerances before evaluating cached results. The
 test's file writes and save barriers are correctness instrumentation and must
 not be used for performance measurements.
+
+The same test file also compares local-only and combined caching with those
+baselines, confirms the local/external token ranges, and covers mixed hits,
+promotion followed by local reuse, failed mixed reads, and changed image/audio
+content.
+
+Record the Omni commit, vLLM and Mooncake versions, model revision, hardware,
+deployment overrides, and actual test results together. After changing the
+native scheduler or worker integration, rerun the native and full-pipeline
+checks on that runtime. Earlier vLLM `0.33.0` results remain evidence for that
+environment; the CPU save-hook regression alone does not establish GPU
+correctness or performance on vLLM `0.34.0`.

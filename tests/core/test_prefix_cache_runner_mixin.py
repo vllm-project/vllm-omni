@@ -33,7 +33,7 @@ except ModuleNotFoundError:
 
 from tests.core.test_prefix_cache import FakeNewReq, FakeSchedOut, FakeView
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter, PrefixCacheStep, PrefixCacheWriteLayout
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
@@ -384,6 +384,27 @@ def decode_runners(monkeypatch):
 
 def _expect_decode_hit(req_id, positions, tail):
     return torch.stack([_decode_row(req_id, p) for p in positions] + [_decode_row(*tail)])
+
+
+def test_decode_batching_caches_capture_only_policy(decode_runners):
+    r = decode_runners()
+    r._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=False)
+    r.omni_prefix_cache.register_policy(r._omni_cache_policy)
+    for pos in range(8):
+        r.step(
+            {"a": (A_BLOCKS, pos, 1)},
+            new=["a"] if pos == 0 else (),
+            mm={"hidden_states.layer_0": torch.full((1, DECODE_WIDTH), float(pos))},
+        )
+    _, (hidden, mm) = r.step(
+        {"b": (A_BLOCKS, 8, 1)},
+        new=["b"],
+        hits={"b": 8},
+        finished=["a"],
+        mm={"hidden_states.layer_0": torch.full((1, DECODE_WIDTH), 8.0)},
+    )
+    assert hidden is None
+    assert torch.equal(mm["hidden_states.layer_0"]["b"], torch.arange(9.0)[:, None].expand(9, DECODE_WIDTH))
 
 
 @pytest.mark.parametrize(

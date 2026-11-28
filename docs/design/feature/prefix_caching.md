@@ -43,6 +43,13 @@ With this in mind, consider the set of blocks in a 2D layout, where the row repr
 
 Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. Device→host copies use separate pinned staging buffers. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
+For Qwen3-Omni MRv2 with the Mooncake KV/HS connector, the same CPU pool also
+accepts validated external capture blocks before their GPU KV becomes reusable.
+Promotion uses the ordinary slot-claim and write lifecycle, so delayed output
+readers retain their previous rows. The combined mode caches the two captures
+consumed by Talker; the local-only policy is unchanged. See
+[Mooncake two-level cooperation](mooncake_kv_hs_cache.md#two-level-cache-cooperation).
+
 ### Example
 
 !!! note "Note 3"
@@ -243,8 +250,10 @@ reads zeros from the pool for those positions rather than raising. Abort still
 writes: once a hash entered this step's batch it must land in the cache.
 
 `enable_prefix_caching` is refused on KV-consumer stages (`kv_role` of
-`kv_consumer` or `kv_both`). KV received from a producer is reported as
-`num_computed_tokens` too, and the manager cannot tell it from a local hit.
+`kv_consumer` or `kv_both`), except the supported Qwen3-Omni MRv2 Mooncake
+configuration. Other connectors report producer KV as `num_computed_tokens`
+without first installing the matching local pool rows. Mooncake promotes those
+rows before receive completion, making the combined hit safe to reuse.
 Producer-only stages are unaffected. Pooling stages never save, so they get
 no cache. This gate is one function, `stage_prefix_cache_config`, called by
 both the GPU and the NPU model runner at kv-cache init.
@@ -259,7 +268,7 @@ Which stages may set `enable_prefix_caching: true`:
 | AR stage that appends its mm outputs in `sample()` and sets `mm_outputs_written_in_sample = True` together with `requires_full_prefix_cached_hidden_states = False` (YuE2) | supported | The step snapshot is taken before `sample()` and cannot hold those outputs, so the runner discards the step context and builds the payload from the live outputs. KV blocks are still reused on a hit. Setting the flag without the hidden-state opt-out is refused when the policy is built. |
 | Token-only AR stage with `uses_native_kv_cache_only = True` and `requires_full_prefix_cached_hidden_states = False` (Ming3 Thinker) | native cache only | Bypasses the Omni stage-output tensor cache; native vLLM KV and aligned recurrent-state caching retain their own validation. No prefix hidden states or deferred multimodal outputs may be requested by this policy. |
 | Pooling stage | ignored | Never saves; the gate returns no config. |
-| `kv_role: kv_consumer` / `kv_both` | refused at kv-cache init (`OmniPrefixCacheUnmatchError`) | Producer KV shows up as `num_computed_tokens` and is indistinguishable from a local hit. |
+| `kv_role: kv_consumer` / `kv_both` | refused except the supported Qwen3-Omni MRv2 Mooncake configuration | Mooncake promotes matching output rows before receive completion; other consumers do not provide this guarantee. |
 | Speculative decoding on the stage | refused at kv-cache init | Under async scheduling vLLM keeps `num_computed_tokens_cpu` optimistic (all drafts accepted) during the forward and corrects it afterwards; `step_slots_cpu` would mirror rows at the wrong slots. Not verified; refused as a whole. |
 | `prefix_match_unit` smaller than `block_size` | refused at kv-cache init | Sub-block hits make `num_computed_tokens` unaligned; the hit registry only mirrors whole blocks. |
 | Hybrid / sliding-window / multi-group kv cache (e.g. a talker with `attention_type: sliding_recompute`) | refused at kv-cache init | The cache mirrors exactly one full-attention block table. |

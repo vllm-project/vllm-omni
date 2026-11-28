@@ -61,6 +61,10 @@ class PrefixBlockPool:
     def has_key(self, key: str) -> bool:
         return key in self._caches
 
+    def matches_layout(self, key: str, dtype: torch.dtype, feat: int) -> bool:
+        storage = self._caches[key]
+        return storage.dtype == dtype and storage.shape[-1] == feat
+
     def keys(self) -> set[TensorName]:
         return set(self._caches.keys())
 

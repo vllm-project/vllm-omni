@@ -25,8 +25,31 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.kv_transfer.mooncake.connector import OmniMooncakeStoreConnector
     from vllm_omni.outputs import OmniModelRunnerOutput
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+    from vllm_omni.worker_v2.prefix_cache import MRv2PrefixCacheMixin
 
 OutputFinalizer = Callable[["OmniModelRunnerOutput"], "OmniModelRunnerOutput"]
+
+
+def bind_mooncake_prefix_cache(runner: MRv2PrefixCacheMixin) -> None:
+    """Bind promotion after both the native connector and local pool exist."""
+    connector = cast("OmniMooncakeStoreConnector", runner.kv_connector.kv_connector)
+    cache = runner.omni_prefix_cache
+    if cache is None:
+        raise RuntimeError("Mooncake local caching requires the stage-output pool")
+
+    def promote(block_ids: list[int], tensors: dict[str, torch.Tensor]) -> None:
+        # Buffered decode writes can still refer to slots since reclaimed for
+        # this receive. Flush them before claiming the external destination.
+        runner._prefix_cache_flush_decode()
+        cache.promote_blocks(
+            block_ids,
+            {
+                "hidden_states.layer_0": tensors["embedding"],
+                f"hidden_states.layer_{connector.hidden_layer}": tensors["hidden"],
+            },
+        )
+
+    connector.set_prefix_cache_promoter(promote)
 
 
 @dataclass(frozen=True)
@@ -110,6 +133,9 @@ def snapshot_mooncake_output(runner: OmniARModelRunner, input_batch: InputBatch)
     """Snapshot before sampling mutates counts; other deployments are a no-op."""
     config = runner.vllm_config.kv_transfer_config
     if config is None or config.kv_connector != "OmniMooncakeStoreConnector":
+        return None
+    # Extensible-KV warmup runs before the native connector is activated.
+    if all(is_warmup_request(req_id) for req_id in input_batch.req_ids[: input_batch.num_reqs]):
         return None
     connector = cast("OmniMooncakeStoreConnector", runner.kv_connector.kv_connector)
     rows = []

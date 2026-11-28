@@ -64,7 +64,17 @@ def _multimodal_cases(prompt: dict) -> list[tuple[str, dict]]:
     return cases
 
 
-def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncake: dict | None, monkeypatch) -> dict:
+def _run_arm(
+    model: str,
+    directory: Path,
+    cases: list[tuple[str, dict]],
+    mooncake: dict | None,
+    monkeypatch,
+    *,
+    local_prefix: bool = False,
+    reset_before: frozenset[str] = frozenset(),
+    fail_reads: frozenset[str] = frozenset(),
+) -> dict:
     from vllm import SamplingParams
 
     from vllm_omni.entrypoints.omni import Omni
@@ -80,7 +90,7 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
         "max_model_len": 2048,
         "max_num_batched_tokens": 256,
         "enable_chunked_prefill": True,
-        "enable_prefix_caching": False,
+        "enable_prefix_caching": local_prefix,
         "block_size": BLOCK_SIZE,
         "gpu_memory_utilization": 0.85,
         "revision": REVISION,
@@ -122,7 +132,16 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
     try:
         for case, prompt in cases:
             (directory / "case.txt").write_text(case)
-            outputs[case] = helpers.collect(omni, [prompt])
+            if case in reset_before:
+                reset = omni.engine.collective_rpc("reset_prefix_cache", args=(False, False), stage_ids=[0], timeout=30)
+                assert reset == [True], f"local reset failed: {reset}"
+            failure_marker = directory / "fail-hs-read"
+            if case in fail_reads:
+                failure_marker.touch()
+            try:
+                outputs[case] = helpers.collect(omni, [prompt])
+            finally:
+                failure_marker.unlink(missing_ok=True)
     finally:
         omni.close()
     return outputs
@@ -214,3 +233,94 @@ def test_mooncake_turn_cold_full_and_partial_hits(tmp_path, monkeypatch):
             assert entry["inserted_rows"] == full_prefix
         else:
             assert 0 < entry["inserted_rows"] < full_prefix
+
+
+def test_two_level_local_external_mixed_promotion_and_failure(tmp_path, monkeypatch):
+    """Compare actual Talker inputs through local hits, promotion and recovery."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+    if not config_path:
+        pytest.skip("set MOONCAKE_CONFIG_PATH to run two-level GPU acceptance")
+    assert config_path is not None
+    assert Path(config_path).is_file()
+    pytest.importorskip("mooncake")
+    model = os.environ.get("MOONCAKE_TEST_MODEL", MODEL)
+    full = helpers.prompts(1)[0]
+    # A shorter request shares the beginning but closes its user message early.
+    # After a local reset it repopulates only the leading part of the full
+    # prompt; the remaining full-prompt blocks must come from Mooncake.
+    short = {
+        "prompt": full["prompt"].split("Fact 12:")[0]
+        + "Repeat Fact 0 above word for word.<|im_end|>\n<|im_start|>assistant\n"
+    }
+    cases = [
+        ("seed", full),
+        ("local", full),
+        ("external", full),
+        ("promoted_local", full),
+        ("short", short),
+        ("mixed", full),
+        ("short_failure", short),
+        ("failed_mixed", full),
+        ("recovered_local", full),
+    ]
+    media_cases = _multimodal_cases(full)
+    for offset in range(0, len(media_cases), 3):
+        cold, local_hit, changed = media_cases[offset : offset + 3]
+        modality = cold[0].removesuffix("_cold")
+        cases.extend(
+            [cold, local_hit, (f"{modality}_external", cold[1]), (f"{modality}_promoted_local", cold[1]), changed]
+        )
+    reset_before = frozenset({"external", "short", "short_failure", "image_external", "audio_external"})
+    baseline = _run_arm(model, tmp_path / "baseline", cases, None, monkeypatch)
+    repeat = _run_arm(model, tmp_path / "repeat", cases, None, monkeypatch)
+    _assert_outputs_equal(baseline, repeat)
+    _assert_handoffs_equal(tmp_path / "baseline", tmp_path / "repeat", cases)
+    local = _run_arm(model, tmp_path / "local", cases, None, monkeypatch, local_prefix=True, reset_before=reset_before)
+    _assert_outputs_equal(baseline, local)
+    _assert_handoffs_equal(tmp_path / "baseline", tmp_path / "local", cases)
+    assert _observations(tmp_path / "local", "local", "local_rewrite")
+    config = {
+        "config_file": str(Path(config_path).resolve()),
+        "namespace": f"two-level-acceptance-{uuid4().hex}",
+        "model_revision": REVISION,
+    }
+    combined = _run_arm(
+        model,
+        tmp_path / "combined",
+        cases,
+        config,
+        monkeypatch,
+        local_prefix=True,
+        reset_before=reset_before,
+        fail_reads=frozenset({"failed_mixed"}),
+    )
+    _assert_outputs_equal(baseline, combined)
+    _assert_handoffs_equal(tmp_path / "baseline", tmp_path / "combined", cases)
+    for case, _ in cases:
+        captures = _observations(tmp_path / "combined", case, "capture")
+        last = max(captures, key=lambda row: row["recomputed_tokens"])
+        assert last["local_tokens"] + last["external_tokens"] + last["recomputed_tokens"] == last["prompt_len"], case
+    for case in (
+        "local",
+        "promoted_local",
+        "recovered_local",
+        "image_full",
+        "image_promoted_local",
+        "audio_full",
+        "audio_promoted_local",
+    ):
+        capture = min(_observations(tmp_path / "combined", case, "capture"), key=lambda row: row["start_token"])
+        assert capture["local_tokens"] > 0 and capture["external_tokens"] == 0, case
+    for case in ("external", "image_external", "audio_external"):
+        external = min(_observations(tmp_path / "combined", case, "capture"), key=lambda row: row["start_token"])
+        assert external["local_tokens"] == 0 and external["external_tokens"] > 0, case
+    for case in ("image_changed", "audio_changed"):
+        changed_capture = min(_observations(tmp_path / "combined", case, "capture"), key=lambda row: row["start_token"])
+        assert changed_capture["local_tokens"] == changed_capture["external_tokens"] == 0, case
+    mixed = min(_observations(tmp_path / "combined", "mixed", "capture"), key=lambda row: row["start_token"])
+    assert mixed["local_tokens"] > 0 and mixed["external_tokens"] > 0
+    failures = _observations(tmp_path / "combined", "failed_mixed", "injected_failure")
+    assert len(failures) == 1 and failures[0]["local_tokens"] > 0
+    recovered = _observations(tmp_path / "combined", "failed_mixed", "capture")
+    assert recovered and all(row["external_tokens"] == 0 for row in recovered)

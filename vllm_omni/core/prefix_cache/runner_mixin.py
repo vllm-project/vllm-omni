@@ -66,6 +66,7 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
     _prefix_cache_coalesce_decode = False
+    _prefix_cache_coalesce_mm_only = False
     _prefix_cache_decode_cfg: PrefixCacheConfig | None = None
     _prefix_cache_decode_steps: (
         list[tuple[tuple[PrefixCacheWrite, ...], torch.Tensor, dict[str, torch.Tensor]]] | None
@@ -123,7 +124,11 @@ class PrefixCacheRunnerMixin:
         self._prefix_cache_adapter = adapter
         self._prefix_cache_group_view = view
         policy = self._omni_cache_policy
-        if self._prefix_cache_coalesce_decode and policy.needs_full_hidden_states and not policy.deferred_keys:
+        if (
+            self._prefix_cache_coalesce_decode
+            and (policy.needs_full_hidden_states or self._prefix_cache_coalesce_mm_only)
+            and not policy.deferred_keys
+        ):
             self._prefix_cache_decode_cfg = cfg
             self._prefix_cache_decode_steps = []
 
@@ -197,13 +202,12 @@ class PrefixCacheRunnerMixin:
         hidden_key = self._omni_cache_policy.hidden_key
         if (
             self._prefix_cache_pure_decode
-            and hidden_key is not None
-            and _is_step_token_tensor(hidden_states, n, num_tokens_padded)
+            and (hidden_key is None or _is_step_token_tensor(hidden_states, n, num_tokens_padded))
             and len(layout.writes) == n
             and layout.slots_cpu is not None
             and layout.slots_cpu.numel() == n
         ):
-            rows = {hidden_key: hidden_states[:n]}
+            rows = {} if hidden_key is None else {hidden_key: hidden_states[:n]}
             rows.update(
                 (key, val[:n])
                 for key, val in mm.items()
@@ -269,8 +273,7 @@ class PrefixCacheRunnerMixin:
         cache.release_device_bytes(self._prefix_cache_decode_reserved)
         self._prefix_cache_decode_reserved = 0
         hidden_key = self._omni_cache_policy.hidden_key
-        assert hidden_key is not None
-        hidden = rows.pop(hidden_key)
+        hidden = rows.pop(hidden_key) if hidden_key is not None else None
         step_id = cache.save_outputs(
             hidden,
             rows,

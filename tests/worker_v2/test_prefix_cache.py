@@ -9,13 +9,19 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, VllmConfig
+from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR, ActiveKVConnector
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 import vllm_omni.worker_v2.prefix_cache as mrv2_prefix_cache
 from tests.worker_v2.test_omni_ar_model_runner import _async_output
 from vllm_omni.core.prefix_cache import MRv2FullAttentionGroupView
 from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.distributed.kv_transfer.mooncake.connector import OmniMooncakeStoreConnector
+from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.prefix_cache import PrefixCacheRewrite
@@ -102,6 +108,46 @@ def test_init_stages_config_with_async_depth(monkeypatch):
     runner = _init_runner(monkeypatch, None)
     runner._init_omni_prefix_cache(is_profiling=False)
     runner._ensure_omni_prefix_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("extensible", [False, True])
+def test_mooncake_promotion_binds_after_native_connector_activation(monkeypatch, extensible):
+    runner = _init_runner(monkeypatch, PrefixCacheConfig(num_blocks=8, block_size=16))
+    runner.vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="OmniMooncakeStoreConnector",
+            kv_connector_module_path="vllm_omni.distributed.kv_transfer.mooncake.connector",
+            kv_role="kv_both",
+            kv_load_failure_policy="recompute",
+        ),
+    )
+    runner.cache_config = CacheConfig(enable_prefix_caching=True, enable_extensible_kv_cache=extensible)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner.omni_prefix_cache = MagicMock(spec=OmniPrefixCacheManager)
+    connector = MagicMock(spec=OmniMooncakeStoreConnector)
+    active = ActiveKVConnector.__new__(ActiveKVConnector)
+    active.kv_connector = connector
+    # vLLM 0.34 uses the real no-op wrapper until extensible memory is final.
+    runner.kv_connector = NO_OP_KV_CONNECTOR if extensible else active
+    runner._init_omni_prefix_cache(is_profiling=False)
+
+    if extensible:
+        connector.set_prefix_cache_promoter.assert_not_called()
+        worker = GPUARWorker.__new__(GPUARWorker)
+        worker.vllm_config = runner.vllm_config
+        worker.model_runner = runner
+
+        def activate_native(worker, num_blocks):
+            assert num_blocks == 8
+            connector.set_prefix_cache_promoter.assert_not_called()
+            worker.model_runner.kv_connector = active
+
+        monkeypatch.setattr(GPUWorker, "extend_kv_cache", activate_native)
+        worker.extend_kv_cache(8)
+
+    connector.set_prefix_cache_promoter.assert_called_once()
+    assert runner._omni_cache_policy.needs_full_hidden_states is False
 
 
 @pytest.mark.parametrize(

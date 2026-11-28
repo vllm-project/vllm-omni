@@ -36,6 +36,17 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     model_runner_cls = OmniARModelRunner
 
+    def extend_kv_cache(self, num_blocks: int) -> None:
+        super().extend_kv_cache(num_blocks)
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is not None and transfer.kv_connector == "OmniMooncakeStoreConnector":
+            runner = self.model_runner
+            if runner.omni_prefix_cache is not None:
+                from vllm_omni.worker_v2.mooncake_capture import bind_mooncake_prefix_cache
+
+                # The native connector now owns the final GPU KV views.
+                bind_mooncake_prefix_cache(runner)
+
     def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
         from vllm_omni.distributed.weight_sharing.worker_session import control_runner
 

@@ -469,6 +469,75 @@ class OmniPrefixCacheManager:
             self._slot_status.init_table(hk)
 
     @torch.inference_mode()
+    def promote_blocks(self, block_ids: list[int], tensors: dict[str, torch.Tensor]) -> None:
+        """Install validated external rows before their KV blocks become hits.
+
+        Engine thread only. The caller owns these destination KV blocks until
+        this returns. Use the ordinary single-writer queue and slot claims so
+        delayed readers keep the previous tenant's rows and pending writes
+        cannot overwrite the promoted data. No request output is published.
+        """
+        bs = self._config.block_size
+        n = len(block_ids) * bs
+        if not block_ids or not tensors:
+            raise ValueError("prefix promotion requires blocks and tensors")
+        if len(set(block_ids)) != len(block_ids) or any(
+            block < 0 or block >= self._config.num_blocks for block in block_ids
+        ):
+            raise ValueError("invalid prefix promotion block ids")
+        for key, tensor in tensors.items():
+            if tensor.device.type != "cpu" or tensor.ndim != 2 or tensor.shape[0] != n or tensor.shape[1] <= 0:
+                raise ValueError(f"invalid prefix promotion rows for {key}")
+            if self._pool.has_key(key):
+                if not self._pool.matches_layout(key, tensor.dtype, tensor.shape[1]):
+                    raise ValueError(f"incompatible prefix promotion layout for {key}")
+        self._wait_for_host_ready()
+        new_storage = {
+            key: storage
+            for key, tensor in tensors.items()
+            if (storage := self._pool.alloc_key(key, tensor.dtype, tensor.shape[1])) is not None
+        }
+        slots = self._get_hit_slots(n, block_ids)
+        capacity = self._config.staging_capacity_tokens
+        for start in range(0, n, capacity):
+            end = min(n, start + capacity)
+            chunk_slots = slots[start:end]
+            with self._state_lock:
+                step_id = self._next_step_id
+                self._next_step_id += 1
+            with self._controller.prepare_step(
+                step_id=step_id,
+                immediate={key: tensor[start:end] for key, tensor in tensors.items()},
+                deferred={},
+                slots=chunk_slots,
+                num_tokens=end - start,
+                freeze_event=None,
+            ) as write_ctx:
+                try:
+                    with self._state_lock:
+                        self._commit_drained_writes()
+                        for key, storage in new_storage.items():
+                            self._pool.install_key(key, storage)
+                            self._slot_status.init_table(key)
+                        new_storage.clear()
+                        tid = self._request_tasks.alloc_tid()
+                        write_ctx.register(
+                            tid=tid,
+                            req_id="",
+                            write_n=0,
+                            schedule=WriteSchedule.JOIN_NEXT_STEP,
+                            start=0,
+                            end=end - start,
+                        )
+                        self._claim_slots(chunk_slots, tuple(tensors), [(tid, 0, end - start)])
+                    write_ctx.start_writes()
+                    self._controller.join([tid])
+                    with self._state_lock:
+                        self._commit_drained_writes()
+                finally:
+                    write_ctx.snapshot.release()
+
+    @torch.inference_mode()
     def new_step_starts(self, step: PrefixCacheStep) -> None:
         """Handle one immutable adapter-produced step.
 
