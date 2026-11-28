@@ -70,6 +70,12 @@ platforms:
           cfm_graph_batch_buckets: [1, 2, 4, 8]
           code2wav_max_npu_graphs: 96
           minicpmo_vocoder_replica_route: adaptive_secondary
+          # Scope generation coalescing to Code2Wav so Talker can use refill coalescing.
+          generation_max_regular_batch: 16
+          generation_min_batch_size: 4
+          generation_max_wait_ms: 25
+          generation_first_chunk_express: true
+          generation_first_chunk_express_min_slack_s: 0.30
         env:
           MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY: "1"
     connectors:
@@ -84,12 +90,7 @@ platforms:
           token2wav_setup_cache_size: 64
           token2wav_setup_host_cache_size: 512
           token2wav_ref_cpu_prefetch_workers: 4
-          generation_max_regular_batch: 16
-          generation_min_batch_size: 4
-          generation_max_wait_ms: 25
           cfm_drop_upstream_att_buffer: true
           code2wav_encoder_padded_flow_history: 416
           code2wav_encoder_padded_flow_continuations: true
           minicpmo_code2wav_sync_primary: true
-          generation_first_chunk_express: true
-          generation_first_chunk_express_min_slack_s: 0.30
