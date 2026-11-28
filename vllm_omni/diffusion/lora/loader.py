@@ -47,6 +47,12 @@ def get_converter_by_pipeline(pipeline):
     return None
 
 
+# Names under which a quantized linear layer registers its weight in place of
+# `weight`: `qweight` (AWQ, GPTQ, INC, SVDQuant) and `weight_packed`
+# (compressed-tensors).
+_PACKED_WEIGHT_SUFFIXES = (".qweight", ".weight_packed")
+
+
 def _prepare_lora_delta(
     lora_state_dict,
     base_key: str,
@@ -394,11 +400,16 @@ class LoraLoaderMixin:
 
         for name, params in module.named_parameters(prefix):
             is_bias = False
+            is_packed = False
             if name.endswith(".bias"):
                 base_key = name[: -len(".bias")]
                 is_bias = True
             elif name.endswith(".weight"):
                 base_key = name[: -len(".weight")]
+            elif name.endswith(_PACKED_WEIGHT_SUFFIXES):
+                # Looked up as a weight target only so that a match is rejected below.
+                base_key = name.rpartition(".")[0]
+                is_packed = True
             else:
                 continue
 
@@ -415,6 +426,14 @@ class LoraLoaderMixin:
             )
             if delta is None:
                 continue
+            # Quantized weights (int8, fp8, packed int32) hold scaled and possibly
+            # transposed data; adding a delta cast to that dtype is wrong.
+            if is_packed or not params.dtype.is_floating_point or params.dtype.itemsize == 1:
+                raise ValueError(
+                    f"Distilled LoRA cannot be fused into quantized parameter {name} ({params.dtype}). "
+                    "The distill LoRA backend fuses only into unquantized weights: remove --quantization "
+                    "and --diffusion-quantization-config, and use a checkpoint that is not pre-quantized."
+                )
             delta = _shard_lora_delta(delta, layers[base_key], is_bias)
             if delta.shape != params.shape:
                 raise ValueError(
