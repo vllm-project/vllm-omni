@@ -1,0 +1,138 @@
+meta:
+  title: "MOSS-TTS-Nano"
+  slug: "moss-tts-nano"
+  provider: "OpenMOSS"
+  description: "OpenMOSS's 0.1B voice-cloning TTS — a single-stage autoregressive LM paired with the MOSS-Audio-Tokenizer-Nano codec, served via vLLM-Omni through the OpenAI /v1/audio/speech API (48 kHz mono). Small enough for a 6 GiB laptop GPU."
+  date_added: 2026-11-23
+  date_updated: 2026-11-23
+  tasks:
+    - omni
+  related_recipes:
+    - OpenMOSS-Team/MOSS-TTS
+    - OpenMOSS-Team/MOSS-TTS-Realtime
+    - Qwen/Qwen3-TTS-12Hz-0.6B-Base
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-TTS-Nano"
+  min_vllm_version: "0.28.0"
+  architecture: dense
+  parameter_count: "0.1B"
+  active_parameters: "0.1B"
+  context_length: 4096
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "MOSS-TTS-Nano voice-cloned TTS from a reference clip (reference audio required)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "OpenMOSS-Team/MOSS-TTS-Nano",
+            "input": "Hello, this is a MOSS-TTS-Nano clone test.",
+            "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. The codec is a separate checkpoint (`OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano`) that the model config downloads on first start."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 6
+    description: "MOSS-TTS-Nano 0.1B (bf16), single stage — verified on 1x RTX 3060 Laptop 6 GiB with the stock deploy config: 0.73 GiB peak device memory, ~60 s startup, RTF ~3 on that laptop"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [MOSS-TTS-Nano](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M) is the
+  **0.1B** member of OpenMOSS's MOSS-TTS Family. It pairs a small autoregressive
+  language model (`MossTTSNanoForCausalLM`) with the
+  `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` codec and serves through
+  **vLLM-Omni** with the OpenAI-compatible `/v1/audio/speech` API. Output is
+  **48 kHz mono**.
+
+  Every request needs reference audio: the model clones the voice it is given
+  and has no preset speaker list, so `voice` and `ref_text` are ignored. The
+  Hub repository is published as `MOSS-TTS-Nano-100M`; the shorter
+  `MOSS-TTS-Nano` id redirects to it.
+
+  ## Prerequisites
+
+  - **Hardware**: one CUDA GPU with at least 6 GiB. The variant above is
+    qualified on an RTX 3060 Laptop 6 GiB: 0.73 GiB peak device memory,
+    ~60 s cold start, and a real-time factor of ~3 (about 8 s of compute for
+    2.8 s of audio) on that laptop, dominated by generation rather than loading.
+  - **vLLM-Omni** targeting vLLM >= 0.28 (the NPU qualification used 0.28.0).
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  MOSS-TTS-Nano uses `model_type=moss_tts_nano`, so its deploy config
+  (`vllm_omni/deploy/moss_tts_nano.yaml`) is auto-discovered. That config sets
+  `gpu_memory_utilization=0.3`, `max_num_seqs=1` and `enforce_eager=true`: the
+  model runs upstream `inference_stream()` through `trust_remote_code`, keeps
+  process-wide RNG and streaming decode state, and has no CUDA graph capture.
+
+  ```bash
+  vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8000
+  ```
+
+  ## Client usage
+
+  ### Voice clone (curl)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "OpenMOSS-Team/MOSS-TTS-Nano",
+      "input": "Hello, this is a MOSS-TTS-Nano clone test.",
+      "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
+      "response_format": "wav"
+    }' --output output.wav
+  ```
+
+  `ref_audio` accepts an HTTP(S) URL, a local path, or a
+  `data:audio/wav;base64,...` payload.
+
+  ## Known limitations
+
+  - **Reference audio is mandatory**; there are no built-in voices.
+  - Generation is **serialized** (`max_num_seqs=1`): concurrent HTTP requests
+    are accepted but decode one at a time, to avoid cross-request audio
+    corruption.
+  - The deploy config caps `max_model_len` at 4096 tokens, below the model's
+    32768-token positional range; raise it with `--max-model-len` only if you
+    also have memory to spare.
+  - The codec (`OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano`) is a separate
+    checkpoint and is downloaded on first start.
+  - On Ascend NPUs see
+    [MOSS-TTS-Nano-NPU.md](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenMOSS/MOSS-TTS-Nano-NPU.md).
+
+  ## References
+
+  - [Model card](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M)
+  - [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) · [GitHub](https://github.com/OpenMOSS/MOSS-TTS)
