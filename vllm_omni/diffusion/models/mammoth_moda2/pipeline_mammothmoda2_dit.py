@@ -14,7 +14,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
@@ -392,6 +392,19 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
         self.weights_sources = [_root_weight_source(od_config)]
+        parallel = od_config.parallel_config
+        # remove the following check when support DiT TP with PP/SP/CFG > 1
+        if parallel.tensor_parallel_size > 1:
+            if (
+                parallel.pipeline_parallel_size != 1
+                or parallel.sequence_parallel_size != 1
+                or parallel.cfg_parallel_size != 1
+            ):
+                raise ValueError("MammothModa2 DiT TP requires PP=SP=CFG parallel size 1")
+            if od_config.quantization_config is not None:
+                raise ValueError("MammothModa2 DiT TP does not yet support quantized projections")
+            if not od_config.enforce_eager:
+                raise ValueError("MammothModa2 DiT TP currently requires enforce_eager=True")
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
@@ -1122,6 +1135,12 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
             # generation tokenizer from this composite checkpoint. This is
             # equivalent to the two None entries in hf_to_vllm_mapper above.
             if name.startswith(("llm_model.", "gen_tokenizer.")):
+                continue
+
+            if self.od_config.parallel_config.tensor_parallel_size > 1 and name.startswith("gen_transformer."):
+                local_name = name.removeprefix("gen_transformer.")
+                loaded = AutoWeightsLoader(self.gen_transformer).load_weights([(local_name, loaded_weight)])
+                loaded_params.update(f"gen_transformer.{key}" for key in loaded)
                 continue
 
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
