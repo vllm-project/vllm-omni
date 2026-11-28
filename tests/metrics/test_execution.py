@@ -70,7 +70,7 @@ def test_diffusion_facts_read_frame_counts_of_encoded_video():
 
     facts = execution.diffusion_facts(_request(), DiffusionOutput(), formatted)
 
-    assert (facts["num_frames"], facts["frames_source"]) == (124, "metadata")
+    assert (facts["num_frames"], facts["frames_source"]) == (124, "encoder")
     assert facts["size_source"] == "request"
 
 
@@ -91,7 +91,7 @@ def test_diffusion_facts_prefer_values_the_pipeline_resolved():
     facts = execution.diffusion_facts(request, output, formatted)
 
     assert (facts["width"], facts["height"], facts["size_source"]) == (1344, 768, "pipeline")
-    assert (facts["num_frames"], facts["frames_source"]) == (209, "metadata")
+    assert (facts["num_frames"], facts["frames_source"]) == (209, "encoder")
     assert (facts["flow_shift"], facts["audio_flow_shift"]) == (12.0, 5.0)
     assert (facts["num_inference_steps"], facts["completed_steps"]) == (None, 50)
 

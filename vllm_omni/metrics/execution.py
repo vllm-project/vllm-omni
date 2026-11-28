@@ -98,7 +98,7 @@ def _output_size(formatted_outputs: Sequence[Any] | None) -> tuple[int | None, i
                 return int(size[0]), int(size[1]), None, "image"
         frame_counts = _video_metadata(request_output).get("frame_counts")
         if valid_frame_counts(frame_counts, len(images)):
-            return None, None, frame_counts[0], "metadata"
+            return None, None, frame_counts[0], "encoder"
     return None
 
 
@@ -135,7 +135,8 @@ def diffusion_facts(
     from: ``tensor`` (typed video tensor), ``image``, ``pipeline`` (the size
     the pipeline reported, e.g. for video it encoded in the worker) or
     ``request``; ``frames_source`` does the same for ``num_frames`` (``tensor``,
-    ``metadata`` for the encoder's frame counts, ``stream`` or ``request``).
+    ``encoder`` for the frame counts of video the worker encoded, ``stream``
+    or ``request``).
     ``num_inference_steps`` is the requested step count; ``completed_steps``
     is the denoising steps the model runner counted (``None`` without a
     progress signal).
