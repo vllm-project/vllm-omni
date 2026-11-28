@@ -883,6 +883,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "StableDiffusion3Pipeline": "get_sd3_pre_process_func",
     "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
