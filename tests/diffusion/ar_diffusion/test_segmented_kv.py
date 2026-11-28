@@ -91,6 +91,56 @@ def test_pending_archive_views_require_all_layers_and_exclude_transient_conditio
     state.close()
 
 
+@pytest.mark.parametrize("failure", ["none", "copy", "missing_layer", "allocation", "peer"])
+def test_archive_replacement_is_atomic_and_uses_declared_pool(failure, monkeypatch):
+    cache = make_cache()
+    owner = make_state(cache)
+    state = owner.segmented("main")
+    original_free = cache.manager.block_pool.get_num_free_blocks()
+    old = append(state, (3, 5), offset=7)
+    free = cache.manager.block_pool.get_num_free_blocks()
+
+    def layers():
+        yield rows(9, 99), -rows(9, 99)
+        if failure == "copy":
+            raise RuntimeError("injected CPU copy failure")
+        if failure != "missing_layer":
+            yield rows(9, 199), -rows(9, 199)
+
+    original_allocate = cache.begin_segment
+
+    def allocate(request_id, length):
+        if length == 5:
+            raise RuntimeError("injected allocation failure")
+        return original_allocate(request_id, length)
+
+    if failure == "allocation":
+        monkeypatch.setattr(cache, "begin_segment", allocate)
+    if failure in ("copy", "missing_layer", "allocation"):
+        with pytest.raises(RuntimeError):
+            state.stage_replacement((4, 5), layers())
+    else:
+        replacement = state.stage_replacement((4, 5), layers())
+        assert state.handles == old
+        if failure == "peer":
+            state.rollback()
+        else:
+            state.commit(retain=replacement)
+    assert not state.commit_active
+    if failure != "none":
+        assert state.handles == old
+        assert cache.manager.block_pool.get_num_free_blocks() == free
+    state.prepare_layer_views(1, 0)
+    for layer in range(2):
+        empty = rows(0)
+        key, value = state.assemble(layer, empty, empty, rows(1), rows(1))
+        expected = rows(9, 99 + 100 * layer) if failure == "none" else rows(8, 7 + 100 * layer)
+        torch.testing.assert_close(key[:-1], expected, rtol=0, atol=0)
+        torch.testing.assert_close(value[:-1], -expected, rtol=0, atol=0)
+    owner.close()
+    assert cache.manager.block_pool.get_num_free_blocks() == original_free
+
+
 @pytest.mark.parametrize("lengths", [(1, 1), (15, 3), (17, 5)])
 def test_ragged_pages_match_dense_attention_without_padding(lengths):
     cache = make_cache()
