@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm_omni.diffusion.attention.selector as selector
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -165,8 +166,15 @@ def test_empty_text_stream_skips_the_entire_context_refiner():
     torch.testing.assert_close(refined_image, torch.ones_like(image))
 
 
-def test_backend_selection_reaches_the_dit_layer():
+def test_backend_selection_reaches_the_dit_layer(monkeypatch):
     """The diffusion config selects the backend when the DiT layer is constructed."""
+    # Resolve names from the registry without the platform's capability checks, which reject
+    # FLASH_ATTN on some hosts (for example Blackwell without FA4). This test checks the routing only.
+    monkeypatch.setattr(
+        selector,
+        "_cached_get_backend_cls",
+        lambda backend_name, *args, **kwargs: DiffusionAttentionBackendEnum[backend_name].get_class(),
+    )
     assert _block(2).attn.omni_attn.attn_backend is DiffusionAttentionBackendEnum.TORCH_SDPA.get_class()
     with set_current_diffusion_config(
         OmniDiffusionConfig(diffusion_attention_config={"default": {"backend": "FLASH_ATTN"}})

@@ -339,6 +339,13 @@ def test_worker_wrapper_only_extends_paged_request_rpc() -> None:
     ]
 
 
+def _bare_worker() -> DiffusionWorker:
+    worker = object.__new__(DiffusionWorker)
+    # load_model() resolves this on a real worker; a bare worker would auto-enable FlashInfer autotune on SM100+.
+    worker._flashinfer_autotune_on = False
+    return worker
+
+
 def test_dense_worker_call_does_not_extend_model_runner_signature() -> None:
     calls: list[tuple] = []
 
@@ -347,7 +354,7 @@ def test_dense_worker_call_does_not_extend_model_runner_signature() -> None:
             calls.append((req, kv_prefetch_job))
             return DiffusionOutput(output=None)
 
-    worker = object.__new__(DiffusionWorker)
+    worker = _bare_worker()
     worker.model_runner = DenseModelRunner()
     worker.lora_manager = None
     worker._get_profiler = lambda: None
@@ -366,7 +373,7 @@ def test_dlo_worker_selects_request_and_metadata_from_same_envelope(monkeypatch)
             calls.append((req, kwargs))
             return DiffusionOutput(output=None)
 
-    worker = object.__new__(DiffusionWorker)
+    worker = _bare_worker()
     worker.model_runner = ModelRunner()
     worker.lora_manager = None
     worker._get_profiler = lambda: None
