@@ -37,9 +37,12 @@ stages:
         hf_numerics: true
 ```
 
-The mode is meant to be combined with `VLLM_BATCH_INVARIANT=1`, `tensor_parallel_size: 1`
-and no expert parallelism. Only the default rope type and MoE decoder layers are
-supported. One more requirement is checked when the model is built: the
+The mode is meant to be combined with `VLLM_BATCH_INVARIANT=1` and no expert
+parallelism. With `tensor_parallel_size` above 1 the row-parallel layers, the
+attention output projection and the MoE experts, return the all-reduced sum of one
+partial result per rank. That sum rounds differently from a single-device matmul, so
+a trainer has to add the same partial results in the same way to stay bitwise equal.
+Only the default rope type and MoE decoder layers are supported. One more requirement is checked when the model is built: the
 **unquantized Triton MoE backend**. The MoE block reads the loaded expert weights
 as HF `[experts, 2 * intermediate, hidden]` / `[experts, hidden, intermediate]`
 matrices. The FlashInfer backends repack them after loading, so any other backend

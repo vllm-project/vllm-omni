@@ -14,7 +14,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
     apply_rotary_pos_emb,
 )
-from vllm.config import KernelConfig, ModelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import KernelConfig, ModelConfig, ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_module
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.model_executor.models.qwen3_omni import hf_numerics
 from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     HFNumericsDecoderLayer,
     HFNumericsRMSNorm,
@@ -276,7 +277,13 @@ def _dist():
     cleanup_dist_env_and_memory()
 
 
-def _build_layer(tmp_path, moe_backend: str = "triton", dtype: torch.dtype = torch.bfloat16, enforce_eager=False):
+def _build_layer(
+    tmp_path,
+    moe_backend: str = "triton",
+    dtype: torch.dtype = torch.bfloat16,
+    enforce_eager=False,
+    enable_expert_parallel=False,
+):
     Qwen3MoeConfig(
         **_TEXT_CONFIG,
         architectures=["Qwen3MoeForCausalLM"],
@@ -287,6 +294,7 @@ def _build_layer(tmp_path, moe_backend: str = "triton", dtype: torch.dtype = tor
             model=str(tmp_path), dtype=dtype, skip_tokenizer_init=True, enforce_eager=enforce_eager
         ),
         kernel_config=KernelConfig(moe_backend=moe_backend),
+        parallel_config=ParallelConfig(enable_expert_parallel=enable_expert_parallel),
     )
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(dtype), torch.device(DEVICE_TYPE):
         return HFNumericsDecoderLayer(vllm_config, prefix="model.layers.0")
@@ -313,6 +321,36 @@ def test_triton_loaded_moe_matches_hf_router_with_fused_experts(_dist, tmp_path)
     _load_hf_experts(layer, hf_block)
     x = torch.randn(9, 32, dtype=torch.bfloat16, device=DEVICE_TYPE)
     torch.testing.assert_close(layer.mlp(x), _hf_router_then_fused_experts(hf_block, x), rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@_requires_cuda_or_xpu
+def test_moe_all_reduces_the_rank_output_under_tensor_parallelism(_dist, tmp_path, monkeypatch):
+    torch.manual_seed(0)
+    layer = _build_layer(tmp_path, enforce_eager=True)
+    _load_hf_experts(layer, _hf_moe_block(torch.bfloat16))
+    x = torch.randn(9, 32, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    rank_output = layer.mlp(x)
+    reduced = []
+
+    def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+        reduced.append(tensor)
+        return tensor + 1
+
+    monkeypatch.setattr(hf_numerics, "tensor_model_parallel_all_reduce", all_reduce)
+    monkeypatch.setattr(layer.mlp, "tp_size", 2)
+    out = layer.mlp(x)
+
+    assert len(reduced) == 1
+    torch.testing.assert_close(reduced[0], rank_output, rtol=0, atol=0)
+    torch.testing.assert_close(out, rank_output + 1, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@_requires_cuda_or_xpu
+def test_expert_parallelism_is_rejected(_dist, tmp_path):
+    with pytest.raises(ValueError, match="needs no expert parallelism"):
+        _build_layer(tmp_path, enforce_eager=True, enable_expert_parallel=True)
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
