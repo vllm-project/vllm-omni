@@ -25,8 +25,6 @@ connectors:
       device_name: "auto"
       memory_pool_size: 1073741824
       memory_pool_device: "npu"
-  shared_memory_connector:
-    name: SharedMemoryConnector
 
 stages:
   - stage_id: 0
@@ -90,6 +88,10 @@ platforms:
           ulysses_degree: 1
 
   xpu:
+    # Mooncake is not available on XPU.
+    connectors:
+      rdma_connector:
+        name: SharedMemoryConnector
     stages:
       # Both stages stay resident, so they cannot share cards.
       - stage_id: 0
