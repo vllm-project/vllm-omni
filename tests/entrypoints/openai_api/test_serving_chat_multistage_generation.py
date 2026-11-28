@@ -64,7 +64,12 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine_prompt["prompt"] == "draw a robot"
     assert engine_prompt["modalities"] == ["img2img"]
     assert engine_prompt["negative_prompt"] == "blurry"
-    assert engine_prompt["mm_processor_kwargs"] == {"target_h": 768, "target_w": 1024, "vae_generator_seed": 0}
+    assert engine_prompt["mm_processor_kwargs"] == {
+        "target_h": 768,
+        "target_w": 1024,
+        "vae_generator_seed": 0,
+        "modalities": ["img2img"],
+    }
     assert engine_prompt["multi_modal_data"]["img2img"].size == (24, 24)
 
     assert len(sampling_params_list) == 3
@@ -94,6 +99,36 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_build_multistage_generation_inputs_forwards_modalities_to_mm_processor(serving_chat):
+    """MM processors such as Ming-Image read ``modalities`` from mm_processor_kwargs.
+
+    The chat image-generation path already forwards them; /v1/images/generations
+    must too, or Ming-Image skips its image-generation template and the
+    thinker2image bridge rejects the prompt.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[SamplingParams(temperature=0.0), OmniDiffusionSamplingParams()],
+    )
+
+    engine_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="a red apple",
+        extra_body={},
+        reference_images=[],
+        gen_params=OmniDiffusionSamplingParams(height=1024, width=1024),
+    )
+
+    assert engine_prompt["modalities"] == ["image"]
+    assert engine_prompt["mm_processor_kwargs"] == {"target_h": 1024, "target_w": 1024, "modalities": ["image"]}
 
 
 @pytest.mark.parametrize("extra_body", [{}, {"bot_task": "think"}])

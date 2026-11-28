@@ -3448,6 +3448,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if seed is not None and engine_prompt_data is not None:
             mm_processor_kwargs["vae_generator_seed"] = int(seed)
         if mm_processor_kwargs:
+            # Pass output modalities to the MM processor as the chat
+            # image-generation path does, so model-specific processors (e.g.
+            # Ming-Image) can detect image-generation requests and apply their
+            # image-generation template. Only added when mm_processor_kwargs is
+            # already attached, so prompts without it keep their current route.
+            mm_processor_kwargs["modalities"] = list(modalities)
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data

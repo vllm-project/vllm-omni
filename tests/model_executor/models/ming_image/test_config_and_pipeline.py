@@ -26,6 +26,7 @@ from vllm_omni.model_executor.models.ming_image import checkpoint
 from vllm_omni.model_executor.models.ming_image.model import (
     MingImageForConditionalGeneration,
     MingImageMultiModalProcessor,
+    _MingImageDataParser,
 )
 from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.ming_image import thinker2image
@@ -216,6 +217,25 @@ def test_image_generation_template_matches_upstream_layout():
         "edit this image",
         has_reference_image=True,
     )
+
+
+def test_data_parser_moves_img2img_into_image_in_callers_dict(monkeypatch: pytest.MonkeyPatch):
+    """vLLM validates the request's multi_modal_data keys against the parsed items.
+
+    The parser must rename ``img2img`` in the caller's dict (as the Ming-flash-omni
+    thinker parser does); renaming a copy leaves ``img2img`` with no parsed items
+    and /v1/images/edits fails multi_modal_uuids validation.
+    """
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    monkeypatch.setattr(MultiModalDataParser, "parse_mm_data", lambda self, mm_data: mm_data)
+    reference = object()
+    mm_data = {"img2img": reference}
+
+    parsed = _MingImageDataParser.parse_mm_data(object.__new__(_MingImageDataParser), mm_data)
+
+    assert mm_data == {"image": [reference]}
+    assert parsed is mm_data
 
 
 def test_multimodal_processor_applies_generation_template(monkeypatch: pytest.MonkeyPatch):

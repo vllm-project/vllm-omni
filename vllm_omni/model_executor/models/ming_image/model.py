@@ -35,14 +35,19 @@ from vllm_omni.transformers_utils.processors.ming import MingImageProcessor
 
 class _MingImageDataParser(MultiModalDataParser):
     def parse_mm_data(self, mm_data):
-        normalized = dict(mm_data)
-        if "img2img" in normalized:
-            references = normalized.pop("img2img")
+        # Move ``img2img`` into ``image`` in the caller's dict (as
+        # ``_MingMultiModalDataParser`` does), not in a copy: vLLM's renderer
+        # validates the request's ``multi_modal_data`` keys against the parsed
+        # items, so a copy leaves an ``img2img`` key with no parsed items and
+        # ``/v1/images/edits`` fails with "multi_modal_data['img2img'] is empty
+        # but multi_modal_uuids['img2img'] is missing".
+        if "img2img" in mm_data:
+            references = mm_data.pop("img2img")
             references = references if isinstance(references, list) else [references]
-            existing = normalized.get("image", [])
+            existing = mm_data.get("image", [])
             existing = existing if isinstance(existing, list) else [existing]
-            normalized["image"] = existing + references
-        return super().parse_mm_data(normalized)
+            mm_data["image"] = existing + references
+        return super().parse_mm_data(mm_data)
 
 
 class MingImageProcessingInfo(MingFlashOmniThinkerProcessingInfo):
