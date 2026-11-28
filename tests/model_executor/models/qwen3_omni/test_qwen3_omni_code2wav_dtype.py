@@ -119,13 +119,10 @@ def test_invalid_fallback_option_fails_before_model_construction(mocker, value):
         _codec(mocker, torch.float32, device="cpu", connector={"extra": {"codec_cudnn_fp32_fallback": value}})
 
 
-@pytest.mark.parametrize(
-    ("profile", "first_frame_enabled"),
-    [("qwen3_omni_moe.yaml", False), ("qwen3_omni_moe_codec.yaml", True)],
-)
+@pytest.mark.parametrize("first_frame_enabled", [False, True])
 @pytest.mark.parametrize("fallback", [False, True])
 def test_deploy_option_reaches_both_decoder_placements(
-    mocker, blackwell_cudnn, tmp_path, profile, first_frame_enabled, fallback
+    mocker, blackwell_cudnn, tmp_path, first_frame_enabled, fallback
 ):
     from tests.helpers.stage_config import get_deploy_config_path
     from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -137,9 +134,11 @@ def test_deploy_option_reaches_both_decoder_placements(
     mocker.patch.dict("os.environ", {"VLLM_OMNI_TALKER_FIRST_AUDIO": "1"})
     overlay = tmp_path / "deploy.yaml"
     overlay.write_text(
-        f"base_config: {get_deploy_config_path(profile)}\n"
+        f"base_config: {get_deploy_config_path('qwen3_omni_moe.yaml')}\n"
         "connectors:\n  connector_of_shared_memory:\n    extra:\n"
         f"      codec_cudnn_fp32_fallback: {str(fallback).lower()}\n"
+        # Exercise both the bundled first-frame default and its explicit opt-out.
+        + ("" if first_frame_enabled else "      talker_first_audio: false\n")
     )
     transfer = load_omni_transfer_config(config_dict=resolve_deploy_yaml(overlay))
     config = Qwen3OmniMoeConfig(

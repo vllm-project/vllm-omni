@@ -5,7 +5,12 @@
 # Unconfigured history_policy preserves full history. Per-request media counts
 # use vLLM defaults; configure smaller counts explicitly when needed. Context
 # capacity and Session input-admission budgets still apply.
-# Thinker prefix caching remains disabled in the inherited codec profile.
-base_config: qwen3_omni_moe_codec.yaml
+# Codec tuning and disabled Thinker prefix caching come from the default.
+base_config: qwen3_omni_moe.yaml
 
 session_mode: duplex
+
+platforms:
+  # Preserve the duplex profile's NPU restriction; turn mode uses V2 on NPU.
+  npu:
+    model_runner: v1

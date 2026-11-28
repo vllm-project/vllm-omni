@@ -99,8 +99,8 @@ Validate smoothness with `audio_continuity_ok_rate`, not mean RTF.
 ## Model runner V2
 
 `model_runner: v2` is the default and only supported runner with vLLM 0.34.
-Workload-specific profiles include
-`qwen3_omni_moe_codec.yaml`, `qwen3_omni_moe_h200.yaml`,
+Qwen3-Omni's default `qwen3_omni_moe.yaml` includes streaming codec tuning.
+Workload-specific profiles include `qwen3_omni_moe_h200.yaml`
 and `minicpmo_4_5_turn.yaml`. MiniCPM-o duplex uses MRv2 for all stages
 through the default `minicpmo_4_5.yaml`.
 

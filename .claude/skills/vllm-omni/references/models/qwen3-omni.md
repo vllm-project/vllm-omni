@@ -21,8 +21,7 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 
 | YAML | Use |
 |------|-----|
-| `qwen3_omni_moe.yaml` | Default CUDA MRv2 with Thinker prefix caching on. 2×H100: thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). `async_chunk: true`, shared-memory connector with `initial_codec_chunk_frames: 4`, `codec_chunk_frames: 25`, `codec_left_context_frames: 25` |
-| `qwen3_omni_moe_codec.yaml` | Streaming codec tuning over the MRv2 default; disables Thinker prefix caching and adds `talker_first_audio`, `codec_chunk_ramp`, Code2Wav graph batch sizes, fused snake. CUDA/ROCm/XPU select V2; NPU/MUSA retain unsupported V1 pins |
+| `qwen3_omni_moe.yaml` | Default MRv2 on CUDA/ROCm/NPU/XPU; MUSA retains an unsupported V1 pin. Thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). Prefix caching off, `async_chunk: true`, `talker_first_audio`, `[1, 2, 4, 8, 16, 25]` codec chunk ramp, grouped graph buckets and CUDA fused Snake |
 | `qwen3_omni_moe_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10) plus code-predictor KV and sampling optimizations |
 | `qwen3_omni_moe_thinking.yaml` | Thinker-only pipeline, TP=2, prefix caching on |
 | `qwen3_omni_duplex.yaml` | `session_mode: duplex` |
@@ -30,10 +29,9 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 
 ## Known quirks
 
-- Default CUDA deploy enables Thinker prefix caching on either runner; Talker
-  and Code2Wav keep it off. Non-CUDA platform sections and the specialized
-  `qwen3_omni_moe_codec.yaml` overlay disable Thinker caching (the H200 overlay
-  inherits that setting). Read the effective profile before tuning.
+- The default deploy disables prefix caching on Thinker, Talker and Code2Wav.
+  The duplex and H200 profiles inherit that setting. Thinker caching can be
+  enabled explicitly on stage 0. Read the effective profile before tuning.
 - Talker first-frame and fused MTP fast paths require Talker prefix caching
   off, independently of Thinker caching. Eligibility lives in
   `vllm_omni/model_executor/models/common/talker_first_audio.py` and

@@ -1769,7 +1769,7 @@ stages:
         else:
             stages = merge_pipeline_deploy(pipeline, deploy)
             assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
-            assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
+            assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
 
         duplex = _apply_platform_overrides(
@@ -2228,9 +2228,9 @@ stages:
     @pytest.mark.parametrize(
         ("yaml_name", "platform", "enabled"),
         [
-            ("qwen3_omni_moe.yaml", "cuda", True),
+            ("qwen3_omni_moe.yaml", "cuda", False),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
-            ("qwen3_omni_moe_codec.yaml", "cuda", False),
+            ("qwen3_omni_moe_h200.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", False),
             *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
@@ -2239,7 +2239,7 @@ stages:
         ],
     )
     def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
-        """Stage-0 prefix caching ships on only for the validated CUDA turn profiles.
+        """These turn and duplex profiles keep stage-0 prefix caching disabled.
 
         Checked on the final engine args: the stage value rides in
         ``engine_extras`` and must keep winning over the pipeline-wide flag.

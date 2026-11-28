@@ -1,10 +1,12 @@
 # Qwen3-Omni MRv2 performance
 
-For streaming workloads, `qwen3_omni_moe_codec.yaml` opts into one-frame first
-audio on CUDA and length-grouped codec graphs on CUDA/ROCm. It keeps Thinker
-prefix caching disabled. The base turn-serving profile enables that cache on
-CUDA and uses a four-frame first chunk. Existing deployments can continue using
-`qwen3_omni_moe_codec.yaml`, a compatibility alias for the codec profile.
+The default `qwen3_omni_moe.yaml` includes the streaming codec tuning: one-frame
+first audio on eligible CUDA Talkers, a `[1, 2, 4, 8, 16, 25]` chunk ramp,
+length-grouped codec graph buckets and CUDA fused Snake blocks. All three stages
+keep prefix caching disabled. The duplex and H200 profiles inherit these
+settings directly from the default; a separate codec overlay is no longer needed.
+The ramp takes precedence over the four-frame initial chunk setting, which
+remains the fallback when `codec_chunk_ramp: null` is configured.
 
 This model adaptation builds on #8184's existing stage runtime and output
 contracts. It adds Talker CPU metadata parsing, sampled-token embedding
@@ -25,10 +27,13 @@ request, so it uses the turn-mode data plane. Turn-mode measurements do not
 establish duplex latency or interruption behavior.
 
 First-frame delivery requires `talker_first_audio: true` in connector extra,
-a one-frame initial codec chunk, CUDA, a local single-rank Talker and prefix caching disabled.
+a one-frame initial codec chunk, CUDA, a local single-rank Talker and Talker prefix caching disabled.
 Other deployments retain the regular Code2Wav path.
-`codec_fused_snake` explicitly opts CUDA profiles into fused decoder blocks;
-profiles that do not opt in retain their original blocks and indexed text cache.
+Set `talker_first_audio: false` (or `VLLM_OMNI_TALKER_FIRST_AUDIO=0`) to disable
+first-frame delivery. To restore the previous codec defaults, also set
+`codec_chunk_ramp: null`, `codec_graph_batch_sizes: []` and
+`codec_fused_snake: false` in connector extra. Thinker prefix caching can be
+enabled separately on stage 0; it does not control Talker first-frame eligibility.
 
 ## ROCm generation stages
 
@@ -86,9 +91,9 @@ these longer non-streaming windows (#10090).
 
 ## Ascend prefix cache
 
-The default Thinker prefix cache is enabled on CUDA for V1 and V2. NPU keeps
-it disabled by default until cold/hit Thinker token parity is established;
-set `enable_prefix_caching: true` on stage 0 to opt in. Talker and Code2Wav
+The default Thinker prefix cache is disabled on every platform. On NPU, cold/hit
+Thinker token parity still needs to be established; set
+`enable_prefix_caching: true` on stage 0 to opt in. Talker and Code2Wav
 retain disabled prefix caching. When enabled, the NPU V2 AR runner
 initializes the Omni stage-output cache after native Ascend KV setup; KV
 reuse alone would omit the cached Thinker rows needed by the Talker. The
