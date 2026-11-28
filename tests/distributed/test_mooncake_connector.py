@@ -26,11 +26,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import MooncakeStoreConnector
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     BlobBlockHashes,
+    ChunkedTokenDatabase,
     LoadSpec,
     MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
     ReqMeta,
     TailKeyBoundary,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.layout import (
+    KeyMetadata,
+    StoreLayout,
+    TPShardedStoreLayout,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import MooncakeStoreConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import MooncakeStoreScheduler
@@ -99,18 +105,18 @@ class MemoryStore:
         return 0 if self.objects.pop(key, None) is not None else -1
 
 
-@dataclass
-class TokenDatabase:
-    prefix: str = "kv:"
+def token_database(store_layout: StoreLayout | None = None) -> ChunkedTokenDatabase:
+    return ChunkedTokenDatabase(KeyMetadata("test", 0, 0, 0, 0), 4, store_layout=store_layout)
 
-    def key_for(self, block_hash: bytes) -> str:
-        return self.prefix + block_hash.hex()
+
+def kv_key(block_hash: bytes) -> str:
+    return token_database().store_layout.key_for(0, block_hash)
 
 
 @dataclass
 class WorkerSeam:
     store: MemoryStore
-    token_dbs: list[TokenDatabase] = field(default_factory=lambda: [TokenDatabase()])
+    token_dbs: list[ChunkedTokenDatabase] = field(default_factory=lambda: [token_database()])
     kv_connector_stats: MooncakeStoreConnectorStats = field(default_factory=MooncakeStoreConnectorStats)
 
     def _record_kv_connector_operation(self, operation, duration_seconds, num_keys, **fields):
@@ -310,7 +316,7 @@ def save_prefix(connector, attempt, blocks):
         key = hs_key(connector.namespace, block_hash)
         store.objects[key] = payload
         store.objects[key + ":ready"] = hashlib.sha256(payload).digest()
-        store.objects["kv:" + block_hash.hex()] = b"kv"
+        store.objects[kv_key(block_hash)] = b"kv"
 
 
 def begin_read(connector, attempt, tokens=8, local_tokens=0):
@@ -589,7 +595,7 @@ def test_admission_gap_preserves_previously_queued_prefix(connector):
     attempt = install_attempt(connector)
     connector.settings = replace(connector.settings, max_pending_transfers=1)
     store = connector.connector_worker.store
-    store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+    store.objects[kv_key(attempt.hashes[0])] = b"kv"
     connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
     connector.capture_step(attempt.req_id, attempt.token, 4, 9, captures(4, 8))
     assert not attempt.rows.save_enabled
@@ -623,7 +629,7 @@ class LateKVStore(MemoryStore):
 
 def test_save_publishes_completion_records_in_block_order(connector):
     attempt = install_attempt(connector)
-    first_kv, second_kv = ("kv:" + block_hash.hex() for block_hash in attempt.hashes[:2])
+    first_kv, second_kv = (kv_key(block_hash) for block_hash in attempt.hashes[:2])
     store = LateKVStore(first_kv)
     store.objects[second_kv] = b"kv"
     connector.connector_worker = WorkerSeam(store)
@@ -631,6 +637,22 @@ def test_save_publishes_completion_records_in_block_order(connector):
     # The second block's KV existed first, but its record waited for the first.
     assert store.records_before_late_kv == 0
     assert store.records == [hs_key(connector.namespace, block_hash) + ":ready" for block_hash in attempt.hashes[:2]]
+
+
+@pytest.mark.parametrize("shards", [1, 2], ids=["rank-local", "multiple-store-shards"])
+def test_hs_ready_waits_for_all_native_store_layout_shards(connector, shards):
+    attempt = install_attempt(connector)
+    db = token_database()
+    if shards > 1:
+        db.store_layout = TPShardedStoreLayout(db.metadata, 4, 4, local_tp_size=1, store_tp_size=shards, tp_rank=0)
+    keys = [db.store_layout.key_for(shard, attempt.hashes[0]) for shard in db.store_layout.local_shard_ids]
+    store = LateKVStore(keys[-1])
+    for key in keys[:-1]:
+        store.objects[key] = b"kv"
+    connector.connector_worker = WorkerSeam(store, token_dbs=[db])
+    assert connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4))], 0))
+    assert store.records_before_late_kv == 0
+    assert store.records == [hs_key(connector.namespace, attempt.hashes[0]) + ":ready"]
 
 
 def test_hs_admission_failure_still_waits_for_native_gpu_copy(connector):
@@ -652,7 +674,7 @@ def test_save_publishes_commit_after_kv_and_hs_exist(connector):
     attempt = install_attempt(connector)
     block_hash = attempt.hashes[0]
     store = connector.connector_worker.store
-    store.objects["kv:" + block_hash.hex()] = b"kv"
+    store.objects[kv_key(block_hash)] = b"kv"
     connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4))], 0))
     key = hs_key(connector.namespace, block_hash)
     assert store.objects[key + ":ready"] == hashlib.sha256(store.objects[key]).digest()
@@ -665,7 +687,7 @@ def test_slow_hs_write_preserves_kv_readiness_budget(connector, monkeypatch, kv_
     store = connector.connector_worker.store
     key = hs_key(connector.namespace, attempt.hashes[0])
     if kv_ready:
-        store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+        store.objects[kv_key(attempt.hashes[0])] = b"kv"
     clock = ClockSeam()
     put = store.put
 
@@ -700,14 +722,14 @@ def test_save_failure_stops_already_queued_and_future_saves(connector, monkeypat
     store = connector.connector_worker.store
     first, second = (hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes[:2])
     for block_hash in attempt.hashes:
-        store.objects["kv:" + block_hash.hex()] = b"kv"
+        store.objects[kv_key(block_hash)] = b"kv"
     if failure in ("put", "ready"):
         store.fail_put.add(first if failure == "put" else first + ":ready")
     elif failure == "remove":
         store.objects[first + ":ready"] = b"stale"
         monkeypatch.setattr(store, "remove", lambda *_args, **_kwargs: -1)
     elif failure == "timeout":
-        del store.objects["kv:" + attempt.hashes[0].hex()]
+        del store.objects[kv_key(attempt.hashes[0])]
         connector.settings = replace(connector.settings, load_timeout_seconds=0.01)
     else:
         original_get = store.get
@@ -742,7 +764,7 @@ def test_save_failure_preserves_successful_leading_blocks(connector):
     store = connector.connector_worker.store
     keys = [hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes]
     for block_hash in attempt.hashes:
-        store.objects["kv:" + block_hash.hex()] = b"kv"
+        store.objects[kv_key(block_hash)] = b"kv"
     store.fail_put.add(keys[1])
     connector.capture_step(attempt.req_id, attempt.token, 0, 13, captures(0, 8))
     connector.capture_step(attempt.req_id, attempt.token, 8, 13, captures(8, 12))
@@ -762,9 +784,9 @@ def test_queued_successor_leaves_a_save_worker_for_other_requests(connector, mon
     other.hashes = [b"other"]
     store = connector.connector_worker.store
     first, second = (hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes[:2])
-    first_kv = "kv:" + attempt.hashes[0].hex()
+    first_kv = kv_key(attempt.hashes[0])
     for block_hash in [*attempt.hashes[:2], *other.hashes]:
-        store.objects["kv:" + block_hash.hex()] = b"kv"
+        store.objects[kv_key(block_hash)] = b"kv"
     if fail_predecessor:
         store.fail_put.add(first + ":ready")
     first_waiting, release = threading.Event(), threading.Event()
@@ -803,7 +825,7 @@ def test_queued_successor_leaves_a_save_worker_for_other_requests(connector, mon
 
 def test_shutdown_drains_deferred_saves(connector, monkeypatch):
     attempt = install_attempt(connector)
-    store = KVPollStore(["kv:" + attempt.hashes[0].hex()])
+    store = KVPollStore([kv_key(attempt.hashes[0])])
     connector.connector_worker = WorkerSeam(store)
     connector._read_executor = None
     connector._save_executor = ThreadPoolExecutor(max_workers=2)
@@ -837,7 +859,7 @@ def test_large_deferred_save_queue_releases_every_successor(connector, cancelled
 
     other = install_attempt(connector, req_id="other", token="other")
     other.hashes = [b"other"]
-    store.objects["kv:" + other.hashes[0].hex()] = b"kv"
+    store.objects[kv_key(other.hashes[0])] = b"kv"
     connector.capture_step(other.req_id, other.token, 0, 9, captures(0, 4))
     other_future = next(reversed(connector._saves))
     if cancelled:
@@ -928,7 +950,7 @@ def test_write_without_kv_never_publishes_commit(connector, monkeypatch):
 
 def test_normal_finish_allows_already_queued_save_to_drain(connector):
     attempt = install_attempt(connector)
-    connector.connector_worker.store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+    connector.connector_worker.store.objects[kv_key(attempt.hashes[0])] = b"kv"
     connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
     connector.bind_connector_metadata(
         joint_metadata(
@@ -1126,7 +1148,7 @@ def test_saves_waiting_for_kv_do_not_delay_a_complete_read(connector):
         Attempt(f"writer-{index}", f"writer-{index}", 9, [f"w{index}-{block}".encode() for block in range(3)])
         for index in range(2)
     ]
-    store = KVPollStore(["kv:" + writer.hashes[0].hex() for writer in writers])
+    store = KVPollStore([kv_key(writer.hashes[0]) for writer in writers])
     connector.connector_worker = WorkerSeam(store)
     reader = install_attempt(connector, req_id="reader", token="reader")
     save_prefix(connector, reader, 2)
@@ -1620,7 +1642,7 @@ def test_save_reports_writes_and_blocks_left_without_completion_records(connecto
     connector.settings = replace(connector.settings, load_timeout_seconds=0.05)
     worker = connector.connector_worker
     # Only the first block's KV object ever appears.
-    worker.store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+    worker.store.objects[kv_key(attempt.hashes[0])] = b"kv"
     connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4)), (4, 8, captures(4, 8))], 0))
     assert recorded(worker, "hs_put") == [(2, 192, "ok", 0)]
     assert recorded(worker, "hs_commit") == [(2, 0, "partial_failure", 1)]

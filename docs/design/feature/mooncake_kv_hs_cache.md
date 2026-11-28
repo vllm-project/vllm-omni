@@ -148,7 +148,8 @@ first value. It then releases the staging reservation and starts a fresh
 `load_timeout_seconds` budget for polling the blocks' KV objects. HS encoding
 and Store writes do not consume that readiness budget; it is not an overall
 save-duration limit and cannot interrupt a blocking Store call. Completion records are
-published in block order, stopping at the first block whose KV object is still
+published in block order after every local Store-layout KV shard exists,
+stopping at the first block whose KV shards are still
 missing. If a KV object never appears, no record is written for it or for
 later blocks, and normal Store eviction removes the orphaned HS objects.
 

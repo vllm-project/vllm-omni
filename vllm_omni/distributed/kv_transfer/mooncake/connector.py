@@ -932,8 +932,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
     def _write_hs_block(
         self, store: Any, attempt: Attempt, block: tuple[int, int, CaptureTensors]
-    ) -> tuple[str, str, bytes] | None:
-        """Write one HS object; return its KV key, completion key and digest."""
+    ) -> tuple[list[str], str, bytes] | None:
+        """Write one HS object; return its KV keys, completion key and digest."""
         assert self.connector_worker is not None
         start, _, tensors = block
         index = start // self.block_size
@@ -948,8 +948,9 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         if not isinstance(actual, bytes) or not actual:
             return None
         decode_hs(actual, spec)
-        kv_key = self.connector_worker.token_dbs[0].key_for(block_hash)
-        return kv_key, key + ":ready", hashlib.sha256(actual).digest()
+        layout = self.connector_worker.token_dbs[0].store_layout
+        kv_keys = [layout.key_for(shard, block_hash) for shard in layout.local_shard_ids]
+        return kv_keys, key + ":ready", hashlib.sha256(actual).digest()
 
     def _save_hs(self, save: PendingSave) -> bool:
         """Write HS objects, then publish each completion record after its KV.
@@ -963,7 +964,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         attempt = save.attempt
         store = self.connector_worker.store
         total = len(save.blocks)
-        commits: list[tuple[str, str, bytes]] = []
+        commits: list[tuple[list[str], str, bytes]] = []
         try:
             complete = True
             started = time.perf_counter()
@@ -994,10 +995,14 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             started, written_blocks, published = time.perf_counter(), len(commits), 0
             try:
                 while commits and not attempt.cancelled and time.monotonic() < deadline:
-                    exists = store.batch_is_exist([kv_key for kv_key, _, _ in commits])
-                    ready = 0
-                    while ready < min(len(commits), len(exists)) and exists[ready] == 1:
+                    exists = store.batch_is_exist([key for keys, _, _ in commits for key in keys])
+                    ready = offset = 0
+                    for keys, _, _ in commits:
+                        end = offset + len(keys)
+                        if len(exists) < end or any(value != 1 for value in exists[offset:end]):
+                            break
                         ready += 1
+                        offset = end
                     for _, ready_key, digest in commits[:ready]:
                         if attempt.cancelled:
                             return False

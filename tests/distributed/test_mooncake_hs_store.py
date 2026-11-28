@@ -17,6 +17,8 @@ from typing import Protocol
 
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import ChunkedTokenDatabase
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.layout import KeyMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import MooncakeStoreConnectorStats
 
 from vllm_omni.distributed.kv_transfer.mooncake import connector as connector_module
@@ -42,17 +44,9 @@ class NativeStore(Protocol):
 
 
 @dataclass
-class NativeTokenDatabase:
-    prefix: str
-
-    def key_for(self, block_hash: bytes) -> str:
-        return self.prefix + block_hash.hex()
-
-
-@dataclass
 class NativeWorkerSeam:
     store: NativeStore
-    token_dbs: list[NativeTokenDatabase]
+    token_dbs: list[ChunkedTokenDatabase]
     kv_connector_stats: MooncakeStoreConnectorStats = field(default_factory=MooncakeStoreConnectorStats)
 
     def _record_kv_connector_operation(self, operation, duration_seconds, num_keys, **fields):
@@ -99,11 +93,11 @@ def native_connector(native_store):
     )
     connector.connector_worker = NativeWorkerSeam(
         store=store,
-        token_dbs=[NativeTokenDatabase(namespace + ":kv:")],
+        token_dbs=[ChunkedTokenDatabase(KeyMetadata("native-test", 0, 0, 0, 0, cache_prefix=namespace), 4)],
     )
     attempt = Attempt("request", uuid.uuid4().hex, 5, [b"prefix-0"])
     hs = hs_key(namespace, attempt.hashes[0])
-    kv = connector.connector_worker.token_dbs[0].key_for(attempt.hashes[0])
+    kv = connector.connector_worker.token_dbs[0].store_layout.key_for(0, attempt.hashes[0])
     keys.extend([hs, hs + ":ready", kv])
     return connector, attempt, hs, kv
 
@@ -211,7 +205,7 @@ def test_native_batched_read_spans_batches_and_rejects_a_gap(native_store, nativ
     expected = [tensors(10 * index) for index in range(3)]
     for block_hash in attempt.hashes:
         key = hs_key(namespace, block_hash)
-        kv_key = connector.connector_worker.token_dbs[0].key_for(block_hash)
+        kv_key = connector.connector_worker.token_dbs[0].store_layout.key_for(0, block_hash)
         cleanup.extend([key, key + ":ready", kv_key])
         assert store.put(kv_key, b"test-kv-commit") == 0
     connector._save_hs(PendingSave(attempt, [(4 * i, 4 * i + 4, expected[i]) for i in range(3)], 0))
@@ -232,7 +226,7 @@ def test_native_mixed_read_skips_locally_resident_prefix(native_store, native_co
     attempt.prompt_len = 9
     attempt.local_tokens = 4
     key = hs_key(namespace, attempt.hashes[1])
-    kv_key = connector.connector_worker.token_dbs[0].key_for(attempt.hashes[1])
+    kv_key = connector.connector_worker.token_dbs[0].store_layout.key_for(0, attempt.hashes[1])
     cleanup.extend([key, key + ":ready", kv_key])
     assert store.put(kv_key, b"test-kv-commit") == 0
     expected = tensors(10)
