@@ -56,6 +56,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AuraQwen3VLForConditionalGeneration": "qwen3_vl",
+    "AuraQwen3_5ForConditionalGeneration": "qwen3_5",
 }
 
 # Model types whose official Hub repo ships no config.json, so
@@ -182,6 +184,15 @@ def register_omni_models_to_vllm():
     # (and matches OmniModelRegistry's omni-wins ordering).
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import register_speculative_method
+
+    from vllm_omni.model_executor.models.higgs_audio_v3.spec_config import (
+        HIGGS_AUDIO_SPEC_METHOD,
+        HiggsAudioSpeculatorConfig,
+    )
+
+    register_speculative_method(HIGGS_AUDIO_SPEC_METHOD, HiggsAudioSpeculatorConfig)
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
@@ -443,6 +454,7 @@ class OmniEngineArgs(EngineArgs):
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
     enable_distributed_layerwise_offload: bool | None = None
+    enable_submodule_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
@@ -885,6 +897,7 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0
@@ -967,6 +980,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "enable_cpu_offload",
         "enable_layerwise_offload",
         "enable_distributed_layerwise_offload",
+        "enable_submodule_offload",
         "dlo_use_allgather",
         "dlo_resident_layers",
         "host_weight_runtime_mode",

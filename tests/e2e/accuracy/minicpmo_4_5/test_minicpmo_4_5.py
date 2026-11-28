@@ -49,6 +49,7 @@ _RESULT_DIR = Path(
 # sits 10 items below the observed minimum (932) while still failing a
 # >=1pp real accuracy regression.
 _MIN_DAILY_OMNI_ACCURACY = 0.77
+_DAILY_OMNI_NUM_PROMPTS = 599  # ceil(1197 / 2); the shared runner uses deterministic seed 0.
 _MAX_SEED_TTS_MEAN_WER = 0.05
 # English Seed-TTS, 1088 utterances. 2026-10-08 mean SIM 0.865 (median 0.869),
 # WER 0.021. 2026-10-20 L20X stock and bfloat16-cache runs scored SIM 0.8655
@@ -141,6 +142,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
         omni_server,
         skip_seed=True,
         skip_daily=False,
+        num_prompts=_DAILY_OMNI_NUM_PROMPTS,
     )
     argv.extend(
         [
@@ -156,6 +158,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
             "all",
             "--daily-omni-pack-mode",
             "minicpm-interleave",
+            "--daily-omni-save-eval-items",
             "--daily-extra-body-json",
             json.dumps(_DAILY_EXTRA_BODY, separators=(",", ":")),
             "--trust-remote-code",

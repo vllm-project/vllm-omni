@@ -67,20 +67,26 @@ On one H100, the pinned Modular Diffusers pipeline generates reference images in
 with component-level CPU offload. The vLLM-Omni server uses single-GPU
 layerwise offload. The test resolves the model's `main` once and passes the
 same local snapshot to both implementations. It records the resolved commit in
-the accuracy results. Both implementations use the same text encoder and fixed
-requests from the NPU recipe: 1024² text-to-image with seed 42 and 2048²
-single-reference editing with seed 1234. Both use the CPU generator and the
-checkpoint's six-step schedule. The 1024² output is generated on the default
-2048² canvas and resized. The test keeps one PNG from each implementation per
-case and records cross-implementation SSIM and PSNR.
+the accuracy results. CUDA Nightly compares text-to-image and single-reference
+editing with the same text encoder in both implementations. Text-to-image uses
+seed 42 and sets `min_generation_area` to 1024², so it generates directly on a
+1024² canvas. The NPU recipe's 1024² text-to-image benchmark generates on a
+2048² canvas and downsamples the result. Editing uses seed 1234 and generates on
+a 2048² canvas. Both cases use a CPU generator and the checkpoint's six-step
+schedule.
+
+For editing, the reference script draws the target and reference noise in
+Omni's order and passes both tensors to Diffusers. Diffusers samples the
+reference VAE posterior using the advanced generator. The test retains one
+PNG per implementation and case and records SSIM and PSNR.
 
 From the repository root, source
 `tests/e2e/accuracy/minimax_h3_image/setup_reference.sh` and run the accuracy
 test with `--run-level full_model`. The first run needs access to the pinned
 Diffusers source and the model's `main` snapshot. For offline runs, cache both
-weight formats and `examples/reference1.png` and `examples/prompt.edit.txt` in
-that snapshot. The CUDA Nightly job retains images, metrics, and standard
-`result_acc_*.json` accuracy summaries. The test allocates
+weight formats. The CUDA edit case also needs `examples/reference1.png` and
+`examples/prompt.edit.txt` from that snapshot. The CUDA Nightly job retains
+images, metrics, and standard `result_acc_*.json` accuracy summaries. The test allocates
 up to 3 minutes for reference preflight, 20 for CUDA reference generation, 10
 for server startup, and 3 per image request. These limits leave at
 least 10 minutes of the 60-minute job for setup, cleanup, and artifacts.
@@ -89,15 +95,17 @@ least 10 minutes of the 60-minute job for setup, cleanup, and artifacts.
 after retaining artifacts with `calibration_only=true` because it does not
 enforce numerical accuracy floors.
 Runtime errors still fail the test. To enforce thresholds, set `H3_IMAGE_CALIBRATE=0`
-after selecting device-specific `ssim` and `psnr` floors for both `t2i` and
-`edit` in `tests/e2e/accuracy/minimax_h3_image/thresholds.json` and changing its
+after selecting device-specific `ssim` and `psnr` floors for the cases run on the
+device in `tests/e2e/accuracy/minimax_h3_image/thresholds.json` and changing its
 status to `selected`. The shared accuracy helpers resolve the device profile.
 All floors currently remain `null`. Gate mode requires each case to meet both
 floors and fails before model startup when the floors are unselected or invalid.
 
-A3 accuracy calibration is paused in Nightly while the Diffusers reference
-failure is investigated. Manual A3 runs use one die for each implementation.
-The Diffusers reference uses leaf-level offload for the text encoder and one
-block per group for the DiT, with a 25-minute generation timeout. For a manual
-run, initialize the CANN environment, source `setup_reference.sh`, and select
+A3 Nightly compares direct 1024² text-to-image on one die per implementation. The
+Diffusers reference uses leaf-level offload for the text encoder and one block
+per group for the DiT, with a 35-minute generation timeout. Omni has 20 minutes
+for engine initialization within a 21-minute server startup budget. The NPU
+phase budgets total 62 minutes of the 75-minute job, and the job retains the
+text-to-image calibration artifacts. For a manual run, initialize the CANN
+environment, source `setup_reference.sh`, and select
 `full_model and npu and A3 and cards_1`.
