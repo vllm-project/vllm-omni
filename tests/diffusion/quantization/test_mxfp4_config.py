@@ -27,6 +27,47 @@ def test_mxfp4_config_get_name():
     assert DiffusionMXFP4Config.get_name() == "mxfp4"
 
 
+@pytest.mark.parametrize("offset", [0, 64])
+def test_npu_mxfp4_gemm_packed_weight_offset(monkeypatch, offset):
+    import sys
+    from types import ModuleType
+    from unittest.mock import Mock
+
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config, NPUMxfp4LinearMethod, _npu_w4a8_matmul
+
+    backing = torch.arange(256, dtype=torch.uint8)
+    weight = backing[offset : offset + 128].view(4, 32)
+    scale = backing[192:200].view(4, 1, 2)
+    layer = torch.nn.Module()
+    layer.register_buffer("weight", weight)
+    layer.register_buffer("weight_scale", scale)
+    gemm = Mock(return_value=torch.zeros(2, 4, dtype=torch.bfloat16))
+    fake_npu = ModuleType("torch_npu")
+    fake_npu.npu_quant_matmul = gemm  # type: ignore[attr-defined]
+    fake_npu.npu_dynamic_mx_quant = Mock(return_value=(weight, scale))  # type: ignore[attr-defined]
+    fake_npu.float4_e2m1fn_x2 = 0  # type: ignore[attr-defined]
+    fake_npu.float8_e4m3fn = 2  # type: ignore[attr-defined]
+    fake_npu.float8_e8m0fnu = 1  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+    method = NPUMxfp4LinearMethod(DiffusionMXFP4Config())
+    method._quant_matmul(weight, scale, layer, None, torch.bfloat16)
+    _, operand, operand_scale = gemm.call_args.args
+
+    assert operand.storage_offset() == 0
+    assert (operand.data_ptr() == weight.data_ptr()) == (offset == 0)
+    torch.testing.assert_close(operand, weight.T, check_stride=True)
+    assert operand_scale.data_ptr() == scale.data_ptr()
+    assert operand_scale.storage_offset() == scale.storage_offset()
+    assert layer.weight is weight and weight.storage_offset() == offset
+
+    gemm.reset_mock()
+    _npu_w4a8_matmul(torch.zeros(2, 64, dtype=torch.bfloat16), weight, scale, None, torch.bfloat16)
+    _, w4a8_operand, _ = gemm.call_args.args
+    assert w4a8_operand.storage_offset() == 0
+    assert (w4a8_operand.data_ptr() == weight.data_ptr()) == (offset == 0)
+    torch.testing.assert_close(w4a8_operand, weight.T, check_stride=True)
+
+
 @pytest.mark.parametrize("value", [True, False, None, "2", 2.0, 1, -1, 3])
 def test_mxfp4_scale_alg_rejects_invalid_values(value):
     from vllm_omni.quantization import build_quant_config

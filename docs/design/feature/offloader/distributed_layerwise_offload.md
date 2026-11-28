@@ -29,7 +29,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Online INT8 linears** | ✅ Ordinary loader finalizes the int8 weight (contiguous or transposed view) and fp32 scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Online MXFP8 linears** | ✅ Ordinary loader finalizes the fp8 weight (contiguous) and e8m0 block scale (contiguous or transposed view) before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
-| **Online MXFP4 linears (vLLM XPU kernel)** | ✅ Ordinary loader finalizes the packed fp4 weight and e8m0 block scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online MXFP4 linears (NPU single-scale and vLLM XPU)** | ✅ Ordinary loader finalizes the packed fp4 weight and e8m0 block scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
@@ -185,6 +185,34 @@ This mode means:
   mmap is selected; the ordinary-loader fallback keeps one private runtime
   copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
+
+### Online BF16 prefix payloads
+
+With `prefix_bf16_master_mode="dlo"`, an online quantization method that
+implements `get_layerwise_prefix_weights()` (such as online NPU single-scale
+MXFP4) exposes its BF16 master weight as an auxiliary tensor. DLO maintains
+separate host payloads for the prefix master and the standard quantized
+weights/scales, and reconstructs only the selected representation in its shared
+device slots. Buffer capacities account for both layouts; pinned prefix staging
+is shared and bounded by two largest per-rank shards.
+
+Prefetch records the precision phase as well as slot ownership. A mismatch at
+the prefix boundary or a new request forces a fresh transfer before the block
+runs. CFG passes at the same denoising index retain the same phase. Transfer
+events protect shared host staging from reuse while a transfer is in flight.
+Disabling the backend restores both standard tensors and auxiliary masters to
+CPU independently of the current request phase.
+
+This mode requires the resolved distributed backend to select the affected
+quantized component. Startup checks both the compact selector and legacy flags
+against the model offload plan before loading checkpoint weights. Eligible
+streamed blocks use the prefix payload; non-block and resident auxiliary
+linears keep the ordinary CPU-master fallback.
+
+Model migration, mixed-step batches, reload, and sleep/wake are outside its
+supported contract. CPU tests cover ring reuse, phase transitions, simulated
+AllGather, and request reset; actual NPU streams, distributed execution,
+memory, and generation quality still require device validation.
 
 ### Component allocator-cache retention
 
