@@ -274,7 +274,18 @@ steps:
         source_file_dependencies: omni_minicpmo_4_5_perf
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -m 'core_model and cuda'
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -k test_minicpmo_4_5_ready -m 'core_model and cuda'
+        mirror_hardwares: h100_1
+
+      - label: "Omni · MiniCPM-o 4.5 Duplex Perf Test"
+        timeout_in_minutes: 120
+        source_file_dependencies: omni_minicpmo_4_5_duplex_perf
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5_ready/**/*
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -k test_minicpmo_4_5_duplex_ready -m 'core_model and cuda'
         mirror_hardwares: h100_1
 
       - label: "TTS · Chatterbox Turbo and Original Test"
