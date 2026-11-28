@@ -427,13 +427,12 @@ def _minimax_h3_output_canvas(
 
 
 def _minimax_h3_execution_facts(height: int, width: int, context: Mapping[str, Any]) -> dict[str, Any]:
-    """Size and flow shifts the request ran with, for ``--enable-execution-summary``."""
+    """What the request ran with, for the execution summary; H3 is CFG-distilled, so no CFG."""
     return {
         "width": int(width),
         "height": int(height),
         "flow_shift": context.get("video_shift"),
         "audio_flow_shift": context.get("audio_shift"),
-        # H3 checkpoints are CFG-distilled: no negative branch, guidance unused.
         "cfg": False,
     }
 
@@ -4512,19 +4511,13 @@ class MiniMaxH3Pipeline(
     def _record_component_quantization(
         self, component: str, quant_config: QuantizationConfig | None
     ) -> QuantizationConfig | None:
-        """Remember the quantization a component loads with, for the execution summary."""
         name = None if quant_config is None else quant_config.get_name()
         self.__dict__.setdefault("_component_quantization", {})[component] = name
         return quant_config
 
     def execution_runtime_facts(self) -> dict[str, Any]:
-        """Facts the weights alone do not show, for ``--enable-execution-summary``.
-
-        ``component_quantization`` is the method each component loaded with,
-        including checkpoint-shipped ones (FastH3 FP8/NVFP4) that
-        ``--quantization`` does not show; ``adaln_cache`` whether the exact
-        AdaLN projection cache is on (``minimax_h3_adaln_cache``, default on).
-        """
+        """Execution summary facts the config and weights do not show: checkpoint-shipped quantization
+        (FastH3 FP8/NVFP4), the AdaLN cache (on by default), and the VAE decode precision."""
         facts: dict[str, Any] = {"component_quantization": dict(self.__dict__.get("_component_quantization", {}))}
         adaln_cache = getattr(getattr(self, "transformer", None), "adaln_cache", None)
         if adaln_cache is not None:

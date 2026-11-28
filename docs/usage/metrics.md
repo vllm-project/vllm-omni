@@ -166,59 +166,19 @@ by the pipeline instrumentation.
 
 ## Execution summary
 
-Pass `--enable-execution-summary` to log what each request actually ran, for
-example to check a benchmark run against its declared workload. `[OmniTiming]`
-reports how long a request took; `[OmniExecution]` reports what it ran: one JSON
-line per finished request, logged next to its `[OmniTiming]` line, with
-`schema_version` (currently `1`) and `event: "diffusion_request_completed"`. Each line stands on its
-own; there are no separate startup lines to correlate.
+`--enable-execution-summary` logs one `[OmniExecution]` JSON line per finished request, next to
+`[OmniTiming]`, so a benchmark can check what each request actually ran. Values the pipeline resolved
+or generated (e.g. size when only `aspect_ratio` was sent) are reported over the request's.
 
 | Field | Meaning |
 | --- | --- |
-| `request_id` | The id the client sees, to match client-side records: the `POST /v1/videos` job `id` or the `X-Request-Id` header. |
-| `engine_request_id` | Internal id, as in `[OmniTiming] req=`. |
-| `status`, `failure_reason` | `completed` or `failed`; the reason as in `vllm_omni:requests_failed` (e.g. `client_disconnect`, `stage_error`). |
-| `stages` | One entry per stage: `stage_id`, `replica_id`, `output_type`, `batch_size`; `diffusion` and `runtime` for diffusion stages, `num_tokens_in` and `num_tokens_out` for the others, `audio` (`duration_s`, `sample_rate`) for stages that output audio samples. |
+| `request_id`, `engine_request_id` | Id the client sees (`POST /v1/videos` job id or `X-Request-Id`); internal id as in `[OmniTiming] req=`. |
+| `status`, `failure_reason` | `completed` or `failed`, with the reason as in `vllm_omni:requests_failed`. |
+| `stages[].diffusion` | `width`, `height`, `num_frames`, `fps`, `seed`, `num_inference_steps` (requested), `completed_steps` (counted from the denoising loop), `cached_steps` (served by Cache-DiT), `guidance_scale`, `flow_shift`, `num_outputs_per_prompt`, `lora`, plus values the pipeline reports (e.g. MiniMax-H3 `audio_flow_shift`, `cfg`). |
+| `stages[].runtime` | Versions, `model` and `model_revision` (resolved from a hub snapshot), `configured_dtype`, `quantization`, `cache_backend`/`cache_config`, `parallel_config`, `device`, `world_size`, `attention` (backend per layer role), `weight_dtypes` (loaded weight elements per dtype on rank 0), plus pipeline facts (e.g. MiniMax-H3 `component_quantization`, `adaln_cache`, `compute_dtypes`). |
 
-`diffusion` is what the request ran. Values the request left to the model
-defaults report what the pipeline resolved where the pipeline reports it
-(`DiffusionOutput.execution_facts`, e.g. MiniMax-H3's size and flow shifts):
-
-| Field | Meaning |
-| --- | --- |
-| `width`, `height`, `size_source` | Output size and its source: `tensor` (typed video tensor), `image`, `pipeline` (reported by the pipeline, e.g. for video it encoded in the worker) or `request` (resolved sampling parameters). |
-| `num_frames`, `frames_source` | Frame count before optional frame interpolation and its source: `tensor`, `encoder` (frame counts the encoder reported for video the worker encoded), `container` (frame count read from the encoded MP4), `stream` (sum of streamed chunks) or `request`. |
-| `fps`, `seed` | Output rate; resolved seed, including a server-assigned random seed. |
-| `num_inference_steps` | Requested denoising steps (`null` when the model default applied). |
-| `completed_steps` | Denoising steps the pipeline completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
-| `cached_steps` | Of the completed steps, those a step cache (Cache-DiT) served from its cache instead of running the transformer; the transformer ran `completed_steps - cached_steps` times. `null` without such a step cache. |
-| `flow_shift` | Shift the pipeline reported, else the request's or server's value; `null` when unknown. |
-| `guidance_scale` | Value set by the request; `null` when the request left it to the model default or the pipeline runs without CFG (`cfg: false`). |
-| `num_outputs_per_prompt` | Outputs generated for the request. |
-| `lora` | LoRA adapters in effect: the request's and the one the server loaded at startup (`lora_path`); `null` for none. |
-| other keys | Further values the pipeline resolved, e.g. MiniMax-H3's `audio_flow_shift` and `cfg: false` (CFG-distilled, no guidance). |
-
-`runtime` is how the stage ran it; the engine computes it once at startup and the
-worker once after the model loads:
-
-| Field | Meaning |
-| --- | --- |
-| `vllm_omni_version`, `vllm_version`, `torch_version` | Software versions (`dev` when vLLM-Omni runs from a source tree without version metadata). |
-| `model`, `model_revision` | Model as served; a local directory that resolves into a Hugging Face hub snapshot reports the repo id and snapshot commit. |
-| `model_class_name`, `configured_dtype`, `quantization` | Pipeline class, the stage's configured dtype (`--dtype`), quantization method (`null` for none). |
-| `cache_backend`, `cache_config` | Step cache backend (`none` when off) and its settings (`null` when off). |
-| `parallel_config`, `max_num_seqs` | Parallel degrees; maximum requests batched together. |
-| `device`, `world_size` | Accelerator name and number of ranks. |
-| `attention` | The backend each attention layer resolved, counted per role. |
-| `weight_dtypes` | Weight elements per dtype of each pipeline component as loaded on the reporting rank (rank 0; a component sharded with tensor parallelism shows its shard) (parameters and persistent buffers, so packed quantized weights such as NVFP4 show), e.g. `{"transformer": {"bfloat16": …}, "video_vae": {"float32": …, "float16": …}}`. |
-| other keys | Facts the pipeline reports through `execution_runtime_facts()`. MiniMax-H3 reports `component_quantization` (the method each component loaded with, including checkpoint-shipped FP8/NVFP4 that `--quantization` does not show), `adaln_cache` (whether its exact AdaLN projection cache is on; default on), `compute_dtypes` (`video_vae_decode: float16`) and `video_vae_decoder: nvfp4` when the NVFP4 decoder is installed. |
-
-MiniMax-H3 on one B300; the request set `prompt`, `aspect_ratio`, `seed` and `num_inference_steps=49`:
+Example (MiniMax-H3, one B300, request with `aspect_ratio`, `seed` and `num_inference_steps=49`):
 
 ```text
-[OmniExecution] {"schema_version": 1, "event": "diffusion_request_completed", "request_id": "video_gen_<job id>", "engine_request_id": "video_gen_<job id>-<8 hex>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "diffusion": {"width": 1344, "height": 768, "size_source": "pipeline", "num_frames": 209, "frames_source": "encoder", "fps": 24, "seed": 42, "num_inference_steps": 49, "completed_steps": 49, "cached_steps": null, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "lora": null, "audio_flow_shift": 3.0, "cfg": false}, "runtime": {"vllm_omni_version": "dev", "vllm_version": "0.34.0", "torch_version": "2.14.0+cu130", "model": "MiniMaxAI/MiniMax-H3", "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe", "model_class_name": "MiniMaxH3ModularPipeline", "configured_dtype": "bfloat16", "quantization": null, "cache_backend": "none", "cache_config": null, "parallel_config": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1, "data_parallel_size": 1, "sequence_parallel_size": 1, "ulysses_degree": 1, "ring_degree": 1, "cfg_parallel_size": 1, "vae_patch_parallel_size": 1, "use_hsdp": false}, "max_num_seqs": 1, "device": "NVIDIA B300 SXM6 AC", "world_size": 1, "attention": {"minimax_h3.token_refiner": {"FLASHINFER_ATTN": 2}, "self": {"FLASHINFER_ATTN": 50}}, "weight_dtypes": {"transformer": {"float32": 17222160, "bfloat16": 33105770752}, "text_encoder": {"bfloat16": 25753095920}, "video_vae": {"float32": 186993464, "float16": 2416877568}, "audio_vae": {"float32": 151326585}}, "component_quantization": {"transformer": null, "text_encoder": null}, "adaln_cache": false, "compute_dtypes": {"video_vae_decode": "float16"}}}]}
+[OmniExecution] {"schema_version": 1, "event": "diffusion_request_completed", "request_id": "video_gen_<job id>", "engine_request_id": "video_gen_<job id>-<8 hex>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "diffusion": {"width": 1344, "height": 768, "num_frames": 209, "fps": 24, "seed": 42, "num_inference_steps": 49, "completed_steps": 49, "cached_steps": null, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "lora": null, "audio_flow_shift": 3.0, "cfg": false}, "runtime": {"vllm_omni_version": "dev", "vllm_version": "0.34.0", "torch_version": "2.14.0+cu130", "model": "MiniMaxAI/MiniMax-H3", "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe", "model_class_name": "MiniMaxH3ModularPipeline", "configured_dtype": "bfloat16", "quantization": null, "cache_backend": "none", "cache_config": null, "parallel_config": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1, "data_parallel_size": 1, "sequence_parallel_size": 1, "ulysses_degree": 1, "ring_degree": 1, "cfg_parallel_size": 1, "vae_patch_parallel_size": 1, "use_hsdp": false}, "max_num_seqs": 1, "device": "NVIDIA B300 SXM6 AC", "world_size": 1, "attention": {"minimax_h3.token_refiner": {"FLASHINFER_ATTN": 2}, "self": {"FLASHINFER_ATTN": 50}}, "weight_dtypes": {"transformer": {"float32": 17222160, "bfloat16": 33105770752}, "text_encoder": {"bfloat16": 25753095920}, "video_vae": {"float32": 186993464, "float16": 2416877568}, "audio_vae": {"float32": 151326585}}, "component_quantization": {"transformer": null, "text_encoder": null}, "adaln_cache": false, "compute_dtypes": {"video_vae_decode": "float16"}}}]}
 ```
-
-Failed requests whose diffusion stage did not return have no `diffusion` or
-`runtime` entry. Nothing is logged per denoising step; counting adds one integer
-update per step and only runs while the flag is set.

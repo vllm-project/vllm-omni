@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Progress bar mixin for diffusion pipelines.
 
@@ -14,13 +14,10 @@ from vllm_omni.diffusion.denoise_progress import DenoiseProgress, active_denoise
 
 
 class _CountingTqdm(tqdm):
-    """tqdm that reports its steps to the enclosing ``denoise_progress_scope``.
+    """tqdm that counts completed steps into the enclosing ``denoise_progress_scope``, also when disabled.
 
-    Counts also when the bar is disabled on non-zero ranks. One accounting path
-    per mode: an iterated item counts once the loop asks for the next one, and
-    an explicit ``update(n)`` outside iteration adds ``n``. While iterating, an
-    enabled tqdm calls ``update()`` itself to refresh the display, for items
-    already counted, so those calls do not count again.
+    Iteration counts an item once its loop body finishes; ``update(n)`` counts only outside iteration,
+    since an enabled tqdm calls it while iterating to refresh the display.
     """
 
     def __init__(self, *args, progress: DenoiseProgress, **kwargs):
@@ -39,7 +36,6 @@ class _CountingTqdm(tqdm):
         try:
             for obj in super().__iter__():
                 yield obj
-                # Resumed only after the loop body for ``obj`` finished.
                 self._denoise_progress.num_completed_steps += 1
         finally:
             self._denoise_iterating = False

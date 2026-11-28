@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Count the denoising steps a pipeline forward completes.
-
-While a ``denoise_progress_scope`` is open, every denoising-loop progress bar
-opened through ``ProgressBarMixin.progress_bar`` reports its iterations here.
-Pipelines without that progress bar report nothing (``None``).
-"""
+"""Count the denoising steps a pipeline forward completes through ``ProgressBarMixin.progress_bar``."""
 
 from __future__ import annotations
 
@@ -17,34 +12,29 @@ from dataclasses import dataclass
 
 @dataclass
 class DenoiseProgress:
-    """Steps counted during one pipeline forward."""
-
     num_completed_steps: int = 0
     num_loops: int = 0
 
     def result(self) -> int | None:
-        """Completed denoising steps, or None when no loop reported."""
-        if not self.num_loops:
-            return None
-        return self.num_completed_steps
+        """Completed steps, or None when no progress bar reported (the pipeline does not use one)."""
+        return self.num_completed_steps if self.num_loops else None
 
 
-_active_denoise_progress: ContextVar[DenoiseProgress | None] = ContextVar("_active_denoise_progress", default=None)
+_active: ContextVar[DenoiseProgress | None] = ContextVar("_active_denoise_progress", default=None)
 
 
 def active_denoise_progress() -> DenoiseProgress | None:
-    return _active_denoise_progress.get()
+    return _active.get()
 
 
 @contextmanager
 def denoise_progress_scope(enabled: bool = True) -> Iterator[DenoiseProgress | None]:
-    """Count the denoising steps of the pipeline forward run inside this scope."""
     if not enabled:
         yield None
         return
     progress = DenoiseProgress()
-    token = _active_denoise_progress.set(progress)
+    token = _active.set(progress)
     try:
         yield progress
     finally:
-        _active_denoise_progress.reset(token)
+        _active.reset(token)

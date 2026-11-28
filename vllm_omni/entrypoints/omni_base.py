@@ -209,7 +209,6 @@ class OmniBase(PDDisaggregationMixin):
         self._initialize_output_state()
         self.model = model
         self.log_stats = log_stats
-        # Also forwarded to the diffusion stages (OmniDiffusionConfig).
         self.enable_execution_summary = bool(kwargs.get("enable_execution_summary", False))
         self.collect_stage_metrics = collect_stage_metrics
         # Provisional value (mirrors the CLI/caller kwarg); the engine resolves

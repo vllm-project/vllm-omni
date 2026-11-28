@@ -356,8 +356,7 @@ class OrchestratorAggregator:
         # by the orchestrator's cleanup path (e.g. final-stage cleanup races
         # the omni_base finalize emit).
         self._replica_cache: dict[tuple[int, str], int] = {}
-        # Execution facts a diffusion stage attached to its final output, per
-        # request and stage (``--enable-execution-summary``).
+        # Per request and stage: the execution summary facts a diffusion stage attached.
         self.diffusion_execution: dict[str, dict[int | None, dict[str, Any]]] = defaultdict(dict)
 
     def init_run_state(self, wall_start_ts: float) -> None:
@@ -1031,22 +1030,22 @@ class OrchestratorAggregator:
             return
         for rid in sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events}):
             e2e_evt = next((e for e in self.e2e_events if e.request_id == rid), None)
-            stage_evts = self._sorted_stage_events(rid)
+            stage_evts = sorted(
+                self.stage_events.get(rid, []),
+                key=lambda e: e.stage_id if e.stage_id is not None else -1,
+            )
             self._log_omni_timing(rid, e2e_evt, stage_evts)
 
     def log_execution_summary(
         self, request_id: Any, external_request_id: str | None, failure_reason: str | None = None
     ) -> None:
-        """Emit the per-request ``[OmniExecution]`` line (``--enable-execution-summary``)."""
         rid = str(request_id)
         completed = rid in self.e2e_done
-        stage_evts = self._sorted_stage_events(rid)
+        stage_evts = sorted(self.stage_events.get(rid, []), key=lambda e: e.stage_id if e.stage_id is not None else -1)
         execution = self.diffusion_execution.pop(rid, {})
         log_execution(
             "diffusion_request_completed",
             {
-                # The id the client sees, to match its benchmark records; the
-                # engine id is the one ``[OmniTiming] req=`` logs.
                 "request_id": external_request_id or rid,
                 "engine_request_id": rid,
                 "status": "completed" if completed else "failed",
@@ -1054,9 +1053,6 @@ class OrchestratorAggregator:
                 "stages": [stage_entry(evt, execution.get(evt.stage_id)) for evt in stage_evts],
             },
         )
-
-    def _sorted_stage_events(self, rid: str) -> list[StageRequestStats]:
-        return sorted(self.stage_events.get(rid, []), key=lambda e: e.stage_id if e.stage_id is not None else -1)
 
     def _log_omni_timing(self, rid: str, e2e_evt: RequestE2EStats | None, stage_evts: list[StageRequestStats]) -> None:
         pt: dict[str, float] = {}
@@ -1173,7 +1169,10 @@ class OrchestratorAggregator:
                     )
 
             # === [OmniTiming] concise per-request summary ===
-            stage_evts = self._sorted_stage_events(rid)
+            stage_evts = sorted(
+                self.stage_events.get(rid, []),
+                key=lambda e: e.stage_id if e.stage_id is not None else -1,
+            )
             self._log_omni_timing(rid, e2e_evt, stage_evts)
 
             # === Stage table (columns = stage_id) ===

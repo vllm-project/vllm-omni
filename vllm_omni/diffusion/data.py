@@ -1003,8 +1003,6 @@ class OmniDiffusionConfig:
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
-    # Attach per-request execution facts to the output metrics and log the stage
-    # configuration at startup (``--enable-execution-summary``).
     enable_execution_summary: bool = False
 
     # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
@@ -2194,17 +2192,10 @@ class DiffusionOutput:
     # Host-side playback diagnostics; carried through the existing output metadata.
     streaming_metrics: dict[str, float | int] = field(default_factory=dict)
 
-    # Denoising steps the runner counted for this output (completed loop
-    # iterations). None when the pipeline did not report progress (no shared
-    # progress bar) or counting was disabled.
+    # --enable-execution-summary: denoising steps the runner counted (cached: served by a step
+    # cache), values the pipeline resolved (e.g. size, flow_shift) and the worker's runtime facts.
     num_completed_steps: int | None = None
-    # Of those, steps a step cache (Cache-DiT) served from its cache instead of
-    # computing the transformer; None without a step cache reporting them.
     num_cached_steps: int | None = None
-    # Values the pipeline resolved itself (e.g. ``width``, ``height``,
-    # ``flow_shift`` when the request left them to the model defaults), and the
-    # worker's runtime facts (resolved attention backends, device), reported by
-    # the execution summary (``--enable-execution-summary``).
     execution_facts: dict[str, Any] | None = None
     execution_runtime: dict[str, Any] | None = None
 

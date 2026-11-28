@@ -1007,11 +1007,7 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--enable-execution-summary",
             action="store_true",
-            help=(
-                "Log what each request actually ran as one [OmniExecution] JSON line next to [OmniTiming]: "
-                "per diffusion stage the generated size, seed, flow shift and counted denoising steps, plus "
-                "the runtime it ran with (versions, model revision, dtype, quantization, attention backends)."
-            ),
+            help="Log one [OmniExecution] JSON line per finished request with what it ran and the runtime.",
         )
         omni_config_group.add_argument(
             "--step-execution",

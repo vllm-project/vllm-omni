@@ -1,17 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Execution summary: what each request actually ran (``--enable-execution-summary``).
-
-``[OmniTiming]`` reports how long a request took; ``[OmniExecution]`` reports
-what it ran, so a benchmark harness can check a run against its declared
-workload. Each line is one JSON object with ``schema_version`` and ``event``:
-
-- ``diffusion_request_completed``: once per finished request, next to ``[OmniTiming]``. Each
-  diffusion stage reports what the request ran (``diffusion``) and how the
-  stage ran it (``runtime``: versions, model revision, dtype, quantization,
-  resolved attention backends, cache and parallel config), so a single line
-  verifies a request without correlating startup logs.
-"""
+"""Per-request execution summary (``--enable-execution-summary``): one ``[OmniExecution]`` JSON line
+per finished request with what each diffusion stage ran and the runtime it ran with."""
 
 from __future__ import annotations
 
@@ -19,10 +9,10 @@ import dataclasses
 import enum
 import json
 import os
-import re
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from vllm.logger import init_logger
 
@@ -35,101 +25,77 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SCHEMA_VERSION = 1
-# Key under which a diffusion stage attaches its facts to the output metrics.
 EXECUTION_METRICS_KEY = "execution"
+_HF_SNAPSHOT = re.compile(r"models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})")
+_PARALLEL_FIELDS = (
+    "tensor_parallel_size",
+    "pipeline_parallel_size",
+    "data_parallel_size",
+    "sequence_parallel_size",
+    "ulysses_degree",
+    "ring_degree",
+    "cfg_parallel_size",
+    "vae_patch_parallel_size",
+    "use_hsdp",
+)
 
 
 def _jsonable(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        value = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
     if isinstance(value, enum.Enum):
         return value.value
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    return str(value)
+        return [_jsonable(v) for v in value]
+    return value if value is None or isinstance(value, (str, bool, int, float)) else str(value)
+
+
+def _dtype_name(dtype: Any) -> str | None:
+    return None if dtype is None else str(dtype).removeprefix("torch.")
 
 
 def log_execution(event: str, payload: dict[str, Any]) -> None:
     logger.info("[OmniExecution] %s", json.dumps({"schema_version": SCHEMA_VERSION, "event": event, **payload}))
 
 
-# ----------------------------------------------------------------------------- diffusion facts
+def num_tensor_frames(output: DiffusionOutput | None) -> int:
+    size = _tensor_size(output)
+    return size[2] if size else 0
 
 
 def _tensor_size(output: DiffusionOutput | None) -> tuple[int, int, int] | None:
-    """(width, height, num_frames) of a typed video output, before frame interpolation."""
     media = getattr(output, "media", None)
     if media is None:
         return None
     from vllm_omni.diffusion.media import VideoTensorLayout
 
-    shape = tuple(media.video.tensor.shape)
+    shape = media.video.tensor.shape
     if media.video.spec.layout is VideoTensorLayout.BCTHW:
-        _, _, num_frames, height, width = shape
+        _, _, frames, height, width = shape
     else:
-        _, num_frames, height, width, _ = shape
-    return int(width), int(height), int(num_frames)
+        _, frames, height, width, _ = shape
+    return int(width), int(height), int(frames)
 
 
-def num_tensor_frames(output: DiffusionOutput | None) -> int:
-    size = _tensor_size(output)
-    return size[2] if size is not None else 0
-
-
-def _video_metadata(request_output: Any) -> Mapping[str, Any]:
-    """The ``metadata["video"]`` a model postprocessor attached to its multimodal output."""
-    multimodal_output = getattr(request_output, "multimodal_output", None)
-    metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, Mapping) else None
-    video = metadata.get("video") if isinstance(metadata, Mapping) else None
-    return video if isinstance(video, Mapping) else {}
-
-
-def _output_size(formatted_outputs: Sequence[Any] | None) -> tuple[int | None, int | None, int | None, str] | None:
-    """(width, height, num_frames, size_source) read from post-processed outputs."""
-    for request_output in formatted_outputs or ():
-        images = getattr(request_output, "images", None) or []
+def _output_size(formatted_outputs: Sequence[Any] | None) -> tuple[int | None, int | None, int | None]:
+    """(width, height, num_frames) of post-processed outputs: images, encoder frame counts or the MP4 itself."""
+    for out in formatted_outputs or ():
+        images = getattr(out, "images", None) or []
         for image in images:
-            size = getattr(image, "size", None)  # PIL images; encoded video bytes have none
-            if isinstance(size, tuple) and len(size) == 2:
-                return int(size[0]), int(size[1]), None, "image"
-        frame_counts = _video_metadata(request_output).get("frame_counts")
-        if valid_frame_counts(frame_counts, len(images)):
-            return None, None, frame_counts[0], "encoder"
+            if isinstance(getattr(image, "size", None), tuple):
+                return int(image.size[0]), int(image.size[1]), None
+        mm = getattr(out, "multimodal_output", None)
+        video = ((mm or {}).get("metadata") or {}).get("video") if isinstance(mm, Mapping) else None
+        counts = video.get("frame_counts") if isinstance(video, Mapping) else None
+        if valid_frame_counts(counts, len(images)):
+            return None, None, counts[0]
         if images and isinstance(images[0], (bytes, bytearray)):
-            # Encoded video without reported counts: read the MP4's sample table.
             from vllm_omni.diffusion.utils.media_utils import count_mp4_frames
 
-            num_frames = count_mp4_frames(bytes(images[0]))
-            if num_frames is not None:
-                return None, None, num_frames, "container"
-    return None
-
-
-def _output_fps(output: DiffusionOutput | None, formatted_outputs: Sequence[Any] | None) -> float | None:
-    metadata = getattr(getattr(output, "media", None), "metadata", None) or {}
-    video = metadata.get("video")
-    fps = video.get("fps") if isinstance(video, Mapping) else metadata.get("fps")
-    for request_output in formatted_outputs or ():
-        if fps is not None:
-            break
-        fps = _video_metadata(request_output).get("fps")
-    return fps
-
-
-def _lora(lora_request: Any, static_lora_path: Any = None) -> list[str] | None:
-    """Names of the LoRA adapters in effect: the request's, then the server's static one."""
-    names = []
-    if lora_request is not None:
-        requests = lora_request if isinstance(lora_request, list) else [lora_request]
-        names += [str(getattr(item, "lora_name", item)) for item in requests]
-    if static_lora_path:
-        paths = static_lora_path if isinstance(static_lora_path, list) else [static_lora_path]
-        names += [str(path) for path in paths]
-    return names or None
+            return None, None, count_mp4_frames(bytes(images[0]))
+    return None, None, None
 
 
 def diffusion_facts(
@@ -139,255 +105,139 @@ def diffusion_facts(
     od_config: OmniDiffusionConfig | None = None,
     num_streamed_frames: int | None = None,
 ) -> dict[str, Any]:
-    """What one finished diffusion request ran.
-
-    Values come from what the pipeline generated or resolved where available,
-    so requests that leave parameters to the model defaults still report the
-    values that ran. ``size_source`` names where ``width``/``height`` come
-    from: ``tensor`` (typed video tensor), ``image``, ``pipeline`` (the size
-    the pipeline reported, e.g. for video it encoded in the worker) or
-    ``request``; ``frames_source`` does the same for ``num_frames`` (``tensor``,
-    ``encoder`` for the frame counts of video the worker encoded,
-    ``container`` for the frame count in the encoded MP4 itself, ``stream``
-    or ``request``).
-    ``num_inference_steps`` is the requested step count; ``completed_steps``
-    is the denoising steps the model runner counted (``None`` without a
-    progress signal).
-    ``guidance_scale`` is the request's value, ``None`` when the request left
-    it to the model default or the pipeline reports it runs without CFG
-    (``cfg: false``). ``lora`` lists the adapters in effect: the request's and
-    the one the server loaded at startup (``lora_path``).
-    """
+    """What a finished request ran; values the pipeline generated or resolved win over the request's."""
     sp = request.sampling_params
-    reported = getattr(output, "execution_facts", None) or {}
-    width, height, size_source = sp.width, sp.height, "request"
-    num_frames, frames_source = sp.num_frames, "request"
-    output_size = _output_size(formatted_outputs)
-    tensor_size = _tensor_size(output)
-    if tensor_size is not None:
-        width, height, num_frames = tensor_size
-        size_source = frames_source = "tensor"
-    else:
-        if output_size is not None and output_size[0] is not None:
-            width, height, size_source = output_size[0], output_size[1], output_size[3]
-        elif reported.get("width") is not None and reported.get("height") is not None:
-            width, height, size_source = reported["width"], reported["height"], "pipeline"
-        if output_size is not None and output_size[2] is not None:
-            num_frames, frames_source = output_size[2], output_size[3]
-    if num_streamed_frames:
-        # Streamed requests return their video in chunks; report the whole clip.
-        num_frames, frames_source = num_streamed_frames, "stream"
-    flow_shift = reported.get("flow_shift")
-    if flow_shift is None:
-        flow_shift = (sp.extra_args or {}).get("flow_shift")
-    if flow_shift is None and od_config is not None:
-        flow_shift = getattr(od_config, "flow_shift", None)
+    reported = output.execution_facts or {}
+    out_w, out_h, out_frames = _tensor_size(output) or _output_size(formatted_outputs)
+    extra = sp.extra_args or {}
+    shifts = (reported.get("flow_shift"), extra.get("flow_shift"), getattr(od_config, "flow_shift", None))
+    flow_shift = next((v for v in shifts if v is not None), None)
+    cfg_ran = sp.guidance_scale_provided and reported.get("cfg") is not False
+    lora = sp.lora_request if isinstance(sp.lora_request, list) else [sp.lora_request]
+    static_lora = getattr(od_config, "lora_path", None)
+    lora_names = [str(getattr(r, "lora_name", r)) for r in lora if r is not None]
+    lora_names += [str(p) for p in (static_lora if isinstance(static_lora, list) else [static_lora]) if p]
     facts = {
-        "width": width,
-        "height": height,
-        "size_source": size_source,
-        "num_frames": num_frames,
-        "frames_source": frames_source,
-        "fps": sp.fps if sp.fps is not None else _output_fps(output, formatted_outputs),
+        "width": out_w or reported.get("width") or sp.width,
+        "height": out_h or reported.get("height") or sp.height,
+        "num_frames": num_streamed_frames or out_frames or sp.num_frames,
+        "fps": sp.fps,
         "seed": sp.seed,
         "num_inference_steps": sp.num_inference_steps,
         "completed_steps": output.num_completed_steps,
-        "cached_steps": getattr(output, "num_cached_steps", None),
-        "guidance_scale": (
-            sp.guidance_scale if sp.guidance_scale_provided and reported.get("cfg") is not False else None
-        ),
+        "cached_steps": output.num_cached_steps,
+        # None when left to the model default or the pipeline runs without CFG.
+        "guidance_scale": sp.guidance_scale if cfg_ran else None,
         "flow_shift": flow_shift,
         "num_outputs_per_prompt": sp.num_outputs_per_prompt,
-        "lora": _lora(sp.lora_request, getattr(od_config, "lora_path", None)),
+        "lora": lora_names or None,
     }
-    # Other values the pipeline resolved (e.g. ``audio_flow_shift``).
     for key, value in reported.items():
         facts.setdefault(key, _jsonable(value))
     return facts
 
 
-# ----------------------------------------------------------------------------- runtime facts
-
-# ``<cache>/models--<org>--<name>/snapshots/<commit>`` of a Hugging Face hub download.
-_HF_SNAPSHOT = re.compile(r"models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})")
-
-
 def _model_identity(model: Any) -> tuple[Any, str | None]:
-    """(hub repo id, snapshot commit) when ``model`` resolves into a hub cache snapshot.
-
-    Serving wrappers often pass a local directory of symlinks into the snapshot,
-    so the directory and its entries are resolved.
-    """
+    """(hub repo id, snapshot commit) when ``model`` (or a symlink in it) resolves into a hub snapshot."""
     if not isinstance(model, str) or not os.path.isdir(model):
         return model, None
-    candidates = [model]
-    try:
-        candidates += [os.path.join(model, name) for name in sorted(os.listdir(model))[:16]]
-    except OSError:
-        pass
-    for path in candidates:
+    for path in [model, *(os.path.join(model, n) for n in sorted(os.listdir(model))[:16])]:
         match = _HF_SNAPSHOT.search(os.path.realpath(path))
-        if match is not None:
-            return f"{match.group(1)}/{match.group(2)}", match.group(3)
+        if match:
+            return f"{match[1]}/{match[2]}", match[3]
     return model, None
 
 
 def engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any] | None:
-    """Configuration part of a diffusion stage's ``runtime`` facts; computed once at startup."""
+    """Runtime facts the engine knows from its config; computed once at startup."""
     try:
-        return _engine_runtime(od_config)
+        import vllm
+
+        import vllm_omni
+
+        model, snapshot = _model_identity(od_config.model)
+        quant = od_config.quantization_config
+        parallel = od_config.parallel_config
+        cache_backend = od_config.cache_backend
+        return {
+            "vllm_omni_version": vllm_omni.__version__,
+            "vllm_version": vllm.__version__,
+            "torch_version": torch.__version__,
+            "model": model,
+            "model_revision": od_config.revision or snapshot,
+            "model_class_name": od_config.model_class_name,
+            "configured_dtype": _dtype_name(od_config.dtype),
+            "quantization": _jsonable(quant.get_name() if hasattr(quant, "get_name") else quant),
+            "cache_backend": cache_backend,
+            "cache_config": _jsonable(od_config.cache_config) if cache_backend not in (None, "none") else None,
+            "parallel_config": {f: getattr(parallel, f, None) for f in _PARALLEL_FIELDS} if parallel else None,
+            "max_num_seqs": od_config.max_num_seqs,
+        }
     except Exception:
-        logger.warning("Failed to collect the execution runtime config", exc_info=True)
+        logger.warning("Failed to collect the execution summary runtime", exc_info=True)
         return None
 
 
-def _engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any]:
-    import vllm
-
-    import vllm_omni
-
-    model, snapshot = _model_identity(getattr(od_config, "model", None))
-    quantization = getattr(od_config, "quantization_config", None)
-    if hasattr(quantization, "get_name"):
-        quantization = quantization.get_name()
-    parallel = getattr(od_config, "parallel_config", None)
-    cache_backend = getattr(od_config, "cache_backend", None)
-    parallel_fields = (
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "sequence_parallel_size",
-        "ulysses_degree",
-        "ring_degree",
-        "cfg_parallel_size",
-        "vae_patch_parallel_size",
-        "use_hsdp",
-    )
-    return {
-        "vllm_omni_version": vllm_omni.__version__,
-        "vllm_version": vllm.__version__,
-        "torch_version": torch.__version__,
-        "model": model,
-        "model_revision": getattr(od_config, "revision", None) or snapshot,
-        "model_class_name": getattr(od_config, "model_class_name", None),
-        "configured_dtype": _dtype_name(getattr(od_config, "dtype", None)),
-        "quantization": _jsonable(quantization),
-        "cache_backend": cache_backend,
-        "cache_config": _jsonable(getattr(od_config, "cache_config", None))
-        if cache_backend not in (None, "none")
-        else None,
-        "parallel_config": (
-            {name: getattr(parallel, name, None) for name in parallel_fields} if parallel is not None else None
-        ),
-        "max_num_seqs": getattr(od_config, "max_num_seqs", None),
-    }
-
-
-def _dtype_name(dtype: Any) -> str | None:
-    return None if dtype is None else str(dtype).removeprefix("torch.")
-
-
-def _weight_dtypes(module: torch.nn.Module, seen: set[int]) -> dict[str, int]:
-    """Elements per dtype of a module's weights: parameters and persistent buffers.
-
-    Persistent buffers count because packed quantized weights (e.g. NVFP4) are
-    buffers; non-persistent ones (caches) do not. Tensors in ``seen`` are skipped.
-    """
-    counts: dict[str, int] = {}
-    for submodule in module.modules():
-        tensors = list(submodule._parameters.values())
-        tensors += [
-            buffer for name, buffer in submodule._buffers.items() if name not in submodule._non_persistent_buffers_set
-        ]
-        for tensor in tensors:
-            if tensor is None or id(tensor) in seen:
-                continue
-            seen.add(id(tensor))
-            name = _dtype_name(tensor.dtype)
-            counts[name] = counts.get(name, 0) + tensor.numel()
-    return counts
-
-
-def _component_weight_dtypes(pipeline: torch.nn.Module) -> dict[str, dict[str, int]]:
-    """``_weight_dtypes`` per top-level pipeline component (e.g. ``transformer``, ``vae``)."""
-    seen_modules: set[int] = set()
-    seen_tensors: set[int] = set()
+def _weight_dtypes(pipeline: torch.nn.Module) -> dict[str, dict[str, int]]:
+    """Weight elements per dtype of each component; persistent buffers count, as packed quantized weights are."""
+    seen: set[int] = set()
     components: dict[str, dict[str, int]] = {}
     for name, child in pipeline.named_children():
-        # Aliases (e.g. ``vae`` for ``video_vae``) report under their first name.
-        if id(child) in seen_modules:
-            continue
-        seen_modules.add(id(child))
-        counts = _weight_dtypes(child, seen_tensors)
+        counts: dict[str, int] = {}
+        for module in child.modules():
+            buffers = [b for n, b in module._buffers.items() if n not in module._non_persistent_buffers_set]
+            for tensor in [*module._parameters.values(), *buffers]:
+                if tensor is not None and id(tensor) not in seen:
+                    seen.add(id(tensor))
+                    dtype = _dtype_name(tensor.dtype)
+                    counts[dtype] = counts.get(dtype, 0) + tensor.numel()
         if counts:
             components[name] = counts
     return components
 
 
 def worker_runtime(pipeline: torch.nn.Module | None) -> dict[str, Any] | None:
-    """Worker part of a diffusion stage's ``runtime`` facts, computed once after the model loads.
-
-    ``attention`` counts the backend each attention layer resolved, per role;
-    ``weight_dtypes`` the weight elements per dtype of each pipeline component,
-    as loaded. A pipeline adds facts only it knows (e.g. the precision it
-    computes in) through ``execution_runtime_facts()``.
-    """
+    """Runtime facts the worker knows after loading: device, attention backends, weight dtypes."""
     if pipeline is None:
         return None
     try:
         from vllm_omni.diffusion.attention.layer import Attention
         from vllm_omni.platforms import current_omni_platform
 
-        backends: dict[str, dict[str, int]] = {}
+        attention: dict[str, dict[str, int]] = {}
         for module in pipeline.modules():
-            if not isinstance(module, Attention):
-                continue
-            backend_cls = getattr(module, "attn_backend", None)
-            # Model-owned kernels (``custom_attention``) bypass backend selection.
-            if backend_cls is not None:
-                name = backend_cls.get_name()
-            else:
-                name = type(getattr(module, "attention", None)).__name__
-            counts = backends.setdefault(str(getattr(module, "role", None)), {})
-            counts[name] = counts.get(name, 0) + 1
+            if isinstance(module, Attention):
+                backend = getattr(module, "attn_backend", None)
+                name = backend.get_name() if backend else type(getattr(module, "attention", None)).__name__
+                role = attention.setdefault(str(getattr(module, "role", None)), {})
+                role[name] = role.get(name, 0) + 1
         facts = {
             "device": current_omni_platform.get_device_name(),
             "world_size": torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
-            "attention": backends,
-            "weight_dtypes": _component_weight_dtypes(pipeline),
+            "attention": attention,
+            "weight_dtypes": _weight_dtypes(pipeline),
         }
-        report = getattr(pipeline, "execution_runtime_facts", None)
-        if callable(report):
+        # Facts only the pipeline knows (e.g. compute precision, checkpoint-shipped quantization).
+        if callable(report := getattr(pipeline, "execution_runtime_facts", None)):
             facts.update(_jsonable(report()))
         return facts
     except Exception:
-        logger.warning("Failed to collect the worker runtime facts", exc_info=True)
+        logger.warning("Failed to collect the execution summary runtime", exc_info=True)
         return None
 
 
-# ----------------------------------------------------------------------------- request event
-
-
 def stage_entry(stage_stats: Any, execution: Mapping[str, Any] | None) -> dict[str, Any]:
-    """One stage of a ``request`` event: common fields plus its modality facts.
-
-    A diffusion stage adds the ``diffusion`` and ``runtime`` facts its engine
-    attached to the output; token counts only apply to the other stages.
-    """
-    entry: dict[str, Any] = {
+    entry = {
         "stage_id": getattr(stage_stats, "stage_id", None),
         "replica_id": getattr(stage_stats, "replica_id", None),
         "output_type": getattr(stage_stats, "final_output_type", None),
         "batch_size": getattr(stage_stats, "batch_size", None),
     }
     if execution is not None:
-        entry.update({key: _jsonable(value) for key, value in execution.items()})
+        entry.update(_jsonable(execution))
     else:
         entry["num_tokens_in"] = getattr(stage_stats, "num_tokens_in", None)
         entry["num_tokens_out"] = getattr(stage_stats, "num_tokens_out", None)
     if getattr(stage_stats, "audio_duration_s", 0):
-        entry["audio"] = {
-            "duration_s": getattr(stage_stats, "audio_duration_s", None),
-            "sample_rate": getattr(stage_stats, "audio_sample_rate", None),
-        }
+        entry["audio"] = {"duration_s": stage_stats.audio_duration_s, "sample_rate": stage_stats.audio_sample_rate}
     return entry

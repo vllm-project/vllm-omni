@@ -349,7 +349,6 @@ class DiffusionEngine:
             self._init_runtime_state()
             self._init_execute_fn()
             self._log_execution_mode(od_config)
-            # Configuration facts of every execution summary; the worker adds its own.
             self._execution_runtime = (
                 engine_runtime(od_config) if getattr(od_config, "enable_execution_summary", False) is True else None
             )
@@ -638,19 +637,15 @@ class DiffusionEngine:
         formatted_outputs: list[OmniRequestOutput],
         num_streamed_frames: int,
     ) -> tuple[dict[str, Any] | None, int]:
-        """Facts of the final output (``--enable-execution-summary``); never fails the request."""
+        """Execution summary facts of the final output; never fails the request."""
         try:
             num_streamed_frames += num_tensor_frames(output)
             if not output.finished:
                 return None, num_streamed_frames
-            # Streamed requests return their video in chunks; the facts cover the whole clip.
             clip_frames = num_streamed_frames if output.chunk_index else None
             runtime = {**(getattr(self, "_execution_runtime", None) or {}), **(output.execution_runtime or {})}
-            facts = {
-                "diffusion": diffusion_facts(request, output, formatted_outputs, self.od_config, clip_frames),
-                "runtime": runtime or None,
-            }
-            return facts, num_streamed_frames
+            diffusion = diffusion_facts(request, output, formatted_outputs, self.od_config, clip_frames)
+            return {"diffusion": diffusion, "runtime": runtime or None}, num_streamed_frames
         except Exception:
             logger.warning("Failed to build the execution summary for %s", request.request_id, exc_info=True)
             return None, num_streamed_frames
