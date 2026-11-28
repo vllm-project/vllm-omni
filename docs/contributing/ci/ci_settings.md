@@ -4,6 +4,52 @@ This document describes **where** Buildkite YAML lives in the repo, **how each p
 
 For CI levels (L1–L5) and triggers, see [Test System Overview](./test_system_overview.md). For test authoring, see [Test Writing Guide](./test_writing_guide.md). For running tests locally or replaying CI jobs, see [Test Execution Guide](./test_execution_guide.md).
 
+## Run one CUDA or NPU job from a PR comment
+
+In the PR conversation, a commenter trusted by Buildkite can post
+`/ci-cuda Simple Test` or `/ci-npu ready-platforms-test`. Use the exact YAML
+`key` or `label` of a command step in CUDA ready, merge, nightly, or weekly,
+or in NPU ready or nightly. Use one command on one line. Matching is
+case-sensitive. If a label is shared across tiers, prefix it with the tier,
+as in `/ci-cuda ready/Omni · Qwen3-Omni Test`. Scheduled-only steps and steps
+that require other test jobs are rejected.
+
+The comment build runs the selected step for the PR commit, including its CI
+image prerequisite. The uploader skips the label and changed-file filters for
+this build and disables automatic sharding so it schedules one test job. Jobs
+keep their original timeout and hardware configuration. A normally sharded
+sweep can take longer as a single job. NPU builds only the image used by the
+selected job. Both pipelines continue to handle their regular triggers.
+
+In each existing pipeline's GitHub settings, use Code trigger mode and enable
+**Build on new pull request comment** with **contains** matching. Set the CUDA
+command word to `/ci-cuda` and the NPU command word to `/ci-npu` so a comment
+selects one platform.
+Enable **Issue comments** and **Pull requests** on the GitHub webhook. To allow
+multiple targeted runs on one PR head, disable **Skip when pull request has
+existing build for commit and branch**. The existing bootstrap reads the
+original webhook body from Buildkite build metadata for `issue_comment` events.
+
+Before enabling the comment trigger, switch off **Update commit statuses** for
+each pipeline and add a top-level `notify` block to its existing Buildkite
+Steps editor. Keep the existing upload step and the current status context for
+regular runs. For NPU, use its existing context and append `-comment` for the
+comment context. For CUDA, use the following configuration.
+
+```yaml
+notify:
+  - github_commit_status:
+      context: buildkite/vllm-omni
+    if: build.source_event != "issue_comment"
+  - github_commit_status:
+      context: buildkite/vllm-omni-comment
+    if: build.source_event == "issue_comment"
+```
+
+[Buildkite GitHub settings](https://buildkite.com/docs/pipelines/source-control/github#running-builds-on-additional-github-events)
+· [Buildkite webhook metadata](https://buildkite.com/docs/pipelines/configure/build-meta-data#buildkitewebhook)
+· [GitHub commit status settings](https://buildkite.com/docs/pipelines/source-control/github#customizing-commit-statuses)
+
 ## Directory layout
 
 Canonical layout (prefer these paths for new changes):
