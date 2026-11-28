@@ -346,7 +346,7 @@ backend-specific throughput measurements should use explicit overrides.
 
 ### Experimental Qwen3-TTS single-GPU throughput profile
 
-The opt-in `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile uses a
+The opt-in `qwen3_tts_high_concurrency_single_gpu.yaml` profile uses a
 Qwen3-TTS-specific execution path on CUDA with BF16 weights:
 
 - `code_predictor_kv_cache` reuses each layer's keys and values across the 15
@@ -389,7 +389,7 @@ for requirements and ownership. Startup includes compilation and graph capture.
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
-  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_single_gpu.yaml \
   --api-server-count 4 --stage-init-timeout 1800 --init-timeout 2400
 ```
 

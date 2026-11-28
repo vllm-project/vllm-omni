@@ -12,7 +12,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = os.environ.get("VLLM_TEST_VOXTRAL_MODEL", "mistralai/Voxtral-4B-TTS-2603")
-STAGE_CONFIG = get_deploy_config_path("voxtral_tts_mrv2.yaml")
+STAGE_CONFIG = get_deploy_config_path("voxtral_tts.yaml")
 SERVER_PARAMS = [
     OmniServerParams(
         model=MODEL,

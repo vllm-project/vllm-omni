@@ -570,7 +570,7 @@ Both benchmarks replay recorded clips into one duplex session. Qwen answers
 committed turns, so run them with server VAD turn detection: the client never
 commits, and frames reach Qwen as `input_image` items (it refuses
 `video_frames` on audio appends). Qwen refuses a reference voice, so omit it.
-Serve `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` (one session at a time) and
+Serve `vllm_omni/deploy/qwen3_omni_duplex.yaml` (one session at a time) and
 keep client concurrency at 1.
 
 ```bash

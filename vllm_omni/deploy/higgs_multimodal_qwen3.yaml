@@ -4,7 +4,7 @@
 # feature switches self-enable from the runner selection. The CUDA default
 # uses the graph shape below; other platforms keep their eager configuration.
 # vLLM 0.34 only supports model_runner: v2. The H200-tuned profile is
-# higgs_multimodal_qwen3_mrv2_h200.yaml.
+# higgs_multimodal_qwen3_h200.yaml.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's

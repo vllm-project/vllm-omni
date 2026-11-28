@@ -15,7 +15,7 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_DEPLOY = "personaplex_duplex_mrv2.yaml"
+_DEPLOY = "personaplex.yaml"
 
 
 def _resolve_cuda_stages(monkeypatch):

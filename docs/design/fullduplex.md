@@ -440,7 +440,7 @@ and combines repeated observations across frames into one memory.
 Configure the policy in a deployment overlay:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   model_custom_options:
     history_policy: incremental
@@ -465,7 +465,7 @@ selection/compression interface. They independently replace message-count
 triggering and batching:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   model_custom_options:
     history_policy: incremental

@@ -1,7 +1,5 @@
-# Historical V1 profile. On vLLM 0.34 use personaplex_duplex_mrv2.yaml
-# with duplex mode and async_chunk enabled.
-# Configuration resolution rejects this profile because its Talker requires retired Model Runner V1.
-# Keep the V1 pin to fail explicitly; selecting V2 does not implement model support.
+# CUDA Model Runner V2 profile; requires duplex mode and async_chunk.
+# Non-CUDA platforms retain V1 pins and are unavailable with vLLM 0.34.
 # PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.
 #
 # PersonaPlex is a Moshi finetune (full-duplex S2S), served offline as a 2-stage
@@ -115,6 +113,7 @@ stages:
     # TF32 (mimi_decode_tf32, default on); weights stay float32.
     hf_overrides:
       mimi_cuda_graphs: true
+      mimi_decode_tf32: true
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
@@ -127,6 +126,13 @@ stages:
 
 platforms:
   npu:
+    model_runner: v1
     stages:
       - stage_id: 0
         enforce_eager: false
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

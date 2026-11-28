@@ -121,7 +121,7 @@ def test_invalid_fallback_option_fails_before_model_construction(mocker, value):
 
 @pytest.mark.parametrize(
     ("profile", "first_frame_enabled"),
-    [("qwen3_omni_moe.yaml", False), ("qwen3_omni_moe_codec.yaml", True), ("qwen3_omni_moe_mrv2.yaml", True)],
+    [("qwen3_omni_moe.yaml", False), ("qwen3_omni_moe_codec.yaml", True)],
 )
 @pytest.mark.parametrize("fallback", [False, True])
 def test_deploy_option_reaches_both_decoder_placements(

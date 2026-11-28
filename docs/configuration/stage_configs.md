@@ -328,16 +328,19 @@ does not change `PipelineConfig` topology or the connector payload contract.
 
 The default Qwen3-TTS and Qwen3-Omni profiles select V2 on CUDA, ROCm, NPU and
 XPU. MiniCPM-o 4.5 selects V2 through its CUDA, ROCm and NPU platform overlays,
-while Moss-TTS-local selects V2 on CUDA. The CUDA-tuned `*_mrv2.yaml` overlays
-are not NPU profiles. A V2 worker implementation alone does not qualify every
-model or deployment on a platform.
+while Moss-TTS-local selects V2 on CUDA and NPU. Runner-specific YAML overlays
+have been consolidated into the default profiles. Hardware and workload tuning
+remains explicit in profiles named `h200`, `codec`, `b2`, `b4` or `single_gpu`;
+these names do not select a different runner. A V2 worker implementation alone
+does not qualify every model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
-PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
+PersonaPlex's non-CUDA overrides, VibeVoice, and the LFM3-Omni profiles. Selecting
 `v2` manually does not establish support for those paths.
-The complete PersonaPlex workflow is also unavailable: its Talker still
-requires V1, although its Code2Wav stage has V2 components.
+The default `personaplex.yaml` runs both stages on V2 for CUDA duplex serving.
+`qwen3_omni_duplex.yaml` runs V2 on CUDA, ROCm and XPU; its NPU and MUSA
+overrides remain unavailable.
 The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
@@ -718,7 +721,7 @@ The talker requires `async_scheduling: true`.
 | Profile | Runner | Intended use |
 | --- | --- | --- |
 | `higgs_multimodal_qwen3.yaml` | V2 | Default CUDA graph shape scaled to 16 sequences |
-| `higgs_multimodal_qwen3_mrv2_h200.yaml` | V2 | Large-card tuning (64-sequence capacities, MPS) |
+| `higgs_multimodal_qwen3_h200.yaml` | V2 | Large-card tuning (64-sequence capacities, MPS) |
 
 The default CUDA connector uses 25-frame chunks, 8-frame left context, and an
 8-frame first chunk, matching the Stage-1 codec graph windows `[8, 33]`.
@@ -754,14 +757,15 @@ Select one of these deployment profiles:
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
 | `qwen3_tts.yaml` | V2 on CUDA/ROCm/NPU/XPU; MUSA V1 override unsupported | B1 | Shipped default; experimental |
-| `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
-| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
-| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
+| `qwen3_tts_high_concurrency_b2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
+| `qwen3_tts_high_concurrency_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
 | `qwen3_tts_high_concurrency.yaml` | V2 (default) | Existing defaults | Original high-concurrency tuning |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
-The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
-`qwen3_tts.yaml` instead; it selects V2 on CUDA, ROCm, NPU and XPU.
+Use `qwen3_tts.yaml` for the default V2 deployment on CUDA, ROCm, NPU and XPU.
+The B2/B4 and single-GPU profiles retain their distinct tuning and platform
+restrictions; they are not required to enable V2.
 
 ```bash
 # Use the bundled V2 profile.
@@ -808,7 +812,7 @@ without a Code2Wav engine or stage connector.
 ```bash
 # Two stages on one GPU; the two-stage pipeline remains independently selectable.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
-  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_single_gpu.yaml
 
 # One stage on one GPU; no inter-stage transport or Code2Wav scheduling.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
@@ -859,9 +863,9 @@ the shared worker does not select Qwen's context length or codebook layout.
 ### Qwen3-TTS first-frame delivery and rollback
 
 The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`
-and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+and `qwen3_tts_high_concurrency_b2.yaml` profiles
 enable the `talker_first_audio` connector option, as does the experimental
-two-stage `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile.
+two-stage `qwen3_tts_high_concurrency_single_gpu.yaml` profile.
 This changes the default CUDA MRV2 streaming path:
 residual prediction runs eagerly after the Talker sample, the Talker loads
 an additional first-frame decoder with its weights and CUDA graphs, and the
@@ -931,7 +935,7 @@ does not claim bitwise or quality equivalence.
 
 NVIDIA MPS lets colocated CUDA stage processes share GPU execution resources.
 It is disabled by default. The experimental
-`qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile sets `cuda_mps: true`,
+`qwen3_tts_high_concurrency_single_gpu.yaml` profile sets `cuda_mps: true`,
 alongside cached residual prediction, fused sampling, time-major codec
 convolutions, first-frame delivery, and larger graph batches.
 
@@ -986,17 +990,16 @@ GPUs and services without MPS should provide deployment overrides for the
 capacities, capture sizes, KV budget and `platforms.cuda.cuda_mps`. The
 pipeline no longer changes configuration based on a GPU-memory or MPS probe.
 
-Other platforms use V1 in the same file; NPU keeps its codec graph override.
-On Ascend NPU, `moss_tts_local_npu_mrv2.yaml` is an opt-in profile that runs the
+On Ascend NPU, the default `moss_tts_local.yaml` runs the
 Talker (Stage0) and codec (Stage1) on MRV2. The Talker builds Ascend attention
-metadata, and the codec inherits the NPU streaming graph settings from
-`moss_tts_local.yaml`. The Stage0
+metadata, and the codec retains its NPU streaming graph settings. Other
+platforms retain unsupported V1 pins in the same file. The Stage0
 first-frame direct decode is off on NPU because it needs CUDA-only kernels, so
 Stage1 delivers every chunk:
 
 ```bash
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
-  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml
+  --deploy-config vllm_omni/deploy/moss_tts_local.yaml
 ```
 
 The 2/3-NPU files retain their distinct multi-device topology. These changes

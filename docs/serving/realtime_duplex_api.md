@@ -115,7 +115,7 @@ Save this as `qwen3_history.yaml`, replacing `base_config` with the absolute pat
 to the repository's Qwen3-Omni duplex deployment:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   history_ms_per_token: 383
   history_calibration_timeout_ms: 1000
@@ -175,7 +175,7 @@ short calibration deadline.
 Use this overlay as `qwen3_history.yaml` instead of the fixed-rate overlay:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   history_asr_url: http://127.0.0.1:18942/v1/audio/transcriptions
   history_asr_model: history-asr
@@ -1048,7 +1048,7 @@ With the serving environment active, start Qwen's duplex server:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-  --deploy-config vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml --port 8099
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml --port 8099
 ```
 
 In your working directory, define an async tool and its declaration:

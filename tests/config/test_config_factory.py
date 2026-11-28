@@ -1776,9 +1776,14 @@ stages:
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
             platform=platform,
         )
-        assert duplex.model_runner == "v1"
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-            merge_pipeline_deploy(pipeline, duplex)
+        if platform in {"cuda", "rocm", "xpu"}:
+            assert duplex.model_runner == "v2"
+            stages = merge_pipeline_deploy(pipeline, duplex)
+            assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        else:
+            assert duplex.model_runner == "v1"
+            with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+                merge_pipeline_deploy(pipeline, duplex)
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -1852,9 +1857,16 @@ stages:
         assert pipeline.model_type == expected_pipeline
         assert [stage.stage_id for stage in pipeline.stages] == expected_stage_ids
 
-    def test_load_voxtral_tts_deploy_config_schema_fields(self):
+    @pytest.mark.parametrize("platform", ["cuda", "rocm", "xpu"])
+    def test_load_voxtral_tts_deploy_config_schema_fields(self, monkeypatch, platform):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_name", platform)
         deploy_path = Path(get_deploy_config_path("voxtral_tts.yaml"))
-        deploy = load_deploy_config(deploy_path)
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+        # The deleted runner overlay had stale V1 guards, including ROCm.
+        stages = merge_pipeline_deploy(resolve_pipeline_config("voxtral_tts"), deploy)
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
         assert deploy.stages[0].config_format == "mistral"
         assert deploy.stages[0].load_format == "mistral"
         assert deploy.stages[0].tokenizer_mode == "mistral"
@@ -2219,9 +2231,7 @@ stages:
             ("qwen3_omni_moe.yaml", "cuda", True),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_codec.yaml", "cuda", False),
-            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
-            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", False),
             *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5.yaml", "cuda", False),
@@ -3677,6 +3687,7 @@ class TestPlatformOverrides:
         )
         npu_full_mrv2 = platform == "npu" and filename in (
             "qwen3_tts.yaml",
+            "moss_tts_local.yaml",
             "minicpmo_4_5.yaml",
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
@@ -3752,8 +3763,8 @@ class TestPlatformOverrides:
         assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
         assert all(stage.yaml_runtime["cuda_mps"] for stage in stages)
 
-    @pytest.mark.parametrize("platform", ["cpu", "npu", "xpu", "rocm", "musa"])
-    def test_moss_local_non_cuda_default_preserves_v1(self, monkeypatch, platform):
+    @pytest.mark.parametrize("platform", ["cpu", "xpu", "rocm", "musa"])
+    def test_moss_local_deferred_platforms_preserve_v1(self, monkeypatch, platform):
         from vllm.platforms import current_platform
 
         from vllm_omni.platforms import current_omni_platform
@@ -3771,19 +3782,18 @@ class TestPlatformOverrides:
         with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
             StageConfigFactory._create_legacy_from_registry(pipeline, {})
 
-    def test_moss_local_npu_mrv2_profile_runs_both_stages_on_v2_with_codec_graphs(self, monkeypatch):
+    def test_moss_local_npu_default_runs_both_stages_on_v2_with_codec_graphs(self, monkeypatch):
         from vllm_omni.platforms import current_omni_platform
 
         monkeypatch.setattr(current_omni_platform, "device_name", "npu")
-        path = get_deploy_config_path("moss_tts_local_npu_mrv2.yaml")
         pipeline = resolve_pipeline_config("moss_tts_local")
-        config = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=path)
+        config = VllmOmniConfig.from_pipeline_config(pipeline)
         talker, codec = config.stage_configs
         assert talker.model_config.use_v2_model_runner
         assert codec.model_config.use_v2_model_runner
         assert not codec.model_config.enforce_eager
         assert codec.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64]
-        stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {}, deploy_config_path=path)
+        stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {})
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
         assert stages[1].yaml_engine_args["enforce_eager"] is False
 
@@ -3809,12 +3819,15 @@ class TestPlatformOverrides:
             StageConfigFactory._create_legacy_from_registry(pipeline, {}, deploy_config_path=path)
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_moss_local_system_profile_reaches_native_runner_and_cuda_only_mps(self, platform):
+    def test_moss_local_system_profile_reaches_native_runner_and_cuda_only_mps(self, platform, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_name", platform)
         pipeline = resolve_pipeline_config("moss_tts_local")
         path = Path(get_deploy_config_path("moss_tts_local.yaml"))
         deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
         is_cuda = platform == "cuda"
-        if not is_cuda:
+        if platform not in {"cuda", "npu"}:
             assert not deploy.cuda_mps
             with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
                 merge_pipeline_deploy(pipeline, deploy)
@@ -3822,7 +3835,7 @@ class TestPlatformOverrides:
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert deploy.cuda_mps is is_cuda
         assert all(stage.yaml_runtime.get("cuda_mps", False) is is_cuda for stage in stages)
-        assert all(stage.yaml_engine_args["use_v2_model_runner"] is is_cuda for stage in stages)
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
         if is_cuda:
             args = stages[0].yaml_engine_args
             assert args["enable_prefix_caching"] is True

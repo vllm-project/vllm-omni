@@ -78,7 +78,7 @@ def _deploy(path: Path, *, mooncake: dict | None) -> Path:
     # codes make the audio comparison independent of sampler state.
     talker = {"stage_id": 1, "subtalker_sampling_params": {"do_sample": False}}
     # An absolute base keeps the production YAML's relative inheritance.
-    config = {"base_config": get_deploy_config_path("qwen3_omni_duplex_mrv2.yaml"), "stages": [thinker, talker]}
+    config = {"base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"), "stages": [thinker, talker]}
     path.write_text(yaml.safe_dump(config))
     return path
 

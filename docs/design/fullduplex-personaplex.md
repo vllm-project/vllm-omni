@@ -2,9 +2,9 @@
 
 ## Status and target
 
-On vLLM 0.34, use the [PersonaPlex MRv2 duplex profile](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/personaplex_duplex_mrv2.yaml).
-Stage 0 MRv2 requires duplex mode with `async_chunk` enabled. The default
-V1 profile is retained for historical reference.
+On vLLM 0.34, the [default PersonaPlex profile](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/personaplex.yaml)
+uses MRv2 on CUDA. Stage 0 requires duplex mode with `async_chunk` enabled.
+Non-CUDA platforms retain explicit V1 pins and are unavailable.
 
 PersonaPlex (`nvidia/personaplex-7b-v1`, a Moshi finetune) was served by the
 [Unified Full-Duplex Framework](fullduplex.md) through one model plugin,

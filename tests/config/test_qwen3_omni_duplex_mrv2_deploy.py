@@ -16,7 +16,7 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_DEPLOY = "qwen3_omni_duplex_mrv2.yaml"
+_DEPLOY = "qwen3_omni_duplex.yaml"
 
 
 def _resolve_stages(monkeypatch, platform: str):

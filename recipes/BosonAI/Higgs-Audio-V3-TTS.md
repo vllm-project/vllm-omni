@@ -122,7 +122,7 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
     - The sampler supports `temperature`, `top_p`, `top_k` and `seed`. Remove unsupported penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias; they are rejected before queue admission.
 - Deploy profiles:
     - Default: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml`.
-    - H200 tuning: `vllm_omni/deploy/higgs_multimodal_qwen3_mrv2_h200.yaml` (64-sequence capacities, larger capture sizes, MPS).
+    - H200 tuning: `vllm_omni/deploy/higgs_multimodal_qwen3_h200.yaml` (64-sequence capacities, larger capture sizes, MPS).
     - The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for compatibility, but both files are V2 profiles on vLLM 0.34: the former keeps the eager local MLP graph and the latter uses the external `FULL_DECODE_ONLY` graph. Neither is a V1 opt-out.
     - Profile details: `vllm_omni/deploy/README_higgs_audio_v3.md`.
 - Validation notes:

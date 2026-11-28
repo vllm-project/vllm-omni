@@ -147,7 +147,7 @@ Create an overlay named `qwen3_vad.yaml`, replacing both paths with absolute pat
 on the backend host:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   server_vad_model_path: /path/to/silero_vad.onnx
 ```
@@ -241,7 +241,7 @@ while serving. Pre-download it into the Hugging Face cache, or point the overlay
 local copy next to the Silero artifact:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   server_vad_model_path: /path/to/silero_vad.onnx
   semantic_vad_model_path: /path/to/smart-turn-v3.2-cpu.onnx

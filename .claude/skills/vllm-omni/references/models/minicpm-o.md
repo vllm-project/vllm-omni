@@ -29,8 +29,7 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
 | `minicpmo_4_5_{3,4}gpu_stage1_replicas.yaml` | Experimental tts replicas (2 or 3) |
 | `minicpmo_4_5_8x4090.yaml` (+ `_stage1_replicas`) | llm (stage 0) TP=4, `max_model_len: 4096`, mostly eager |
 | `minicpmo_4_5_duplex_h200.yaml` | Duplex with incremental fbank, fused vision, duplex audio-encoder graphs, stage-2 TF32 and fused CFM |
-| `minicpmo_4_5_turn.yaml` | `session_mode: turn` for ordinary HTTP chat; enables llm (stage 0) prefix caching on CUDA |
-| `minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`) | Turn mode on MRv2; disables stage 0 prefix caching; tts/code2wav `max_num_seqs` 8 (16 on H200) |
+| `minicpmo_4_5_turn.yaml` | `session_mode: turn` for ordinary HTTP chat on MRv2; inherits CUDA ngram speculation and keeps stage 0 prefix caching disabled |
 
 ## Known quirks
 

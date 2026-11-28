@@ -154,15 +154,12 @@ WebSocket query parameters cannot switch engines.
 
 **MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`),
 **Realtime-Venus Omni** (`vllm_omni/deploy/realtime_venus_omni.yaml`, the default), **Qwen3-Omni**
-(`vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml`), and **Nemotron VoiceChat**
+(`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
 (`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
-over this endpoint today. The Qwen3-Omni deployment selects Model Runner V2
-on CUDA, ROCm and XPU. Its NPU and MUSA V1 overrides are unsupported with
-vLLM 0.34. PersonaPlex
-carries its pre-framework duplex code: its pipeline declares no `duplex_plugin`,
-so it runs turn-based until the
-follow-up PR ports it to the plugin contract
-(RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
+over this endpoint today. Qwen3-Omni's duplex profile selects Model Runner V2
+on CUDA, ROCm and XPU; NPU and MUSA retain unsupported V1 overrides.
+**PersonaPlex** uses `vllm_omni/deploy/personaplex.yaml` and its
+`PersonaPlexDuplexPlugin` on CUDA, with duplex mode and `async_chunk` enabled.
 
 For Nemotron VoiceChat Python clients, use
 `vllm_omni.clients.nemotron_voicechat.create_duplex_session_config()` with

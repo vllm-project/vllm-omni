@@ -4,7 +4,7 @@ For streaming workloads, `qwen3_omni_moe_codec.yaml` opts into one-frame first
 audio on CUDA and length-grouped codec graphs on CUDA/ROCm. It keeps Thinker
 prefix caching disabled. The base turn-serving profile enables that cache on
 CUDA and uses a four-frame first chunk. Existing deployments can continue using
-`qwen3_omni_moe_mrv2.yaml`, a compatibility alias for the codec profile.
+`qwen3_omni_moe_codec.yaml`, a compatibility alias for the codec profile.
 
 This model adaptation builds on #8184's existing stage runtime and output
 contracts. It adds Talker CPU metadata parsing, sampled-token embedding
@@ -14,12 +14,12 @@ also enables conservative fused sampling and bounded cuDNN algorithm search.
 The shared predictor keeps the upstream re-prefill helper and its default
 sampling behavior; short KV is explicitly selected by the deployment profile.
 
-Use `vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml` for the experimental H200
+Use `vllm_omni/deploy/qwen3_omni_moe_h200.yaml` for the experimental H200
 profile. Preserve a control with `code_predictor_fused_sampling=false` and
 `codec_cudnn_benchmark=false` when C64 P99 is the primary requirement.
 cuDNN search restores process settings on exit and has startup cost. Kernel
 arithmetic is not bitwise-equivalent; the first-frame decoder uses additional
-model memory. `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` runs these MRv2
+model memory. `vllm_omni/deploy/qwen3_omni_duplex.yaml` runs these MRv2
 stages for duplex. Qwen duplex submits each committed utterance as a new
 request, so it uses the turn-mode data plane. Turn-mode measurements do not
 establish duplex latency or interruption behavior.

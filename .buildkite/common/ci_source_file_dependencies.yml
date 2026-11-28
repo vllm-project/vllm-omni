@@ -75,7 +75,7 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/model_executor/models/common/alias_free_activation.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
   - vllm_omni/deploy/qwen3_tts.yaml
-  - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency_single_gpu.yaml
   - vllm_omni/entrypoints/openai/serving_speech.py
   - vllm_omni/entrypoints/openai/tts_adapters/
   - vllm_omni/engine/stage_pool.py
@@ -89,8 +89,8 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/cuda_mps.py
   - vllm_omni/engine/stage_runtime.py
   - vllm_omni/engine/stage_init_utils.py
-  - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
-  - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_b4.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency_b2.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency_b4.yaml
 
 x-omnivoice: &omnivoice
   - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
@@ -207,8 +207,7 @@ x-qwen3-omni: &qwen3_omni
   - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
   - vllm_omni/deploy/qwen3_omni_moe.yaml
   - vllm_omni/deploy/qwen3_omni_moe_codec.yaml
-  - vllm_omni/deploy/qwen3_omni_moe_mrv2.yaml
-  - vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_h200.yaml
   - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
 
 # Accuracy/performance share these execution and measurement dependencies.
@@ -725,7 +724,7 @@ source_file_dependencies:
     - tests/helpers/runtime.py
     - tests/helpers/stage_config.py
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
-    - vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
 
   omni_bagel_sleep_function:
     - *bagel
@@ -802,7 +801,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/duplex_sampling.py
     - vllm_omni/outputs/duplex.py
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
-    - vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
     - vllm_omni/entrypoints/cli/benchmark/
     - vllm_omni/benchmarks/
     - tests/dfx/conftest.py
@@ -1151,7 +1149,6 @@ source_file_dependencies:
     - tests/helpers/stage_config.py
     - vllm_omni/config/
     - vllm_omni/deploy/voxcpm2.yaml
-    - vllm_omni/deploy/voxcpm2_mrv2.yaml
     - vllm_omni/engine/
     - vllm_omni/entrypoints/omni_base.py
     - vllm_omni/entrypoints/openai/tts_adapters/voxcpm2.py
@@ -1515,7 +1512,6 @@ source_file_dependencies:
     - tests/helpers/assertions.py
     - tests/helpers/stage_config.py
     - vllm_omni/deploy/moss_tts_local.yaml
-    - vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml
     - vllm_omni/model_executor/models/moss_tts/
     - vllm_omni/model_executor/stage_input_processors/moss_tts.py
     - vllm_omni/platforms/npu/models/moss_tts_local_model_state.py

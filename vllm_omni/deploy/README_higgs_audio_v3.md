@@ -32,7 +32,7 @@ value in `default_sampling_params` fails at startup with the remediation
 named; per-request use raises. Remove the parameter or run the affected stage
 with a compatible runner configuration to use them.
 
-For a tuned large-card V2 profile see `higgs_multimodal_qwen3_mrv2_h200.yaml`
+For a tuned large-card V2 profile see `higgs_multimodal_qwen3_h200.yaml`
 (H200-validated: 64-sequence capacities, larger capture sizes, MPS).
 
 ## High Throughput
@@ -146,7 +146,7 @@ CUDA SM80+ GPU, BF16 target weights, FlashAttention, async scheduling, and
 `VLLM_BATCH_INVARIANT=1`. Keep prefix caching disabled. The extra weights reduce
 the memory available for the Stage 0 KV cache.
 
-Copy `higgs_multimodal_qwen3_mrv2_h200.yaml` to `higgs-k1.yaml`. For Stage 0,
+Copy `higgs_multimodal_qwen3_h200.yaml` to `higgs-k1.yaml`. For Stage 0,
 merge the fields below into the existing stage entry and remove
 `compilation_config.max_cudagraph_capture_size`.
 

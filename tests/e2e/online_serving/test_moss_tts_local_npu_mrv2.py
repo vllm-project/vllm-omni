@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E online tests for MOSS-TTS Local 1.5 on Ascend NPU with both stages on MRV2.
 
-Uses the opt-in ``moss_tts_local_npu_mrv2.yaml`` profile with codec graphs
+Uses the default ``moss_tts_local.yaml`` profile with codec graphs
 through /v1/audio/speech. The reference audio is inlined as a base64
 data URL because CI hosts cannot fetch external URLs.
 """
@@ -30,7 +30,7 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("moss_tts_local_npu_mrv2.yaml"),
+            stage_config_path=get_deploy_config_path("moss_tts_local.yaml"),
             server_args=["--disable-log-stats"],
             stage_init_timeout=1200,
         ),
@@ -66,7 +66,7 @@ def _request_config(omni_server, *, run_level: str = "full_model", **overrides) 
 def test_text_to_audio_001(omni_server, openai_client, run_level: str) -> None:
     """Non-streaming WAV with both stages on MRV2.
 
-    Deploy Setting: moss_tts_local_npu_mrv2.yaml
+    Deploy Setting: moss_tts_local.yaml
     Input Modal: text + reference audio
     Output Modal: audio (48 kHz, WAV)
     Input Setting: stream=False

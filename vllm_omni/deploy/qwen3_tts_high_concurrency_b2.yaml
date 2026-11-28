@@ -1,4 +1,4 @@
-# Opt-in Model Runner V2 profile. CUDA keeps the tuned graph settings below;
+# Opt-in B2 codec graph profile. CUDA keeps the tuned graph settings below;
 # ROCm selects V2 while keeping Code2Wav eager.
 base_config: qwen3_tts_high_concurrency.yaml
 model_runner: v2

@@ -77,7 +77,7 @@ def qwen_duplex_server(
     deploy.write_text(
         yaml.safe_dump(
             {
-                "base_config": get_deploy_config_path("qwen3_omni_duplex_mrv2.yaml"),
+                "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
                 **overrides,
                 "duplex_session": {**duplex_options, **overrides.get("duplex_session", {})},
             }

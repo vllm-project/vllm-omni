@@ -173,7 +173,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 #### 1x Ascend A3 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
 
-`moss_tts_local_npu_mrv2.yaml` is an opt-in profile with both stages on
+The default `moss_tts_local.yaml` runs both NPU stages on
 Model Runner V2. Stage0 (Talker) uses ACL graphs and builds Ascend attention
 metadata; Stage1 (codec) uses streaming NPUGraphs. Stage0 does not send the
 first audio frame itself on NPU; Stage1 delivers every chunk.
@@ -181,7 +181,7 @@ first audio frame itself on NPU; Stage1 delivers every chunk.
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni --port 8091 \
-  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml \
+  --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
 

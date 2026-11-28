@@ -1,6 +1,6 @@
 # PersonaPlex
 
-> On vLLM 0.34, use the `personaplex_duplex_mrv2.yaml` profile. Stage 0 MRv2 requires duplex mode with `async_chunk` enabled.
+> On vLLM 0.34, use the `personaplex.yaml` profile. Stage 0 MRv2 requires duplex mode with `async_chunk` enabled.
 > The measurements below are from the historical V1 deployment.
 
 ## Summary
@@ -115,7 +115,7 @@ Live duplex serving through the unified stack:
 HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
   /path/to/personaplex-7b-v1 \
   --omni \
-  --deploy-config vllm_omni/deploy/personaplex_duplex_mrv2.yaml
+  --deploy-config vllm_omni/deploy/personaplex.yaml
 ```
 
 This exposes `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`): the OpenAI

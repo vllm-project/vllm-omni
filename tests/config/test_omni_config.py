@@ -1562,8 +1562,8 @@ def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
         assert deploy.model_runner == "v2"
 
 
-# PersonaPlex's talker is V1-only on every platform (excluded from the 0.34 move).
-_V1_ONLY_DEPLOYS = {"personaplex_duplex_mrv2.yaml"}
+# PersonaPlex retains a rejecting V1 pin on XPU; its duplex V2 path is CUDA-only.
+_V1_ONLY_DEPLOYS = {"personaplex.yaml", "personaplex_rtx5080_16gb.yaml"}
 
 
 @pytest.mark.parametrize(
@@ -1658,7 +1658,7 @@ def test_v1_downstream_stage_is_rejected():
 
 def test_qwen3_tts_profiles_default_to_v2():
     assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml").model_runner == "v2"
-    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml").model_runner == "v2"
+    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_b2.yaml").model_runner == "v2"
 
 
 def test_qwen3_tts_default_profile_uses_mrv2_on_supported_platforms():
@@ -1675,23 +1675,23 @@ def test_qwen3_tts_default_profile_uses_mrv2_on_supported_platforms():
     assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="musa").model_runner == "v1"
 
 
-def test_qwen3_tts_mrv2_retunes_do_not_change_base_profile():
+def test_qwen3_tts_b2_retunes_do_not_change_base_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
-    mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
+    tuned = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_b2.yaml")
     default_extra = default["connectors"]["connector_of_shared_memory"]["extra"]
-    mrv2_extra = mrv2["connectors"]["connector_of_shared_memory"]["extra"]
+    tuned_extra = tuned["connectors"]["connector_of_shared_memory"]["extra"]
 
     # B2 batch stays consistent with the graph buckets; the base profile is untouched.
     assert default_extra["decode_batch_max_size"] == 1
-    assert mrv2_extra["decode_batch_max_size"] == 2
-    assert mrv2_extra["decode_cudagraph_batch_sizes"] == [1, 2]
-    assert mrv2_extra["code_predictor_prefix_graphs"] is False
-    assert mrv2["stages"][1]["enforce_eager"] is False
+    assert tuned_extra["decode_batch_max_size"] == 2
+    assert tuned_extra["decode_cudagraph_batch_sizes"] == [1, 2]
+    assert tuned_extra["code_predictor_prefix_graphs"] is False
+    assert tuned["stages"][1]["enforce_eager"] is False
     assert default["stages"][1]["enforce_eager"] is True
 
 
 def test_qwen3_tts_high_concurrency_single_gpu_rocm_uses_mrv2_with_eager_code2wav():
-    deploy_path = _DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml"
+    deploy_path = _DEPLOY_DIR / "qwen3_tts_high_concurrency_single_gpu.yaml"
     deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
 
@@ -3199,7 +3199,7 @@ def test_structured_diffusion_stage_rejects_explicit_shared_engine_field(field_n
 
 def test_mps_is_explicit_only_in_experimental_single_gpu_profile():
     assert not load_deploy_config(_DEPLOY_DIR / "qwen3_tts.yaml").cuda_mps
-    deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+    deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_single_gpu.yaml")
     assert deploy.cuda_mps
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     stages = merge_pipeline_deploy(pipeline, deploy)
@@ -3217,7 +3217,7 @@ def test_mps_stays_in_runtime_instead_of_engine_arguments():
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
     config = _from_pipeline_key(
-        "qwen3_tts", deploy_config_path=str(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+        "qwen3_tts", deploy_config_path=str(_DEPLOY_DIR / "qwen3_tts_high_concurrency_single_gpu.yaml")
     )
     for stage in config.stage_configs:
         assert stage.runtime_config.cuda_mps

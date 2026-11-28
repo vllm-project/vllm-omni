@@ -98,7 +98,7 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
-    if platform != "cuda":
+    if platform not in {"cuda", "npu"}:
         with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
             merge_pipeline_deploy(pipeline, deploy)
         return
@@ -115,7 +115,7 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     # The raw extras persist through fallback; the live constructor must cope.
     assert extras["generation_min_batch_size"] == 16
     assert extras["generation_max_wait_ms"] == 6
-    assert scheduler._native_data_plane is (platform == "cuda")
+    assert scheduler._native_data_plane is True
     assert scheduler._generation_min_batch_size == 16
     assert scheduler._generation_max_wait_s == 0.006
     assert scheduler._generation_max_regular_batch == 0
@@ -135,7 +135,7 @@ def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(constr
 def test_personaplex_native_decoder_enables_batch_waiting(construct_scheduler, monkeypatch, policy):
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     pipeline = resolve_pipeline_config("personaplex")
-    deploy = load_deploy_config(get_deploy_config_path("personaplex_duplex_mrv2.yaml"))
+    deploy = load_deploy_config(get_deploy_config_path("personaplex.yaml"))
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     config = _config(
         native=codec.yaml_engine_args["use_v2_model_runner"],

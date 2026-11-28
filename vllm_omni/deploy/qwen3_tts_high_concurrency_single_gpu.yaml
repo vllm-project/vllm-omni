@@ -13,9 +13,9 @@
 # Warm the full pipeline before measuring latency or throughput.
 #
 # vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
-#   --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml \
+#   --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_single_gpu.yaml \
 #   --api-server-count 4 --stage-init-timeout 1800 --init-timeout 2400
-base_config: qwen3_tts_high_concurrency_mrv2.yaml
+base_config: qwen3_tts_high_concurrency_b2.yaml
 cuda_mps: true
 
 connectors:

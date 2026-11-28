@@ -28,7 +28,7 @@ Knobs (deploy YAML, per stage): `devices`, `gpu_memory_utilization`
 - Scale the talker with `num_replicas` before raising thinker batch limits;
   device count must equal replicas × per-replica world size
   (`minicpmo_4_5_{3,4}gpu_stage1_replicas.yaml`).
-- Single-GPU co-location is possible (`qwen3_omni_moe_mrv2_h200.yaml`:
+- Single-GPU co-location is possible (`qwen3_omni_moe_h200.yaml`:
   0.60 / 0.22 / 0.10) and should run under NVIDIA MPS.
 - Smaller cards: thinker TP and a lower `max_model_len`
   (`minicpmo_4_5_8x4090.yaml`).
@@ -98,12 +98,13 @@ Validate smoothness with `audio_continuity_ok_rate`, not mean RTF.
 
 ## Model runner V2
 
-Knob: `model_runner: v2` (top-level or per stage). Ready-made overlays:
-`qwen3_omni_moe_mrv2.yaml`, `qwen3_omni_moe_mrv2_h200.yaml`,
-`minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`). MiniCPM-o duplex runs llm and code2wav on MRv2
-on CUDA through the default `minicpmo_4_5.yaml`; tts keeps v1 for multi-frame decode.
+`model_runner: v2` is the default and only supported runner with vLLM 0.34.
+Workload-specific profiles include
+`qwen3_omni_moe_codec.yaml`, `qwen3_omni_moe_h200.yaml`,
+and `minicpmo_4_5_turn.yaml`. MiniCPM-o duplex uses MRv2 for all stages
+through the default `minicpmo_4_5.yaml`.
 
-- CUDA only; overlays fall back to V1 on NPU, XPU, ROCm, and MUSA.
+- Platform support is profile-specific; retained V1 pins reject startup rather than providing a fallback.
 - Gains come from keeping sampler and EOS state on device (no per-step D2H
   wait), native data plane hand-off, and FULL decode graphs.
 - Output is not bitwise identical to V1. MRv2 downstream stages support turn
