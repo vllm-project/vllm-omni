@@ -2184,8 +2184,11 @@ stages:
             ("qwen3_omni_moe.yaml", "npu", True),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_moe_mrv2.yaml", "npu", True),
             ("qwen3_omni_duplex.yaml", "cuda", False),
+            ("qwen3_omni_duplex.yaml", "npu", True),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_duplex_mrv2.yaml", "npu", True),
             ("minicpmo_4_5_turn.yaml", "cuda", False),
             *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5.yaml", "cuda", False),
@@ -3421,6 +3424,51 @@ class TestPlatformOverrides:
             stage = structured.stage_by_id(stage_id)
             assert stage.cache_config.enable_prefix_caching is False
             assert stage.compilation_config.cudagraph_mode.name == "PIECEWISE"
+
+    @pytest.mark.parametrize(
+        "yaml_name",
+        ["qwen3_omni_moe_mrv2.yaml", "qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml"],
+    )
+    @pytest.mark.parametrize("override_npu", [False, True], ids=["inherit", "npu-override"])
+    def test_qwen3_omni_derived_npu_cache_and_graph_settings(self, monkeypatch, tmp_path, yaml_name, override_npu):
+        """NPU defaults override top-level stages; child NPU settings win.
+
+        These profiles retain V1 on NPU, so validate the resolved deployment
+        settings and the serving rejection without claiming V2 support.
+        """
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", "npu")
+        base = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))), platform="npu"
+        )
+        expected_graphs = base.stages[0].compilation_config
+        deploy_path = Path(get_deploy_config_path(yaml_name))
+        if override_npu:
+            expected_graphs = {
+                "cudagraph_mode": "PIECEWISE",
+                "decode_cudagraph_capture_request_sizes": [1, 2, 4],
+                "prefill_cudagraph_capture_token_sizes": [1, 2, 4, 8],
+            }
+            overlay = tmp_path / "npu.yaml"
+            overlay.write_text(
+                f"base_config: {deploy_path}\n"
+                "platforms:\n  npu:\n    stages:\n      - stage_id: 0\n"
+                "        enable_prefix_caching: false\n"
+                f"        compilation_config: {json.dumps(expected_graphs)}\n",
+                encoding="utf-8",
+            )
+            deploy_path = overlay
+
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.stages[0].engine_extras["enable_prefix_caching"] is False
+        npu = _apply_platform_overrides(deploy, platform="npu")
+        assert npu.stages[0].engine_extras["enable_prefix_caching"] is (not override_npu)
+        assert npu.stages[0].compilation_config == expected_graphs
+        assert npu.model_runner == "v1"
+        pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            merge_pipeline_deploy(pipeline, npu)
 
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
