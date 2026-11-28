@@ -66,7 +66,7 @@ from vllm_omni.clients.duplex import (  # noqa: E402
 from vllm_omni.clients.duplex import (  # noqa: E402
     reference_audio_data_url as _ref_audio_data_url,
 )
-from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
+from vllm_omni.clients.video_stacking import (  # noqa: E402
     concat_frames_b64,
     unit_subframe_offsets,
 )

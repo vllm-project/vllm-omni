@@ -88,6 +88,21 @@ vLLM `EngineClient` versions (`checkpoint_prepare`, `checkpoint_restore`, and
 checkpoint support. All three raise `NotImplementedError` before accessing or
 changing stage state; sleep and weight-transfer APIs retain their own contracts.
 
+Standalone model services live under `entrypoints/joyvl` (HTTP orchestration
+over an external OpenAI backend) and `entrypoints/mage_vl` (WebSocket sessions
+over Transformers). Mage-VL owns the scaffold runtime and protocol required by
+its adapter; these are separate from the engine-resident duplex plugin contract.
+JoyAI's native pipeline uses the engine-resident contract. Its action parser and
+prompts live in the JoyAI model package and are shared with the HTTP service.
+See [standalone services](../../serving/standalone_servers.md) for their routes.
+
+`entrypoints/mage_vl/core` is intentionally internal to Mage-VL, its only
+production consumer. Its `DuplexRuntime`, `DuplexAdapter`, `DuplexSession`, and
+protocol helpers are not a shared model-integration API. The scaffold cases in
+`tests/e2e/features/fullduplex/test_runtime.py` and `test_core_contracts.py`
+retain coverage for this service's lifecycle behavior. Shared native duplex
+integrations use `engine/duplex`.
+
 ## Contract status
 
 This document describes current entrypoint responsibilities plus the boundary

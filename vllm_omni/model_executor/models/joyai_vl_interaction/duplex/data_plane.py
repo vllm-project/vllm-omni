@@ -19,7 +19,6 @@ from vllm_omni.engine.duplex.visual_memory import (
     VisualMemory,
     VisualMemorySource,
 )
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
     delegation_arguments,
@@ -30,6 +29,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     SUMMARY_CHUNK_MESSAGES,
     JoyAISummaryMemory,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
     spoken_text_ready,
 )

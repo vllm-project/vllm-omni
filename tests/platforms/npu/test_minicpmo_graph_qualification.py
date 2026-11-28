@@ -3,6 +3,7 @@
 """Prefill and decode graphs must qualify against the reference path."""
 
 import asyncio
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import numpy as np
@@ -104,6 +105,28 @@ def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch
         assert runner._exact_prefill_passed == {length}
         assert torch.equal(second, output) and second.data_ptr() != output.data_ptr()
         assert model.call_count == 1
+
+
+def test_thinker_prefill_shapes_share_the_worker_pool(monkeypatch):
+    pool = object()
+    warmup = Mock()
+    runner = Mock(_prefill_graph_warmup_stream=warmup, spec=["_prefill_graph_warmup_stream"])
+    pool_handle = Mock(return_value=pool)
+    capture = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(torch.npu, "graph_pool_handle", pool_handle)
+    monkeypatch.setattr(torch.npu, "NPUGraph", Mock)
+    monkeypatch.setattr(torch.npu, "graph", capture)
+    monkeypatch.setattr(torch.npu, "current_stream", Mock)
+    monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(prefill_graph, "get_forward_context", lambda: Mock(attn_metadata={}, slot_mapping={}))
+    monkeypatch.setattr(prefill_graph, "override_forward_context", lambda _: nullcontext())
+
+    for length in (128, 160):
+        positions = torch.arange(length)
+        prefill_graph.PrefillGraph(runner, Mock(), torch.zeros(length, 4), positions, positions, {}, {}, thinker=True)
+
+    pool_handle.assert_called_once_with()
+    assert [call.kwargs for call in capture.call_args_list] == [{"pool": pool, "stream": warmup}] * 2
 
 
 @pytest.mark.asyncio

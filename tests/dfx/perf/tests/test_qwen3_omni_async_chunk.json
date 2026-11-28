@@ -136,6 +136,15 @@
           "(720, 1280, 2)": 0.5
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "MI300": {
+            "metrics": [
+              "mean_tpot_ms"
+            ],
+            "attempts": 3,
+            "tolerance": 0.1
+          }
+        },
         "baseline": {
           "MI300": {
             "mean_audio_rtf": [

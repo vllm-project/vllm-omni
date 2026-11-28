@@ -15,7 +15,7 @@ from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import PreparedSample
 from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_SERVER_VAD
-from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, RealtimeEventCollector
+from vllm_omni.clients.realtime import RealtimeDuplexClient, RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -132,7 +132,7 @@ async def _generate(monkeypatch, tmp_path, client_cls):
         created.append(client)
         return client
 
-    monkeypatch.setattr(runner, "RealtimeDuplexClient", client_factory)
+    monkeypatch.setattr("vllm_omni.clients.realtime.RealtimeDuplexClient", client_factory)
     prepared = PreparedSample(pcm=b"", frames=(), duration=1.0, ref_audio=None, ref_audio_sha256=None)
     started = time.monotonic()
     result = await runner.generate_sample(

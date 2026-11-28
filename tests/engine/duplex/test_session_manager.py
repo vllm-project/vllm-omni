@@ -67,6 +67,11 @@ from vllm_omni.engine.duplex.session.runner import _Internal
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture
+def short_admission_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("vllm_omni.engine.duplex.session.manager._CLOSING_ADMISSION_WAIT_S", 0.01)
+
+
 # --------------------------------------------------------------------------- #
 # Fakes                                                                       #
 # --------------------------------------------------------------------------- #
@@ -886,7 +891,7 @@ async def test_close_releases_stage_resources_and_is_idempotent() -> None:
         assert await harness.events() == []
 
 
-async def test_close_retains_the_admission_slot_until_stage_cleanup_succeeds() -> None:
+async def test_close_retains_the_admission_slot_until_stage_cleanup_succeeds(short_admission_wait) -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-close-retry")
         session = harness.session("sid-close-retry")
@@ -1091,6 +1096,87 @@ async def test_wire_close_command_frees_the_slot_before_session_closed() -> None
         assert (await harness.open("sid-replacement")).ok is True
 
 
+async def test_replacement_open_waits_for_pending_window_release(monkeypatch) -> None:
+    port = PlacementStagePort()
+    release_attempts = 0
+
+    async def release_window(session_id: str) -> None:
+        nonlocal release_attempts
+        if session_id == "sid-closing":
+            release_attempts += 1
+            if release_attempts == 1:
+                raise TimeoutError("Stage 0 window release still pending")
+
+    monkeypatch.setattr(port, "release_session_window", release_window)
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        assert (await harness.open("sid-closing")).ok
+        await harness.events()
+        assert (await harness.close("sid-closing")).ok
+        assert [type(event) for event in await harness.events("sid-closing")] == [SessionClosed]
+        assert port.release_calls == []
+
+        replacement = asyncio.create_task(harness.open("sid-replacement"))
+        try:
+            await asyncio.sleep(0)
+            assert not replacement.done()
+            assert port.rejections == []
+            assert (await harness.open("sid-overflow")).error_code == "resource_exhausted"
+            assert port.reserve_calls == ["sid-closing"]
+            assert await harness.manager.reap_expired() == 1
+            assert (await asyncio.wait_for(replacement, timeout=1)).ok
+            assert port.release_calls == ["sid-closing"]
+            assert port.reserve_calls == ["sid-closing", "sid-replacement"]
+        finally:
+            if not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "close_waiting", "close_queued", "close_queued_and_release"])
+async def test_pending_admission_releases_its_wait_position(request: pytest.FixtureRequest, outcome: str) -> None:
+    if outcome == "timeout":
+        request.getfixturevalue("short_admission_wait")
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        assert (await harness.open("sid-closing")).ok
+        port.cleanup_failures_remaining = 1
+        assert (await harness.close("sid-closing")).ok
+
+        harness.manager.dispatch(
+            OpenDuplexSessionMessage(
+                control_id="waiting-open",
+                session_id="sid-waiting",
+                session_config=DuplexSessionConfig(model="fake-model"),
+                output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+            )
+        )
+        if outcome in {"timeout", "close_waiting"}:
+            await asyncio.sleep(0)
+        if outcome != "timeout":
+            harness.manager.dispatch(
+                CloseDuplexSessionMessage(control_id="waiting-close", session_id="sid-waiting", reason="open_abandoned")
+            )
+        released = outcome == "close_queued_and_release"
+        if released:
+            await asyncio.sleep(0)
+            assert await harness.manager.reap_expired() == 1
+        result = await harness.result()
+        assert result.control_id == "waiting-open"
+        assert result.error_code == ("resource_exhausted" if outcome == "timeout" else "session_closed")
+        if outcome != "timeout":
+            closed = await harness.result()
+            assert closed.control_id == "waiting-close"
+            assert closed.ok
+            assert port.rejections == []
+        assert port.reserve_calls == ["sid-closing"]
+        assert port.release_calls == (["sid-closing"] if released else [])
+        assert not harness.manager._queued_opens
+        assert not harness.manager._waiting_admissions
+        if not released:
+            assert await harness.manager.reap_expired() == 1
+        assert (await harness.open("sid-replacement")).ok
+
+
 async def test_wire_close_stops_the_worker_and_refuses_later_control_ops() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-wire")
@@ -1219,7 +1305,7 @@ async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
         gate.set()
 
 
-async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds() -> None:
+async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds(short_admission_wait) -> None:
     async with Harness.create(max_sessions=1, idle_ttl_s=1.0) as harness:
         await harness.open("sid-expired")
         await harness.events()
@@ -1244,7 +1330,7 @@ async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds
         assert (await harness.open("sid-replacement")).ok is True
 
 
-async def test_expired_session_holds_the_admission_slot_while_cleanup_is_blocked() -> None:
+async def test_expired_session_holds_the_admission_slot_while_cleanup_is_blocked(short_admission_wait) -> None:
     async with Harness.create(max_sessions=1, idle_ttl_s=1.0) as harness:
         await harness.open("sid-blocked")
         session = harness.session("sid-blocked")
@@ -1287,7 +1373,7 @@ async def test_expired_cleanup_failure_does_not_block_other_sessions() -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_close_sessions_for_request_ids_expires_the_owner_and_retries_cleanup() -> None:
+async def test_close_sessions_for_request_ids_expires_the_owner_and_retries_cleanup(short_admission_wait) -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-request")
         await harness.events()
@@ -1322,7 +1408,9 @@ async def test_close_sessions_for_request_ids_expires_the_owner_and_retries_clea
         assert harness.manager.close_sessions_for_request_ids([request_id], abort=True) == {}
 
 
-async def test_in_progress_request_cleanup_is_finalized_by_the_orchestrator_not_the_reaper() -> None:
+async def test_in_progress_request_cleanup_is_finalized_by_the_orchestrator_not_the_reaper(
+    short_admission_wait,
+) -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-in-progress")
         session = harness.session("sid-in-progress")
@@ -2028,7 +2116,7 @@ async def test_frontend_budget_is_atomic_without_changing_worker_config(limit) -
         assert all(result.ok for result in await asyncio.gather(*opens))
 
 
-async def test_frontend_budget_remains_occupied_until_cleanup_finishes() -> None:
+async def test_frontend_budget_remains_occupied_until_cleanup_finishes(short_admission_wait) -> None:
     port = PlacementStagePort(replicas=2, capacity=2)
     async with Harness.create(stage_port=port, max_sessions=8, admission_limit=1) as harness:
         assert (await harness.open("a")).ok
@@ -2148,7 +2236,7 @@ async def test_open_cancelled_after_stage0_reservation_releases_replica_capacity
         assert (await harness.open("replacement")).ok
 
 
-async def test_replica_capacity_stays_reserved_while_close_cleanup_is_blocked() -> None:
+async def test_replica_capacity_stays_reserved_while_close_cleanup_is_blocked(short_admission_wait) -> None:
     port = PlacementStagePort()
     async with Harness.create(stage_port=port) as harness:
         assert (await harness.open("a")).ok
@@ -2222,7 +2310,7 @@ async def test_late_rollback_cleanup_cannot_release_a_reopened_sessions_reservat
 
 
 @pytest.mark.parametrize("cleanup_kind", ["close", "expiry", "request_failure"])
-async def test_failed_cleanup_holds_replica_capacity_until_reaper_succeeds(cleanup_kind) -> None:
+async def test_failed_cleanup_holds_replica_capacity_until_reaper_succeeds(cleanup_kind, short_admission_wait) -> None:
     port = PlacementStagePort()
     async with Harness.create(stage_port=port, idle_ttl_s=1) as harness:
         assert (await harness.open("a")).ok

@@ -1261,6 +1261,12 @@ remain accepted for client compatibility. Text replies commit the emitted text
 without playback ACKs even under `ack_only`; cancellation retains the emitted
 prefix and discards stale output. Whitespace-only replies are not stored as
 assistant turns; meaningful text retains its emitted whitespace verbatim.
+On text-only deployments, when a reply starts before its input commits,
+history places the owning input before that reply and subsequent input
+after it. A terminal native LISTEN uses the same history policy as normal
+completion, including when the continuation budget is exhausted;
+`conversation: "none"` keeps its text out of history and releases
+zero-audio response state without an ACK.
 The unconditional playback-policy bypass applies to deployments without audio
 output. On speech deployments, text replies with zero generated/sent audio and
 no audio-completion dependency commit without an ACK. Text that depends on
@@ -2782,8 +2788,10 @@ them out into typed events before they reach a client.
 - `rate_limits.updated` is emitted for compatibility only and always carries
   an empty list.
 - Session capacity is bounded by `duplex_session.max_sessions` in the deploy
-  configuration; admission beyond it fails with `resource_exhausted`
-  (`rate_limit_error`, retryable).
+  configuration. When capacity is full and sessions are closing, the server
+  can wait up to 15 seconds for a slot to be released. If capacity is still
+  unavailable, the server returns retryable `resource_exhausted`
+  (`rate_limit_error`).
 - A duplex deployment serves the websocket route and, when supported by the
   model, ordinary `/v1/chat/completions` requests on the same engine without a
   session per request (see [Start the Server](#start-the-server)). Other

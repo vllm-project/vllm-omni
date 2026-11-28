@@ -8,6 +8,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import wave
 from contextlib import suppress
@@ -15,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 import websockets
+
+logger = logging.getLogger(__name__)
 
 CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livekit" / "client_vad_replay.jsonl"
 SEMANTIC_VAD_MODEL_PATH = os.environ.get("VLLM_OMNI_TEST_SMART_TURN_MODEL_PATH")
@@ -282,6 +285,15 @@ async def _run_client_vad_replay(
                     response_id = response["id"]
                     text = answers_by_response_id.get(response_id, "")
                     completed_answers[response_id] = text or _output_text(response)
+                    if response.get("status") == "failed" or not completed_answers[response_id]:
+                        logger.warning(
+                            "Realtime replay response failed or has no text: response_id=%s status=%s "
+                            "status_details=%s text_length=%d",
+                            response_id,
+                            response.get("status"),
+                            response.get("status_details"),
+                            len(completed_answers[response_id]),
+                        )
                     first_output_at.setdefault(response_id, asyncio.get_running_loop().time())
                     future = pending_responses.get(response_id)
                     if future is not None and not future.done():

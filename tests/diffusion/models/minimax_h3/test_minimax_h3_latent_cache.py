@@ -501,6 +501,78 @@ def test_chained_requests_combine_continuation_with_every_task_and_lock_source()
     ]
 
 
+WINDOWED = {
+    "long_video": True,
+    "long_video_mode": "continuation",
+    "continuation_window_frames": 141,
+    "continuation_overlap_frames": 22,
+}
+
+
+@pytest.mark.parametrize("task", ["t2va", "fl2va"])
+def test_one_windowed_request_samples_what_a_continue_from_chain_samples(task):
+    def first_frame(num_frames):
+        if task == "t2va":
+            return _conditioning(task, num_frames)
+        keyframe = torch.zeros((LATENT_H // 2) * (LATENT_W // 2), 96)
+        return _conditioning(
+            task,
+            num_frames,
+            visual_condition=keyframe,
+            visual_condition_shapes=((1, LATENT_H, LATENT_W),),
+            keyframe_frame_indices=(0,),
+            ref_blocks=({"kind": "image", "latent_h": LATENT_H, "latent_w": LATENT_W},),
+        )
+
+    # Three requests: 141 frames, then two that each continue the previous clip.
+    chain, chained, _ = _pipeline()
+    _run(chain, first_frame(141), {"latent_cache_key": "a"})
+    _run(chain, _conditioning("t2va", 141), {"latent_cache_key": "b", "continue_from": "a"})
+    _run(chain, _conditioning("t2va", 141), {"continue_from": "b"})
+
+    # One request over the same 379 frames.
+    pipeline, calls, _ = _pipeline()
+    video, _ = _run(pipeline, first_frame(379), WINDOWED)
+    assert video.shape[1] == 379 and len(calls) == len(chained) == 3
+
+    assert (
+        calls[0].get("guide_blocks") is None
+        and calls[0]["keyframe_frame_indices"] == chained[0]["keyframe_frame_indices"]
+    )
+    for window, request in zip(calls, chained, strict=True):
+        for key in ("num_frames", "latent_t", "audio_t", "guide_blocks", "visual_condition_shapes"):
+            assert window[key] == request[key], key
+        assert window["temporal_offset"] == pytest.approx(request.get("temporal_offset", 0.0))
+        for key in ("visual_condition", "audio_condition"):
+            if request[key] is None:
+                assert window[key] is None
+            else:
+                torch.testing.assert_close(window[key], request[key])
+    for window, request in zip(calls[1:], chained[1:], strict=True):
+        # A later window carries nothing but its predecessor's tail, like a text-only continue_from request.
+        assert [block["kind"] for block in window["guide_blocks"]] == ["video_audio"]
+        assert not window["ref_blocks"] and not request["ref_blocks"]
+        assert (
+            window["keyframe_frame_indices"] is None
+            and window["audio_condition_lengths"] == request["audio_condition_lengths"]
+        )
+
+
+def test_windowed_fl2va_refuses_a_late_keyframe_from_an_encoder_stage():
+    pipeline, calls, _ = _pipeline()
+    keyframes = torch.zeros(2 * (LATENT_H // 2) * (LATENT_W // 2), 96)
+    conditioning = _conditioning(
+        "fl2va",
+        379,
+        visual_condition=keyframes,
+        visual_condition_shapes=((1, LATENT_H, LATENT_W),) * 2,
+        keyframe_frame_indices=(0, -1),
+    )
+    with pytest.raises(OmniClientError, match="first frame only"):
+        _run(pipeline, conditioning, WINDOWED)
+    assert not calls
+
+
 def test_continuation_rejects_latent_refine():
     pipeline, calls, _ = _pipeline()
     _run(pipeline, _conditioning("t2va", 124), {"latent_cache_key": "a"})
