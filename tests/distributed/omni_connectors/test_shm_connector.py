@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
+import errno
 import fcntl
 import os
 import time
@@ -353,6 +354,80 @@ class TestCleanup:
                 patch.setattr(time, "monotonic", lambda: later)
                 connector.reap_consumed()
             assert writer.get("0", "1", key)[0] == "replacement"
+        finally:
+            writer.close()
+
+    @pytest.mark.parametrize("release", ["tracked", "close"])
+    @pytest.mark.parametrize("lookup_fails", [False, True], ids=["no-identity", "stat-error"])
+    def test_unidentified_publication_preserves_completed_replacement(self, connector, mocker, release, lookup_fails):
+        key = f"no_identity_{uuid.uuid4().hex}"
+        error = OSError(errno.EIO, "temporary stat failure") if lookup_fails else None
+        lookup = mocker.patch.object(connector, "_segment_identity", return_value=None, side_effect=error)
+        assert connector.put("0", "1", key, "original")[0]
+        if lookup_fails:
+            mocker.stop(lookup)
+
+        writer = SharedMemoryConnector({})
+        try:
+            ok, size, _ = writer.put("0", "1", key, "replacement")
+            assert ok
+            exact_key = f"{key}_exact"
+            assert writer.put("0", "1", exact_key, "explicit cleanup")[0]
+            assert connector.cleanup(exact_key)
+            assert not writer._shm_exists(exact_key)
+            if release == "close":
+                connector.close()
+            else:
+                connector.cleanup_tracked(key, defer_if_busy=True)
+            assert writer.get("0", "1", key) == ("replacement", size)
+            assert key not in connector._pending_keys
+        finally:
+            writer.close()
+
+    @pytest.mark.parametrize(
+        ("failed_operation", "replace"),
+        [("open", False), ("_segment_identity", True), ("_unlink_segment", False)],
+        ids=["lock-open", "stat-then-replace", "unlink"],
+    )
+    def test_deferred_cleanup_retries_after_storage_error(
+        self, connector, monkeypatch, mocker, failed_operation, replace
+    ):
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+        key = f"retry_error_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        lock_path = connector._lock_file(key)
+        now = time.monotonic()
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        with open(lock_path, "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert not connector.cleanup_tracked(key, defer_if_busy=True)
+
+        now += 60
+        with monkeypatch.context() as patch:
+            failure = mocker.Mock(side_effect=OSError(errno.EMFILE, "temporary storage failure"))
+            if failed_operation == "open":
+                patch.setattr(module, "open", failure, raising=False)
+            else:
+                patch.setattr(connector, failed_operation, failure)
+            connector.reap_consumed()
+            connector.reap_consumed()
+            failure.assert_called_once()
+        assert connector._shm_exists(key) and os.path.exists(lock_path)
+
+        writer = SharedMemoryConnector({})
+        try:
+            if replace:
+                ok, size, _ = writer.put("0", "1", key, "replacement")
+                assert ok
+            now += 60
+            connector.reap_consumed()
+            assert key not in connector._pending_keys
+            if replace:
+                assert writer.get("0", "1", key) == ("replacement", size)
+            else:
+                assert not connector._shm_exists(key)
+                assert not os.path.exists(lock_path)
         finally:
             writer.close()
 

@@ -35,7 +35,7 @@ _sweep_gate = threading.Lock()
 
 @dataclass(eq=False, slots=True)
 class _Publication:
-    segment_identity: object | None
+    segment_identity: object
     retry_after: float | None = None
 
 
@@ -155,8 +155,8 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _segment_identity(self, name: str) -> object | None:
         """Return an identity that changes on replacement, or raise FileNotFoundError if absent.
 
-        Backends with separate storage may override this hook. None disables deferred
-        release because this backend cannot distinguish a replacement from the original.
+        Backends with separate storage may override this hook. A publication without
+        a stable identity is left to its reader or explicit cleanup by key.
         """
         if type(self)._shm_exists is not SharedMemoryConnector._shm_exists:
             return None
@@ -456,7 +456,10 @@ class SharedMemoryConnector(OmniConnectorBase):
                 except OSError:
                     identity = None
                 with self._pending_keys_lock:
-                    self._pending_keys[put_key] = _Publication(identity)
+                    if identity is None:
+                        self._pending_keys.pop(put_key, None)
+                    else:
+                        self._pending_keys[put_key] = _Publication(identity)
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}
@@ -542,24 +545,22 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _cleanup_key(self, key: str, publication: _Publication | None, *, defer_if_busy: bool = False) -> bool:
         name = self._shm_name(key)
         lock_file = self._lock_file(name)
-        expected = publication.segment_identity if publication is not None else None
         unlinked = False
         try:
-            with _publication_lock(lock_file, blocking=expected is not None and not defer_if_busy) as fd:
+            with _publication_lock(lock_file, blocking=publication is not None and not defer_if_busy) as fd:
                 if publication is not None:
                     with self._pending_keys_lock:
                         still_tracked = self._pending_keys.get(key) is publication
-                        publication.retry_after = None
                     if not still_tracked:
                         if self._orphan_lock_directory is not None:
                             _unlink_if_orphan(fd, lock_file, f"{self.shm_directory}/{name}")
                         return False
                 try:
-                    if expected is not None:
+                    if publication is not None:
                         current = self._segment_identity(name)
                         if current is None:
                             return False
-                        if current != expected:
+                        if current != publication.segment_identity:
                             with self._pending_keys_lock:
                                 self._pending_keys.pop(key, None)
                             return False
@@ -574,14 +575,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                     self._pending_keys.pop(key, None)
                 _unlink_current_lock(fd, lock_file)
         except OSError as e:
-            if defer_if_busy and publication is not None:
+            if defer_if_busy and publication is not None and isinstance(e, BlockingIOError):
                 with self._pending_keys_lock:
-                    if expected is not None:
-                        publication.retry_after = (
-                            time.monotonic() + _BUSY_CLEANUP_RETRY_SECONDS if isinstance(e, BlockingIOError) else None
-                        )
-                    elif isinstance(e, BlockingIOError) and self._pending_keys.get(key) is publication:
-                        del self._pending_keys[key]
+                    publication.retry_after = time.monotonic() + _BUSY_CLEANUP_RETRY_SECONDS
             logger.debug("cleanup: could not acquire SHM lock for %s: %s", key, e)
         return unlinked
 

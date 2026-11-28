@@ -189,10 +189,15 @@ If the lock is busy, it returns `False` and the caller can retry. Cleanup remove
 tracking record only after unlinking the segment or confirming its absence. Other storage errors
 preserve both. Acquiring the lock can briefly create its file if the path is missing.
 
-For request completion and abort, the sender releases the publications it recorded. Prefix cleanup
-selects tracked keys whose suffix is a numeric chunk ID. The default Linux connector records each
-segment's device and inode under the publication lock. It checks that identity before unlinking the
-segment. If another writer has replaced it, the new segment and its lock stay available to readers.
+Under the publication lock, `put()` records the segment's stable identity (device and inode on
+the default Linux backend). If the backend supplies no identity or the lookup fails, `put()`
+still returns the handle and discards any previous record for that key. Completion, abort and
+`close()` skip that publication. The receiver can still consume it with `get()`, and callers
+can explicitly release it with `cleanup(key)`.
+
+Prefix cleanup selects tracked keys whose suffix is a numeric chunk ID. Before unlinking a
+tracked segment, the sender checks its identity under the lock. If a peer has replaced it,
+the sender retires the old record and leaves the replacement and its lock untouched.
 
 The V1 chunk adapter processes aborts and completions on its send thread. The native model
 runner v2 (MRv2) handles release requests under the lock that also protects request registration
@@ -201,14 +206,11 @@ chunk's lock cannot stall unrelated requests. If a release arrives before an MRv
 terminal delivery, MRv2 records it and tries cleanup when that delivery finishes. Prefix cleanup
 counts only segments removed during the call.
 
-When a lock is busy and the storage backend supplies a stable segment identity, the sender
-retains the original publication for retry. Both send paths retry during later `put()` calls
-and from their idle send loops. An idle MRv2 sender checks at most four records per pass and
-waits at least 100 ms between passes. If the original segment remains, a retry removes it.
-If a peer has replaced it, the retry retires the old record and preserves the replacement and
-its lock. If the backend supplied no stable identity, the sender drops its tracking record on
-contention and leaves the segment and lock in place. A later shutdown can then safely skip
-that key even if a peer has reused it.
+When a tracked publication's lock is busy, the sender schedules cleanup for retry during later
+`put()` calls or from its idle send loop. If a retry encounters a temporary error opening the
+lock, checking the segment's identity or unlinking the segment, the publication stays scheduled
+for a later pass after the retry delay. An idle MRv2 sender checks at most four records per pass
+and waits at least 100 ms between passes.
 
 A crashed process can leave a lock file behind after its segment disappears. With the default
 file layout, initialization, `put()` and ordinary `get()` can trigger a scan of the lock directory. Each
@@ -225,6 +227,11 @@ releases. It leaves a busy segment and its lock available to the peer, continues
 publications, then removes its own visibility marker and closes its wakeup FIFO. A stopped
 sender has no idle loop to retry a skipped release. An unread segment can therefore remain
 after shutdown.
+
+On Linux, independently launched Python processes can have separate resource trackers.
+If an old publisher exits after a peer has reused its segment name, its `resource_tracker`
+can unlink the replacement by name without taking the connector lock. The lock file can
+remain even though a new reader can no longer open the segment.
 
 ### 7. Data Flow in the Pipeline
 
