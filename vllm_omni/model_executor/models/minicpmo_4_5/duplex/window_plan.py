@@ -262,7 +262,8 @@ def prepare_stage0_window(
     runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
     window = runtime_config.get("duplex_window_config")
     mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
-    if mode not in {"basic", "context"}:
+    retains_units = mode in {"basic", "context", "evidence"}
+    if not retains_units:
         # Without a window the worker keeps no unit history to carry.
         session._minicpmo45_carried_window = None
 
@@ -294,7 +295,7 @@ def prepare_stage0_window(
     # async lookahead can overwrite the worker's pending terminator after
     # the scheduler accepted the segment stop. Window retention is optional.
     if not isinstance(window, dict) or (
-        mode not in {"basic", "context"}
+        not retains_units
         and (
             not runtime_config.get("duplex_boundary_token_ids")
             or duplex.get("session_window_owned") is False
@@ -337,8 +338,72 @@ def prepare_stage0_window(
             session._minicpmo45_window_previous_token_ids = list(carry.get("previous", ()))
     drop_count = 0
     dropped_len = 0
+    selected = None
+    retrieval_plan = None
+    retrieved_units = None
 
-    if mode == "basic":
+    if mode == "evidence":
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_evidence import (
+            EvidenceScorer,
+            select_evidence_units,
+        )
+
+        previous = getattr(session, "model_intermediate_buffer", None) or {}
+        previous_duplex = previous.get("duplex") or {}
+        observation = previous_duplex.get("window_evidence")
+        scorer = getattr(session, "_minicpmo45_evidence_scorer", None)
+        if scorer is None:
+            scorer = session._minicpmo45_evidence_scorer = EvidenceScorer()
+        if window.get("evidence_query_retrieval"):
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_retrieval import (
+                evidence_score,
+                plan_retrieval,
+            )
+
+            if carried_units:
+                # Input sequence numbers are fence-local. Carried units precede
+                # the new fence, and its former host archive has been released.
+                session._minicpmo45_memory_offset = len(carried_units)
+                for index, unit in enumerate(carried_units, 1):
+                    unit.update(append_seq=index, evidence_score=0.0, salience=(0.0, 0.0))
+            offset = getattr(session, "_minicpmo45_memory_offset", 0)
+            frame, energy, onset = observation if observation is not None else (b"", 0.0, 0.0)
+            salience = scorer.observe(frame, energy)
+            costs = previous_duplex.get("window_modalities", (0, 0))
+            units[-1].update(
+                append_seq=offset + seq - 1,
+                salience=salience,
+                evidence_score=evidence_score(*salience),
+                audio_peak=energy,
+                boundary_onset=onset,
+                modality_costs=costs if unit_len >= 3 + sum(costs) else (0, 0),
+            )
+            retrieved_units, archive, retrieval_plan = plan_retrieval(
+                units,
+                getattr(session, "_minicpmo45_memory_archive", {}),
+                projected_len=projected_len,
+                high=int(window["basic_window_high_tokens"]),
+                low=int(window["basic_window_low_tokens"]),
+                history_budget=int(window["evidence_history_tokens"]),
+                relevance=[(offset + index, v, a) for index, v, a in duplex.get("memory_relevance", ())],
+                restore_opening=not offset and duplex.get("memory_restore_opening") is True,
+            )
+            session._minicpmo45_memory_archive = archive
+            dropped_len = sum(unit["length"] for unit in units) - sum(unit["length"] for unit in retrieved_units)
+        elif observation is not None:
+            route, units[-1]["evidence_score"] = scorer.score(*observation)
+            if (costs := previous_duplex.get("window_modalities")) and route != "av":
+                vision, audio = costs
+                if unit_len >= 3 + vision + audio:
+                    units[-1]["remove_media"] = (1 + vision, audio) if route == "vision" else (1, vision)
+        if retrieved_units is None and projected_len > int(window["basic_window_high_tokens"]):
+            unit_tokens = sum(unit["length"] for unit in units)
+            fixed = projected_len - unit_tokens
+            budget = max(0, int(window["basic_window_low_tokens"]) - fixed)
+            selected = select_evidence_units(units, budget, int(window["evidence_history_tokens"]))
+            drop_count = len(units) - len(selected)
+            dropped_len = unit_tokens - sum(unit["length"] for _, unit in selected)
+    elif mode == "basic":
         try:
             high = int(window.get("basic_window_high_tokens", 8000))
             low = int(window.get("basic_window_low_tokens", 6000))
@@ -374,9 +439,11 @@ def prepare_stage0_window(
         session._minicpmo45_window_previous_len = len(previous_with_marker)
         projected_len += len(previous_with_marker) - old_previous_len
 
-    retained_units = units[drop_count:]
+    retained_units = units[drop_count:] if selected is None else [unit for _, unit in selected]
+    if retrieved_units is not None:
+        retained_units = retrieved_units
     session._minicpmo45_window_units = retained_units
-    if drop_count == 0 and not carried_units:
+    if dropped_len == 0 and not carried_units and retrieval_plan is None:
         session._minicpmo45_window_open_start = boundary
         return False
 
@@ -411,6 +478,27 @@ def prepare_stage0_window(
         "previous_marker_token_ids": marker_ids,
         "replacement_prompt_len": replacement_len,
     }
+    if selected is not None:
+        duplex["stage0_window"]["evidence_keep"] = [
+            (index, *(units[index]["remove_media"] if unit["length"] != units[index]["length"] else (0, 0)))
+            for index, unit in selected
+        ]
+    if retrieval_plan is not None:
+        duplex["stage0_window"].update(retrieval_plan)
+        if retrieval_plan["retrieval_query"] and window.get("evidence_local_prefill") and not carried_units:
+            # Only the contiguous unchanged suffix has a single RoPE displacement.
+            end = preserve_len + sum(unit["length"] for unit in units)
+            old_start = end
+            last = len(units) - 1
+            for source, _, removed, length in reversed(retrieval_plan["retrieval_keep"]):
+                if last < 0 or source != last or removed or length != units[last]["length"]:
+                    break
+                old_start -= length
+                last -= 1
+            new_start = old_start - dropped_len
+            keep = min(base_len, session.num_computed_tokens) - old_start
+            if end == boundary and keep >= 512 and new_start > preserve_len and new_start + keep < replacement_len:
+                duplex["stage0_window"]["local_prefill"] = (preserve_len, old_start, new_start, keep)
     if carried_units:
         duplex["stage0_window"]["carried_units"] = len(carried_units)
         duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]

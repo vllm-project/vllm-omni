@@ -1375,6 +1375,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        advance_replacement = getattr(self._window_policy, "advance_local_prefill", None)
+        if advance_replacement is not None:
+            advance_replacement(self.running)
         blocked_text_requests = self._find_text_input_waits()
         coalescing_enabled = bool(getattr(self, "_generation_max_wait_s", 0.0) and self._generation_min_batch_size > 1)
         # Talker K-frame guard: a step whose decode spans would be uneven
@@ -1587,6 +1590,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # row index from req_ids like the pin's scheduler does.
         req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
         window_policy = getattr(self, "_window_policy", None)
+        is_local_prefill_gap = getattr(window_policy, "is_local_prefill_gap", None)
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             if num_tokens_scheduled <= 0:
                 # A zero-token schedule entry used to die on the bare assert
@@ -1842,7 +1846,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
-            if sampling_validation_failed:
+            # Restoring historical KV does not produce hidden rows the
+            # downstream speech bridge needs for the current generated unit.
+            if sampling_validation_failed or (
+                not new_token_ids
+                and is_local_prefill_gap is not None
+                and is_local_prefill_gap(request, num_tokens_scheduled)
+            ):
                 pooler_output = mm_output = inter_stage_output = None
             kv_transfer_params = None
             ec_transfer_params = None
@@ -2346,8 +2356,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if replacement_len is not None:
                 if self._streaming_update_overflows(session, update, projected_len=replacement_len):
                     return
-                self._release_replaced_streaming_prompt_cache(session)
-                self._replace_streaming_session(session, update)
+                preserve = getattr(self._window_policy, "prepare_local_prefill", None)
+                prefix = preserve(self, session, update) if preserve is not None else 0
+                if not prefix:
+                    self._release_replaced_streaming_prompt_cache(session)
+                self._replace_streaming_session(session, update, computed_prefix=prefix)
                 return
         streaming_prompt_payload = next(
             (

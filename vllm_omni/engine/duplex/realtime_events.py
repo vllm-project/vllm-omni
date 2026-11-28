@@ -1453,6 +1453,9 @@ def resolve_commit(state: RealtimeProjectionState, command: Commit) -> ResolvedC
         payload["is_speech"] = command.is_speech
     if transcript:
         payload["transcript"] = transcript
+    if command.final and command.memory_relevance:
+        payload["memory_relevance"] = command.memory_relevance
+        payload["memory_restore_opening"] = command.memory_restore_opening
     if command.event_id is not None:
         payload["realtime_event_id"] = command.event_id
     return ResolvedCommit(payload=payload, events=events, reset_vad=True)

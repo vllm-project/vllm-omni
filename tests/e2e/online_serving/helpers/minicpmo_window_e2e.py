@@ -32,6 +32,7 @@ async def run_window_turn(
         if ref_audio is not None
         else None
     )
+    evidence_camera = mode == "evidence" and video_frames is not None
     config = create_duplex_session_config(
         modalities=("text", "audio") if ref_audio is not None else ("text",),
         ref_audio=reference,
@@ -43,8 +44,9 @@ async def run_window_turn(
             # during the two-repeat input and its response.
             "context_max_units": 8,
             "context_previous_max_tokens": 16,
-            "basic_window_high_tokens": 192,
-            "basic_window_low_tokens": 128,
+            "basic_window_high_tokens": 640 if evidence_camera else 192,
+            "basic_window_low_tokens": 480 if evidence_camera else 128,
+            **({"evidence_history_tokens": 160 if evidence_camera else 48} if mode == "evidence" else {}),
         },
     )
     client = DuplexClient(

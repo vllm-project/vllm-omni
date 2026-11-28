@@ -1438,3 +1438,53 @@ def test_flattened_layout_preflight_preserves_storage():
     view = validate(key, 16, 8, 8)
     assert view.data_ptr() == key.data_ptr()
     torch.testing.assert_close(storage, before)
+
+
+@pytest.mark.parametrize("old_start,new_start", [(2, 4), (4, 2), (2, 2)])
+def test_local_prefill_relocates_overlapping_kv_rows(monkeypatch, old_start, new_start):
+    helper = MiniCPMO45DuplexWorkerHelper
+    dtype = torch.float64
+    cache = torch.arange(3 * 2 * 4 * 8, dtype=dtype).reshape(3, 2, 4, 8)
+    reference = cache.clone()
+    inv_freq = torch.tensor([1.0, 0.5], dtype=torch.float32)
+    monkeypatch.setattr(helper, "get_reanchor_parameters", lambda _: (4, 4, inv_freq))
+    monkeypatch.setattr(helper, "resolve_group_block_ids", lambda *args: [2, 0, 1])
+    state = SimpleNamespace(
+        num_computed_tokens_np=[1],
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([1])),
+    )
+    runner = SimpleNamespace(req_states=state, kv_caches=[cache], device=torch.device("cpu"))
+    count = 5
+    plan = [1, old_start, new_start, count]
+
+    helper._apply_local_prefill(runner, "req", 0, plan)
+    table = torch.tensor([2, 0, 1])
+    old = torch.arange(old_start, old_start + count)
+    new = torch.arange(new_start, new_start + count)
+    saved = reference[table[old // 4], :, old % 4]
+    restored = cache[table[new // 4], :, new % 4]
+    torch.testing.assert_close(restored[..., 4:], saved[..., 4:])
+    torch.testing.assert_close(restored[..., :4], rotate_keys(saved[..., :4], old_start - new_start, inv_freq))
+    state.num_computed_tokens_np[0] = new_start + count
+    helper._apply_local_prefill(runner, "req", 0, plan)
+    assert state.num_computed_tokens.gpu[0] == new_start + count
+
+
+def test_local_prefill_skips_copied_rows_only_after_first_span_settles():
+    policy = MiniCPMO45SchedulerWindowPolicy()
+    request = SimpleNamespace(num_computed_tokens=84, num_in_flight_tokens=0)
+    request._minicpmo45_local_prefill = (84, 744, 6910)
+    output = SimpleNamespace(num_scheduled_tokens={"req": 6840}, total_num_scheduled_tokens=6840)
+    policy.before_book({"req": request}, output)
+    assert output.num_scheduled_tokens == {"req": 660}
+    assert output.total_num_scheduled_tokens == 660
+
+    request.num_computed_tokens += 660
+    request.num_in_flight_tokens = 660
+    policy.advance_local_prefill([request])
+    assert request.num_computed_tokens == 744
+
+    request.num_in_flight_tokens = 0
+    policy.advance_local_prefill([request])
+    assert request.num_computed_tokens == 6910
+    assert request._minicpmo45_local_prefill is None

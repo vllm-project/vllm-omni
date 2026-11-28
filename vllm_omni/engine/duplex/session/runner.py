@@ -3235,6 +3235,12 @@ class DuplexSessionRunner:
                 model_state.input_since_commit = False
             return False
         self.memory.note_committed_input(flushed)
+        if relevance := event.get("memory_relevance"):
+            flushed = {
+                **flushed,
+                "memory_relevance": relevance,
+                "memory_restore_opening": event.get("memory_restore_opening", False),
+            }
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
             flushed["force_listen"] = True
@@ -3458,6 +3464,12 @@ class DuplexSessionRunner:
             )
         else:
             retained_payload = deferred_payload
+        if relevance := event.get("memory_relevance"):
+            retained_payload = {
+                **retained_payload,
+                "memory_relevance": relevance,
+                "memory_restore_opening": event.get("memory_restore_opening", False),
+            }
         model_state.retain_committed_audio(
             retained_payload,
             operation_id=commit_reservation.operation_id,
@@ -3536,6 +3548,12 @@ class DuplexSessionRunner:
                 final_payload = prior_committed
         commit_reservation.commit()
         if final_payload is not None:
+            if relevance := event.get("memory_relevance"):
+                final_payload = {
+                    **final_payload,
+                    "memory_relevance": relevance,
+                    "memory_restore_opening": event.get("memory_restore_opening", False),
+                }
             model_state.retain_committed_audio(
                 final_payload,
                 operation_id=commit_reservation.operation_id,

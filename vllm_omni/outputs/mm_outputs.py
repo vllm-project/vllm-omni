@@ -187,7 +187,7 @@ class MultimodalPayload(Mapping):
             self.metadata[key] = value
         return self
 
-    def consolidate_tensors(self, modality: OutputModality) -> None:
+    def consolidate_tensors(self, modality: OutputModality, *, exclude: frozenset[str] = frozenset()) -> None:
         """Concatenate deferred tensor lists into single tensors.
 
         Tensors are generated content accumulated as chunks, so each key's
@@ -198,6 +198,7 @@ class MultimodalPayload(Mapping):
         key can be registered for a different strategy -- e.g. a codec-frame
         matrix that grows along dim 0 rather than the waveform-tuned default
         for its modality -- via ``register_key_accumulation_strategy``.
+        Excluded keys retain their tensor chunks for a later call.
         """
         # Relocate scalar metadata tensors (e.g. sample rate) that from_dict
         # routed into .tensors, so they take the REPLACE path via .metadata
@@ -209,7 +210,7 @@ class MultimodalPayload(Mapping):
             self.metadata[key] = value[-1] if isinstance(value, list) else value
 
         for key, value in list(self.tensors.items()):
-            if _is_tensor_list(value):
+            if key not in exclude and _is_tensor_list(value):
                 strategy = get_accumulation_strategy(modality, key)
                 self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
 

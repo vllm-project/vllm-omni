@@ -141,6 +141,7 @@ class _MiniCPMO45Stage0SessionState(MiniCPMO45TurnState):
     context_suffix_embeds: list[Any] = field(default_factory=list)
     context_suffix_token_ids: list[int] = field(default_factory=list)
     window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
+    window_archive: dict[int, _MiniCPMO45WindowUnit] = field(default_factory=dict)
     window_enabled: bool = False
     window_previous_ids: list[int] = field(default_factory=list)
     window_previous_marker: list[int] = field(default_factory=list)
@@ -509,7 +510,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         rt = runtime_config or {}
         window_config = rt.get("duplex_window_config")
         state.window_enabled = bool(rt.get("duplex_boundary_token_ids")) or (
-            isinstance(window_config, dict) and window_config.get("sliding_window_mode") in {"basic", "context"}
+            isinstance(window_config, dict)
+            and window_config.get("sliding_window_mode") in {"basic", "context", "evidence"}
         )
         state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
         state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
@@ -879,6 +881,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             return result
         if window_result is not None:
             embed_parts, token_ids = window_result
+        if num_frames and state.window_enabled:
+            logger.debug(
+                "MiniCPM-o window camera session=%s epoch=%s seq=%s frames=%d", state.session_id, epoch, seq, num_frames
+            )
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
         result = self._stage_prefill_result(True, start_time)
         result.update(
@@ -1148,7 +1154,25 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
                 f"drop={drop_units}, completed={len(state.window_units)}"
             )
-        del state.window_units[:drop_units]
+        evidence_keep = stage0_window.get("evidence_keep")
+        if "retrieval_keep" in stage0_window:
+            self._apply_window_retrieval(state, stage0_window)
+        elif evidence_keep is None:
+            del state.window_units[:drop_units]
+        else:
+            if len(evidence_keep) != len(state.window_units) - drop_units:
+                raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence window selection")
+            retained = []
+            previous_index = -1
+            for index, start, count in evidence_keep:
+                if not previous_index < index < len(state.window_units):
+                    raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence window selection")
+                unit = state.window_units[index]
+                if count:
+                    unit = self._project_evidence_unit(unit, start, count)
+                retained.append(unit)
+                previous_index = index
+            state.window_units = retained
 
         mode = stage0_window.get("mode")
         embeds: list[Any] = []
@@ -1216,6 +1240,57 @@ class MiniCPMO45Stage0DuplexRuntime:
                 f"units={unit_lengths}, pending={pending_len}, drop={drop_units}"
             )
         return embeds, token_ids
+
+    def _project_evidence_unit(self, unit: _MiniCPMO45WindowUnit, start: int, count: int) -> _MiniCPMO45WindowUnit:
+        stop = start + count
+        if start < 1 or count <= 0 or stop >= len(unit.token_ids) - 1:
+            raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence projection")
+        return _MiniCPMO45WindowUnit(
+            embeds=self._slice_embed_list(unit.embeds, 0, start)
+            + self._slice_embed_list(unit.embeds, stop, len(unit.token_ids)),
+            token_ids=unit.token_ids[:start] + unit.token_ids[stop:],
+        )
+
+    def _apply_window_retrieval(self, state: _MiniCPMO45Stage0SessionState, plan: dict[str, Any]) -> None:
+        import torch
+
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_retrieval import STREAMOV_ARCHIVE_TOKENS
+
+        def source_unit(source: int) -> _MiniCPMO45WindowUnit:
+            if source < 0 and -source in state.window_archive:
+                return state.window_archive[-source]
+            if 0 <= source < len(state.window_units):
+                return state.window_units[source]
+            raise _UnrecoverableWindowError("Missing MiniCPM-o retrieval source")
+
+        retained = []
+        device = self._model_device()
+        for source, start, count, length in plan["retrieval_keep"]:
+            unit = source_unit(source)
+            if count:
+                unit = self._project_evidence_unit(unit, start, count)
+            if len(unit.token_ids) != length:
+                raise _UnrecoverableWindowError("MiniCPM-o retrieved unit length mismatch")
+            if source < 0:
+                unit = _MiniCPMO45WindowUnit([part.to(device) for part in unit.embeds], unit.token_ids)
+            retained.append(unit)
+        sources = {key: (source, source_unit(source)) for key, source in plan["retrieval_archive"]}
+        if sum(len(unit.token_ids) for _, unit in sources.values()) > STREAMOV_ARCHIVE_TOKENS:
+            raise _UnrecoverableWindowError("MiniCPM-o evidence archive exceeds budget")
+        archive = {}
+        for key, (source, unit) in sources.items():
+            if source >= 0:
+                embeds = torch.cat([self._as_2d_tensor(part) for part in unit.embeds], dim=0)
+                unit = _MiniCPMO45WindowUnit([embeds.to("cpu", copy=True)], unit.token_ids)
+            archive[key] = unit
+        state.window_units = retained
+        state.window_archive = archive
+        if plan.get("retrieval_query"):
+            logger.debug(
+                "MiniCPM-o retrieval history=%s archive_tokens=%d",
+                plan["retrieval_history"],
+                sum(len(unit.token_ids) for unit in archive.values()),
+            )
 
     @staticmethod
     def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, object]:

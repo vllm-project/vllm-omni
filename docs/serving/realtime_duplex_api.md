@@ -661,6 +661,37 @@ available to the Thinker. The retained time span depends on the input and
 generated speech; these limits are token counts, not a fixed number of seconds.
 
 Pass `extra_body={"sliding_window_mode": "off"}` to retain the full history.
+The opt-in `"evidence"` mode uses the same high and low watermarks. It
+keeps a continuous recent suffix and budgets up to `evidence_history_tokens`
+(800 by default) for older units ranked by frame changes, audio peaks and
+their temporal alignment. A selected unit can keep only the relevant modality
+when the input layout permits it. The Thinker re-prefills selected units in
+their original order after a trim. This mode uses the native checkpoint and
+listen/speak decisions.
+
+Set `evidence_query_retrieval: true` alongside `sliding_window_mode: evidence`
+to retain a bounded CPU cache of up to 16,000 input embedding rows. The active
+history budget is still set by `evidence_history_tokens`. To rerank at query
+time, a client can supply `memory_relevance` on its final
+`input_audio_buffer.commit` event. Each of up to 512 rows is
+`[append_sequence, visual_score, audio_score]`, using the Stage-0 append
+sequence of the current epoch and scores between −1 and 1 or `null` for an
+unavailable modality. Clients can compute these scores with CLIP and CLAP
+using observed media. For requests about the beginning of a stream,
+`memory_restore_opening: true` lets the selector restore consecutive opening
+audio/video units if they fit and are still available. The archive lives with
+the active Stage-0 request. Barge-in carries the accepted active window through
+the existing window replay path.
+
+Set `evidence_local_prefill: true` with query retrieval to reuse the cached
+keys and values of an unchanged recent suffix during recovery. The Thinker
+aligns the cached keys to the new positions and pre-fills the restored history
+and new inputs. Reused rows still carry the context from their original
+forward pass, so responses can differ from full re-prefill. The fast path
+requires the CUDA MRv2 Thinker with `TRITON_ATTN` and synchronous scheduling.
+The engine uses ordinary prefill when the request or runtime cannot reuse the
+suffix safely. This option defaults to `false`.
+
 The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
