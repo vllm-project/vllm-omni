@@ -11,10 +11,7 @@ from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE, _VideoV
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-@pytest.mark.parametrize("fail_decode", [False, True])
-def test_streaming_decode_stages_only_decoder(monkeypatch, fail_decode):
-    events = []
-
+def _stub_pipeline(monkeypatch, events):
     class Stager:
         def __init__(self, name):
             self.name = name
@@ -62,6 +59,14 @@ def test_streaming_decode_stages_only_decoder(monkeypatch, fail_decode):
     pipeline.audio_vae = Audio()
     pipeline.device = torch.device("cpu")
     pipeline.od_config = OmniDiffusionConfig(enable_distributed_layerwise_offload=True)
+    monkeypatch.setattr(MiniMaxH3Pipeline, "_release_stage_cache", lambda self: events.append(("release", "stage")))
+    return pipeline, vae, Session
+
+
+@pytest.mark.parametrize("fail_decode", [False, True])
+def test_streaming_decode_stages_only_decoder(monkeypatch, fail_decode):
+    events = []
+    pipeline, vae, Session = _stub_pipeline(monkeypatch, events)
     assert pipeline._uses_manual_component_offload(vae)
 
     def decode(video_vae, latent, **kwargs):
@@ -84,3 +89,23 @@ def test_streaming_decode_stages_only_decoder(monkeypatch, fail_decode):
     assert not vae._decoder_stager.active
     assert ("load", "encoder") not in events
     assert ("offload", "encoder") not in events
+
+
+def test_streaming_decode_releases_stage_cache_after_the_chunks(monkeypatch):
+    # The per-request peak counter resets but keeps the reserved pool, so the
+    # pages this stage frees must go back to the allocator before the method
+    # returns; otherwise the next request starts its peak on top of them.
+    events = []
+    pipeline, _vae, Session = _stub_pipeline(monkeypatch, events)
+
+    def decode(video_vae, latent, **kwargs):
+        events.append(("decoded", "chunks"))
+        return [b"mp4"]
+
+    monkeypatch.setattr("vllm_omni.diffusion.utils.chunked_video.ChunkedVideoMP4Session", Session)
+    monkeypatch.setattr("vllm_omni.diffusion.utils.chunked_video.decode_to_mp4", decode)
+
+    assert pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=2, width=2) == b"mp4"
+    order = [name for name, _ in events]
+    assert "release" in order
+    assert order.index("decoded") < order.index("release")
