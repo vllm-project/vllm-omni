@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Optional evaluation extras; torch/torchaudio must match the runtime.
+openai-whisper==20250625
+zhconv==1.4.3
+soundfile>=0.14
+scipy>=1.11
+numpy>=1.26
+psutil>=7
+matplotlib>=3.8
