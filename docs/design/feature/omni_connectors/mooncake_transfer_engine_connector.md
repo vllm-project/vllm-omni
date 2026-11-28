@@ -31,6 +31,7 @@ connectors:
       host: "auto"                  # Auto-detect local RDMA IP
       zmq_port: 50051               # ZMQ base port (see "Port Offset Scheme" below)
       protocol: "rdma"              # "rdma" or "tcp"
+      native_tcp_proto_version: 2   # verified completion capability on both endpoints
       device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
       memory_pool_size: 4294967296  # 4 GB (CPU); use 2147483648 (2 GB) for GPU
       memory_pool_device: "cpu"     # "cpu" for pinned memory (recommended), "cuda" for GPUDirect RDMA
@@ -54,7 +55,7 @@ stages:
 ### Required
 
 | Parameter | Description |
-|---|---|
+| --- | --- |
 | `role` | **Internal, do not set manually.** Auto-injected by the orchestration layer (`"sender"` for `output_connectors`, `"receiver"` for `input_connectors`). Defaults to `"sender"` if omitted. |
 | `host` | Local IP address for RDMA. `"auto"` detects from network interfaces. |
 | `protocol` | Transport protocol: `"rdma"` (InfiniBand/RoCE) or `"tcp"`. |
@@ -62,31 +63,43 @@ stages:
 ### Memory Pool
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `memory_pool_size` | 4 GB (CPU) / 2 GB (GPU) | Total size of the RDMA-registered memory pool in bytes. Recommended 4 GB for CPU pinned memory; 2 GB for GPU VRAM to conserve device memory. |
 | `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended, works on all topologies). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity, PIX topology). |
 
 ### Networking
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `zmq_port` | 50051 | ZMQ **base** port. The orchestration layer computes the actual port as `base + purpose_offset + stage_offset` (see table below). Users only set this base value. |
 | `sender_host` | `None` | **Internal.** Receiver-side only — dynamically resolved via `update_sender_info()`. Not needed in YAML. |
 | `sender_zmq_port` | `None` | **Internal.** Receiver-side only — defaults to the sender's adjusted port. Not needed in YAML. |
 | `device_name` | `""` | RDMA device name (e.g., `"mlx5_0"`). Empty for auto-detect. Can also be set via `RDMA_DEVICE_NAME` env var. |
+| `native_tcp_proto_version` | `0` | Acknowledged-completion capability; set to `2` on both endpoints. |
+
+#### RDMA Transport Guard
+
+> **Required on both endpoints:** set `native_tcp_proto_version: 2` for
+> `protocol: "rdma"` or `protocol: "tcp"`. Missing or mismatched values are
+> rejected before a destination is published or native WRITE is submitted.
+
+For `protocol: "rdma"`, startup verifies local HCA availability unless
+`MC_FORCE_HCA=1` delegates that check to the native SDK; `MC_FORCE_TCP` is
+rejected. Topology discovery does not prove the effective transport, so the
+capability requirement applies even when an HCA is found.
 
 #### ZMQ Port Offset Scheme
 
 To avoid port conflicts when multiple edges, purposes, DP replicas, or TP ranks share the same node, the actual ZMQ port is computed as:
 
-```
+```text
 side_channel_port = zmq_port + purpose_offset + stage_offset + dp_index * tp_size
 sender_listen     = side_channel_port + tp_rank
 receiver_connect  = remote_side_channel_port + tp_rank
 ```
 
 | Component | Value | Description |
-|---|---|---|
+| --- | --- | --- |
 | `zmq_port` | 50051 (default) | Base port from YAML config |
 | `purpose_offset` | `request_forwarding` = 0, `kv_transfer` = 100 | Separates control-plane vs KV-cache connections |
 | `stage_offset` | `int(from_stage)` (0, 1, 2...) | Separates edges from different source stages |
@@ -97,7 +110,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 **Example** (base=50051, stage 0→1, DP=2, TP=2, kv_transfer):
 
 | Caller | DP | TP rank | Port |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Stage worker | DP0 | rank 0 | `50051 + 100 + 0 + 0×2 + 0 = 50151` |
 | Stage worker | DP0 | rank 1 | `50051 + 100 + 0 + 0×2 + 1 = 50152` |
 | Stage worker | DP1 | rank 0 | `50051 + 100 + 0 + 1×2 + 0 = 50153` |
@@ -107,7 +120,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 ## Memory Pool Modes
 
 | Mode | Config | Recommended Pool Size | Data Flow | Best For |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | CPU Pinned | `memory_pool_device: "cpu"` | 4 GB | GPU → CPU pool → RDMA → CPU pool → GPU | Most hardware topologies (recommended) |
 | GPUDirect | `memory_pool_device: "cuda"` | 2 GB | GPU → GPU pool → RDMA (NIC reads GPU BAR1) → GPU pool | NIC-GPU direct PCIe (PIX topology) |
 
@@ -118,7 +131,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 ## Environment Variables
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `RDMA_DEVICE_NAME` | Override RDMA device name (e.g., `mlx5_0`). |
 | `MC_IB_PCI_RELAXED_ORDERING` | Set to `1` to enable PCIe relaxed ordering for GPUDirect. |
 
@@ -142,7 +155,7 @@ docker run -it \
 Benchmark results on H800 GPUs with mlx5_0 RDMA NIC (~186 MB KV cache):
 
 | Metric | MooncakeStoreConnector | MooncakeTransferEngineConnector (CPU) |
-|---|---|---|
+| --- | --- | --- |
 | KV transfer wall time | ~810 ms | **~14 ms** |
 | RDMA throughput | N/A (TCP) | ~22 GB/s |
 | Speedup | 1x | **58x** |
@@ -175,7 +188,7 @@ echo "MC_IB_PCI_RELAXED_ORDERING=${MC_IB_PCI_RELAXED_ORDERING:-<not set>}"
 ### Common Issues
 
 | Symptom | Cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | `Failed to modify QP to RTR` | Cross-NIC QP handshake failure (multi-NIC DGX) | Set `device_name` to a single RoCE NIC (e.g., `mlx5_2`) or set `RDMA_DEVICE_NAME` env var |
 | `transport retry counter exceeded` | RDMA path between incompatible NICs | Same as above — restrict to one NIC |
 | `zmq.error.Again: Resource temporarily unavailable` | ZMQ recv timeout (transfer took too long) | Check NIC selection; increase data may need longer timeout |
@@ -195,6 +208,7 @@ ibdev2netdev | grep -v "ib[0-9]"
 ```
 
 Then configure the connector:
+
 ```yaml
 device_name: "mlx5_2"  # or set RDMA_DEVICE_NAME=mlx5_2
 ```
@@ -378,10 +392,10 @@ Two helper classes control local memory ownership:
 
 - `ManagedBuffer`
   Represents one live slice of the pool and exposes:
-  - `.tensor`
-  - `.as_tensor(dtype, shape)`
-  - `.to_bytes()`
-  - `.release()`
+    - `.tensor`
+    - `.as_tensor(dtype, shape)`
+    - `.to_bytes()`
+    - `.release()`
 
 #### 4.4 ZMQ Side Channel
 
@@ -489,20 +503,20 @@ The high-level flow is:
 
 `put()` supports three payload classes:
 
-**A. `ManagedBuffer`**
+#### A. `ManagedBuffer`
 
-If the buffer belongs to the same pool, the connector can use it directly without copying. This is the most efficient path.
+The connector copies the buffer into its own allocation, including same-pool
+inputs. This keeps the source valid if the caller releases its original buffer
+while a native write remains active or its completion is unknown.
 
-If the buffer comes from a different pool, the connector falls back to a copy path.
-
-**B. `torch.Tensor` or `bytes`**
+#### B. `torch.Tensor` or `bytes`
 
 These payloads are copied into the local pool and marked as fast-path data:
 
 - no Omni object serialization is required
 - receiver can get a `ManagedBuffer` back
 
-**C. Generic Python object**
+#### C. Generic Python object
 
 Any other payload is serialized via `OmniSerializer.serialize(...)` and then copied into the pool.
 
@@ -558,7 +572,7 @@ This table is the sender-side truth source for both metadata queries and pull re
 
 The `metadata` parameter in `get()` is optional. The connector supports two resolution modes depending on whether the caller supplies it.
 
-**With metadata**
+##### With metadata
 
 When the caller passes metadata, the connector uses it directly. The metadata carries:
 
@@ -568,7 +582,7 @@ When the caller passes metadata, the connector uses it directly. The metadata ca
 
 This mode is suitable when the control plane already forwards the sender's `put()` output to the receiver.
 
-**Without metadata**
+##### Without metadata
 
 When `get(metadata=None)` is called, the connector queries the sender over ZMQ to discover the same fields (`data_size`, `is_fast_path`). The caller must first call:
 
@@ -599,8 +613,11 @@ This tells the sender exactly where to write the incoming data.
 
 The receiver then sends the pull request over ZMQ and waits for:
 
-- `TRANS_DONE`
-- or `TRANS_ERROR`
+- `TRANS_DONE`: the synchronous native write returned success.
+- `TRANS_NOT_SUBMITTED`: the handler did not invoke the native write.
+- `TRANS_UNKNOWN`, legacy `TRANS_ERROR`, or an invalid reply: completion is unknown.
+
+Only the first two permit destination reclamation. See the ownership rules below.
 
 If the transfer succeeds:
 
@@ -645,7 +662,8 @@ For a transfer request, the sender:
 1. locates the source addresses in `_local_buffers`
 2. constructs the remote session identifier
 3. calls `batch_transfer_sync_write(...)`
-4. replies `TRANS_DONE` or `TRANS_ERROR`
+4. replies `TRANS_DONE` on success, `TRANS_UNKNOWN` on native error/exception, or
+   `TRANS_NOT_SUBMITTED` when rejected before calling the SDK
 
 On success, the sender immediately calls `cleanup(meta.request_id)` and frees the producer-side buffer if it owns it.
 
@@ -686,7 +704,10 @@ This preserves a uniform object-oriented API while still allowing optimized raw-
 
 #### 11.1 Timeouts and Socket Recovery
 
-The receiver caches ZMQ REQ sockets per thread, but invalidates them after failures. This avoids reusing sockets that may be stuck in a bad state after timeout or receive errors.
+Metadata queries use thread-local REQ sockets. Each transfer uses a dedicated
+socket, retained by a completion waiter if the caller times out.
+`get_with_deadline()` shares one budget across metadata and completion waits;
+it does not cancel the sender's `batch_transfer_sync_write()` call.
 
 Timeout is scaled based on payload size:
 
@@ -699,21 +720,31 @@ This is intended to reduce false timeouts for large remote writes.
 
 The sender periodically reclaims old entries from `_local_buffers` using a TTL policy. This protects the memory pool from permanent leaks if a receiver crashes or never consumes a prepared payload.
 
-This is a practical recovery mechanism, although the code notes that TTL cleanup can still race with very long-running in-flight transfers.
+Active or ambiguous native writes pin both endpoints' buffers and registrations.
+TTL, explicit cleanup, duplicate put and close cannot recycle a pinned source.
+A nonzero SDK result does not prove the remote write has stopped. Ambiguous
+results retain memory until process exit; late safe ACKs release timed-out
+receiver allocations. There is no bounded reclamation guarantee after every failure.
+
+`max_inflight_receives` and `max_inflight_sends` default to 64. The sender limit
+bounds queued/active handlers and ambiguous writes. Capacity exhaustion rejects
+new requests before native submission. A receive-side capacity rejection is a
+retryable backpressure result: `get_with_deadline()` returns `None`, and the
+caller retries until its shared deadline so an in-flight slot can be released.
+The `receive_capacity_rejections` health metric and rate-limited warning make
+capacity pressure distinguishable from a payload that has not been published.
+
+Both peers must use connector protocol v2: `put()` metadata, metadata-query
+responses and transfer requests carry `protocol_version=2`. Old metadata and
+legacy `MC_TCP_PROTO=1` are rejected before a write. See **RDMA Transport
+Guard** for the acknowledged-completion requirement.
 
 #### 11.3 Connector Shutdown
 
-`close()` is a full resource teardown routine. It:
-
-- stops the listener thread
-- shuts down the worker executor
-- releases all pending buffers
-- closes cached sockets
-- unregisters memory from the engine when supported
-- terminates the ZMQ context
-- drops the pool reference
-
-This makes `MooncakeTransferEngineConnector` the most lifecycle-aware connector in the current connector family.
+`close()` rejects new work and defers teardown while receives, native writes,
+handlers or puts may still own memory. Once safe, it drains sender work and
+replies, joins the listener, releases idle buffers, closes sockets and unregisters
+the pool. Unknown native operations keep their memory registered until process exit.
 
 ### 12. Current Implementation Constraints
 
@@ -729,7 +760,9 @@ The receiver only stores one `(sender_host, sender_zmq_port)` pair through `upda
 
 #### 12.3 Explicit Buffer Ownership Matters
 
-When the connector allocates a pool slice internally, it is responsible for releasing it. When a caller passes an externally owned `ManagedBuffer`, the connector keeps it alive for transfer but does not assume ownership of its eventual release.
+The connector owns its send-side copies. The caller still owns the original
+`ManagedBuffer` passed to `put()` and successful fast-path receive results.
+Pending receive allocations remain connector-owned until a safe completion reply.
 
 These constraints are consistent with the current implementation and should be treated as design assumptions rather than incidental behavior.
 
