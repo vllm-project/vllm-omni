@@ -35,6 +35,15 @@ Omni Sleep Mode is optimized for high-performance computing backends:
 * **Memory Considerations**: System RAM must be sufficient to hold offloaded weights during sleep.
 * **TP Support**: Tensor Parallel groups synchronize sleep/wake transitions across all workers.
 
+### Recovering an interrupted AR sleep
+
+Cancelling an `AsyncOmni.sleep()` call can leave the remote RPC running after some AR stages
+have already offloaded memory. The frontend retains the attempted stages as wake targets.
+When the engine is still alive, use `wake_up(stage_ids=...)` to restore them, then explicitly
+call `resume_generation()` to reopen frontend admission. The existing level-2 restriction
+still applies when weights may have been discarded. Fatal worker errors that shut down the
+orchestrator require engine recovery instead.
+
 ### Quiescing a busy diffusion stage: `pause_generation(mode="keep")`
 
 `sleep()` on a diffusion stage is a worker-level RPC: it offloads memory but does not stop the
