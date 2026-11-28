@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add World Model"
+  short_description: "Integrate stateful world models into vLLM-Omni"
+  default_prompt: "Use $add-world-model to integrate this causal world model with strict loading, shared AR-Diffusion state, and evidence for the requested generation and serving capabilities."
