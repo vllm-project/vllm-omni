@@ -19,6 +19,12 @@ The same clients also support Qwen-Image 2.1. To use that checkpoint instead:
 vllm serve Qwen/Qwen-Image-2.1 --omni --port 8091
 ```
 
+For Qwen-Image-2.1 deployments with fixed output sizes, enable VAE decoder
+compilation with `--additional-config '{"qwen_image_21_compile_vae_decoder":true}'`.
+Warm up every supported size before sending traffic. The first decode of a
+new shape can spend significant time compiling. The option requires an
+Inductor-capable platform and a VAE patch parallel size of one.
+
 !!! note
     If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
 

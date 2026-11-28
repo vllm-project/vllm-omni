@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -21,6 +21,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed, InternalTorchDynamoError
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -64,6 +65,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.vae_fast_path import vae_compile_allowed
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.quantization import resolve_component_quant_config
@@ -467,6 +469,20 @@ class QwenImage21Pipeline(
         self._drop_idx = len(sys_tokens[0])
         self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
         self._max_length = 8192
+
+        # Decoder compilation is opt-in because each new spatial shape may compile
+        # on the request path. Eager mode and platforms without Inductor veto it.
+        from vllm_omni.platforms import current_omni_platform
+
+        self._decoder_compile_allowed = self.od_config.additional_config.get(
+            "qwen_image_21_compile_vae_decoder"
+        ) is True and vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform)
+        self._decoder_compile_attempted = False
+        self._decoder_eager_forward: Callable[..., torch.Tensor] | None = None
+
+        # `latents_mean` / `latents_std` are checkpoint constants, so they are built once
+        # per (device, dtype) instead of on every request.
+        self._latent_stats: tuple[tuple[torch.device, torch.dtype], torch.Tensor, torch.Tensor] | None = None
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -1117,6 +1133,43 @@ class QwenImage21Pipeline(
             "do_true_cfg": do_true_cfg,
         }
 
+    def _maybe_compile_decoder(self) -> None:
+        """Wrap the decoder after the VAE fast paths and profiler are installed."""
+        if self._decoder_compile_attempted or not self._decoder_compile_allowed:
+            return
+        # Distributed VAE execution rethrows rank-local failures as a group error.
+        if self.parallel_config.vae_patch_parallel_size > 1:
+            return
+        self._decoder_compile_attempted = True
+        decoder = self.vae.decoder
+        eager_forward = decoder.forward
+        try:
+            decoder.forward = torch.compile(eager_forward, mode="default", fullgraph=False, dynamic=False)
+        except Exception:
+            logger.warning(
+                "Qwen-Image-2.1: compiling the VAE decoder failed; using the reference forward",
+                exc_info=True,
+            )
+            return
+        self._decoder_eager_forward = eager_forward
+        logger.info("Qwen-Image-2.1: enabled VAE decoder compilation")
+
+    def _decode_vae(self, latents: torch.Tensor) -> torch.Tensor:
+        self._maybe_compile_decoder()
+        try:
+            return self.vae.decode(latents, return_dict=False)[0]
+        except (BackendCompilerFailed, InternalTorchDynamoError):
+            if self._decoder_eager_forward is None:
+                raise
+            self.vae.decoder.forward = self._decoder_eager_forward
+            self._decoder_eager_forward = None
+            logger.warning(
+                "Qwen-Image-2.1: compiling the VAE decoder failed; using the reference forward",
+                exc_info=True,
+            )
+        # Restart the decode so tiling and cache cleanup run from the start.
+        return self.vae.decode(latents, return_dict=False)[0]
+
     def _decode_latents(
         self,
         latents: torch.Tensor,
@@ -1133,18 +1186,17 @@ class QwenImage21Pipeline(
 
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
+        key = (latents.device, latents.dtype)
+        if self._latent_stats is None or self._latent_stats[0] != key:
+            shape = (1, self.vae.config.z_dim, 1, 1, 1)
+            self._latent_stats = (
+                key,
+                torch.tensor(self.vae.config.latents_mean).view(shape).to(*key),
+                torch.tensor(self.vae.config.latents_std).view(shape).to(*key),
+            )
+        _, latents_mean, latents_std = self._latent_stats
         latents = latents * latents_std + latents_mean
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        image = self._decode_vae(latents)[:, :, 0]
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

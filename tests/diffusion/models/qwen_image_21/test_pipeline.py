@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
@@ -424,3 +425,142 @@ def test_online_fp8_ignored_layers_become_name_patterns() -> None:
     text_encoder_config = _exclude_text_encoder_subtrees_from_quant(build_quant_config("fp8"))
     assert text_encoder_config.ignored_layers == ["model.visual", "lm_head"]
     assert text_encoder_config.ignored_layers_match_mode == "substring"
+
+
+def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline, list[torch.Tensor]]:
+    """A pipeline stub with just what `_decode_latents` touches.
+
+    `vae.decode` records what it was handed, because going through it rather than a callable
+    captured at construction is what keeps the pipeline profiler's wrapper and the VAE fast
+    path's replaced forwards in the call path.
+    """
+    pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
+    seen: list[torch.Tensor] = []
+
+    def decode(latents: torch.Tensor, return_dict: bool = True):
+        seen.append(latents)
+        return (pipeline.vae.decoder.forward(latents),)
+
+    pipeline.vae = SimpleNamespace(
+        dtype=torch.float32,
+        config=SimpleNamespace(z_dim=4, latents_mean=[0.0, 1.0, 2.0, 3.0], latents_std=[1.0, 2.0, 4.0, 8.0]),
+        decode=decode,
+        decoder=SimpleNamespace(forward=lambda *args, **kwargs: decoded),
+    )
+    pipeline._latent_stats = None
+    pipeline._decoder_compile_allowed = False
+    pipeline._decoder_compile_attempted = False
+    pipeline._decoder_eager_forward = None
+    pipeline.parallel_config = SimpleNamespace(vae_patch_parallel_size=1)
+    pipeline.vae_scale_factor = 16
+    pipeline._unpack_latents = lambda latents, *args: latents
+    return pipeline, seen
+
+
+def test_decode_latents_goes_through_vae_decode() -> None:
+    """The profiler wraps `vae.decode` and the fast path replaces decoder forwards, both after
+    construction, so the decode must be resolved through the attribute at call time."""
+    decoded = torch.zeros(1, 4, 1, 8, 8)
+    pipeline, seen = _decode_latents_pipeline(decoded)
+
+    out = pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+
+    assert len(seen) == 1, "vae.decode was not called; a captured callable would bypass the profiler"
+    assert out.output.shape == (1, 4, 8, 8)
+
+
+def test_decode_latents_builds_the_latent_statistics_once() -> None:
+    """The normalisation constants are checkpoint config, so they are not rebuilt per request."""
+    pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    first = pipeline._latent_stats
+    assert first is not None, "nothing was cached, so reuse cannot be asserted"
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+
+    assert pipeline._latent_stats is first, "the statistics were rebuilt on the second request"
+    assert torch.equal(seen[0][0, :, 0, 0, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+
+def test_decode_latents_rebuilds_the_statistics_for_a_new_dtype() -> None:
+    """A different dtype or device needs its own copies rather than a silent mismatch."""
+    pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    first = pipeline._latent_stats
+    assert first is not None, "nothing was cached, so a rebuild cannot be asserted"
+    pipeline.vae.dtype = torch.float64
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+
+    assert pipeline._latent_stats is not first
+    assert pipeline._latent_stats[1].dtype == torch.float64
+
+
+@pytest.mark.parametrize(("compile_allowed", "patch_parallel_size"), [(False, 1), (True, 2)])
+def test_decoder_compile_is_skipped_when_not_allowed(compile_allowed, patch_parallel_size) -> None:
+    """Keep the reference forward for eager or distributed VAE decoding."""
+    pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = compile_allowed
+    pipeline.parallel_config.vae_patch_parallel_size = patch_parallel_size
+    original = pipeline.vae.decoder.forward
+
+    pipeline._maybe_compile_decoder()
+
+    assert not pipeline._decoder_compile_attempted
+    assert pipeline.vae.decoder.forward is original
+
+
+def test_decoder_compile_happens_once(monkeypatch) -> None:
+    """Compiled on first use and never again, so later decodes do not re-enter torch.compile."""
+    pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = True
+    calls: list[object] = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append(fn)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    pipeline._maybe_compile_decoder()
+    pipeline._maybe_compile_decoder()
+
+    assert len(calls) == 1, "torch.compile ran more than once"
+
+
+@pytest.mark.parametrize("fail_during_decode", [False, True])
+def test_decoder_compile_failure_falls_back(monkeypatch, fail_during_decode) -> None:
+    """A compile failure must leave the reference forward rather than break the request."""
+    pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = True
+    original = pipeline.vae.decoder.forward
+
+    def fail(*args, **kwargs):
+        raise BackendCompilerFailed(fail, RuntimeError("inductor said no"), None)
+
+    def compile_decoder(fn, **kwargs):
+        if fail_during_decode:
+            return fail
+        raise RuntimeError("could not prepare compilation")
+
+    monkeypatch.setattr(torch, "compile", compile_decoder)
+    latents = torch.zeros(1, 4, 1, 8, 8)
+    assert pipeline._decode_latents(latents, 128, 128).output.shape == (1, 4, 8, 8)
+
+    assert pipeline.vae.decoder.forward is original
+    assert len(seen) == (2 if fail_during_decode else 1)
+    pipeline._decode_latents(latents, 128, 128)
+    assert pipeline.vae.decoder.forward is original
+
+
+def test_decoder_runtime_error_propagates(monkeypatch) -> None:
+    pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = True
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("decoder execution failed")
+
+    monkeypatch.setattr(torch, "compile", lambda *args, **kwargs: fail)
+    with pytest.raises(RuntimeError, match="decoder execution failed"):
+        pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    assert len(seen) == 1
