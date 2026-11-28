@@ -52,8 +52,8 @@ def _jsonable(value: Any) -> Any:
     return value if value is None or isinstance(value, (str, bool, int, float)) else str(value)
 
 
-def _dtype_name(dtype: Any) -> str | None:
-    return None if dtype is None else str(dtype).removeprefix("torch.")
+def _dtype_name(dtype: Any) -> str:
+    return str(dtype).removeprefix("torch.")
 
 
 def log_execution(event: str, payload: dict[str, Any]) -> None:
@@ -191,7 +191,7 @@ def engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any] | None:
             "model_revision": od_config.revision or snapshot,
             "model_class_name": od_config.model_class_name,
             "configured_dtype": _dtype_name(od_config.dtype),
-            "quantization": quant.get_name() if hasattr(quant, "get_name") else quant,
+            "quantization": getattr(quant, "get_name", lambda: quant)(),
             "cache_backend": cache_backend,
             "cache_config": od_config.cache_config if cache_backend not in (None, "none") else None,
             "parallel_config": {f: getattr(parallel, f, None) for f in _PARALLEL_FIELDS} if parallel else None,
