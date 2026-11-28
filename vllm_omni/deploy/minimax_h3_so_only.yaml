@@ -1,0 +1,25 @@
+# MiniMax H3 text encoder stage.
+pipeline: minimax_h3_s0_only
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 4
+    max_model_len: 16384
+    gpu_memory_utilization: 0.55
+    tensor_parallel_size: 2
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      max_tokens: 1
+      temperature: 0.0
+      detokenize: false
