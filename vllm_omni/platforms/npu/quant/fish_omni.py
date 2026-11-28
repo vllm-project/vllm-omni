@@ -47,9 +47,7 @@ def _dequantize_npu_block_fp8_on_cpu(method: QuantizeMethodBase | None) -> None:
         scheme._resolve_experts = MethodType(_resolve_experts_on_cpu, scheme)
 
 
-def get_fish_omni_quant_method(
-    config: Fp8Config, layer: torch.nn.Module, prefix: str, tid2eid: torch.Tensor | None
-) -> QuantizeMethodBase | None:
+def get_fish_omni_quant_method(config: Fp8Config, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
     """Ascend's own methods: block-FP8 routed experts, bf16 Ascend linears.
 
     CUDA's ``Fp8MoEMethod`` selects no Ascend kernel (``Fp8MoeBackend.NONE``),
@@ -70,6 +68,6 @@ def get_fish_omni_quant_method(
         activation_scheme=config.activation_scheme,
         weight_block_size=config.weight_block_size,
     )
-    method = npu_config.get_quant_method(layer, prefix, tid2eid=tid2eid)
+    method = npu_config.get_quant_method(layer, prefix)
     _dequantize_npu_block_fp8_on_cpu(method)
     return method

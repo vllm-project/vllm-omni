@@ -150,9 +150,9 @@ def test_npu_routed_experts_use_ascend_fp8(monkeypatch):
         def __init__(self, **kwargs):
             seen["kwargs"] = kwargs
 
-        def get_quant_method(self, layer, prefix, tid2eid=None):
+        def get_quant_method(self, layer, prefix):
+            seen["layer"] = layer
             seen["prefix"] = prefix
-            seen["tid2eid"] = tid2eid
             return sentinel
 
     _install_fake_ascend(
@@ -165,10 +165,9 @@ def test_npu_routed_experts_use_ascend_fp8(monkeypatch):
 
     config = ExpertFp8Config.from_config(CHECKPOINT_QUANT_CONFIG)
     experts = MagicMock(spec=fp8.RoutedExperts)
-    tid2eid = object()
-    assert config.get_quant_method(experts, prefix="model.layers.0.mlp.experts", tid2eid=tid2eid) is sentinel
+    assert config.get_quant_method(experts, prefix="model.layers.0.mlp.experts") is sentinel
+    assert seen["layer"] is experts
     assert seen["prefix"] == "model.layers.0.mlp.experts"
-    assert seen["tid2eid"] is tid2eid
     assert seen["kwargs"]["is_checkpoint_fp8_serialized"] is True
     assert seen["kwargs"]["weight_block_size"] == [128, 128]
 
@@ -202,7 +201,7 @@ def test_cpu_dequant_override_is_scoped_to_selected_scheme(monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def get_quant_method(self, layer, prefix, tid2eid=None):
+        def get_quant_method(self, layer, prefix):
             return SimpleNamespace(quant_method=selected)
 
     _install_fake_ascend(
