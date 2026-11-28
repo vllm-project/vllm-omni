@@ -79,6 +79,18 @@ def _tensor_size(output: DiffusionOutput | None) -> tuple[int, int, int] | None:
     return int(width), int(height), int(frames)
 
 
+def _video_metadata(output: Any) -> Mapping[str, Any]:
+    metadata = getattr(output, "multimodal_output", None) or {}
+    video = (metadata.get("metadata") or {}).get("video") if isinstance(metadata, Mapping) else None
+    return video if isinstance(video, Mapping) else {}
+
+
+def _output_fps(output: DiffusionOutput, formatted_outputs: Sequence[Any] | None) -> float | None:
+    metadata = getattr(output.media, "metadata", None) or {}
+    fps = (metadata.get("video") or {}).get("fps", metadata.get("fps"))
+    return next((f for f in [fps, *(_video_metadata(o).get("fps") for o in formatted_outputs or ())] if f), None)
+
+
 def _output_size(formatted_outputs: Sequence[Any] | None) -> tuple[int | None, int | None, int | None]:
     """(width, height, num_frames) of post-processed outputs: images, encoder frame counts or the MP4 itself."""
     for out in formatted_outputs or ():
@@ -86,9 +98,7 @@ def _output_size(formatted_outputs: Sequence[Any] | None) -> tuple[int | None, i
         for image in images:
             if isinstance(getattr(image, "size", None), tuple):
                 return int(image.size[0]), int(image.size[1]), None
-        mm = getattr(out, "multimodal_output", None)
-        video = ((mm or {}).get("metadata") or {}).get("video") if isinstance(mm, Mapping) else None
-        counts = video.get("frame_counts") if isinstance(video, Mapping) else None
+        counts = _video_metadata(out).get("frame_counts")
         if valid_frame_counts(counts, len(images)):
             return None, None, counts[0]
         if images and isinstance(images[0], (bytes, bytearray)):
@@ -121,7 +131,7 @@ def diffusion_facts(
         "width": out_w or reported.get("width") or sp.width,
         "height": out_h or reported.get("height") or sp.height,
         "num_frames": num_streamed_frames or out_frames or sp.num_frames,
-        "fps": sp.fps,
+        "fps": sp.fps if sp.fps is not None else _output_fps(output, formatted_outputs),
         "seed": sp.seed,
         "num_inference_steps": sp.num_inference_steps,
         "completed_steps": output.num_completed_steps,

@@ -44,7 +44,7 @@ def _video(frames: int, height: int, width: int) -> DiffusionMediaOutput:
 
 
 def _encoded(frame_counts=None):
-    metadata = {"metadata": {"video": {"frame_counts": frame_counts}}} if frame_counts else {}
+    metadata = {"metadata": {"video": {"fps": 24, "frame_counts": frame_counts}}} if frame_counts else {}
     return [SimpleNamespace(images=[b"mp4"], multimodal_output=metadata)]
 
 
@@ -62,6 +62,10 @@ def test_diffusion_facts_report_generated_frames(monkeypatch, output, formatted,
     monkeypatch.setattr(media_utils, "count_mp4_frames", lambda data: 209)
 
     assert execution.diffusion_facts(_request(), output, formatted)["num_frames"] == frames
+
+
+def test_diffusion_facts_read_fps_from_the_output_when_the_request_omits_it():
+    assert execution.diffusion_facts(_request(fps=None), DiffusionOutput(), _encoded([209]))["fps"] == 24
 
 
 def test_diffusion_facts_prefer_values_the_pipeline_resolved():
