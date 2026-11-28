@@ -42,7 +42,7 @@ import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.offloader.config import offload_enabled, resolve_offload_strategy
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.platforms import current_omni_platform
@@ -425,11 +425,11 @@ class MiniMaxH3WeightFusion:
                 f"{self.adapter_name} delta for {name} has shape {tuple(delta.shape)}, "
                 f"parameter is {tuple(weight.shape)}"
             )
-        # Leave the result on the compute device. These weights are bound for
-        # the accelerator anyway, so returning them to host memory would pay a
-        # device-to-host copy of the whole checkpoint only for the loader to
-        # send it straight back: measured at 152s against 15s for 60 GiB of
-        # patched projections, against 17s for the unavoidable upload alone.
+        # Leave the result on the compute device. Without offload, returning
+        # accelerator-bound weights to host memory would add a needless
+        # round trip. With model-level CPU offload, the loader instead copies
+        # the fused result into the CPU-resident parameter; that startup-only
+        # staging is necessary.
         # Fold the base weight into the freshly built delta in place. Promoting
         # the weight to float32 on its own would allocate two more buffers the
         # size of the parameter, and H3's largest patched projection is 0.5 GiB.
@@ -644,14 +644,25 @@ class FastH3WeightFusion(MiniMaxH3WeightFusion):
         """Hold a starting server to the ladder this student was trained on."""
         if partition == "ref2va":
             raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
-        if offload_enabled(od_config):
-            # A host-weight plan installs the transformer without going through
-            # load_weights(), which is where the fusion and its completeness
-            # check live. Serving base H3 weights under a four-step schedule
-            # would otherwise degrade output with nothing to signal it.
+        offload_strategy = resolve_offload_strategy(od_config)
+        if offload_strategy in (OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE):
+            # Layerwise host-weight paths can install the transformer without
+            # going through load_weights(), which is where the fusion and its
+            # completeness check live. Dense model-level CPU offload is
+            # installed only after ordinary loading and is therefore compatible.
+            remedy = (
+                "Serve VSA without offload."
+                if self.requires_vsa
+                else "Use model-level CPU offload or serve it without offload."
+            )
             raise ValueError(
-                "FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
-                f"{resolve_offload_strategy(od_config).value} offload. Serve it without offload."
+                f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
+                f"{offload_strategy.value}. {remedy}"
+            )
+        if self.requires_vsa and offload_strategy is OffloadStrategy.MODEL_LEVEL:
+            raise ValueError(
+                "FastH3 model-level CPU offload currently supports only the Dense / Data-Free variant; "
+                "serve VSA without offload."
             )
         if self.requires_vsa:
             backend = _resolve_dit_attention_backend(od_config)
