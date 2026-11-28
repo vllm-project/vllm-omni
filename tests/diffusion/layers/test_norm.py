@@ -966,3 +966,15 @@ def test_layernorm_forward_npu_falls_back_to_native_on_cpu_tensor(monkeypatch: p
     expected = layer.forward_native(x)
     torch.testing.assert_close(out, expected)
     assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.cpu
+def test_wan_rmsnorm_vae_forward_npu_falls_back_to_native_on_cpu_tensor() -> None:
+    """RMSNormVAE.forward_npu must fall back to forward_native on CPU tensors without calling torch_npu."""
+    from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
+
+    layer = RMSNormVAE(16, channel_first=True, images=False, bias=True)
+    x = torch.randn(1, 16, 2, 4, 4, dtype=torch.float32)
+    out = layer.forward_npu(x)
+    expected = layer.forward_native(x)
+    torch.testing.assert_close(out, expected)
