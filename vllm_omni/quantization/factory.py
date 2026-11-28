@@ -188,6 +188,10 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     if "bits" in kw and "weight_bits" not in kw:
         kw["weight_bits"] = kw.pop("bits")
 
+    # NVFP4 activation metadata must be checked, not discarded as constructor extras.
+    if kw.get("data_type") == "nv_fp":
+        return OmniINCConfig.from_config({**kw, "bits": kw["weight_bits"]})
+
     # Filter to only valid INCConfig params
     valid = set(inspect.signature(OmniINCConfig.__init__).parameters) - {"self"}
     filtered = {k: v for k, v in kw.items() if k in valid}
