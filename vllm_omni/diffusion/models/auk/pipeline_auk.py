@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportsComponentDiscovery,
 )
+from vllm_omni.diffusion.utils.param_utils import unwrap_request_generator
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.auk import resolve_gen_frames
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig, resolve_component_quant_config
@@ -407,13 +408,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     def _resolve_generator(self, sampling_params: Any) -> torch.Generator | None:
         """Per-request generator; the process-global RNG is never seeded."""
 
-        generator = sampling_params.generator
-        if isinstance(generator, list):
-            if len(generator) > 1:
-                logger.warning(
-                    "AuKPipeline runs one request per forward; using the first of %d generators", len(generator)
-                )
-            generator = generator[0] if generator else None
+        generator = unwrap_request_generator(sampling_params.generator, context="AuKPipeline request")
         if generator is None and sampling_params.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(int(sampling_params.seed))
         return generator
