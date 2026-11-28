@@ -30,6 +30,34 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("model", [None, "video-primary", "video-alias", "missing-model"])
+def test_video_session_checks_all_served_model_names(model):
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
+
+    app = FastAPI()
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name=name, model_path="local-video") for name in ("video-primary", "video-alias")]
+    )
+    handler = OmniStreamingVideoOutputHandler(engine_client=MagicMock(), model_name="video-primary")
+
+    @app.websocket("/video")
+    async def video(websocket: WebSocket):
+        await websocket.accept()
+        result = await handler._receive_start(websocket)
+        if result is not None:
+            await websocket.send_json({"type": "accepted", "model": result[0].model})
+
+    payload = {"type": "session.start", "prompt": "video"}
+    if model is not None:
+        payload["model"] = model
+    with TestClient(app) as client, client.websocket_connect("/video") as websocket:
+        websocket.send_json(payload)
+        response = websocket.receive_json()
+    assert response["type"] == ("error" if model == "missing-model" else "accepted")
+
+
 @pytest.mark.asyncio
 async def test_startup_warmup_drains_generation_and_encoder(mocker, tmp_path):
     released = []

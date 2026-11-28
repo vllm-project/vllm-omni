@@ -8,7 +8,7 @@ configuration from ``request.app.state``."""
 from http import HTTPStatus
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, WebSocket
 from vllm.engine.protocol import EngineClient
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -46,6 +46,19 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
 
 def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
     return getattr(request.app.state, "openai_serving_audio_generate", None)
+
+
+def _is_served_model(request: Request | WebSocket, model_name: str, default_model_name: str | None) -> bool:
+    """Check public aliases without changing the default response name.
+
+    Standalone handlers may have only a default name; initialized OpenAI apps
+    use the same base-model names as ``/v1/models``.
+    """
+    serving_models = getattr(request.app.state, "openai_serving_models", None)
+    base_model_paths = getattr(serving_models, "base_model_paths", None)
+    if base_model_paths:
+        return any(path.name == model_name for path in base_model_paths)
+    return model_name == default_model_name
 
 
 def _get_engine_and_model(raw_request: Request):
