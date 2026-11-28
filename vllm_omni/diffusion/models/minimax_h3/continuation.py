@@ -66,13 +66,18 @@ class LatentPrefix:
     overlap_frames: int
 
 
+# Later FL2VA windows no longer carry the first frame. With the Turbo 4-step adapter
+# its look survives the join for windows up to 209 frames and is lost at 277.
+_DEFAULT_WINDOW_FRAMES = {"fl2va": 141}
+
+
 def resolve_continuation(extra: Mapping[str, Any], *, task: str, step_execution: bool) -> tuple[int, int] | None:
     mode = resolve_long_video_mode(extra, task)
     if mode == "full":
         return None
-    if task != "ref2va" or step_execution:
-        raise OmniClientError("MiniMax H3 continuation requires Ref2VA request execution (not step execution)")
-    window = extra.get("continuation_window_frames", 277)
+    if step_execution:
+        raise OmniClientError("MiniMax H3 continuation requires request execution (not step execution)")
+    window = extra.get("continuation_window_frames", _DEFAULT_WINDOW_FRAMES.get(task, 277))
     overlap = extra.get("continuation_overlap_frames", 22)
     for name, value in (("window", window), ("overlap", overlap)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 5 or value % 17 != 5:
@@ -80,6 +85,26 @@ def resolve_continuation(extra: Mapping[str, Any], *, task: str, step_execution:
     if not 107 <= window <= 345 or overlap >= window:
         raise OmniClientError("MiniMax H3 continuation window must be 107..345 frames and exceed its overlap")
     return window, overlap
+
+
+def continuation_uses_timeline_guides(task: str) -> bool:
+    """Whether a task's windows carry the preceding tail as a frame-0 timeline guide.
+
+    Ref2VA appends the tail as a ``latent_guide`` reference block instead. Keeping
+    the choice here, rather than inline at the call site, keeps it under test.
+    """
+    return task != "ref2va"
+
+
+def later_windows_drop_text_images(task: str) -> bool:
+    """Whether a task's later windows need text encoded without the request's images.
+
+    An FL2VA prompt is encoded together with its first-frame image. Later windows
+    drop that keyframe, so they take the text-only presentation a ``continue_from``
+    request without an image gets; text that still describes a picture the window
+    does not carry breaks the join.
+    """
+    return task == "fl2va"
 
 
 def plan_continuation_windows(
@@ -161,6 +186,26 @@ def _join(guide: torch.Tensor, existing: torch.Tensor | None, *, first: bool) ->
     return torch.cat((guide, existing) if first else (existing, guide), dim=0)
 
 
+# Clean conditions a T2VA/FL2VA request pins to frames of its first window: the
+# FL2VA first frame, and that keyframe re-expressed as a guide behind a prefix.
+_FIRST_WINDOW_CONDITION_KEYS = (
+    "visual_condition",
+    "visual_condition_shape",
+    "visual_condition_shapes",
+    "audio_condition",
+    "ref_audio_t",
+    "audio_condition_lengths",
+    "keyframe_frame_indices",
+    "guide_blocks",
+    # FL2VA lists its keyframe image here as well; the block layout would pack it.
+    "ref_blocks",
+)
+
+
+def _without_first_window_conditions(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: (None if key in _FIRST_WINDOW_CONDITION_KEYS else value) for key, value in kwargs.items()}
+
+
 def window_args(
     kwargs: Mapping[str, Any],
     window: ContinuationWindow,
@@ -199,6 +244,7 @@ def diffuse_continuation(
     overlap_frames: int,
     text_conditioning: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     prefix: LatentPrefix | None = None,
+    timeline_guides: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise fresh windows; retain old latents and append only new suffixes.
 
@@ -211,6 +257,12 @@ def diffuse_continuation(
     A ``prefix`` seeds the cumulative latents with an earlier clip's tail: the
     first window repeats it behind a hidden overlap, and the result starts with
     that tail, so callers trim ``prefix.overlap_frames`` after decoding.
+
+    With ``timeline_guides`` (T2VA and FL2VA) every later window carries its
+    predecessor's tail as a frame-0 AV timeline guide, as a ``prefix`` does,
+    instead of a Ref2VA ``latent_guide`` reference. The request's own keyframe
+    conditions belong to its first window and are dropped from the later ones,
+    and per-window text keeps each window's own text origin.
     """
     origin = prefix.start_frame if prefix is not None else 0
     windows = plan_continuation_windows(
@@ -224,22 +276,27 @@ def diffuse_continuation(
         raise OmniClientError("MiniMax H3 requires one text conditioning per continuation window")
     # Different prompts have different prefix lengths. Keep the media clock
     # anchored after the longest prefix so text length cannot shift AV time.
-    media_time_origin = max(item[0].shape[0] for item in text_conditioning) if text_conditioning else None
+    # Timeline-guide tasks sample their first window in the task's native
+    # layout, where media follows that window's own text, so every window does
+    # the same, as the requests of a ``continue_from`` chain do.
+    shared_origin = bool(text_conditioning) and not timeline_guides
+    media_time_origin = max(item[0].shape[0] for item in text_conditioning) if shared_origin else None
     video, audio = (prefix.video, prefix.audio) if prefix is not None else (None, None)
     for index, window in enumerate(windows):
         overlap_v = _video_t(window.overlap) if window.overlap else 0
         guided = video is not None and audio is not None
         args = window_args(
-            kwargs,
+            _without_first_window_conditions(kwargs) if timeline_guides and index > 0 else kwargs,
             window,
             video_tail=video[:, :, -overlap_v:] if guided else None,
             audio_tail=audio[..., -window.overlap_audio_t :] if guided else None,
-            timeline_guide=prefix is not None and index == 0,
+            timeline_guide=timeline_guides or (prefix is not None and index == 0),
             audio_origin=_audio_t(origin),
         )
         if text_conditioning is not None:
             args["text_embeddings"], args["text_tags"] = text_conditioning[index]
-            args["media_time_origin"] = media_time_origin
+            if media_time_origin is not None:
+                args["media_time_origin"] = media_time_origin
         logger.info(
             "MiniMax H3 continuation window %d/%d: frames [%d, %d), hidden overlap %d, temporal offset %.6f",
             index + 1,

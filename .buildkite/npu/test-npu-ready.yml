@@ -29,6 +29,22 @@ steps:
             -m 'core_model and npu and A3'
             --run-level 'core_model'
 
+      - label: "MOSS codec cache commit - A2"
+        key: ready-moss-codec-cache-commit-a2
+        mirror_hardwares: a2b3_npu_1
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - "vllm_omni/model_executor/models/moss_tts/"
+          - "tests/model_executor/models/moss_tts/test_codec_cache_commit_npu.py"
+          - "tests/helpers/mark.py"
+          - ".buildkite/npu/test-npu-ready.yml"
+        commands:
+          - >-
+            pytest -s -v
+            tests/model_executor/models/moss_tts/test_codec_cache_commit_npu.py
+            -m 'core_model and npu and A2 and cards_1'
+            --run-level 'core_model'
+
       - label: "NPU IPC Weight Sharing - A2"
         key: ready-npu-ipc-weight-sharing
         mirror_hardwares: a2b3_npu_1

@@ -166,6 +166,7 @@ class SilenceContinuationScheduler(Protocol):
         response_owned: bool,
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
+        fast_path: bool = False,
     ) -> bool: ...
 
 
@@ -183,12 +184,14 @@ class ModelChannel:
         *,
         close_from_runtime: Callable[[str], Awaitable[None]],
         schedule_silence_continuation: SilenceContinuationScheduler,
+        silence_continuation_enabled: Callable[[], bool] = lambda: False,
         abort_request: Callable[..., Awaitable[None]],
     ) -> None:
         self._ctx = ctx
         self._out = out
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
+        self._silence_continuation_enabled = silence_continuation_enabled
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
         self._deferred_text_listen: tuple[int, dict[str, object]] | None = None
@@ -926,6 +929,7 @@ class ModelChannel:
             # Pass-through ASR belongs to the user, not the assistant output
             # projector. Its metrics and transcript still use this mailbox.
             return None
+        fast_path = self._note_fast_path(item)
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
@@ -959,6 +963,21 @@ class ModelChannel:
                     self.maybe_continue_response(expected_epoch=expected_epoch, expected_response_id=response_id),
                     name="duplex-continue",
                 )
+        if fast_path:
+            # The frame's own fence names the turn to append into: a tool call
+            # can start before the model speaks, and then no response exists to
+            # take the turn from.
+            turn_id = item.context.model_turn_id
+            if turn_id is None:
+                turn_id = item.context.identity.fence.turn_id
+            self._ctx.services.spawn(
+                self._continue_fast_path(
+                    request_id=item.request_id,
+                    expected_epoch=expected_epoch,
+                    model_turn_id=turn_id,
+                ),
+                name="duplex-fast-path",
+            )
         return None
 
     async def finish_input_transcription(
@@ -1031,6 +1050,10 @@ class ModelChannel:
         """Report a data-plane error and fail the response it interrupted."""
         session = self._ctx.session
         response_id = session.active_response_id
+        # The failed request is not decoding the call any more, so its frames
+        # stop replacing the client's.
+        self._ctx.run.fast_path_active = False
+        self._ctx.run.fast_path_dropped_frames = 0
         self._out.emit_error(
             str(model_result.get("error_code")),
             str(model_result.get("error") or "Duplex native data-plane error"),
@@ -1161,6 +1184,11 @@ class ModelChannel:
         auto_response = self._out.auto_responds()
         close_reason: str | None = None
         emitted_response = False
+        if self._ctx.run.fast_path_active:
+            # Inside a tool call the fast path owns the next frame: this pad
+            # token does not mean the model is listening, and the step is
+            # already scheduled by the output handler.
+            return close_reason, emitted_response
         if (
             auto_response
             and model_result.get("continue_with_partial_input") is True
@@ -2126,6 +2154,114 @@ class ModelChannel:
                 "status_details": {"type": "incomplete", "reason": "continuation_limit"},
             }
         )
+
+    def _fast_path_output_metadata(self, item: StageOutput) -> Mapping[str, object]:
+        """The metadata the plugin's data plane reads for this stage output."""
+        metadata = getattr(item.decision, "metadata", None)
+        if isinstance(metadata, Mapping):
+            return metadata
+        return item.context.segment_output_metadata
+
+    def _note_fast_path(self, item: StageOutput) -> bool:
+        """Track whether this decoded frame is a back-to-back tool-call step.
+
+        Only a decoded frame can start or end the fast path; a partial output
+        neither carries the model's flag nor advances the plugin's step budget.
+        A finished request is never a fast step either: even if the frame that
+        ended it still carried the flag, the model is no longer decoding, so
+        the client's frames must be appended again instead of dropped.
+        """
+        if item.stage_id != 0 or not item.context.segment_finished:
+            return False
+        finished = bool(getattr(item.output, "finished", False))
+        active = not finished and bool(
+            self._ctx.plugin.fast_path_active(item.request_id, self._fast_path_output_metadata(item))
+        )
+        session = self._ctx.session
+        turn_id = item.context.model_turn_id
+        if turn_id is None:
+            turn_id = item.context.identity.fence.turn_id
+        active = (
+            active
+            and self._silence_continuation_enabled()
+            and session.active_request_id == item.request_id
+            and (session.active_response_id is not None or (self._out.auto_responds() and session.turn_id == turn_id))
+        )
+        if active and not self._ctx.run.fast_path_active:
+            self._ctx.run.fast_path_dropped_frames = 0
+        elif self._ctx.run.fast_path_active and not active:
+            model_state = self._ctx.model_state
+            # Back to one token per client frame. Restart the pacing chain from
+            # now: the last fast append moved the anchor, and the paced unit
+            # that follows must not be rejected as stale against it.
+            model_state.last_native_submit_monotonic = time.monotonic()
+            model_state.silence_deadline_monotonic = None
+            logger.debug(
+                "Duplex session %s: tool-call fast path ended, %d client frames dropped",
+                self._ctx.session.session_id,
+                self._ctx.run.fast_path_dropped_frames,
+            )
+        self._ctx.run.fast_path_active = active
+        self._ctx.run.fast_path_config_generation = self._ctx.session.config_generation if active else None
+        return active
+
+    async def _continue_fast_path(
+        self,
+        *,
+        request_id: str,
+        expected_epoch: int | None,
+        model_turn_id: int | None,
+    ) -> None:
+        """Submit the next silence frame at once instead of on the 80 ms clock.
+
+        The fast path is the model decoding a tool call: its tokens come back
+        to back, so waiting for a client frame between them only adds a frame
+        period per token. These steps are not counted against the response
+        continuation limits; the plugin owns the step budget.
+        """
+        session = self._ctx.session
+        if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
+            return
+        if expected_epoch is not None and session.epoch != expected_epoch:
+            return
+        if session.active_request_id != request_id:
+            return
+        response_id = session.active_response_id
+        if response_id is not None:
+            owner_id = f"response:{response_id}"
+            payload_turn_id = (
+                session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+            )
+            response_owned = True
+        elif self._out.auto_responds() and model_turn_id is not None and session.turn_id == model_turn_id:
+            # No response owns the call yet (the model has not spoken): the
+            # session's own turn is the append owner, as for a paced listen.
+            owner_id = f"model-turn:{model_turn_id}"
+            payload_turn_id = model_turn_id
+            response_owned = False
+        else:
+            return
+        payload = self.silence_unit_payload()
+        payload["duplex_turn_id"] = payload_turn_id
+        payload["fast_path"] = True
+        try:
+            scheduled = await self._schedule_silence_continuation(
+                payload,
+                request_id=request_id,
+                owner_id=owner_id,
+                response_id=response_id,
+                response_owned=response_owned,
+                expected_epoch=expected_epoch,
+                expected_model_turn_id=model_turn_id,
+                fast_path=True,
+            )
+            if not scheduled:
+                self._ctx.run.fast_path_active = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._ctx.run.fast_path_active = False
+            logger.exception("Failed to schedule a duplex tool-call fast-path append: %s", exc)
 
     def silence_continuation_is_stale(
         self,
