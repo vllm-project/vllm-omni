@@ -278,6 +278,46 @@ def test_h3_turbo_ref2v_artifact_loads_on_a_ref2va_server(tmp_path):
     assert spec.sigma_points == 9
 
 
+def test_h3_turbo_v1_2_eight_step_serves_ref2va_on_a_ref2va_server(tmp_path):
+    """LightX2V's 8step v1.2 release also supports Ref2VA on the Ref2VA base."""
+    path = tmp_path / _V1_2_EIGHT_STEP
+    _write_tiny_turbo(path, target_alpha=128.0, adaln_rank=16, adaln_alpha=16.0)
+
+    loaded = load_minimax_h3_turbo_lora(
+        partition="ref2va",
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=torch.float32,
+    )
+
+    assert loaded is not None
+    spec = loaded[2]
+    assert spec.task_family == "fl2v"
+    assert spec.supported_tasks == frozenset({"ref2va"})
+
+
+@pytest.mark.parametrize("partition", ["fl2va", "combined"])
+def test_h3_turbo_v1_2_eight_step_serves_no_ref2va_off_the_ref2va_base(tmp_path, partition):
+    """Off the Ref2VA base the artifact keeps its FL2VA/T2VA family tasks.
+
+    A combined server routes ref2va through ``transformers_ref``, which the
+    adapter never binds to: admitting ref2va there would run the undistilled
+    DiT on the artifact's few-step schedule with no error anywhere.
+    """
+    path = tmp_path / _V1_2_EIGHT_STEP
+    _write_tiny_turbo(path, target_alpha=128.0, adaln_rank=16, adaln_alpha=16.0)
+
+    loaded = load_minimax_h3_turbo_lora(
+        partition=partition,
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=torch.float32,
+    )
+
+    assert loaded is not None
+    assert loaded[2].supported_tasks == frozenset({"t2va", "fl2va"})
+
+
 @pytest.mark.parametrize(
     "offload_mode",
     [

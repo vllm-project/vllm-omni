@@ -109,3 +109,8 @@ def test_task_family_decides_supported_tasks() -> None:
     ref2v = _spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
     assert fl2v.supported_tasks == frozenset({"t2va", "fl2va"})
     assert ref2v.supported_tasks == frozenset({"ref2va"})
+    # The filename alone grants no cross-family capability: the loader marks
+    # the v1.2 artifact as serving ref2va only on the Ref2VA base.
+    v1_2 = _spec("minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors")
+    assert v1_2.ref2va_base is False
+    assert v1_2.supported_tasks == frozenset({"t2va", "fl2va"})
