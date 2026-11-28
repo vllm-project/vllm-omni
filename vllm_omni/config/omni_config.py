@@ -1063,6 +1063,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
+    diffusion_weight_stack: Literal["legacy", "unified"] = "legacy"
     hsdp_weight_load_strategy: str = "full"
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -1187,6 +1188,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import (
             normalize_omni_diffusion_kwargs,
+            validate_diffusion_weight_stack,
             validate_omni_diffusion_kwargs,
         )
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
@@ -1194,6 +1196,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
         normalized = normalize_omni_diffusion_kwargs(kwargs)
         validate_omni_diffusion_kwargs(normalized, valid_fields)
+        normalized = {name: value for name, value in normalized.items() if value is not None}
+        validate_diffusion_weight_stack(normalized)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
