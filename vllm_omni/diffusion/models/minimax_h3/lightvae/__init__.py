@@ -3,17 +3,20 @@
 """MiniMax H3 LiteVAE checkpoint loading and installation."""
 
 from .checkpoint import (
+    H3LiteDecodeProfile,
     H3LiteDecoderCheckpoint,
     _validate_config,
     convert_h3_lite_decoder_state_dict,
     read_h3_lite_decoder_checkpoint,
     resolve_h3_lightvae_decoder_path,
 )
-from .native import install_h3_lite_decoder
+from .native import apply_h3_lite_decode_profile, install_h3_lite_decoder
 
 __all__ = [
+    "H3LiteDecodeProfile",
     "H3LiteDecoderCheckpoint",
     "_validate_config",
+    "apply_h3_lite_decode_profile",
     "convert_h3_lite_decoder_state_dict",
     "read_h3_lite_decoder_checkpoint",
     "resolve_h3_lightvae_decoder_path",
