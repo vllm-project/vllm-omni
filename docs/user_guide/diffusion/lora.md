@@ -54,6 +54,41 @@ validation; unsupported module suffixes may already fail during loading.
 Checkpoint-to-engine name mapping is tracked in [#8001](https://github.com/vllm-project/vllm-omni/issues/8001);
 until it is available, adapter keys must resolve to supported engine modules.
 
+### SenseNova-U1 Official LoRAs
+
+The official `sensenova/SenseNova-U1-8B-MoT-LoRAs` release uses a single-file
+layout with `lora_down`, `lora_up`, and per-layer `alpha` tensors. For dynamic
+adapter activation and deactivation, convert the checkpoint to the PEFT
+directory layout before passing it to vLLM-Omni:
+
+```bash
+hf download sensenova/SenseNova-U1-8B-MoT-LoRAs \
+  SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors \
+  --local-dir /path/to/sensenova-lora
+
+python tools/sensenova_u1/convert_lora_to_peft.py \
+  /path/to/sensenova-lora/SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors \
+  /path/to/sensenova-lora/peft
+```
+
+Use `/path/to/sensenova-lora/peft` as `lora_path` or in a `LoRARequest`. The
+converter validates that every target has paired weights and that the adapter
+uses a single rank and alpha before writing `adapter_model.safetensors` and
+`adapter_config.json`.
+
+The converter refuses to replace either output file by default. To regenerate
+an existing adapter directory, add `--overwrite` to the conversion command:
+
+```bash
+python tools/sensenova_u1/convert_lora_to_peft.py \
+  /path/to/sensenova-lora/SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors \
+  /path/to/sensenova-lora/peft --overwrite
+```
+
+For permanent initialization-time fusion instead, use the original single-file
+checkpoint with `--lora-backend distill --lora-path <checkpoint>.safetensors`;
+that path does not use the converter or support per-request deactivation.
+
 ## LoRA scale semantics
 
 The request-level `lora_scale` is a multiplier applied on top of the adapter's
