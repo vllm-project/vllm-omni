@@ -193,9 +193,14 @@ class SupportsSamplingStep(Protocol):
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether the pipeline implements either supported step protocol."""
 
-    return isinstance(pipeline, SupportsStepExecution) or (
+    return (isinstance(pipeline, SupportsStepExecution) and pipeline.supports_step_execution) or (
         isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state
     )
+
+
+def allows_streaming_step_execution(pipeline: object) -> bool:
+    """Whether streaming alone may opt this pipeline into step execution."""
+    return supports_step_execution(pipeline) and getattr(pipeline, "auto_step_execution_for_streaming", True)
 
 
 # --- Generic role-based component loading for diffusion disaggregation ---------

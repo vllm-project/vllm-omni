@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
 from typing import Any
@@ -29,6 +30,8 @@ logger = init_logger(__name__)
 
 SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
 SHUTDOWN_JOIN_TIMEOUT_S = 30.0
+# Shared DELETE and generate cleanup bound. The environment variable is the documented knob.
+ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 _WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 _JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
 

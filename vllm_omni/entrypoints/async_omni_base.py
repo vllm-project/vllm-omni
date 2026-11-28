@@ -12,7 +12,6 @@ request handling lives in ``AsyncOmni``; duplex sessions in ``DuplexOmni``.
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
@@ -25,6 +24,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK
+from vllm_omni.engine.async_engine_utils import ABORT_TIMEOUT_S
 from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -43,8 +43,6 @@ _FINAL_OUTPUT_WAIT_S = 1.0
 _SHUTDOWN_REASON = "server is shutting down"
 # Longest the final-output loop dispatches a batch before yielding the loop.
 _FINAL_OUTPUT_YIELD_INTERVAL_S = 0.001
-# Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
-ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 # How long request cleanup waits for interaction-rejection callbacks.
 INTERACTION_ERROR_DRAIN_TIMEOUT_S = 0.5
 

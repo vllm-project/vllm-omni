@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 class DiffusionRequestStatus(enum.IntEnum):
     """Request status tracked by diffusion scheduler."""
 
+    AWAITING_RESTORE = 0
     WAITING = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()

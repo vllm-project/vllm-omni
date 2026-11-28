@@ -601,20 +601,41 @@ def _rpc_methods(omni: AsyncOmni) -> list[tuple[str, list[int] | None]]:
 
 
 @pytest.mark.cpu
-def test_diffusion_keep_routes_to_backend():
+@pytest.mark.parametrize("mode", ["keep", "step_boundary"])
+def test_diffusion_pause_routes_to_backend(mode):
     async def run() -> None:
         omni = _make_omni(stage_types=["diffusion"])
 
-        await omni.pause_generation(mode="keep", clear_cache=False)
+        await omni.pause_generation(mode=mode, clear_cache=False)
 
         omni.collective_rpc.assert_awaited_once_with(
             method="pause_scheduler",
             args=(),
-            kwargs={"mode": "keep"},
+            kwargs={"mode": mode},
             stage_ids=[0],
         )
         assert await omni.is_paused() is True
         assert omni._hold_admission_until_resume is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_step_boundary_pause_rejects_ar_targets_before_closing_admission():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+
+        with pytest.raises(ValueError, match="only diffusion stages"):
+            await omni.pause_generation(mode="step_boundary", timeout=5)
+        assert not await omni.is_paused()
+        omni.collective_rpc.assert_not_awaited()
+
+        await omni.pause_generation(mode="step_boundary", stage_ids=[1], timeout=5)
+        omni.collective_rpc.assert_awaited_once_with(
+            method="pause_scheduler", args=(), kwargs={"mode": "step_boundary"}, stage_ids=[1], timeout=5
+        )
+        await omni.resume_generation(stage_ids=[1], timeout=5)
+        assert not await omni.is_paused()
 
     asyncio.run(run())
 
