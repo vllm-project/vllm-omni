@@ -28,7 +28,7 @@ def test_dilated_unit_conv_matches_patch_matrix_path():
         StreamingCodecDecoder,
     )
 
-    # decoder_dim 768: unit widths 384, 192, 96 and 48, so every implicit-GEMM tile config runs.
+    # decoder_dim 768: unit widths 384, 192, 96 and 48 (the 1.7B codec adds 768).
     config = Qwen3TTSTokenizerV2DecoderConfig(
         codebook_size=32, hidden_size=16, latent_dim=16, codebook_dim=16, num_attention_heads=2,
         num_key_value_heads=2, intermediate_size=32, num_hidden_layers=1, num_quantizers=2, decoder_dim=768,
@@ -48,7 +48,7 @@ def test_dilated_unit_conv_matches_patch_matrix_path():
     decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
     stream = StreamingCodecDecoder(decoder, num_slots=17, dtype=torch.bfloat16)
     assert stream.dilated_igemm and stream.conv_out_gemm
-    assert {blk["c_out"] for blk in stream.blocks} >= set(_DILATED_IGEMM)
+    assert {blk["c_out"] for blk in stream.blocks} & set(_DILATED_IGEMM) == {384, 192, 96}
 
     batch, frames = 16, 5
     codes = torch.randint(0, 32, (batch, frames + 3, 2), device="cuda", dtype=torch.int32)
@@ -72,3 +72,48 @@ def test_dilated_unit_conv_matches_patch_matrix_path():
         actual = decode(*flags)
         assert actual.abs().max() > 0
         torch.testing.assert_close(actual, expected, rtol=0, atol=4e-3, msg=lambda m, flags=flags: f"{flags}: {m}")
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_streaming_decoder_matches_reference_decoder():
+    """Frame-by-frame streaming (2-tap transposed convs, implicit GEMM) matches one full decode."""
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderConfig,
+    )
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2Decoder,
+    )
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
+
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32, hidden_size=16, latent_dim=16, codebook_dim=16, num_attention_heads=2,
+        num_key_value_heads=2, intermediate_size=32, num_hidden_layers=1, num_quantizers=2, decoder_dim=768,
+        upsample_rates=(8, 5, 4, 3), upsampling_ratios=(2, 2), sliding_window=72,
+    )  # fmt: skip
+    torch.manual_seed(0)
+    decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    for name, param in decoder.named_parameters():
+        if name.endswith(("alpha", "beta")):
+            param.uniform_(-0.5, 0.5)
+        elif name.endswith("gamma"):
+            param.uniform_(0.5, 1.0)
+        elif name.endswith("embedding_sum"):
+            param.normal_()
+    decoder.precompute_snake_caches()
+    decoder = decoder.to(device="cuda", dtype=torch.bfloat16)
+    decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
+    stream = StreamingCodecDecoder(decoder, num_slots=4, dtype=torch.bfloat16)
+
+    batch, frames = 4, 20
+    codes = torch.randint(0, 32, (batch, frames, 2), device="cuda", dtype=torch.int32)
+    expected = decoder(codes.transpose(1, 2).long()).reshape(batch, -1).float()
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    out = []
+    for t in range(frames):
+        pos = torch.full((batch,), t, device="cuda", dtype=torch.int32)
+        out.append(stream(codes[:, t : t + 1].contiguous(), slots, pos).float())
+    actual = torch.cat(out, dim=1)
+    assert actual.shape == expected.shape
+    err = (actual - expected).norm() / expected.norm()
+    assert err < 0.02, f"relative L2 error {err:.4f}"
