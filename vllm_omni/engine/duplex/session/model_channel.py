@@ -1040,7 +1040,7 @@ class ModelChannel:
                     # in-flight reservation and abort the resident request.
                     session.complete_model_turn(result_turn, advance_input_fence=False)
                     if not run.interruption_pending and session.active_response_id is not None:
-                        # An explicit commit/create can reserve the next reply
+                        # Text or an explicit commit/create can reserve the next reply
                         # while controls are pending. Keep that response and
                         # its options, but replace the cancelled turn captured
                         # at admission with the model-confirmed next turn.

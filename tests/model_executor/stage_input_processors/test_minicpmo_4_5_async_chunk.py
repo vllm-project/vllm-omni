@@ -741,17 +741,16 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     manager = _manager()
     stale = _request("req", "internal-0")
 
-    assert tts2code2wav_async_chunk(manager, _delta(*range(10)), stale, False) is None
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(10), turn_id=7), stale, False) is None
     stale.status = RequestStatus.FINISHED_ABORTED
     assert tts2code2wav_async_chunk(manager, None, stale, True) is None
-    assert tts2code2wav_async_chunk(manager, _delta(*range(25)), stale, False) is None
-
     replacement = _request("req", "internal-1")
-    payload = tts2code2wav_async_chunk(manager, _delta(*range(25)), replacement, False)
+    payload = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=0), replacement, False)
 
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=7), stale, False) is None
 
 
 @pytest.mark.parametrize("aborted", [False, True])

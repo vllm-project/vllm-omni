@@ -1040,8 +1040,9 @@ for queue updates and the final validity check before delivery.
   handoff starts its normal new-turn state. The session advances its output
   turn without invalidating input reservations already inside `submit`.
   Repeated interruptions retain their order relative to intervening inputs;
-  output stays suppressed until all queued controls finish. A response explicitly
-  created during suppression keeps its ID and response options; the last control
+  output stays suppressed until all queued controls finish. An unforced text
+  append or explicit audio commit can reserve a cancellable response during
+  suppression. It keeps its ID and response options; the last control
   completion binds it to the confirmed next model turn before output resumes.
   It must not complete empty merely because admission captured the cancelled
   turn. Input-clocked

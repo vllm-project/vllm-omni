@@ -127,20 +127,22 @@ async def _run_interrupted_recall(
             assert done["response"]["status"] == "completed", done
             assert packets, tail
             assert all(e["response_id"] == done["response"]["id"] for e in packets), tail
-            # A new response ID alone cannot rule out old text leaking through
-            # a resident downstream bridge (for example, "Five. Robin."). The
-            # follow-up must recall the word without continuing the counting
-            # task. Allow a short answer such as "The secret word is robin."
-            words = "".join(c if c.isalnum() else " " for c in transcript.casefold()).split()
-            counting_words = set(
-                "one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
-                "fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty".split()
-            )
-            assert secret.casefold() in words, transcript
-            assert not counting_words.intersection(words) and not any(word.isdigit() for word in words), transcript
             return transcript
     finally:
         event_path.write_text(json.dumps(events, ensure_ascii=False, indent=2))
+
+
+def _recalls_own_secret(transcript: str, secret: str, session_secrets: tuple[str, ...]) -> bool:
+    words = set("".join(c if c.isalnum() else " " for c in transcript.casefold()).split())
+    counting_words = (
+        "one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+        "fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty".split()
+    )
+    return (
+        words.intersection(session_secrets) == {secret}
+        and words.isdisjoint(counting_words)
+        and not any(word.isdigit() for word in words)
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
@@ -158,6 +160,8 @@ async def _run_interrupted_recall(
 def test_mrv2_duplex_immediate_recall_after_interrupt(
     omni_server, tmp_path: Path, cancel: str, sessions: int, interruptions: int
 ):
+    secrets = ("robin", "squirrel")[:sessions]
+
     async def recall():
         return await asyncio.gather(
             *(
@@ -169,11 +173,12 @@ def test_mrv2_duplex_immediate_recall_after_interrupt(
                     event_path=tmp_path / f"{secret}.json",
                     interruptions=interruptions,
                 )
-                for secret in ("robin", "squirrel")[:sessions]
+                for secret in secrets
             )
         )
 
-    asyncio.run(recall())
+    for secret, transcript in zip(secrets, asyncio.run(recall()), strict=True):
+        assert _recalls_own_secret(transcript, secret, secrets), (secret, transcript)
 
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.

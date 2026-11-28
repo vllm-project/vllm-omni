@@ -48,17 +48,24 @@ def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch():
 
 
 @pytest.mark.parametrize(
-    "transcript,late_audio,error",
+    "transcript,valid",
     [
-        ("Robin.", None, None),
-        ("The secret word is robin.", None, None),
-        ("Five. Robin.", None, "Five. Robin."),
-        ("5, robin", None, "5, robin"),
-        ("Robin.", "response.output_audio.delta", "cancelled response"),
-        ("Robin.", "response.audio.delta", "cancelled response"),
+        ("Robin.", True),
+        ("The secret word is robin.", True),
+        ("Five. Robin.", False),
+        ("5, robin", False),
+        ("Robin or squirrel.", False),
+        ("Squirrel.", False),
     ],
 )
-def test_interrupt_recall_rejects_stale_output(tmp_path, transcript, late_audio, error):
+def test_interrupted_recall_transcript(transcript, valid):
+    from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _recalls_own_secret
+
+    assert _recalls_own_secret(transcript, "robin", ("robin", "squirrel")) is valid
+
+
+@pytest.mark.parametrize("late_audio", ["response.output_audio.delta", "response.audio.delta"])
+def test_interrupt_recall_rejects_late_audio(tmp_path, late_audio):
     from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _run_interrupted_recall
 
     async def exercise():
@@ -74,28 +81,23 @@ def test_interrupt_recall_rejects_stale_output(tmp_path, transcript, late_audio,
             assert json.loads(await ws.recv())["type"] == "response.cancel"
             assert json.loads(await ws.recv())["type"] == "input.text.append"
             await send({"type": "response.done", "response": {"id": "old", "status": "cancelled"}})
-            await send({"type": "response.output_audio_transcript.delta", "response_id": "new", "delta": transcript})
+            await send({"type": "response.output_audio_transcript.delta", "response_id": "new", "delta": "Robin."})
             await send({"type": "response.output_audio.delta", "response_id": "new", "delta": "AA=="})
             await send({"type": "response.done", "response": {"id": "new", "status": "completed"}})
             assert json.loads(await ws.recv())["type"] == "session.close"
-            if late_audio:
-                await send({"type": late_audio, "response_id": "old", "delta": "AA=="})
+            await send({"type": late_audio, "response_id": "old", "delta": "AA=="})
             await send({"type": "session.closed"})
 
         async with websockets.serve(serve, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
-            result = _run_interrupted_recall(
-                url=f"ws://127.0.0.1:{port}/v1/realtime",
-                model="fixture",
-                cancel="response.cancel",
-                secret="robin",
-                event_path=tmp_path / "events.json",
-            )
-            if error is None:
-                assert await result == transcript
-            else:
-                with pytest.raises(AssertionError, match=error):
-                    await result
+            with pytest.raises(AssertionError, match="cancelled response"):
+                await _run_interrupted_recall(
+                    url=f"ws://127.0.0.1:{port}/v1/realtime",
+                    model="fixture",
+                    cancel="response.cancel",
+                    secret="robin",
+                    event_path=tmp_path / "events.json",
+                )
 
     asyncio.run(exercise())
 

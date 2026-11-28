@@ -122,6 +122,57 @@ async def test_cancel_keeps_request_context_and_filters_late_output(thinker_only
 
 
 @pytest.mark.asyncio
+async def test_clear_after_full_playback_skips_control_until_new_input_arrives():
+    h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        events = await h.deliver_and_settle(tts_output(request_id, turn_end=True))
+        response_id = find(events, "response.done").response_id
+        await h.run(commands.AckPlayback(response_id=response_id, played_ms=1000))
+        count = len(h.port.submissions)
+        events = await h.run(commands.ClearOutputAudio())
+        assert types(events) == ["output_audio_buffer.cleared"]
+        assert events[0].response_id == response_id
+        assert len(h.port.submissions) == count
+        assert not h.runner.run.interruption_pending
+
+        await h.run(append_audio())
+        assert h.session.active_response_id is None
+        await h.run(commands.ClearOutputAudio())
+        assert h.runner.run.interruption_pending
+        assert h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"][INTERRUPTION_KEY]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_stage0_turn", [None, 0, 1], ids=["queued", "completed", "awaiting-tts"])
+async def test_clear_while_pipelined_audio_is_draining(second_stage0_turn):
+    h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(_speak_segment_end(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+        await h.deliver_and_settle(tts_output(request_id))
+        await h.run(append_audio())
+        if second_stage0_turn is not None:
+            await h.deliver_and_settle(
+                _speak_segment_end(request_id), stage_id=0, segment_finished=True, model_turn_id=second_stage0_turn
+            )
+        events = await h.deliver_and_settle(tts_output(request_id, turn_end=True))
+        await h.run(commands.AckPlayback(response_id=find(events, "response.done").response_id, played_ms=1000))
+        count = len(h.port.submissions)
+        events = await h.run(commands.ClearOutputAudio())
+        assert types(events) == ["output_audio_buffer.cleared"]
+        needs_control = second_stage0_turn != 0
+        assert h.runner.run.interruption_pending is needs_control
+        assert len(h.port.submissions) == count + int(needs_control)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_interrupt_does_not_cancel_an_inflight_append():
     h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
     try:
@@ -297,7 +348,8 @@ async def test_control_completion_during_next_submit_keeps_resident_request():
 
 
 @pytest.mark.asyncio
-async def test_new_text_queued_before_control_completion_waits_for_its_model_turn():
+@pytest.mark.parametrize("cancel_followup", [False, True])
+async def test_text_queued_during_interruption_keeps_a_cancellable_response(cancel_followup):
     h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
     try:
         await h.run(append_audio())
@@ -305,14 +357,23 @@ async def test_new_text_queued_before_control_completion_waits_for_its_model_tur
         await h.deliver_and_settle(tts_output(request_id))
         await h.run(commands.CancelResponse())
         events = await h.run(commands.AppendText(text="New question"))
-        assert "response.created" not in types(events)
-        assert h.session.active_response_id is None
+        response_id = find(events, "response.created").response_id
+        if cancel_followup:
+            cancelled = find(await h.run(commands.CancelResponse()), "response.done")
+            assert cancelled.response_id == response_id and cancelled.status == "cancelled"
         control = _stage0(request_id, [LISTEN], "", stop=True)
         control.multimodal_output[INTERRUPTION_KEY] = True
         await h.deliver_and_settle(control, stage_id=0, segment_finished=True, model_turn_id=0)
         events = await h.deliver_and_settle(tts_output(request_id, samples=48000, text="answer", turn_id=1))
-        assert types(events).count("response.created") == 1
-        assert h.session.active_response_turn_id == 1
+        assert "response.created" not in types(events)
+        if cancel_followup:
+            assert "response.output_audio.delta" not in types(events)
+            await h.deliver_and_settle(control, stage_id=0, segment_finished=True, model_turn_id=1)
+            assert h.session.active_response_id is None
+            assert not h.runner.run.interruption_pending
+        else:
+            assert find(events, "response.output_audio.delta").response_id == response_id
+            assert h.session.active_response_turn_id == 1
         assert not h.port.aborts and not h.port.cleanups
     finally:
         await close_harness(h)

@@ -68,6 +68,28 @@ def test_cancelled_turn_audio_is_consumed_before_the_next_turn_is_encoded():
     assert encoded == [[1, 1], [3, 3], [4, 4]]
 
 
+def test_late_audio_cannot_establish_or_replace_a_new_turns_restart_candidate():
+    encoded = []
+
+    def encode(audio, *_args):
+        encoded.append(audio.tolist())
+        return "pcm"
+
+    plane = MiniCPMO45DataPlaneSession(encode)
+    old = _boundary(0, samples=8)
+    assert _project(plane, old)
+    context = DuplexDataPlaneContext(auto_responds=True, turn_id=1, active_response_id="new", active_response_turn_id=1)
+    current = _boundary(0, cache_epoch=1)
+    current.multimodal_output["meta.duplex_turn_id"] = 1
+    waveform = np.arange(2, 8, dtype=np.float32)
+    for stale_len, new_len in ((2, 4), (1, 6)):
+        old.multimodal_output["audio"] = np.zeros(stale_len)
+        assert list(plane.project_output(old, context=context)) == []
+        current.multimodal_output["audio"] = waveform[:new_len]
+        assert list(plane.project_output(current, context=context))
+    assert encoded[1:] == [[2, 3, 4, 5], [6, 7]]
+
+
 @pytest.mark.parametrize(
     "stage_id,epoch,media",
     [(2, 0, {"audio": np.zeros(4)}), (0, 1, {"latent": np.zeros(4)}), (2, 1, {"audio": [np.zeros(4)]})],

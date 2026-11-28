@@ -349,6 +349,7 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         record["last_terminal_turn"] = None
+        record.pop("duplex_turn_key", None)
         record.pop("last_closed_condition", None)
         _drop_codec_state(transfer_manager, request_id)
 

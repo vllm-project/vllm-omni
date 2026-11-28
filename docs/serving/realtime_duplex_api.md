@@ -667,10 +667,11 @@ forced listening. Already submitted inputs finish in order; subsequent inputs
 continue on the same stream. Late text/audio from the cancelled answer is
 discarded. A later answer receives a new response ID, so clients should discard
 cancelled output by response ID rather than treating the whole epoch as dead.
-An explicit audio commit with `create_response: true` can create the next
-response before the model confirms the interruption. That response keeps the
-same ID when its answer arrives; the confirmation does not complete it empty
-and open another response for the answer.
+An unforced text append or an explicit audio commit with `create_response: true`
+creates the next response even while the model is confirming the interruption.
+Clients can cancel it immediately, and its ID stays the same when its answer
+arrives. Clearing an idle, fully played response acknowledges the clear without
+submitting a model control.
 No history prefill is needed for this interruption, on either local or hosted
 Stage-0 replicas. Normal sliding-window eviction still applies. As in the
 official native implementation, KV can contain generated speech the client has

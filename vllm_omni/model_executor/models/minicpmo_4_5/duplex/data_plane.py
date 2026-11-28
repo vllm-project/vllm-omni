@@ -80,9 +80,11 @@ class _RequestState:
             # A short snapshot may be a continuation placeholder. Only rewind
             # the cursor once a live below-cursor snapshot grows from it.
             # Delayed old snapshots alone cannot rewind already delivered PCM.
+            if not allow_restart:
+                return 0
             candidate = self.audio_restart_candidate
             self.audio_restart_candidate = num_samples
-            if not allow_restart or candidate is None or num_samples <= candidate:
+            if candidate is None or num_samples <= candidate:
                 return 0
             previous = candidate
         elif num_samples > previous:

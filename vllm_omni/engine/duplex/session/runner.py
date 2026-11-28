@@ -64,6 +64,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
+    DuplexTurnState,
     ResponseCreateOptions,
     effective_function_call_retry_policy,
     input_clocked,
@@ -78,6 +79,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     InputCleared,
+    OutputAudioCleared,
     PlaybackAcknowledged,
     ResponseDone,
     SessionExpired,
@@ -364,6 +366,8 @@ class DuplexSessionRunner:
             self.model,
             wait_for_append_tail=self._wait_for_append_tail,
         )
+        self._resident_stage0_segments = 0
+        self._last_stage0_turn: int | None = None
         #: Unit tracking of an input-clocked session (``extra_body.clock == "input"``,
         #: fixed at session creation); ``None`` for every other session.
         self._input_clock: InputClock | None = None
@@ -480,6 +484,15 @@ class DuplexSessionRunner:
             return True
         decision: DuplexOutputDecision | None = None
         project = False
+        if (
+            stage_id == 0
+            and context.segment_finished
+            and context.model_turn_id is not None
+            and context.identity.fence.epoch == self.session.epoch
+            and request_id == self.manager.stage_request_id(context.identity.fence, stage_id=0)
+        ):
+            self._resident_stage0_segments += 1
+            self._last_stage0_turn = context.model_turn_id
         if stage_id < context.final_stage_id or (stage_id == 0 and self.run.interruption_pending):
             decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
@@ -1210,9 +1223,7 @@ class DuplexSessionRunner:
                 task = await self._start_append(
                     {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
                     final=False,
-                    # The control unit has not confirmed the next model turn
-                    # yet. Let its first output reserve the new response.
-                    precreate_response=command.force_listen is not True and not self.run.interruption_pending,
+                    precreate_response=command.force_listen is not True,
                 )
                 release = reservation.pop_all().close
                 task.add_done_callback(lambda _done: release())
@@ -1493,6 +1504,8 @@ class DuplexSessionRunner:
         if new_epoch != old_epoch:
             self.run.pending_interruptions = 0
             self.run.interrupted_through_turn = None
+            self._resident_stage0_segments = 0
+            self._last_stage0_turn = None
             self.tool_calls.invalidate_epoch(new_epoch)
             if not closing_before:
                 retired = self._retire_pending_function_output()
@@ -2920,6 +2933,34 @@ class DuplexSessionRunner:
         if self.ctx.history_calibration is not None:
             self.ctx.history_calibration.request_ready()
 
+    def _resident_output_drained(self) -> bool:
+        session = self.session
+        playback = session.playback
+        audio_ms = max(playback.sent_ms, playback.generated_ms)
+        if (
+            session.turn_state != DuplexTurnState.IDLE
+            or session.last_response_id is None
+            or audio_ms == 0
+            or playback.committed_ms < audio_ms
+            or helpers.response_in_progress(session, self.tasks)
+            or self.run.interruption_pending
+            or self.tasks.append_tasks
+            or self._real_input_waiting()
+            or self.model_state.committed_audio_payload is not None
+        ):
+            return False
+        # One completed turn can account for a single append. With pipelined
+        # input, its TTS terminal can precede the next input's first PCM.
+        # All accepted units must have left Stage 0 on already closed turns.
+        return session.turn_id > 0 and (
+            session.input_seq == 1
+            or (
+                self._resident_stage0_segments == session.input_seq
+                and self._last_stage0_turn is not None
+                and self._last_stage0_turn < session.turn_id
+            )
+        )
+
     async def _interrupt_resident_response(self, *, reason: str) -> bool:
         """Stop playback and enqueue the model's ordered resident control, if supported."""
         session = self.session
@@ -2930,6 +2971,11 @@ class DuplexSessionRunner:
             and (payload := self.plugin.interruption_payload()) is not None
         ):
             return False
+        if reason == "output_audio_buffer_clear" and self._resident_output_drained():
+            # The resident request outlives playback. Clearing a drained
+            # reply only owes the client its acknowledgement.
+            self._emit_events([OutputAudioCleared(response_id=session.last_response_id)])
+            return True
         self.run.pending_interruptions += 1
         self.model_state.clear_continuation()
         self._deferred_silence = None
