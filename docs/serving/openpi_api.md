@@ -89,6 +89,43 @@ python examples/online_serving/dreamzero/openpi_client.py \
   --video-dir outputs/dreamzero/assets
 ```
 
+## FastWAM Quick Start
+
+Serve CAE-FastWAM for LIBERO (one GPU, bfloat16):
+
+```bash
+vllm serve amd/CAE-FastWAM --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/cae_fastwam_libero.yaml
+```
+
+The handshake advertises two 224x224 cameras and a `[32, 7]` action chunk.
+Observations use the OpenPI LIBERO client keys plus `task_suite`, which selects
+CAE-FastWAM's per-suite normalisation statistics and action-codec embedding.
+CAE-FastWAM rejects a request without `task_suite`, because the stock OpenPI
+LIBERO client does not send it and the wrong suite gives wrong actions without
+any error. To serve one suite to an unmodified client, pin it with
+`model_config.task_suite` in the deploy config:
+
+```python
+import numpy as np
+from openpi_client import websocket_client_policy
+
+policy = websocket_client_policy.WebsocketClientPolicy(
+    host="ws://127.0.0.1:8091/v1/realtime/robot/openpi"
+)
+actions = policy.infer({
+    "observation/image": agentview,          # uint8 HxWx3, rotated upright
+    "observation/wrist_image": wrist,        # uint8 HxWx3, rotated upright
+    "observation/state": state,              # float32 [8]: eef pos, axis-angle, gripper qpos
+    "prompt": "put the bowl on the plate",
+    "task_suite": "libero_goal",             # required unless the deploy config pins a suite
+    "seed": 42,                              # optional; deploy default 42
+})  # float32 [32, 7]; LIBERO gripper convention (+1 close, -1 open)
+```
+
+See the [CAE-FastWAM recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/AMD/CAE-FastWAM-MI355X.md)
+for the full contract.
+
 ## Protocol
 
 The connection is request-response after an initial server handshake:
@@ -128,9 +165,16 @@ frames are not observation messages.
   dictionary.
 - An optional integer `seed` in an inference message becomes the engine
   request's `sampling_params.seed`. A policy whose sampling consumes the
-  request generator (GR00T-N1.7) returns the same action chunk for the same
-  observation and seed. If omitted, the engine assigns a random per-request
-  seed, so unseeded inferences are independent of each other. The API layer
+  request generator or seed (GR00T-N1.7, FastWAM) returns the same action chunk for the same
+  observation and seed. If omitted, the stage's deploy
+  `default_sampling_params.seed` applies; without one, the engine assigns a
+  random per-request seed. The FastWAM deploy configs set `seed: 42` (the
+  reference LIBERO evaluator's seed), so unseeded FastWAM requests use the
+  same noise. "Same chunk" holds up to run-to-run GPU kernel variation (for
+  FastWAM on ROCm, one non-deterministic convolution in the Wan VAE encoder;
+  bitwise with `torch.use_deterministic_algorithms(True)`, which on ROCm needs
+  `MIOPEN_DEBUG_CONV_DIRECT` and `MIOPEN_DEBUG_CONV_GEMM` unset; the
+  `vllm/vllm-openai-rocm:v0.34.0` image sets both to 0). The API layer
   consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors

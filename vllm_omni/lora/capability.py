@@ -467,6 +467,7 @@ DIFFUSION_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "DiffusersAdapterPipeline": _not_capable("generic diffusers fallback wrapper; no native vLLM linear contract"),
     "DreamZeroPipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "ErnieImagePipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
+    "FastWAMPipeline": _not_capable("action-expert flow-matching pipeline; no merged-LoRA contract"),
     "Flux2KleinPipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "Flux2Pipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "FluxDMD2Pipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),

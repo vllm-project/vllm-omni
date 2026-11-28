@@ -1,0 +1,57 @@
+# CAE-FastWAM (amd/CAE-FastWAM) LIBERO policy: one diffusion stage, one GPU, B=1.
+#
+# Topology: vllm_omni/diffusion/models/fastwam_pipeline_config.py. The OpenPI
+# robot endpoint (/v1/realtime/robot/openpi) returns one [32, 7] LIBERO action
+# chunk per observation. Every key below is documented in
+# recipes/AMD/CAE-FastWAM-MI355X.md.
+
+pipeline: fastwam
+# Required: single-stage pipelines reject the default async_chunk=true.
+async_chunk: false
+distributed_executor_backend: mp
+# bfloat16 is the reference and validated dtype.
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    # FastWAM serves one observation per forward.
+    max_num_seqs: 1
+    # Eager by default (the reference path). Set enforce_eager: false to enable
+    # vLLM-Omni's regional torch.compile of every transformer layer; the shapes
+    # are fixed per checkpoint, so diffusion_compile_dynamic: false avoids
+    # dynamic-shape guards:
+    #   enforce_eager: false
+    #   diffusion_compile_granularity: regional
+    #   diffusion_compile_dynamic: false
+    enforce_eager: true
+    model_class_name: FastWAMPipeline
+    model_config:
+      fastwam_variant: cae_fastwam_libero
+      # Wan2.2 VAE encoder, umT5 text encoder and tokenizer.
+      base_model: Wan-AI/Wan2.2-TI2V-5B-Diffusers
+      # Task suite: selects stats/<suite>.json and the action codec's suite
+      # embedding. Unset, every request must send robot_obs["task_suite"] (no
+      # silent default: the wrong suite gives wrong actions). Pin one suite here
+      # to serve the stock OpenPI LIBERO client, which does not send it:
+      #   task_suite: libero_spatial
+      num_inference_steps: 10
+      # De-normalised actions with LIBERO's gripper convention (+1 close, -1 open).
+      action_postprocess: libero
+      # Run one real forward on a synthetic observation during the engine's
+      # warm-up request (compiles at startup when enforce_eager is false).
+      warmup: true
+      # OpenPI handshake, validated against the loaded checkpoint at startup.
+      policy_server_config:
+        image_resolution: [224, 224]
+        n_external_cameras: 1
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: false
+        action_space: eef_delta
+        action_horizon: 32
+        action_dim: 7
+    default_sampling_params:
+      # The reference LIBERO evaluator seeds every call with 42; clients may send
+      # their own "seed" with each observation.
+      seed: 42

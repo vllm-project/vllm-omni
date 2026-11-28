@@ -131,6 +131,9 @@ EXCLUDED_MODELS = [
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
     "Gr00tN1d7Pipeline",
+    # Robot policy: needs a real checkpoint and a robot observation; covered by
+    # tests/diffusion/models/fastwam and the OpenPI e2e test.
+    "FastWAMPipeline",
     "Pi0Pipeline",
     "Pi05Pipeline",
     "SanaWmPipeline",

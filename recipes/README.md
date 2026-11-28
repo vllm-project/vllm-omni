@@ -58,6 +58,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | Recipe | Task | Hardware |
 | -------- | ------ | ---------- |
 | [`ACVLab/ABot-World.md`](./ACVLab/ABot-World.md) | Offline, typed realtime, and stepwise generation | 1x NVIDIA H200 (measured) |
+| [`AMD/CAE-FastWAM-MI355X.md`](./AMD/CAE-FastWAM-MI355X.md) | Online OpenPI serving for the CAE-FastWAM LIBERO world-action policy | 1x AMD Instinct MI355X |
 | [`AURA/AURA_v2-H200.md`](./AURA/AURA_v2-H200.md) | Full-duplex speech + video assistant (Realtime, tool calls) | 1x or 2x H200 141GB |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
