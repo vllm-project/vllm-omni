@@ -192,6 +192,7 @@ from .npu.lora import (
     NativeDistilledLoRASpec,
     load_minimax_h3_native_distilled_lora,
 )
+from .offline_quantization import resolve_offline_components
 from .packed_sequence import (
     MINIMAX_H3_MAX_PAD_SEQ_LEN,
     MINIMAX_H3_SEQ_ALIGN,
@@ -1128,6 +1129,18 @@ class MiniMaxH3Pipeline(
         # rejects; fail here instead of on every such request.
         service_schedule = od_config.diffusion_attention_schedule
         additional_config = od_config.additional_config or {}
+        self._offline_checkpoints, self._offline_dequantize = resolve_offline_components(
+            additional_config.get("offline_quantization")
+        )
+        if self._offline_checkpoints:
+            if getattr(od_config, "lora_path", None) or getattr(od_config, "enable_lora", False):
+                raise ValueError("offline H3 component overrides do not support LoRA or fused adapters")
+            if getattr(od_config.parallel_config, "use_hsdp", False):
+                raise ValueError("offline H3 component loading does not support HSDP")
+            if getattr(od_config, "host_weight_runtime_mode", "disabled") != "disabled":
+                raise ValueError("offline H3 component loading requires host_weight_runtime_mode='disabled'")
+            if additional_config.get("video_vae_decoder") or additional_config.get("lightvae_decoder_path"):
+                raise ValueError("offline H3 VAE weights cannot be combined with replacement decoders")
         if (
             service_schedule is not None
             and service_schedule.default
@@ -1143,6 +1156,10 @@ class MiniMaxH3Pipeline(
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        if {"video_vae", "audio_vae"} & self._offline_checkpoints.keys() and not (
+            self.load_vae_encoder and self.load_vae_decoder
+        ):
+            raise ValueError("offline VAE overrides require both vae_encoder and vae_decoder enabled")
         if not self.load_vae_decoder and self.load_vae_encoder:
             raise ValueError(
                 "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
@@ -1325,6 +1342,29 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        offline_transformer = self._offline_checkpoints.get("transformer")
+        native_mx = any(checkpoint.execution_mode == "native_mx" for checkpoint in self._offline_checkpoints.values())
+        if self._offline_checkpoints:
+            if native_mx:
+                if od_config.quantization_config is not None:
+                    raise ValueError("offline native MX selects quantization from delivery metadata; remove overrides")
+                if offline_transformer is not None:
+                    from .native_mx import H3NativeMXConfig
+
+                    transformer_quant_config = H3NativeMXConfig.from_checkpoint(offline_transformer)
+            elif transformer_quant_config is not None:
+                raise ValueError("offline dequantize mode requires transformer quantization_config=None")
+            if modular or ref2va_model_path is not None or control_path:
+                raise ValueError("offline component overrides currently require a standalone native H3 partition")
+        if offline_transformer is not None:
+            self.weights_sources[0] = DiffusersPipelineLoader.ComponentSource(
+                model_or_path=str(offline_transformer.path),
+                subfolder=None,
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=False,
+                weight_iterator_factory=lambda: offline_transformer.iter_weights(dequantize=self._offline_dequantize),
+            )
         from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
 
         if isinstance(transformer_quant_config, SerializedPerChannelFp8Config):
@@ -1357,8 +1397,12 @@ class MiniMaxH3Pipeline(
         self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
-            diffusers_weights=modular,
+            diffusers_weights=offline_transformer.diffusers_weights if offline_transformer is not None else modular,
         )
+        if offline_transformer is not None:
+            self.transformer._strict_offline_loading = True
+            if native_mx:
+                transformer_quant_config.validate_model_targets(self.transformer)
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint
             if isinstance(spec, FastH3OmniCheckpointSpec) and self.transformer.arch.pdd_steps != 32:
@@ -1418,6 +1462,7 @@ class MiniMaxH3Pipeline(
             expected_partition,
             self._fasth3.source if self._fasth3 is not None else None,
             eligible=transformer_quant_config is None
+            and offline_transformer is None
             and not modular
             and self._vdn is None
             and self._regenerate is None,
@@ -1515,6 +1560,7 @@ class MiniMaxH3Pipeline(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
                 ),
+                offline_checkpoint=self._offline_checkpoints.get("video_vae"),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
@@ -1522,6 +1568,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                offline_checkpoint=self._offline_checkpoints.get("audio_vae"),
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae

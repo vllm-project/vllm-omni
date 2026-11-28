@@ -245,3 +245,48 @@ omni = Omni(model="<autoround-mxfp8-model>")
    `--output-dir`), regenerate it with the current script. The old script
    wrote a separate `quantization_config.json` that is not read by vLLM-Omni;
    the current script injects the config directly into `transformer/config.json`.
+
+## MiniMax H3 offline MX checkpoints
+
+On Ascend A5 (`Ascend950*`), MiniMax H3 can override component weight sources
+with ModelSlim MXFP8 (`W8A8_MXFP8`) and MXFP4 (`W4A4_MXFP4` or
+`W4A4_MXFP4_DUALSCALE`) checkpoints while keeping `model` pointed at the
+original H3 partition for architecture config, tokenizer, text encoder, and
+trusted VAE modeling code.
+
+```python
+omni = Omni(
+    model="/path/to/original/FL2VA",
+    trust_remote_code=True,
+    quantization_config=None,
+    additional_config={
+        "offline_quantization": {
+            "components": {
+                "transformer": "/path/to/mx/transformer",
+                "video_vae": "/path/to/mx/video_vae",
+                "audio_vae": "/path/to/mx/audio_vae",
+            },
+            "execution_mode": "native_mx",
+        },
+    },
+)
+```
+
+- Pass `path` for a single transformer directory or `components` to override
+  any subset of `transformer`, `video_vae`, and `audio_vae`.
+- Keep `quantization_config=None`. `execution_mode` defaults to `native_auto`
+  (resolving to `native_mx` on Ascend A5); use `execution_mode="dequantize"`
+  for CPU floating-point weight reconstruction without native MX kernels.
+- Delivery metadata selects per-layer precision (`W8A8_MXFP8` -> W8A8,
+  `W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` -> W4A4, `FLOAT` unchanged). All
+  constituents of a fused QKV projection must share a scheme.
+- At load time, all delivery scales (including optional FP32 dual scales) are
+  applied before encoding weights once into native single-scale MX groups of
+  32 for `npu_dynamic_mx_quant` and `npu_quant_matmul`.
+- Offline VAE overrides construct the VAE from its original config and
+  modeling code without loading the original VAE weight file first, require
+  both encoder and decoder enabled, and replace only quantized `nn.Linear`
+  layers.
+- Currently requires a standalone native H3 partition without HSDP, host
+  weight runtime, LoRA/fused adapters, replacement VAE decoders, or a combined
+  FL2VA/Ref2VA model.

@@ -34,6 +34,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
+from .offline_quantization import OfflineComponentCheckpoint, load_offline_vae_weights
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
@@ -163,10 +164,10 @@ def _remove_modules(model: nn.Module, names: tuple[str, ...]) -> None:
         delattr(model, name)
 
 
-def _load_video_vae_encoder(
+def _build_video_vae_model(
     component_path: str,
     config: dict[str, Any],
-) -> nn.Module:
+) -> tuple[type[nn.Module], nn.Module]:
     class_reference = (config.get("auto_map") or {}).get("AutoModel")
     if not isinstance(class_reference, str):
         raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
@@ -183,7 +184,6 @@ def _load_video_vae_encoder(
         ensure_parallel_state()
 
     source_path = Path(component_path) / str(config["source_path"])
-    weights_path = source_path / str(config["source_safetensors_path"])
     load_kwargs = {
         "clip_length": int(config["vae_clip_length"]),
         "token_drop": int(config["vae_token_drop"]),
@@ -200,16 +200,36 @@ def _load_video_vae_encoder(
     source_config = source_cls.load_config(str(source_path))
     with set_default_torch_dtype(torch.float32), torch.device("cpu"):
         model, _unused = source_cls.from_config(source_config, return_unused_kwargs=True, **load_kwargs)
+    return component_cls, model
+
+
+def _load_video_vae_encoder(
+    component_path: str,
+    config: dict[str, Any],
+) -> nn.Module:
+    component_cls, model = _build_video_vae_model(component_path, config)
+    weights_path = Path(component_path) / str(config["source_path"]) / str(config["source_safetensors_path"])
     _remove_modules(model, ("decoder", "post_quant_conv"))
     _load_selected_state_dict(model, weights_path, ("encoder.", "quant_conv."))
     model.eval()
     return component_cls(model)
 
 
-def _load_audio_vae_encoder(
+def _load_offline_video_vae(
     component_path: str,
     config: dict[str, Any],
+    offline_checkpoint: OfflineComponentCheckpoint,
 ) -> nn.Module:
+    component_cls, model = _build_video_vae_model(component_path, config)
+    load_offline_vae_weights(model, offline_checkpoint)
+    model.eval()
+    return component_cls(model)
+
+
+def _build_audio_vae_model(
+    component_path: str,
+    config: dict[str, Any],
+) -> tuple[type[nn.Module], nn.Module]:
     class_reference = (config.get("auto_map") or {}).get("AutoModel")
     if not isinstance(class_reference, str):
         raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
@@ -235,9 +255,28 @@ def _load_audio_vae_encoder(
             vae_latent_channels=audio_config["model_config"]["vae_latent_channels"],
             sample_rate=metadata["sample_rate"],
         )
+    return component_cls, model
+
+
+def _load_audio_vae_encoder(
+    component_path: str,
+    config: dict[str, Any],
+) -> nn.Module:
+    component_cls, model = _build_audio_vae_model(component_path, config)
     _remove_modules(model, ("decoder", "dec_in_proj", "logs_proj"))
-    weights_path = component_dir / str(config["source_safetensors_path"])
+    weights_path = Path(component_path) / str(config["source_safetensors_path"])
     _load_selected_state_dict(model, weights_path, ("encoder.", "pre_block.", "mean_proj."))
+    model.eval()
+    return component_cls(model)
+
+
+def _load_offline_audio_vae(
+    component_path: str,
+    config: dict[str, Any],
+    offline_checkpoint: OfflineComponentCheckpoint,
+) -> nn.Module:
+    component_cls, model = _build_audio_vae_model(component_path, config)
+    load_offline_vae_weights(model, offline_checkpoint)
     model.eval()
     return component_cls(model)
 
@@ -371,6 +410,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
         stack_decode_tiles: bool = True,
+        offline_checkpoint: OfflineComponentCheckpoint | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -381,6 +421,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
         if lightvae_decoder_path is not None and decoder_source is not None:
             raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
+        if offline_checkpoint is not None and (
+            self.encode_only or self.decode_only or decoder_source or lightvae_decoder_path
+        ):
+            raise ValueError("offline video VAE loading requires the complete original VAE")
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -395,6 +439,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
         if self.encode_only:
             self.remote = _load_video_vae_encoder(component_path, self.config_dict)
+        elif offline_checkpoint is not None:
+            self.remote = _load_offline_video_vae(component_path, self.config_dict, offline_checkpoint)
         else:
             self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
@@ -472,6 +518,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             logger.info(
                 "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
             )
+        if offline_checkpoint is not None and offline_checkpoint.execution_mode == "native_mx":
+            from .native_mx import install_native_mx_vae
+
+            install_native_mx_vae(self.remote.model, offline_checkpoint, device)
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None
@@ -509,23 +559,26 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         the checkpoint's structure is not discoverable, fall back to
         whole-module staging (the previous single-stager behavior).
         """
+        # Eagerly pinning every VAE storage on every NPU rank can exhaust
+        # the runtime host allocator despite ample pageable host RAM. Keep
+        # identical CPU masters and let the stager copy them synchronously.
         part_names = ("encoder", "quant_conv", "post_quant_conv", "decoder")
         if all(isinstance(getattr(self.model, name, None), nn.Module) for name in part_names):
             self._encoder_stager = PinnedModuleStager(
                 [self.model.encoder, self.model.quant_conv],
                 device,
-                pin_memory=True,
+                pin_memory=device.type != "npu",
             )
             self._decoder_stager = PinnedModuleStager(
                 [self.model.post_quant_conv, self.model.decoder],
                 device,
-                pin_memory=True,
+                pin_memory=device.type != "npu",
             )
             return
         self._stager = PinnedModuleStager(
             self.remote,
             device,
-            pin_memory=True,
+            pin_memory=device.type != "npu",
         )
 
     def _part_stager(self, part: str) -> PinnedModuleStager | None:
@@ -1420,6 +1473,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        offline_checkpoint: OfflineComponentCheckpoint | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -1427,10 +1481,14 @@ class MiniMaxH3AudioVAE(nn.Module):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 audio VAE cannot be both encode-only and decode-only")
+        if offline_checkpoint is not None and (self.encode_only or self.decode_only):
+            raise ValueError("offline audio VAE loading requires the complete original VAE")
         self.config_dict = _load_component_config(component_path)
         _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
         if self.encode_only:
             self.remote = _load_audio_vae_encoder(component_path, self.config_dict)
+        elif offline_checkpoint is not None:
+            self.remote = _load_offline_audio_vae(component_path, self.config_dict, offline_checkpoint)
         else:
             self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
@@ -1439,12 +1497,16 @@ class MiniMaxH3AudioVAE(nn.Module):
         # encoding and waveform decoding.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        if offline_checkpoint is not None and offline_checkpoint.execution_mode == "native_mx":
+            from .native_mx import install_native_mx_vae
+
+            install_native_mx_vae(self.remote.model, offline_checkpoint, device)
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
                 self.remote,
                 device,
-                pin_memory=True,
+                pin_memory=device.type != "npu",
             )
         self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])

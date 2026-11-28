@@ -824,6 +824,7 @@ class MiniMaxH3DiTModel(nn.Module):
         from .checkpoint_quantization import FastH3NVFP4Config
 
         self._serialized_weight_map = quant_config.weight_map if isinstance(quant_config, FastH3NVFP4Config) else {}
+        self._strict_offline_loading = False
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
@@ -1104,8 +1105,11 @@ class MiniMaxH3DiTModel(nn.Module):
         diffusers_weights = getattr(self, "_diffusers_weights", False)
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
+        strict_offline = getattr(self, "_strict_offline_loading", False)
         for name, loaded_weight in weights:
             layout = "plain"
+            if strict_offline and name in source_names:
+                raise ValueError(f"duplicate offline H3 weight: {name}")
             if diffusers_weights:
                 if name in source_names:
                     raise ValueError(f"duplicate Diffusers H3 weight: {name}")
@@ -1125,10 +1129,12 @@ class MiniMaxH3DiTModel(nn.Module):
                     # channel-scale parameter and TP loaders consume [N].
                     loaded_weight = loaded_weight.squeeze(-1)
                 name, layout = f"{target[0]}.{kind}", target[1]
+            elif strict_offline:
+                source_names.add(name)
             param = params.get(name)
             if param is None:
-                if diffusers_weights:
-                    raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
+                if diffusers_weights or strict_offline:
+                    raise ValueError(f"H3 checkpoint weight has no model parameter: {name}")
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1207,6 +1213,8 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        if strict_offline and (missing := params.keys() - loaded):
+            raise ValueError(f"offline H3 checkpoint is incomplete: {sorted(missing)[:8]}")
         return loaded
 
     @staticmethod
