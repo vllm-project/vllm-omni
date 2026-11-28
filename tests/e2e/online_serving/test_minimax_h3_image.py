@@ -5,6 +5,7 @@
 import base64
 import hashlib
 import io
+import json
 import os
 from urllib.parse import urlsplit
 
@@ -14,7 +15,7 @@ from PIL import Image
 from tests.helpers.client import OnlineOmniClient
 from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.media import get_asset_path
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 pytestmark = pytest.mark.diffusion
 
@@ -98,6 +99,29 @@ TP2_CASE = pytest.param(
 )
 
 
+# --- Ascend A5 SP2 T2I smoke (A3 is covered by the DLO cases above) ---
+
+NPU_SERVER_ARGS = [
+    "--enforce-eager",
+    "--num-gpus",
+    "2",
+    "--usp",
+    "2",
+    "--text-encoder-tp-size",
+    "2",
+    "--diffusion-offload-config",
+    json.dumps(
+        {
+            "mode": "layer",
+            "components": ["dit"],
+            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+        },
+        separators=(",", ":"),
+    ),
+]
+A5_TWO_CARD_MARKS = hardware_marks(res={"npu": "A5"}, num_cards=2)
+
+
 def _assert_image_response(response, output_path, size):
     assert response.status_code == 200, response.error_message
     assert len(response.json_body["data"]) == 1
@@ -129,6 +153,44 @@ def test_text_to_image(omni_server, online_client, tmp_path):
         }
     )[0]
     _assert_image_response(response, tmp_path / "t2i.png", (1024, 1024))
+
+
+@pytest.mark.core_model
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=NPU_SERVER_ARGS,
+                stage_init_timeout=1800,
+                init_timeout=1800,
+            ),
+            id="minimax_h3_image_a5_dlo_sp2_t2i",
+            marks=A5_TWO_CARD_MARKS,
+        ),
+    ],
+    indirect=True,
+)
+def test_npu_text_to_image(omni_server, online_client, tmp_path):
+    """Validate A5 T2I with SP2, text-encoder TP2, and DiT AllGather layer offload."""
+    response = online_client.send_images_generations_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": "A red bicycle leaning against a pale stone wall in warm afternoon sunlight.",
+                "size": "1024x1024",
+                "seed": 42,
+                "generator_device": "cpu",
+                "num_inference_steps": 6,
+                "response_format": "b64_json",
+                "output_format": "png",
+            },
+            "timeout": 300,
+        }
+    )[0]
+    _assert_image_response(response, tmp_path / "t2i-a5.png", (1024, 1024))
 
 
 @pytest.mark.parametrize("omni_server", [*DLO_CASES, TP2_CASE], indirect=True)
