@@ -23,6 +23,10 @@ from .host_registration import (
 
 _CUDA_HOST_REGISTER_READ_ONLY = 0x08
 _CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED = 113
+# ROCm has no read-only registration (hostRegisterReadOnlySupported is 0); the same bit means
+# hipExtHostRegisterCoarseGrained there, which is what immutable weights need (no host coherence).
+_HIP_EXT_HOST_REGISTER_COARSE_GRAINED = 0x08
+_HIP_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED = 90
 
 
 class _CudaRuntime(Protocol):
@@ -86,6 +90,12 @@ def _mapped_regions(regions: Sequence[MappedHostRegion]) -> tuple[_AddressRange,
     return tuple(span for ranges in by_file.values() for span in _coalesce_ranges(ranges))
 
 
+def _global_runtime_symbol(cuda_name: str):
+    """Resolve a runtime entry point that ``torch.cuda.cudart()`` does not expose."""
+    name = "hip" + cuda_name.removeprefix("cuda") if torch.version.hip else cuda_name
+    return getattr(ctypes.CDLL(None), name)
+
+
 def _error_message(runtime: _CudaRuntime, error: int) -> str:
     try:
         message = runtime.cudaGetErrorString(error)
@@ -101,7 +111,7 @@ def _consume_last_cuda_error(runtime: _CudaRuntime, expected_error: int) -> None
     try:
         get_last_error = getattr(runtime, "cudaGetLastError", None)
         if get_last_error is None:
-            get_last_error = ctypes.CDLL(None).cudaGetLastError
+            get_last_error = _global_runtime_symbol("cudaGetLastError")
             get_last_error.argtypes = []
             get_last_error.restype = ctypes.c_int
         pending_error = int(get_last_error())
@@ -129,7 +139,7 @@ def _supports_read_only_host_registration(runtime: _CudaRuntime) -> bool:
     try:
         get_attribute = getattr(runtime, "cudaDeviceGetAttribute", None)
         if get_attribute is None:
-            get_attribute = ctypes.CDLL(None).cudaDeviceGetAttribute
+            get_attribute = _global_runtime_symbol("cudaDeviceGetAttribute")
             get_attribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
             get_attribute.restype = ctypes.c_int
     except (AttributeError, OSError) as exc:
@@ -139,7 +149,9 @@ def _supports_read_only_host_registration(runtime: _CudaRuntime) -> bool:
     try:
         error = get_attribute(
             ctypes.byref(supported),
-            _CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED,
+            _HIP_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED
+            if torch.version.hip
+            else _CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED,
             torch.accelerator.current_device_index(),
         )
     except Exception as exc:
@@ -185,10 +197,11 @@ class CudaHostRegistration:
                 "CUDA device does not support read-only host registration required by immutable HWR mappings"
             )
 
+        flags = _HIP_EXT_HOST_REGISTER_COARSE_GRAINED if torch.version.hip else _CUDA_HOST_REGISTER_READ_ONLY
         registered: list[_AddressRange] = []
         try:
             for region in mapped:
-                error = runtime.cudaHostRegister(region.start, region.size, _CUDA_HOST_REGISTER_READ_ONLY)
+                error = runtime.cudaHostRegister(region.start, region.size, flags)
                 if int(error) != 0:
                     raise HostRegistrationError(
                         "cudaHostRegister(read-only) failed for "
