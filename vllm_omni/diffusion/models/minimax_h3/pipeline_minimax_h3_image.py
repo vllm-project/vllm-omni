@@ -54,6 +54,7 @@ from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     IMAGE_PAD,
@@ -290,7 +291,14 @@ def _load_reference(value: Any) -> Image.Image:
 def get_minimax_h3_image_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
-    def post_process_func(images: torch.Tensor, output_type: str = "pil"):
+    def post_process_func(
+        images: torch.Tensor,
+        output_type: str = "pil",
+        *,
+        sampling_params: OmniDiffusionSamplingParams | None = None,
+    ):
+        if sampling_params is not None:
+            output_type = sampling_params.output_type or output_type
         if output_type == "latent":
             return images
         if images.dtype == torch.uint8 and images.ndim == 4 and images.shape[-1] == 3:
