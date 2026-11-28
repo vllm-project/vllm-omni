@@ -1005,6 +1005,11 @@ class OmniServeCommand(CLISubcommand):
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
         omni_config_group.add_argument(
+            "--enable-execution-summary",
+            action="store_true",
+            help="Log one [OmniExecution] JSON line per finished request with what it ran and the runtime.",
+        )
+        omni_config_group.add_argument(
             "--step-execution",
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",

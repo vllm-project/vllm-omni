@@ -8,6 +8,7 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     CacheDiTBackend,
     CacheDiTEnableResult,
     cache_summary,
+    cached_step_count,
     enable_cache_for_dit,
     set_separate_cfg,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "RequestScopedCacheDiTRuntime",
     "SensenovaCachedAdapter",
     "cache_summary",
+    "cached_step_count",
     "enable_cache_for_dit",
     "set_separate_cfg",
 ]

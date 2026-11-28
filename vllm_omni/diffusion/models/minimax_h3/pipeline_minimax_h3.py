@@ -426,6 +426,17 @@ def _minimax_h3_output_canvas(
     return target.height, target.width
 
 
+def _minimax_h3_execution_facts(height: int, width: int, context: Mapping[str, Any]) -> dict[str, Any]:
+    """What the request ran with, for the execution summary; H3 is CFG-distilled, so no CFG."""
+    return {
+        "width": int(width),
+        "height": int(height),
+        "flow_shift": context.get("video_shift"),
+        "audio_flow_shift": context.get("audio_shift"),
+        "cfg": False,
+    }
+
+
 class _MiniMaxH3EncodedOutput(NamedTuple):
     video: bytes | list[bytes]
     frame_counts: list[int]
@@ -1356,7 +1367,7 @@ class MiniMaxH3Pipeline(
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
         self.transformer = transformer_cls(
             od_config,
-            quant_config=transformer_quant_config,
+            quant_config=self._record_component_quantization("transformer", transformer_quant_config),
             diffusers_weights=modular,
         )
         if self._fasth3_checkpoint is not None:
@@ -1470,7 +1481,9 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                quant_config=self._record_component_quantization(
+                    "text_encoder", _resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config)
+                ),
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
@@ -4495,6 +4508,29 @@ class MiniMaxH3Pipeline(
         }
 
     @torch.no_grad()
+    def _record_component_quantization(
+        self, component: str, quant_config: QuantizationConfig | None
+    ) -> QuantizationConfig | None:
+        name = None if quant_config is None else quant_config.get_name()
+        self.__dict__.setdefault("_component_quantization", {})[component] = name
+        return quant_config
+
+    def execution_runtime_facts(self) -> dict[str, Any]:
+        """Execution summary facts the config and weights do not show: checkpoint-shipped quantization
+        (FastH3 FP8/NVFP4), the AdaLN cache (on by default), and the VAE decode precision."""
+        facts: dict[str, Any] = {"component_quantization": dict(self.__dict__.get("_component_quantization", {}))}
+        adaln_cache = getattr(getattr(self, "transformer", None), "adaln_cache", None)
+        if adaln_cache is not None:
+            facts["adaln_cache"] = adaln_cache.max_bytes > 0
+        video_vae = getattr(self, "video_vae", None)
+        if video_vae is not None:
+            facts["compute_dtypes"] = {"video_vae_decode": str(video_vae.decode_dtype).removeprefix("torch.")}
+            from vllm_omni.diffusion.models.minimax_h3.vae_nvfp4 import PackedNVFP4Linear
+
+            if any(isinstance(module, PackedNVFP4Linear) for module in video_vae.modules()):
+                facts["video_vae_decoder"] = "nvfp4"
+        return facts
+
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
@@ -4627,6 +4663,7 @@ class MiniMaxH3Pipeline(
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+            execution_facts=_minimax_h3_execution_facts(height, width, context),
         )
 
     def _cache_clip_latents(
@@ -4837,6 +4874,8 @@ class MiniMaxH3Pipeline(
                     "latent_continuation": context.get("latent_continuation"),
                     "latent_cache_key": context.get("latent_cache_key"),
                     "num_frames": context["num_frames"],
+                    "video_shift": context.get("video_shift"),
+                    "audio_shift": context.get("audio_shift"),
                 },
             }
         )
@@ -4976,6 +5015,7 @@ class MiniMaxH3Pipeline(
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+            execution_facts=_minimax_h3_execution_facts(height, width, shape),
         )
 
 

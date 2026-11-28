@@ -40,7 +40,7 @@ from vllm_omni.diffusion.attention.schedule import (
     resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
 )
-from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
+from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary, cached_step_count
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
@@ -72,6 +72,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_interaction_apply,
     supports_step_execution,
 )
+from vllm_omni.diffusion.models.progress_bar import count_denoise_steps
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -106,6 +107,7 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.execution import worker_runtime
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -467,6 +469,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
+        if self._execution_summary_enabled():
+            self._execution_runtime = worker_runtime(self.pipeline)
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
         if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
@@ -1043,6 +1047,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     sigma_schedule,
                     from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
                 ),
+                count_denoise_steps(enabled=self._execution_summary_enabled()) as denoise_steps,
             ):
                 with record_function(record_name):
                     try:
@@ -1066,6 +1071,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             [req.request_id for req in reqs],
                         )
                         outputs = [DiffusionOutput(aborted=True, abort_message=str(exc)) for _ in reqs]
+                if denoise_steps is not None:
+                    # One forward runs one denoising schedule for every request in the batch.
+                    completed = denoise_steps[0]
+                    cached = cached_step_count(self.pipeline) if od_config.cache_backend == "cache_dit" else None
+                    for output in outputs:
+                        output.num_completed_steps = completed
+                        output.num_cached_steps = cached
+                        output.execution_runtime = getattr(self, "_execution_runtime", None)
                 with record_function("prepare_output_for_transport"):
                     outputs = [
                         self._prepare_output_for_transport(output, req.sampling_params)
@@ -1094,6 +1107,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         return self._runner_output_from_outputs(reqs, outputs)
 
+    def _execution_summary_enabled(self) -> bool:
+        return getattr(self.od_config, "enable_execution_summary", False) is True
+
     def _attach_stepwise_metadata(
         self,
         state: StepRequestState,
@@ -1104,6 +1120,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             consume_pipeline_stage_durations(self.pipeline),
         )
         attach_stage_durations(state, output)
+        if self._execution_summary_enabled():
+            output.num_completed_steps = state.step_index
+            output.execution_runtime = getattr(self, "_execution_runtime", None)
 
         # In streaming output mode with interaction, acknowledge which events are handled in this chunk.
         meta = state.interaction_chunk_metadata

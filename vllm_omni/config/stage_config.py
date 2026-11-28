@@ -710,6 +710,7 @@ class StageDeployConfig:
     cache_config: dict[str, Any] | None = None
     video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
+    enable_execution_summary: bool | None = None
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None

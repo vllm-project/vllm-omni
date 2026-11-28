@@ -441,6 +441,7 @@ class OmniEngineArgs(EngineArgs):
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool | None = None
+    enable_execution_summary: bool | None = None
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
@@ -882,6 +883,7 @@ class OrchestratorArgs:
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool = False
+    enable_execution_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
@@ -967,6 +969,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "cache_config",
         "video_output_transport",
         "enable_cache_dit_summary",
+        "enable_execution_summary",
         "step_execution",
         "vae_use_slicing",
         "vae_use_tiling",

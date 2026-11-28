@@ -209,6 +209,7 @@ class OmniBase(PDDisaggregationMixin):
         self._initialize_output_state()
         self.model = model
         self.log_stats = log_stats
+        self.enable_execution_summary = bool(kwargs.get("enable_execution_summary", False))
         self.collect_stage_metrics = collect_stage_metrics
         # Provisional value (mirrors the CLI/caller kwarg); the engine resolves
         # pipeline + deploy YAML + CLI precedence below and the final value is
@@ -426,6 +427,7 @@ class OmniBase(PDDisaggregationMixin):
             return
 
         req_state.failure_recorded = True
+        req_state.failure_reason = reason
         prom.request_failed()
         prom.inc_requests_failed(normalize_failure_reason(reason))
 
@@ -460,6 +462,10 @@ class OmniBase(PDDisaggregationMixin):
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
                 req_state.metrics.log_timing_summary()
+            if self.enable_execution_summary:
+                req_state.metrics.log_execution_summary(
+                    request_id, req_state.external_request_id, req_state.failure_reason
+                )
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -666,7 +672,7 @@ class OmniBase(PDDisaggregationMixin):
             req_state = self.request_states.get(req_id)
             consumed = req_state.consumed_metric_message_ids if req_state is not None else None
             if consumed is not None and msg_id not in consumed:
-                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
+                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs, stage_id=stage_id)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
                 if peak_memory_mb > 0:

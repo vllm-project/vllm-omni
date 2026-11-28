@@ -418,8 +418,11 @@ def count_audio_chunk_frames(audio_chunk: object) -> int:
 
     Returns:
         Frame count for this chunk. Uses ``shape[-1]`` when shaped; otherwise
-        ``len(...)``; scalars / unlenable values count as ``1``.
+        ``len(...)``; scalars / unlenable values count as ``1``; ``None`` (an
+        output slot without audio, e.g. audio already muxed into a video) as ``0``.
     """
+    if audio_chunk is None:
+        return 0
     shape = getattr(audio_chunk, "shape", None)
     if shape is not None and len(shape) > 0:
         return int(shape[-1])

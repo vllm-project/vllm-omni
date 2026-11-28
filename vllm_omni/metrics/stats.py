@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.execution import EXECUTION_METRICS_KEY, log_execution, stage_entry
 from vllm_omni.metrics.utils import (
     _as_float,
     _as_float_list,
@@ -23,6 +24,7 @@ from vllm_omni.metrics.utils import (
     _build_row,
     _format_table,
     diffusion_output_metrics,
+    normalize_failure_reason,
 )
 
 if TYPE_CHECKING:
@@ -354,6 +356,8 @@ class OrchestratorAggregator:
         # by the orchestrator's cleanup path (e.g. final-stage cleanup races
         # the omni_base finalize emit).
         self._replica_cache: dict[tuple[int, str], int] = {}
+        # Per request and stage: the execution summary facts a diffusion stage attached.
+        self.diffusion_execution: dict[str, dict[int | None, dict[str, Any]]] = defaultdict(dict)
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -588,7 +592,7 @@ class OrchestratorAggregator:
             # 1. Accumulate metrics from stage stats
             if _m is not None:
                 self.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
-                self.accumulate_diffusion_metrics(stage_type, req_id, engine_outputs)
+                self.accumulate_diffusion_metrics(stage_type, req_id, engine_outputs, stage_id=stage_id)
                 if finished:
                     self.on_stage_metrics(stage_id, req_id, _m, final_output_type)
 
@@ -912,7 +916,9 @@ class OrchestratorAggregator:
         "kv_recv_time_ms": "kv_recv_time_s",
     }
 
-    def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:
+    def accumulate_diffusion_metrics(
+        self, stage_type: str, req_id: Any, engine_outputs: Any, stage_id: int | None = None
+    ) -> None:
         """Accumulate diffusion metrics for a request.
 
         Engine emits ``*_ms`` timings; the accumulator converts them to ``_s``
@@ -931,6 +937,9 @@ class OrchestratorAggregator:
         diffusion_metrics = diffusion_output_metrics(engine_output)
         if not diffusion_metrics:
             return
+        execution = diffusion_metrics.get(EXECUTION_METRICS_KEY)
+        if isinstance(execution, dict):
+            self.diffusion_execution[str(req_id)][stage_id] = execution
         bucket = self.diffusion_metrics[req_id]
         for key, value in diffusion_metrics.items():
             if isinstance(value, bool) or not isinstance(value, int | float):
@@ -1026,6 +1035,24 @@ class OrchestratorAggregator:
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
             self._log_omni_timing(rid, e2e_evt, stage_evts)
+
+    def log_execution_summary(
+        self, request_id: Any, external_request_id: str | None, failure_reason: str | None = None
+    ) -> None:
+        rid = str(request_id)
+        completed = rid in self.e2e_done
+        stage_evts = sorted(self.stage_events.get(rid, []), key=lambda e: e.stage_id if e.stage_id is not None else -1)
+        execution = self.diffusion_execution.pop(rid, {})
+        log_execution(
+            "diffusion_request_completed",
+            {
+                "request_id": external_request_id or rid,
+                "engine_request_id": rid,
+                "status": "completed" if completed else "failed",
+                "failure_reason": None if completed else normalize_failure_reason(failure_reason),
+                "stages": [stage_entry(evt, execution.get(evt.stage_id)) for evt in stage_evts],
+            },
+        )
 
     def _log_omni_timing(self, rid: str, e2e_evt: RequestE2EStats | None, stage_evts: list[StageRequestStats]) -> None:
         pt: dict[str, float] = {}

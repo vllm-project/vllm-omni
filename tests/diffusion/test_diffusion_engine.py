@@ -1115,6 +1115,52 @@ async def test_step_streaming_copies_scheduler_queue_wait(mocker: MockerFixture)
 
 
 @pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_step_streaming_execution_summary_reports_counted_steps_for_omitted_count(
+    mocker: MockerFixture,
+) -> None:
+    # The request leaves num_inference_steps unset; the pipeline resolved and ran
+    # its own 8-step schedule, which the model runner counted on the output.
+    request = OmniDiffusionRequest(
+        prompt="a cat",
+        sampling_params=OmniDiffusionSamplingParams(seed=7),
+        request_id="omitted-steps",
+    )
+    output = DiffusionOutput(
+        num_completed_steps=8,
+        execution_facts={"width": 832, "height": 480, "flow_shift": 5.0},
+        execution_runtime={"device": "cpu"},
+    )
+    formatted_output = SimpleNamespace(metrics={})
+
+    async def output_stream(request_id):
+        yield output
+
+    engine = mocker.Mock(
+        od_config=SimpleNamespace(enable_execution_summary=True, flow_shift=None),
+        pre_process_func=None,
+        _scheduler_num_waiting_reqs=0,
+        _check_and_start_background_loop=mocker.AsyncMock(),
+        _prepare_request_for_admission=mocker.Mock(return_value=request),
+        _add_prepared_request=mocker.Mock(return_value=request.request_id),
+        get_output_stream=output_stream,
+        postprocess_output=mocker.Mock(return_value=[formatted_output]),
+    )
+    engine._execution_runtime = {"dtype": "bfloat16"}
+    engine._execution_facts = lambda *args: DiffusionEngine._execution_facts(engine, *args)
+
+    results = [batch async for batch in DiffusionEngine.step_streaming(engine, request)]
+
+    assert results == [[formatted_output]]
+    execution = formatted_output.metrics["execution"]
+    facts = execution["diffusion"]
+    assert facts["num_inference_steps"] is None
+    assert facts["completed_steps"] == 8
+    assert (facts["width"], facts["height"], facts["flow_shift"]) == (832, 480, 5.0)
+    assert execution["runtime"] == {"dtype": "bfloat16", "device": "cpu"}
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("entrypoint", ["add_request", "async_add_req_and_stream_response"])
 @pytest.mark.asyncio
 async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocker: MockerFixture) -> None:

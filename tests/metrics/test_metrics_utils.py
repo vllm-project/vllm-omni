@@ -75,6 +75,7 @@ def test_count_video_frames_handles_short_channel_last_outputs(shape, expected_f
         (SimpleNamespace(shape=(2, 320)), 320),
         ([0.0, 0.0, 0.0], 3),
         (1.0, 1),
+        (None, 0),
     ],
 )
 def test_count_audio_chunk_frames(audio_chunk: object, expected: int) -> None:

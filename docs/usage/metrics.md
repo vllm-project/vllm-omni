@@ -163,3 +163,16 @@ the active turn context.
 
 No per-token or per-chunk spans, prompts, generated content or media are recorded
 by the pipeline instrumentation.
+
+## Execution summary
+
+`--enable-execution-summary` logs one `[OmniExecution]` JSON line per finished request, next to
+`[OmniTiming]`, so a benchmark can check what each request actually ran. Values the pipeline resolved
+or generated (e.g. size when only `aspect_ratio` was sent) are reported over the request's.
+
+| Field | Meaning |
+| --- | --- |
+| `request_id`, `engine_request_id` | Id the client sees (`POST /v1/videos` job id or `X-Request-Id`); internal id as in `[OmniTiming] req=`. |
+| `status`, `failure_reason` | `completed` or `failed`, with the reason as in `vllm_omni:requests_failed`. |
+| `stages[].diffusion` | `width`, `height`, `num_frames`, `fps`, `seed`, `num_inference_steps` (requested), `completed_steps` (denoising-loop iterations counted from the pipeline's progress bar; pipelines that denoise per tile or time block count every block), `cached_steps` (served by Cache-DiT), `guidance_scale`, `flow_shift`, `num_outputs_per_prompt`, `lora`, plus values the pipeline reports (e.g. MiniMax-H3 `audio_flow_shift`, `cfg`). |
+| `stages[].runtime` | Versions, `model` and `model_revision` (resolved from a hub snapshot), `configured_dtype`, `quantization`, `cache_backend`/`cache_config`, `parallel_config`, `device`, `world_size`, `attention` (backend per layer role), `weight_dtypes` (loaded weight elements per dtype on rank 0), plus pipeline facts (e.g. MiniMax-H3 `component_quantization`, `adaln_cache`, `compute_dtypes`). |
