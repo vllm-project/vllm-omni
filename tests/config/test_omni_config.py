@@ -1631,6 +1631,8 @@ def test_mooncake_turn_acceptance_overrides_resolve(tmp_path, mooncake):
         (None, {"stage_2_trust_remote_code": False}, False, False),
         (None, {"stage_2_quantization": "fp8"}, False, False),
         (None, {"stage_2_devices": "3"}, False, False),
+        (None, {"stage_2_distributed_executor_backend": "ray"}, False, False),
+        (None, {"stage_2_distributed_executor_backend": "mp"}, False, True),
         (None, {"load_format": "dummy"}, False, False),
         (None, {"stage_2_weight_transfer_config": {"backend": "nccl"}}, False, False),
         (None, {}, True, False),

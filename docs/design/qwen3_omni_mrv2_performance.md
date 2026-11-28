@@ -28,10 +28,11 @@ establish duplex latency or interruption behavior.
 
 First-frame delivery requires `talker_first_audio: true` in connector extra,
 a one-frame initial codec chunk, CUDA, a local single-rank Talker and Talker prefix caching disabled.
-The launcher checks that Talker and Code2Wav share a local GPU, weight source,
-Hugging Face configuration, dtype and codec kernel settings. Separately launched
-stages and stages configured for independent weight updates use Code2Wav for the
-entire stream. Graph memory estimation includes the Talker's first-frame pools.
+The launcher checks that both single-rank stages share a local GPU, weight source,
+Hugging Face configuration, dtype and codec kernel settings. Externally placed
+Code2Wav workers, separately launched stages and stages configured for independent
+weight updates use Code2Wav for the entire stream. Graph memory estimation includes
+the Talker's first-frame pools.
 The extensible KV cache measures available memory with the serving graphs resident.
 Other deployments retain the regular Code2Wav path.
 Set `talker_first_audio: false` (or `VLLM_OMNI_TALKER_FIRST_AUDIO=0`) to disable

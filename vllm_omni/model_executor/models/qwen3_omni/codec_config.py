@@ -35,6 +35,14 @@ def first_frame_decoders_match(
         devices is not None
         and devices.isdecimal()
         and devices == codec.runtime_config.devices
+        # Ray and external executors can place their workers on another host
+        # even when both stages name the same local device ordinal.
+        and all(
+            stage.runtime_config.distributed_executor_backend in (None, "uni", "mp")
+            and stage.parallel_config.world_size_across_dp == 1
+            and stage.parallel_config.nnodes == 1
+            for stage in (talker, codec)
+        )
         and talker.weight_transfer_config is None
         and codec.weight_transfer_config is None
         and talker_model.model == codec_model.model
