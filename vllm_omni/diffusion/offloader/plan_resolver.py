@@ -139,9 +139,13 @@ def _warn_legacy_discovery(pipeline_class: str) -> None:
     )
 
 
-@cache
 def _warn_backing_fallback(path: str, requested: BackingKind, reason: str) -> None:
-    """Warn once per path that a disk-streaming backing degraded to PINNED."""
+    """Explain a component whose disk-streaming backing degraded to PINNED.
+
+    The resolver runs once per backend enable, so this is not memoized: a
+    process-global cache would also silence the warning for a later pipeline
+    that hits the same declaration.
+    """
     logger.warning(
         "Component %r requested %r backing but it cannot be served (%s); falling back to PINNED.",
         path,
@@ -162,16 +166,25 @@ def _resolve_component_backing(
     """Resolve a component's one-shot flag and host backing, failing closed.
 
     The declaration supplies the requested backing; any request the resolver
-    can see as unservable (HSDP, multi-rank AllGather, reserved DISK) degrades
-    to ``PINNED`` here, before a backend touches the mmap path. TP>1 and online
-    quantization are loader-side preflights and are not visible at resolution
-    time. ``selected`` only gates the fallback warning: a component the config
-    never offloads still resolves the same values, but its incompatibility is
-    not actionable, so it is not logged.
+    can see as unservable (HSDP, reserved DISK, or a multi-rank AllGather
+    encoder the loader will not plan) degrades to ``PINNED`` here, before a
+    backend touches the mmap path. TP>1 and online quantization are loader-side
+    preflights and are not visible at resolution time. ``selected`` only gates
+    the fallback warning: a component the config never offloads still resolves
+    the same values, but its incompatibility is not actionable, so it is not
+    logged.
     """
     one_shot = declaration is not None and path in declaration.one_shot_component_paths
     requested = declaration.component_backing.get(path, default_backing) if declaration is not None else default_backing
-    uses_allgather = config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and config.uses_allgather(component_type)
+    # The loader plans every selected DiT from the checkpoint, and AllGather
+    # only changes how each rank stages its shard, so a DiT keeps its mmap
+    # backing under a multi-rank AllGather. An encoder joins the plan only when
+    # its own transfer is rank-local, so that case must degrade here.
+    uses_allgather = (
+        component_type is TEXT_ENCODER_COMPONENT
+        and config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        and config.uses_allgather(component_type)
+    )
     fallback_reason = validate_disk_backing(
         backing=requested,
         one_shot=one_shot,
@@ -216,12 +229,15 @@ def _resolve_dit_children(
     *,
     one_shot: bool,
     backing: BackingKind,
+    backing_fallback_reason: str | None,
 ) -> tuple[ResolvedComponent, ...]:
     """Resolve the DiT submodules that own their residency.
 
     A submodule qualifies when the model declares it or when it is large enough
     that keeping it resident would defeat streaming. Submodules that are
-    themselves discovered DiTs are left to their own component.
+    themselves discovered DiTs are left to their own component. Children mirror
+    the parent's backing and fallback reason: they stream through the same
+    transport, so a degraded parent must not look like an unserved child.
     """
     children: list[ResolvedComponent] = []
     block_ids = {id(block) for block in stack.blocks}
@@ -240,7 +256,14 @@ def _resolve_dit_children(
         if id(module) in dit_module_ids:
             # Its own component owns this submodule; the parent must not place it.
             children.append(
-                ResolvedComponent(path=path, module=module, selected=False, one_shot=one_shot, backing=backing)
+                ResolvedComponent(
+                    path=path,
+                    module=module,
+                    selected=False,
+                    one_shot=one_shot,
+                    backing=backing,
+                    backing_fallback_reason=backing_fallback_reason,
+                )
             )
             continue
         nested_stack = _nested_block_stack(module, declared_attr)
@@ -256,6 +279,7 @@ def _resolve_dit_children(
                 on_demand=nested_stack is None,
                 one_shot=one_shot,
                 backing=backing,
+                backing_fallback_reason=backing_fallback_reason,
             )
         )
     return tuple(children)
@@ -444,6 +468,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
                     dit_module_ids,
                     one_shot=one_shot,
                     backing=backing,
+                    backing_fallback_reason=backing_fallback_reason,
                 )
         dits.append(
             ResolvedComponent(

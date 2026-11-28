@@ -423,6 +423,98 @@ class TestBackingResolution:
             is None
         )
 
+    def test_multirank_allgather_dit_keeps_checkpoint_mmap_backing(self, caplog):
+        # The loader plans every selected DiT, and AllGather only changes how a
+        # rank stages its shard, so the DiT must not advertise a PINNED
+        # fallback the backend never performs.
+        pipeline = _WanStylePipeline()
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.diffusion.offloader.plan_resolver"):
+            resolved = resolve_offload_plan(
+                pipeline,
+                _config(
+                    {"dit"},
+                    strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                    dp_size=2,
+                    dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+                ),
+            )
+
+        dit = resolved.dits[0]
+        assert dit.selected
+        assert dit.backing is BackingKind.CHECKPOINT_MMAP
+        assert dit.backing_fallback_reason is None
+        assert "falling back" not in caplog.text
+
+    def test_multirank_allgather_encoder_degrades_to_pinned(self):
+        # An encoder joins the loader plan only when its own transfer is
+        # rank-local, so the declaration must not survive an AllGather encoder.
+        class Pipeline(nn.Module):
+            _dit_modules: ClassVar[list[str]] = ["transformer"]
+            _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+            _vae_modules: ClassVar[list[str]] = []
+            _resident_modules: ClassVar[list[str]] = []
+            _offload_plan = OffloadPlan(
+                encoder_component_types={"text_encoder": "text_encoder"},
+                encoder_block_attrs={"text_encoder": ("encoder.block",)},
+                encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+                component_backing={"text_encoder": BackingKind.CHECKPOINT_MMAP},
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=2)
+                self.text_encoder = _PlainEncoder()
+
+        resolved = resolve_offload_plan(
+            Pipeline(),
+            _config(
+                {"text_encoder"},
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                dp_size=2,
+                dlo_transfers={"dit": "allgather", "text_encoder": "allgather"},
+            ),
+        )
+
+        encoder = resolved.encoders[0]
+        assert encoder.selected
+        assert encoder.backing is BackingKind.PINNED
+        assert encoder.backing_fallback_reason is not None
+
+    def test_dit_children_inherit_the_parent_fallback_reason(self):
+        class Refiner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([_DummyBlock() for _ in range(2)])
+
+        class Pipeline(nn.Module):
+            _dit_modules: ClassVar[list[str]] = ["transformer"]
+            _encoder_modules: ClassVar[list[str]] = []
+            _vae_modules: ClassVar[list[str]] = []
+            _resident_modules: ClassVar[list[str]] = []
+            _offload_plan = OffloadPlan(
+                block_attrs={"transformer": ("blocks",)},
+                offload_submodules={"refiner": "blocks"},
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=2)
+                self.transformer.refiner = Refiner()
+
+        resolved = resolve_offload_plan(
+            Pipeline(),
+            _config({"dit"}, strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, use_hsdp=True),
+        )
+
+        dit = resolved.dits[0]
+        assert dit.backing is BackingKind.PINNED
+        assert dit.children
+        assert [child.backing for child in dit.children] == [dit.backing] * len(dit.children)
+        assert [child.backing_fallback_reason for child in dit.children] == [dit.backing_fallback_reason] * len(
+            dit.children
+        )
+
     def test_one_shot_disk_encoder_degrades_to_pinned_with_reason(self):
         class Pipeline(nn.Module):
             _dit_modules: ClassVar[list[str]] = ["transformer"]

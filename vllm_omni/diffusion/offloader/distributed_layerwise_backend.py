@@ -1586,7 +1586,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     ) -> list[DistributedLayerwiseOffloadHook]:
         """Install one circular block ring with the shared slot protocol.
 
-        ``use_mmap`` selects rank-local staging from the checkpoint mmap
+        ``use_dit_mmap`` selects rank-local staging from the checkpoint mmap
         source.  Plan-owned transforms are passed for every transport: a
         multi-rank AllGather still packs each rank's shard from the raw
         checkpoint view, so it needs the same layout conversion as the

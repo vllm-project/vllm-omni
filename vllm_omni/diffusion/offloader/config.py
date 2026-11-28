@@ -459,12 +459,14 @@ def validate_disk_backing(
 ) -> str | None:
     """Return a fail-closed reason when a disk-streaming backing cannot be served.
 
-    Checkpoint-mmap streaming needs a single-rank, rank-local, HSDP-free
-    configuration. ``dp_size > 1`` with AllGather transport means the loader
-    re-assembles shards through a collective, which has no sequential mmap
-    source; ``PINNED`` (the loader fallback) is the only safe answer. The
-    loader-side preflight in ``build_checkpoint_mmap_plan`` separately rejects
-    TP>1 and online quantization, so those constraints do not surface here.
+    HSDP needs the ordinary loader, and a component the loader will not plan
+    from the checkpoint must not keep its mmap declaration. That planning gate
+    is per component: the loader always plans a selected DiT, but it plans an
+    encoder only when that encoder's own transfer is rank-local, so
+    ``dp_size > 1`` with AllGather transport leaves no sequential mmap source
+    for an encoder and ``PINNED`` is the only safe answer. The loader-side
+    preflight in ``build_checkpoint_mmap_plan`` separately rejects TP>1 and
+    online quantization, so those constraints do not surface here.
 
     ``DISK`` is a reserved declaration kind in this release: no backend can
     serve it yet, so it always reports a reason and callers degrade to
