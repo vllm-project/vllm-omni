@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -13,7 +15,7 @@ from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY, INTERRUPTION_KEY
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import prepare_stage0_window
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import MiniCPMO45SchedulerWindowPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
     _duplex_row_outputs,
@@ -78,7 +80,12 @@ def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_
                 "runtime_config": cfg,
             }
         }
-        replaced = prepare_stage0_window(request, update, segment_output_ids=generated, completed_terminator=terminator)
+        replaced = (
+            MiniCPMO45SchedulerWindowPolicy().prepare_append(
+                SimpleNamespace(), request, update, segment_output_ids=generated, completed_terminator=terminator
+            )
+            is not None
+        )
         plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
         result = runtime._stage_prefill_embeddings_only(
             state,
@@ -112,6 +119,56 @@ def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_
             torch.testing.assert_close(
                 result["inputs_embeds"][-2:], torch.cat([runtime._embed_token(i).reshape(1, -1) for i in expected])
             )
+
+
+@pytest.mark.parametrize("boundary", ["computed_eos", "deferred_eos", "passive_listen"])
+@pytest.mark.parametrize("with_tokenizer", [False, True])
+def test_interruption_reserves_only_the_missing_closure_rows(boundary, with_tokenizer):
+    runtime = stage0_vision_runtime()
+    if not with_tokenizer:
+        runtime.turn_eos_token_id, runtime.listen_token_id = 151717, 151705
+        runtime.stage_model.embed = torch.nn.Embedding(runtime.turn_eos_token_id + 1, 2)
+    state = _MiniCPMO45Stage0SessionState(session_id="resident", window_enabled=True)
+    runtime._stage_prefill_embeddings_only(state, None, input_text_token_ids=[21], epoch=0, seq=1)
+    generated, terminator = {
+        "computed_eos": ([51, runtime.turn_eos_token_id], runtime.listen_token_id),
+        "deferred_eos": ([51], runtime.turn_eos_token_id),
+        "passive_listen": ([], runtime.listen_token_id),
+    }[boundary]
+    payload = {"type": "text", INTERRUPTION_KEY: True, "force_listen": True}
+    cfg = {"duplex_boundary_token_ids": runtime._special_token_ids()} if with_tokenizer else {}
+    prompt = build_duplex_data_plane_prompt(
+        request_id="resident",
+        fence=DuplexFence("resident"),
+        session_config={},
+        runtime_config=cfg,
+        seq=2,
+        turn_seq=2,
+        payload=payload,
+        final=False,
+    )
+    update = StreamingUpdate(
+        mm_features=None,
+        prompt_token_ids=prompt["prompt_token_ids"],
+        max_tokens=8,
+        arrival_time=1,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    update.model_intermediate_buffer = prompt["model_intermediate_buffer"]
+    request = SimpleNamespace(request_id="resident", num_prompt_tokens=2)
+    MiniCPMO45SchedulerWindowPolicy().prepare_append(
+        SimpleNamespace(), request, update, segment_output_ids=generated, completed_terminator=terminator
+    )
+    kwargs = MiniCPMO45OmniForConditionalGeneration._minicpmo45_duplex_prefill_kwargs(
+        update.model_intermediate_buffer["duplex"], payload
+    )
+    result = runtime._stage_prefill_embeddings_only(state, None, **kwargs)
+    closure = [runtime.listen_token_id, runtime.unit_end_token_id]
+    if boundary == "deferred_eos":
+        closure.insert(0, runtime.turn_eos_token_id)
+    assert state.window_units[-1].token_ids[-(len(generated) + len(closure)) :] == [*generated, *closure]
+    assert result["input_token_ids"] == [*closure, runtime.unit_token_id]
+    assert len(update.prompt_token_ids) == result["num_input_tokens"]
 
 
 @pytest.mark.parametrize(

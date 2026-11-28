@@ -646,6 +646,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         is_speech: bool = False,
         force_listen: bool = False,
         interruption: bool = False,
+        interruption_turn_closed: bool = False,
         stage0_window: dict[str, object] | None = None,
         text_token_ids: list[int] | None = None,
         prepend_text_token_ids: list[int] | None = None,
@@ -799,9 +800,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                     # turn_eos + listen + </unit>. Its deferred speech
                     # terminator has not reached KV and must yield to LISTEN.
                     # EOS in the next unit leaves old speech as a continuation.
-                    embed_parts.append(self._embed_token(self.turn_eos_token_id))
-                    token_ids.append(self.turn_eos_token_id)
-                    closure_token_ids.append(self.turn_eos_token_id)
+                    if not interruption_turn_closed:
+                        embed_parts.append(self._embed_token(self.turn_eos_token_id))
+                        token_ids.append(self.turn_eos_token_id)
+                        closure_token_ids.append(self.turn_eos_token_id)
                     pending_terminator = self.listen_token_id
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None

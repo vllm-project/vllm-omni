@@ -2238,10 +2238,10 @@ class DuplexSessionRunner:
         # reached the stage; before_append skips silence that has not started.
         self.model_state.pending_silence_owner_id = None
 
-    def _real_input_waiting(self) -> bool:
+    def _real_input_waiting(self, *, include_queued: bool = True) -> bool:
         self._clear_completed_pending_silence()
         buffer = self.model_state.audio_buffer
-        if self._pending_input_appends > 0 or buffer.has_reserved():
+        if (include_queued and self._pending_input_appends > 0) or buffer.has_reserved():
             return True
         if self.run.partial_input_continuation_turn == (self.session.epoch, self.session.active_response_turn_id):
             # Text can release a reply without an audio commit. Keep partial PCM
@@ -2966,7 +2966,8 @@ class DuplexSessionRunner:
             or helpers.response_in_progress(session, self.tasks)
             or self.run.interruption_pending
             or self.tasks.append_tasks
-            or self._real_input_waiting()
+            # A clear only observes inputs preceding it in the session mailbox.
+            or self._real_input_waiting(include_queued=False)
             or self.model_state.committed_audio_payload is not None
             or self._deferred_silence is not None
             or any(t.get_name() == "duplex-continue" and not t.done() for t in self._background_tasks)

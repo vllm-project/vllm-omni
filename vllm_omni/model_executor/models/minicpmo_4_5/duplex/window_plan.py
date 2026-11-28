@@ -241,7 +241,11 @@ def plan_position_reanchor(
 def stage0_unit_closure_tokens(duplex: dict[str, object]) -> int:
     """Count the deferred terminator and </unit>, plus an interrupt's turn EOS."""
     payload = duplex.get("payload")
-    return 2 + int(isinstance(payload, dict) and payload.get(INTERRUPTION_KEY) is True)
+    return 2 + int(
+        isinstance(payload, dict)
+        and payload.get(INTERRUPTION_KEY) is True
+        and not duplex.get("interruption_turn_closed")
+    )
 
 
 def prepare_stage0_window(

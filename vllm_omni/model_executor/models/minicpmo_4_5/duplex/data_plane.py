@@ -54,6 +54,7 @@ class _EOSCursor:
 @dataclass(slots=True)
 class _RequestState:
     audio_offset: int = 0
+    audio_buffer_id: tuple[int, int] = (0, 0)
     #: Earliest producer turn that can still advance the cursor after a confirmed restart.
     audio_buffer_start_turn: int | None = None
     #: Producer turn and emitted prefix length of a possible restarted waveform.
@@ -73,6 +74,19 @@ class _RequestState:
 
     def turn(self, turn_id: int | None) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
+
+    def accept_audio_buffer(self, buffer_id: tuple[int, int], audio: object) -> bool:
+        if buffer_id < self.audio_buffer_id:
+            return False
+        if buffer_id == self.audio_buffer_id:
+            # A delta list was drained when published. Within a cumulative
+            # buffer, a shorter nonempty snapshot can only be an older one.
+            return not isinstance(audio, list) and not (0 < (_audio_num_samples(audio) or 0) < self.audio_offset)
+        self.audio_buffer_id = buffer_id
+        self.audio_offset = 0
+        self.audio_restart_candidate = None
+        self.audio_buffer_start_turn = None
+        return True
 
     def discard_stale_audio(self, num_samples: int, turn_id: int | None) -> None:
         if self.audio_buffer_start_turn is None or (turn_id is not None and turn_id >= self.audio_buffer_start_turn):
@@ -140,6 +154,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         if state is None:
             return
         state.audio_offset = 0
+        state.audio_buffer_id = (0, 0)
         state.audio_restart_candidate = None
         state.audio_buffer_start_turn = None
         state.turns.pop(None, None)
@@ -279,6 +294,14 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         if interruption and direct_decision is None:
             return
         raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
+        identity = _coerce_int_list(mm_output.get("duplex_audio_buffer_id"))
+        if (
+            not stale_epoch
+            and request_state is not None
+            and len(identity) == 2
+            and not request_state.accept_audio_buffer((identity[0], identity[1]), raw_audio)
+        ):
+            return
         if stale:
             # A late TTS snapshot still contributes PCM to this request's
             # next cumulative waveform. Stage 0 latents and delta lists do not.

@@ -326,7 +326,7 @@ def build_duplex_data_plane_prompt(
     token_budget = _duplex_audio_token_budget(payload) + vision_tokens
     if isinstance(payload, dict) and payload.get("type") == "text":
         if payload.get(INTERRUPTION_KEY) is True:
-            text_tokens = 1  # Stage 0 embeds its native turn EOS.
+            text_tokens = 1  # Reserve a turn EOS until the scheduler knows the previous unit's accepted tail.
         else:
             text_ids = payload.get("text_token_ids")
             if not isinstance(text_ids, list) or not text_ids:

@@ -529,6 +529,21 @@ async def test_clear_after_passive_listen(h, after_reply):
         assert len(h.port.submissions) == submissions
 
 
+@pytest.mark.parametrize("input_first", [False, True])
+async def test_clear_observes_mailbox_input_order(h, input_first):
+    await h.run(append_audio())
+    await h.deliver_and_settle(
+        _stage0(h.stage0_request_id(), [LISTEN], "", stop=True), stage_id=0, segment_finished=True, model_turn_id=0
+    )
+    clear, append = commands.ClearOutputAudio(), append_audio()
+    before = len(h.port.submissions)
+    for command in (append, clear) if input_first else (clear, append):
+        h.submit(command)
+    assert types(await h.settle()).count("output_audio_buffer.cleared") == 1
+    assert h.runner.run.interruption_pending is input_first
+    assert len(h.port.submissions) == before + 1 + int(input_first)
+
+
 @pytest.mark.parametrize("h", [{"stages": 3}], indirect=True)
 async def test_clear_precedes_a_queued_passive_listen(h):
     await h.run(append_audio())

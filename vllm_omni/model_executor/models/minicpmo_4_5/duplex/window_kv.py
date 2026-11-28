@@ -1045,6 +1045,21 @@ class MiniCPMO45SchedulerWindowPolicy:
         completed_terminator: int | None,
     ) -> int | None:
         info = getattr(update, "model_intermediate_buffer", None)
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        payload = duplex.get("payload") if isinstance(duplex, dict) else None
+        if isinstance(payload, dict) and payload.get(INTERRUPTION_KEY) is True:
+            # The prompt reserves an EOS before the previous unit's deferred LISTEN.
+            # Release that row if the accepted KV already ends in EOS or the
+            # previous unit only listened. A sampled but uncomputed EOS still needs a row.
+            ids = (duplex.get("runtime_config") or {}).get("duplex_boundary_token_ids") or {}
+            # Audio-only sessions may omit the tokenizer. Use the released 4.5 vocabulary there.
+            turn_eos = ids.get("turn_eos_token_id", 151717)
+            listen = ids.get("listen_token_id", 151705)
+            if (segment_output_ids and segment_output_ids[-1] == turn_eos) or (
+                not segment_output_ids and completed_terminator == listen
+            ):
+                duplex["interruption_turn_closed"] = True
+                update.prompt_token_ids = update.prompt_token_ids[:-1]
         replay_enabled = duplex_window_replay_enabled(info)
         if replay_enabled:
             self.snapshot_window(request)
@@ -1061,7 +1076,6 @@ class MiniCPMO45SchedulerWindowPolicy:
                 segment_output_ids=segment_output_ids,
                 completed_terminator=completed_terminator,
             )
-        duplex = info.get("duplex") if isinstance(info, dict) else None
         if isinstance(duplex, dict) and isinstance(duplex.get("stage0_window"), dict):
             request._minicpmo45_window_planned = True
         replaced = reanchored is None and prepare_stage0_window(
