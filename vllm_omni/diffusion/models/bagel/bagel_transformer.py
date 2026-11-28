@@ -1262,6 +1262,38 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
     return pos_ids
 
 
+def _step_image_latents(
+    model_output: torch.Tensor,
+    timestep: torch.Tensor,
+    sample: torch.Tensor,
+    dt: torch.Tensor,
+    scheduler: object | None,
+    scheduler_kwargs: dict,
+    update_indexes: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Step only generated rows so fixed references cannot enter the scheduler's log-probability."""
+    velocity = model_output.to(sample.device)
+    current = sample
+    if update_indexes is not None:
+        current = sample.index_select(0, update_indexes)
+        velocity = velocity.index_select(0, update_indexes)
+        if scheduler_kwargs.get("prev_sample") is not None:
+            scheduler_kwargs = {
+                **scheduler_kwargs,
+                "prev_sample": scheduler_kwargs["prev_sample"].index_select(0, update_indexes),
+            }
+    if scheduler is None:
+        updated, log_prob = current - velocity * dt, None
+    else:
+        out = scheduler.step(velocity, timestep, current, dt, **scheduler_kwargs)
+        updated, log_prob = out.prev_sample, getattr(out, "log_prob", None)
+    if update_indexes is None:
+        return updated, log_prob
+    result = sample.to(dtype=updated.dtype, copy=True)  # Preserve the caller's latent buffer.
+    result.index_copy_(0, update_indexes, updated)
+    return result, log_prob
+
+
 class Bagel(CFGParallelMixin, nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
@@ -1530,6 +1562,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_indexes: torch.LongTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
+        return_inputs: bool = False,
     ):
         padded_latent = vae_model.encode(padded_images)
 
@@ -1574,6 +1607,15 @@ class Bagel(CFGParallelMixin, nn.Module):
             **extra_inputs,
         )
         past_key_values = output.past_key_values
+
+        if return_inputs:
+            # ``packed_latent`` already carries the projection, timestep
+            # and position embedding, so these are the rows the layers saw.
+            return past_key_values, {
+                "rows": packed_sequence,
+                "positions": packed_position_ids,
+                "gen_indexes": packed_vae_token_indexes,
+            }
 
         return past_key_values
 
@@ -1638,6 +1680,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         vit_token_seqlens: torch.IntTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
+        return_inputs: bool = False,
     ):
         packed_text_embedding = self.language_model.forward(
             packed_text_ids=packed_text_ids,
@@ -1676,6 +1719,15 @@ class Bagel(CFGParallelMixin, nn.Module):
             **extra_inputs,
         )
         past_key_values = output.past_key_values
+
+        if return_inputs:
+            # The rows this segment feeds the layers.  A trainer with no
+            # ViT (or connector) cannot rebuild them, so an RL replay is
+            # handed them instead of recomputing.
+            return past_key_values, {
+                "rows": packed_sequence,
+                "positions": packed_position_ids,
+            }
 
         return past_key_values
 
@@ -1840,13 +1892,16 @@ class Bagel(CFGParallelMixin, nn.Module):
         frame_condition_token_indexes: torch.LongTensor | None = None,
     ):
         x_t = packed_init_noises
-        # Snapshot the pinned subtensor BEFORE the denoise loop touches
-        # x_t; the cond positions in packed_init_noises hold the
-        # VAE-encoded conditioning latent that must be preserved verbatim.
-        pinned_x_t = None
-        if frame_condition_token_indexes is not None:
+        update_indexes = None
+        if frame_condition_token_indexes is not None and frame_condition_token_indexes.numel() > 0:
             frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
-            pinned_x_t = x_t[frame_condition_token_indexes].clone()
+            update_mask = torch.ones(x_t.shape[0], dtype=torch.bool, device=x_t.device)
+            update_mask[frame_condition_token_indexes] = False
+            update_indexes = update_mask.nonzero(as_tuple=True)[0]
+            if scheduler is not None and update_indexes.numel() == 0:
+                raise ValueError("A conditioned scheduler rollout requires at least one generated token.")
+        else:
+            frame_condition_token_indexes = None
 
         # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
         # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
@@ -1891,6 +1946,8 @@ class Bagel(CFGParallelMixin, nn.Module):
                 return_trajectory_latents=return_trajectory_latents,
                 scheduler=scheduler,
                 scheduler_kwargs=scheduler_kwargs,
+                frame_condition_token_indexes=frame_condition_token_indexes,
+                update_indexes=update_indexes,
             )
 
         # ── SP + CFG: sequential single-branch forwards ──
@@ -1949,13 +2006,11 @@ class Bagel(CFGParallelMixin, nn.Module):
                         cfg_renorm_min,
                     )
 
-                if scheduler is not None:
-                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                    x_t = out.prev_sample
-                    if trajectory_log_probs is not None and out.log_prob is not None:
-                        trajectory_log_probs.append(out.log_prob)
-                else:
-                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                x_t, log_prob = _step_image_latents(
+                    v_t, timesteps[i], x_t, dts[i], scheduler, _sched_kw, update_indexes
+                )
+                if trajectory_log_probs is not None and log_prob is not None:
+                    trajectory_log_probs.append(log_prob)
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
                     trajectory_timesteps.append(timesteps[i])
@@ -1986,14 +2041,11 @@ class Bagel(CFGParallelMixin, nn.Module):
                     packed_seqlens=packed_seqlens,
                     past_key_values=past_key_values,
                 )
-                if scheduler is not None:
-                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                    x_t = out.prev_sample
-                    out_log_prob = getattr(out, "log_prob", None)
-                    if trajectory_log_probs is not None and out_log_prob is not None:
-                        trajectory_log_probs.append(out_log_prob)
-                else:
-                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                x_t, log_prob = _step_image_latents(
+                    v_t, timesteps[i], x_t, dts[i], scheduler, _sched_kw, update_indexes
+                )
+                if trajectory_log_probs is not None and log_prob is not None:
+                    trajectory_log_probs.append(log_prob)
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
                     trajectory_timesteps.append(timesteps[i])
@@ -2050,19 +2102,9 @@ class Bagel(CFGParallelMixin, nn.Module):
                 cfg_branch_caches=cfg_branch_caches,
             )
 
-            if scheduler is not None:
-                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                x_t = out.prev_sample
-                if trajectory_log_probs is not None and out.log_prob is not None:
-                    trajectory_log_probs.append(out.log_prob)
-            else:
-                x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
-                if pinned_x_t is not None:
-                    # i2v: restore cond positions to their encoded-image
-                    # latent.  Matches upstream PR #33 lance.py line 1712:
-                    #     x_t[mse_indexes] = x_t[mse_indexes] - v_t[mse_indexes] * dts[i]
-                    # (cond positions are excluded from the update).
-                    x_t[frame_condition_token_indexes] = pinned_x_t
+            x_t, log_prob = _step_image_latents(v_t, timesteps[i], x_t, dts[i], scheduler, _sched_kw, update_indexes)
+            if trajectory_log_probs is not None and log_prob is not None:
+                trajectory_log_probs.append(log_prob)
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
                 trajectory_timesteps.append(timesteps[i])
@@ -2095,6 +2137,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         scheduler: object | None = None,
         scheduler_kwargs: dict | None = None,
         frame_condition_token_indexes: torch.LongTensor | None = None,
+        update_indexes: torch.Tensor | None = None,
     ):
         """CFG parallel denoising loop: each rank computes one CFG branch.
 
@@ -2186,13 +2229,9 @@ class Bagel(CFGParallelMixin, nn.Module):
                 branches_kwargs=branches_kwargs,
             )
 
-            if scheduler is not None:
-                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                x_t = out.prev_sample
-                if trajectory_log_probs is not None and out.log_prob is not None:
-                    trajectory_log_probs.append(out.log_prob)
-            else:
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+            x_t, log_prob = _step_image_latents(v_t, timesteps[i], x_t, dts[i], scheduler, _sched_kw, update_indexes)
+            if trajectory_log_probs is not None and log_prob is not None:
+                trajectory_log_probs.append(log_prob)
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
                 trajectory_timesteps.append(timesteps[i])
