@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -33,7 +33,6 @@ from vllm_omni.model_extras.cosmos3 import (
     reject_multiview_negative_fields,
     validate_multiview_request,
 )
-from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames, required_lidar_sweeps
 
 from .action import find_closest_target_size
 from .lidar_vae import Cosmos3LidarDecoder, Cosmos3LidarEncoder
@@ -52,6 +51,7 @@ from .multiview_prompts import (
     control_emphasis,
     format_rig_view_captions,
 )
+from .multiview_vae import MultiviewVaeMixin
 from .pipeline_cosmos3 import (
     COSMOS3_TRANSFER_SYSTEM_PROMPT,
     Cosmos3OmniDiffusersPipeline,
@@ -78,9 +78,6 @@ COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
 # Rates and frame counts outside these bounds are allowed with a warning.
 COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE = (10.0, 30.0)
 COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE = (24, 400)
-# Measured LiDAR sweeps conditioned when lidar.condition_path omits a count,
-# as in the reference inference.
-COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # The tokenizer appends eos and vision_start after truncating. Derive the
 # request ceiling from the sparse attention's single fixed UND capacity so the
 # two cannot drift and accidentally trigger shape-specific recompilation.
@@ -398,7 +395,7 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
+class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
     """Joint camera/LiDAR and camera-only generation with checkpoint-owned view layouts."""
 
     # The generic engine warmup has no per-camera WSM inputs and uses image
@@ -528,6 +525,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         num_frames: int,
         keep_first: bool,
         require_complete: bool = False,
+        load_frames: Callable[..., torch.Tensor] = media_to_uint8_cthw,
     ) -> torch.Tensor:
         prepared = []
         for view in views:
@@ -537,7 +535,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
                     continue
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
-            frames = media_to_uint8_cthw(
+            frames = load_frames(
                 value,
                 height=height,
                 width=width,
@@ -550,67 +548,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
         camera_major = torch.cat(prepared, dim=1)
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
-
-    def _encode_multiview_video(
-        self,
-        camera_major_video: torch.Tensor,
-        *,
-        num_views: int,
-        frames_per_view: int,
-    ) -> torch.Tensor:
-        expected_frames = num_views * frames_per_view
-        if camera_major_video.ndim != 5 or camera_major_video.shape[2] != expected_frames:
-            raise ValueError(
-                "Cosmos3 multiview pixel video must be camera-major [1, 3, V*F, H, W]: "
-                f"shape={tuple(camera_major_video.shape)}, V={num_views}, F={frames_per_view}."
-            )
-        per_view = [
-            self._encode_video_tensor(camera_major_video[:, :, view * frames_per_view : (view + 1) * frames_per_view])
-            for view in range(num_views)
-        ]
-        latent_frames = {int(latent.shape[2]) for latent in per_view}
-        if len(latent_frames) != 1:
-            raise ValueError(f"Cosmos3 multiview per-camera VAE encodes have unequal lengths: {latent_frames}.")
-        return torch.cat(per_view, dim=2)
-
-    def _decode_multiview_latents(
-        self,
-        camera_major_latents: torch.Tensor,
-        *,
-        num_views: int,
-        latent_frames_per_view: int,
-    ) -> torch.Tensor:
-        if (
-            num_views <= 0
-            or latent_frames_per_view <= 0
-            or camera_major_latents.ndim != 5
-            or camera_major_latents.shape[2] != num_views * latent_frames_per_view
-        ):
-            raise ValueError(
-                "Cosmos3 multiview latents must be camera-major before decode: "
-                f"shape={tuple(camera_major_latents.shape)}, V={num_views}, F={latent_frames_per_view}."
-            )
-        decoded_output = None
-        for view in range(num_views):
-            decoded_view = self._decode_latents(
-                camera_major_latents.narrow(2, view * latent_frames_per_view, latent_frames_per_view)
-            )
-            if decoded_view.ndim != 5 or decoded_view.shape[2] <= 0:
-                raise ValueError("Cosmos3 multiview VAE decode must return non-empty [B, C, F, H, W] clips.")
-            if decoded_output is None:
-                view_shape = decoded_view.shape
-                frames_per_view = view_shape[2]
-                output_shape = (*view_shape[:2], num_views * frames_per_view, *view_shape[3:])
-                decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
-            elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
-                raise ValueError("Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes.")
-            # Copy each camera before decoding the next: retaining the GPU clips
-            # and concatenating them would require two full multiview videos.
-            decoded_output.narrow(2, view * frames_per_view, frames_per_view).copy_(decoded_view)
-            del decoded_view
-
-        assert decoded_output is not None
-        return decoded_output
 
     def _mask_transfer_noise(
         self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
@@ -641,7 +578,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _prepare_multiview_latents(
         self,
         *,
-        target_pixels: torch.Tensor | None,
+        vision_latents: torch.Tensor | None,
         condition_indexes: Sequence[int],
         num_views: int,
         num_frames: int,
@@ -672,13 +609,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         condition_mask = torch.zeros(1, 1, shape[2], 1, 1, device=self.device, dtype=self.sampling_dtype)
         condition_latents = torch.zeros_like(noise)
         if condition_indexes:
-            if target_pixels is None:
+            if vision_latents is None:
                 raise ValueError("Cosmos3 multiview condition indexes require per-camera vision inputs.")
-            encoded = self._encode_multiview_video(
-                target_pixels,
-                num_views=num_views,
-                frames_per_view=num_frames,
-            )
+            encoded = vision_latents
             if tuple(encoded.shape) != shape:
                 raise ValueError(
                     f"Cosmos3 multiview target VAE latent shape mismatch: expected={shape}, got={tuple(encoded.shape)}."
@@ -688,36 +621,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 condition_latents[:, :, index : index + 1] = encoded[:, :, index : index + 1]
         latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
         return latents, 1.0 - condition_mask, condition_latents
-
-    def _encode_lidar_condition(
-        self, lidar_request: Mapping[str, Any], num_sweeps: int, target_shape: Sequence[int]
-    ) -> torch.Tensor:
-        """Encode the measured sweeps that condition the start of the generated LiDAR.
-
-        The reference encodes the prefix inside an otherwise empty (zero) target
-        clip. The streaming tokenizer is frame-causal within a chunk, but how much
-        history a chunk keeps depends on that chunk's length, so encoding the bare
-        prefix would change the latents of a trailing partial chunk. Zero-padding
-        the prefix to the target's chunk boundary reproduces the full clip's chunk
-        lengths for every chunk holding prefix sweeps; the causal padding cannot
-        affect the prefix latents.
-        """
-        count = lidar_request.get("num_conditional_sweeps", COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS)
-        if not 0 < count < num_sweeps:
-            raise ValueError(
-                f"Cosmos3 lidar.num_conditional_sweeps={count} must leave at least one of the request's "
-                f"{num_sweeps} LiDAR sweeps to generate."
-            )
-        frames = load_lidar_frames(lidar_request["condition_path"], num_sweeps=count)
-        chunk = self.lidar_encoder.config["streaming_chunk_frames"]
-        padded = min(math.ceil(count / chunk) * chunk, num_sweeps)
-        if padded > count:
-            frames = torch.cat([frames, frames.new_zeros(frames.shape[0], padded - count, *frames.shape[2:])], dim=1)
-        latents = self.lidar_encoder(frames)[:, :, :count].to(device=self.device, dtype=self.sampling_dtype)
-        expected = (*target_shape[:2], count, *target_shape[3:])
-        if tuple(latents.shape) != expected:
-            raise ValueError(f"Cosmos3 LiDAR condition latents must have shape {expected}, got {tuple(latents.shape)}.")
-        return latents
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) != 1:
@@ -759,29 +662,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         has_vision = bool(known_views)
         completion = has_vision and len(known_views) < num_views
         vision_kind = _media_kind(self._view_value(views[known_views[0]], "vision")) if has_vision else None
-        target_pixels = None
-        if has_vision:
-            target_pixels = self._prepare_camera_major_pixels(
-                views,
-                field="vision",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=condition_video_as_image,
-                require_complete=completion,
-            )
-        control_pixels = (
-            self._prepare_camera_major_pixels(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
-            )
-            if selected_hints
-            else None
-        )
 
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         raw_indexes = multiview.get("condition_frame_indexes_vision")
@@ -807,13 +687,28 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 view * latent_frames_per_view + frame for view in range(num_views) for frame in local_indexes
             ]
 
+        # Only views with conditioned latent frames need their vision encoded.
+        vision_views = sorted({index // latent_frames_per_view for index in condition_indexes}) if has_vision else []
+        vision_latents, control_latents, lidar_control_latents, lidar_condition_latents = self._encode_inputs(
+            views=views,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            vision_views=vision_views,
+            keep_first=condition_video_as_image,
+            require_complete=completion,
+            encode_control=bool(selected_hints),
+            lidar_request=lidar_request,
+        )
+
         generator = sp.generator
         seed = self._resolve_seed(sp, generator)
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
         injected_latents = sp.latents if isinstance(sp.latents, torch.Tensor) else None
         latents, velocity_mask, condition_latents = self._prepare_multiview_latents(
-            target_pixels=target_pixels,
+            vision_latents=vision_latents,
             condition_indexes=condition_indexes,
             num_views=num_views,
             num_frames=num_frames,
@@ -822,16 +717,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             generator=generator,
             injected_latents=injected_latents,
         )
-        control_latents = (
-            self._encode_multiview_video(
-                control_pixels,
-                num_views=num_views,
-                frames_per_view=num_frames,
-            )
-            if control_pixels is not None
-            else None
-        )
-        del target_pixels, control_pixels
+        del vision_latents
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
@@ -858,15 +744,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         items.append(MaskItem(camera_shape, num_views, seconds_per_frame=camera_rate))
         targets = [latents]
-        lidar_control_latents = None
-        lidar_condition_latents = None
         lidar_condition_frames = 0
         if lidar_request is not None:
             lidar_config = deployment["lidar"]
-            sweeps = required_lidar_sweeps(num_frames, frame_rate, lidar_config["fps"])
-            lidar_frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
-            lidar_control_latents = self.lidar_encoder(lidar_frames).to(device=self.device, dtype=self.dtype)
-            del lidar_frames
             # Continue the request RNG after camera noise; reseeding would
             # reuse its initial stream and discard caller-supplied RNG state.
             lidar_noise = randn_tensor(
@@ -875,8 +755,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 device=self.device,
                 dtype=self.sampling_dtype,
             )
-            if lidar_request.get("condition_path") is not None:
-                lidar_condition_latents = self._encode_lidar_condition(lidar_request, sweeps, lidar_noise.shape)
+            if lidar_condition_latents is not None:
                 lidar_condition_frames = int(lidar_condition_latents.shape[2])
                 # As in the reference, the sample starts clean on the measured prefix.
                 lidar_noise[:, :, :lidar_condition_frames] = lidar_condition_latents
@@ -1020,16 +899,24 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
         del condition_latents, control_latents, lidar_control_latents, lidar_condition_latents, shared_kwargs
-        latents = final_targets[0]
-        video = self._decode_multiview_latents(
-            latents,
+        decoded = self._decode_outputs(
+            final_targets,
             num_views=num_views,
-            latent_frames_per_view=latent_frames_per_view,
-        ).clamp_(-1, 1)
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            return_lidar=lidar_request is not None and lidar_request.get("return_output", False),
+        )
+        if decoded is None:
+            # Only the output rank holds the decoded request output.
+            return DiffusionOutput(
+                output=None,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+        video, lidar_output = decoded
         payload = {"video": video}
         lidar_metadata = {}
-        if lidar_request is not None and lidar_request.get("return_output", False):
-            lidar_output = self.lidar_decoder(final_targets[1])
+        if lidar_output is not None:
             payload["lidar"] = lidar_output
             lidar_config = self.lidar_decoder.config
             lidar_metadata = {
