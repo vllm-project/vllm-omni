@@ -18,7 +18,8 @@ class StepAudio2Adapter(ARTTSAdapter):
     Step-Audio2 runs a single thinker stage that emits audio tokens after a
     ``<tts_start>`` marker, with no uploaded-voice / ref-audio handling.
     Mini uses a native chat prompt string; Base encodes its two segments into
-    ``prompt_token_ids`` to match upstream tokenization boundaries.
+    ``prompt_token_ids`` to match upstream tokenization boundaries; Think is
+    served via ``/v1/chat/completions`` and rejected on ``/v1/audio/speech``.
     """
 
     stage_keys = frozenset({"step_audio2_thinker"})
@@ -36,7 +37,8 @@ class StepAudio2Adapter(ARTTSAdapter):
 
         Mini leaves the assistant turn open (omitting ``<|EOT|>``) so the
         thinker continues by generating audio tokens; Base encodes instructions
-        and input text separately into ``prompt_token_ids``.
+        and input text separately into ``prompt_token_ids``; Think raises
+        ``ValueError`` because upstream defines Think as a two-pass chat flow.
         """
         system_prompt = request.instructions or "以自然的语速读出下面的文字。"
         # Deploy configs mark non-Mini checkpoints through stage-0 hf_overrides.
@@ -49,6 +51,12 @@ class StepAudio2Adapter(ARTTSAdapter):
             ids = tokenizer.encode(system_prompt + "\n", add_special_tokens=False)
             ids += tokenizer.encode(request.input + "<tts_start>", add_special_tokens=False)
             return PreparedRequest(prompt={"prompt_token_ids": ids}, tts_params={}, model_type="step_audio2")
+        if variant == "think":
+            raise ValueError(
+                "/v1/audio/speech does not support Step-Audio2 variant 'think'; "
+                "use /v1/chat/completions for two-pass reasoning with Step-Audio-2-mini-Think "
+                "or deploy Step-Audio-2-mini-Base for TTS."
+            )
         if variant != "mini":
             raise ValueError(f"/v1/audio/speech does not support Step-Audio2 variant {variant!r}")
         prompt = {
