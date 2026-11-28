@@ -12,7 +12,7 @@ Only online activation scaling is currently supported.
 
 | Device                         | Support                                           |
 | ------------------------------ | ------------------------------------------------- |
-| NVIDIA Blackwell GPU (SM 100+) | ✅                                                |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ (❌ on SM 120)                                 |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅                                                |
 | NVIDIA Ampere GPU (SM 80+)     | ✅                                                |
 | AMD ROCm                       | Kernel dispatch enabled; model validation pending |
@@ -21,6 +21,15 @@ Only online activation scaling is currently supported.
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide.
+
+Int8 W8A8 does not run on workstation/consumer Blackwell (`sm_120`, for
+example RTX 50-series GPUs) with vLLM 0.33.0 or 0.34.0. vLLM's CUTLASS W8A8
+kernel raises `Int8 not supported on SM120` when an Int8 linear runs. This was
+reproduced with
+`tests/diffusion/quantization/test_int8_config.py::TestCudaInt8Smoke` on an
+RTX 5090 D v2; see
+[vllm-project/vllm#54316](https://github.com/vllm-project/vllm/pull/54316).
+Use FP8 on these GPUs.
 
 ROCm uses vLLM's INT8 kernel selection for both online and serialized weights.
 The common linear wrapper flattens batched inputs for the upstream matrix
