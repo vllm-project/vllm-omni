@@ -775,6 +775,103 @@ def _rocm_flash_attn_varlen_func():
         return flash_attn_varlen_func
 
 
+def _npu_gather_paged_kv(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq_len: int,
+    kv_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather the visible KV window for the NPU fused attention kernel.
+
+    The Ascend kernel reads one contiguous buffer, so the paged KV has to be
+    packed first. Only the first ``kv_len`` tokens are visible to the kernel,
+    so the gather is bounded by ``ceil(kv_len / block_size)`` blocks instead of
+    the padded ``max_seq_len`` capacity: the block ids of the visible window
+    are a prefix of the block table row, so the packed tensors are identical
+    while the cache read shrinks with the request instead of with the padded
+    capacity.
+
+    Whole blocks are gathered in one index_select instead of per-token
+    advanced indexing: the block-major flatten + truncate is byte-identical
+    (same block_table row mapping) and measurably faster on NPU (-4.1% full
+    40-chunk request at SP4, -7.3% steady chunk interval at SP8 on 910C;
+    477-frame precodec output bit-identical).
+    """
+    block_size = key_cache.shape[1]
+    window = min(int(kv_len), int(max_seq_len))
+    num_blocks = (window + block_size - 1) // block_size
+    block_ids = block_table[0, :num_blocks].long()
+    packed_k = key_cache.index_select(0, block_ids).flatten(0, 1)[:window]
+    packed_v = value_cache.index_select(0, block_ids).flatten(0, 1)[:window]
+    return packed_k, packed_v
+
+
+def _npu_fused_paged_attention(
+    query_flat: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    *,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    softmax_scale: float,
+    npu_lengths: tuple[int, int] | None,
+) -> torch.Tensor:
+    """Run the Ascend fused paged attention over the gathered KV window.
+
+    Split out of :func:`ar_diffusion_paged_attention` so the NPU-only branch
+    can be exercised on CPU CI: the kernel call is the only NPU-specific
+    piece, the gather and the length bookkeeping around it are plain tensor
+    work that a CPU test can pin.
+
+    ``npu_lengths`` carries the host-known ``(query_tokens, kv_tokens)`` of a
+    singleton request, so the branch never reads the lengths back from the
+    device. Without it the lengths are derived from ``query_start_loc`` and
+    ``seq_lens``, which costs a device-to-host sync on every call.
+    """
+    if npu_lengths is not None:
+        q_len, kv_len = npu_lengths
+        if (
+            query_start_loc.numel() != 2
+            or seq_lens.numel() != 1
+            or q_len != query_flat.shape[0]
+            or q_len <= 0
+            or not 0 < kv_len <= max_seq_len
+        ):
+            raise ValueError("NPU host lengths require a matching singleton query and valid KV length")
+        actual_seq_q, actual_seq_kv = [q_len], [kv_len]
+    else:
+        kv_len = int(seq_lens[0].item())
+        q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
+        actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
+        actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
+
+    packed_k, packed_v = _npu_gather_paged_kv(
+        key_cache,
+        value_cache,
+        block_table,
+        max_seq_len,
+        kv_len,
+    )
+
+    import torch_npu
+
+    out = torch_npu.npu_fusion_attention(
+        query_flat.contiguous(),
+        packed_k.contiguous(),
+        packed_v.contiguous(),
+        head_num=query_flat.shape[1],
+        input_layout="TND",
+        actual_seq_qlen=actual_seq_q,
+        actual_seq_kvlen=actual_seq_kv,
+        scale=float(softmax_scale),
+        keep_prob=1.0,
+    )[0]
+    return out
+
+
 def ar_diffusion_paged_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -811,48 +908,17 @@ def ar_diffusion_paged_attention(
         # npu_fusion_attention kernel over the packed (contiguous) window.
         # Mirrors the ROCm gather path; the reference implementation below is
         # the correctness oracle but pays per-block gathers and fp32 einsum.
-        import torch_npu
-
-        if npu_lengths is not None:
-            q_len, kv_len = npu_lengths
-            if (
-                query_start_loc.numel() != 2
-                or seq_lens.numel() != 1
-                or q_len != query_flat.shape[0]
-                or q_len <= 0
-                or not 0 < kv_len <= max_seq_len
-            ):
-                raise ValueError("NPU host lengths require a matching singleton query and valid KV length")
-            actual_seq_q, actual_seq_kv = [q_len], [kv_len]
-
-        # Gather whole blocks in one index_select instead of per-token
-        # advanced indexing: the block-major flatten + truncate is byte-identical
-        # (same block_table row mapping) and measurably faster on NPU
-        # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
-        # SP8 on 910C; 477-frame precodec output bit-identical).
-        block_size = key_cache.shape[1]
-        num_blocks = (int(max_seq_len) + block_size - 1) // block_size
-        block_ids = block_table[0, :num_blocks].long()
-        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
-        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
-        if npu_lengths is None:
-            kv_len = int(seq_lens[0].item())
-            q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
-            actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
-            actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
-        packed_k = gathered_k[:kv_len]
-        packed_v = gathered_v[:kv_len]
-        out = torch_npu.npu_fusion_attention(
-            query_flat.contiguous(),
-            packed_k.contiguous(),
-            packed_v.contiguous(),
-            head_num=query_flat.shape[1],
-            input_layout="TND",
-            actual_seq_qlen=actual_seq_q,
-            actual_seq_kvlen=actual_seq_kv,
-            scale=float(softmax_scale),
-            keep_prob=1.0,
-        )[0]
+        out = _npu_fused_paged_attention(
+            query_flat,
+            key_cache,
+            value_cache,
+            block_table=block_table,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=softmax_scale,
+            npu_lengths=npu_lengths,
+        )
         if batched:
             return out.reshape(query.shape)
         return out
