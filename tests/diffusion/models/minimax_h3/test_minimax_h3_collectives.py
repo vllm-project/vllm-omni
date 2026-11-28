@@ -83,6 +83,8 @@ def _collective_worker(rank, rendezvous, backend):
         model.od_config = SimpleNamespace(diffusion_offload_config=None, enable_layerwise_offload=False)
         model.video_vae = VisualCodec()
         model.audio_vae = AudioCodec()
+        # _encode_local_media consults the lifecycle flag before the codecs.
+        model.load_vae_encoder = True
         model.partition = "combined"
         model.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
         model.text_encoder_tp_size = 2
@@ -221,6 +223,8 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
     model = object.__new__(module.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(model)
     model.device = torch.device("cpu")
+    # _encode_local_media consults the lifecycle flag before the codecs.
+    model.load_vae_encoder = True
     model.video_vae = SimpleNamespace(is_distributed_enabled=lambda: False)
     model.audio_vae = SimpleNamespace()
     model._broadcast_media_conditioning = lambda conditioning: conditioning

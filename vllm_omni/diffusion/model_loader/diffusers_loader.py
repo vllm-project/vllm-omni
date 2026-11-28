@@ -62,9 +62,10 @@ from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
     resolve_offload,
+    validate_disk_backing,
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
-from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
+from vllm_omni.diffusion.offloader.offload_plan import BackingKind, OffloadPlan, get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
@@ -801,8 +802,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
                 tensor_parallel_size = int(self.parallel_config.tensor_parallel_size)
                 use_hsdp = bool(self.parallel_config.use_hsdp)
-                data_parallel_size = int(self.parallel_config.data_parallel_size)
-                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size)
+                data_parallel_size = int(self.parallel_config.data_parallel_size or 1)
+                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size or 1)
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)
@@ -872,29 +873,60 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 hwr_active = hwr_state is not None
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
+                if distributed_offload and not hwr_active and not self._force_canonical_load:
                     lora_backend = self.od_config.lora_backend
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
                         self.od_config.lora_path
                     )
-                    plan_result = build_checkpoint_mmap_plan(
-                        model,
-                        dit_modules=tuple(zip(modules.dit_names, modules.dits)),
-                        sources=weight_sources,
-                        model_path=str(self.od_config.model) or None,
-                        tensor_parallel_size=tensor_parallel_size,
-                        use_hsdp=use_hsdp,
-                        online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
-                        has_distilled_lora=has_distilled_lora,
+                    # Plan only the components the user selected. The encoder
+                    # must not require the DiT to be selected (component
+                    # isolation, RFC #10943).
+                    dit_mmap_modules = (
+                        tuple(zip(modules.dit_names, modules.dits)) if resolved_offload.offloads(DIT_COMPONENT) else ()
                     )
-                    self.host_weight_plan = plan_result.plan
+                    encoder_mmap_modules = self._mmap_encoder_modules(
+                        modules,
+                        plan,
+                        selected=resolved_offload.offloads(TEXT_ENCODER_COMPONENT),
+                        use_hsdp=use_hsdp,
+                        # The backend transports an AllGather component over the
+                        # data-parallel group, so this gate must use the same
+                        # group size the resolver and the backend see.
+                        # ``dlo_group_size`` falls back to sequence parallel when
+                        # DP is single, which would withhold a rank-local encoder
+                        # the backend can stream.
+                        dp_size=data_parallel_size,
+                        uses_allgather=(
+                            resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+                            and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
+                        ),
+                    )
+                    if dit_mmap_modules or encoder_mmap_modules:
+                        # Scope the online-quantization preflight to the DiTs
+                        # actually being planned: an unselected DiT cannot
+                        # disqualify an otherwise eligible BF16 encoder. A
+                        # planned encoder keeps its own rules -- AllGather
+                        # rejects unsupported methods separately, rank-local
+                        # streaming supports them.
+                        plan_result = build_checkpoint_mmap_plan(
+                            model,
+                            dit_modules=dit_mmap_modules,
+                            sources=weight_sources,
+                            model_path=str(self.od_config.model) or None,
+                            tensor_parallel_size=tensor_parallel_size,
+                            use_hsdp=use_hsdp,
+                            online_quantization=any(self._has_online_quant(module) for _, module in dit_mmap_modules),
+                            has_distilled_lora=has_distilled_lora,
+                            encoder_modules=encoder_mmap_modules,
+                        )
+                        self.host_weight_plan = plan_result.plan
 
                 host_weight_plan = self.host_weight_plan
 
                 if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
-                        "AllGather" if dit_uses_allgather and dlo_group_size > 1 else "rank-local",
+                        "AllGather" if dit_uses_allgather and data_parallel_size > 1 else "rank-local",
                         host_weight_plan.backing_kind,
                         sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
@@ -914,7 +946,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             planned_weights=host_weight_plan.bindings,
                         )
                 else:
-                    if dit_distributed_offload and plan_result is not None:
+                    if distributed_offload and plan_result is not None:
                         logger.info(
                             "DLO direct checkpoint mmap unavailable; using ordinary loader: %s",
                             plan_result.fallback_reason,
@@ -1021,6 +1053,54 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         materialization onto the ``meta`` device (upstream vLLM
         ``uses_meta_device=True``, e.g. online FP8)."""
         return has_online_quantization(model)
+
+    @staticmethod
+    def _mmap_encoder_modules(
+        modules: PipelineModules,
+        plan: OffloadPlan | None,
+        *,
+        selected: bool,
+        use_hsdp: bool,
+        dp_size: int,
+        uses_allgather: bool,
+    ) -> tuple[tuple[str, nn.Module], ...]:
+        """Encoders whose declaration the loader can serve from checkpoint mmap.
+
+        The same fail-closed rule the resolver applies decides eligibility here,
+        so an encoder never joins the plan with a backing the backend will
+        refuse to stream; every other encoder keeps the ordinary loader.
+
+        Eligibility is per-component: the encoder's own transport decides, so a
+        rank-local encoder still streams even when the DiT uses a multi-rank
+        AllGather transfer. The backend resolves each component's transport
+        independently of the DiT.
+
+        A rank that owns no encoder shard holds a weight-less stub. It has no
+        weight source to plan from, and planning it would fail the whole plan,
+        the DiT included, so the stub stays on the ordinary loader.
+        """
+        if plan is None or not selected:
+            return ()
+        selected_encoders: list[tuple[str, nn.Module]] = []
+        for name, encoder in zip(modules.encoder_names, modules.encoders):
+            if getattr(encoder, "is_loaded", True) is False:
+                continue
+            if encoder_component_type(name, plan) != TEXT_ENCODER_COMPONENT:
+                continue
+            requested = plan.component_backing.get(name)
+            if requested is None or requested is BackingKind.PINNED:
+                continue
+            unsupported = validate_disk_backing(
+                backing=requested,
+                one_shot=name in plan.one_shot_component_paths,
+                use_hsdp=use_hsdp,
+                dp_size=dp_size,
+                uses_allgather=uses_allgather,
+            )
+            if unsupported is not None:
+                continue
+            selected_encoders.append((name, encoder))
+        return tuple(selected_encoders)
 
     @staticmethod
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
@@ -1866,7 +1946,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         parameters = dict(model.named_parameters())
         targets: dict[str, torch.Tensor] = {**dict(model.named_buffers()), **parameters}
         preserved_params = {param for root in roots for param in root.context.ignored_params or ()}
-        binding_names = frozenset(plan.bindings)
+        # Pre-sharded HSDP streams one checkpoint slice per runtime tensor; a
+        # fused binding has no single slice, so it cannot join this plan.
+        dit_bindings = {name: binding for name, binding in plan.bindings.items() if isinstance(binding, TensorBinding)}
+        if len(dit_bindings) != len(plan.bindings):
+            raise ValueError("Pre-sharded HSDP cannot serve fused checkpoint bindings")
+        binding_names = frozenset(dit_bindings)
         self._release_hsdp_checkpoint_targets_to_meta(
             model,
             targets,
@@ -1878,7 +1963,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         return _PreShardedHSDPLoadPlan(
             roots=roots,
             groups=groups,
-            bindings=plan.bindings,
+            bindings=dit_bindings,
             binding_names=binding_names,
         )
 

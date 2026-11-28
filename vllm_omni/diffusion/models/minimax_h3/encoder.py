@@ -1212,6 +1212,17 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     def tp_size(self) -> int:
         return self._tp_size
 
+    def map_checkpoint_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
+        """Map one checkpoint tensor onto this encoder's runtime namespace.
+
+        Returns ``None`` for tensors this encoder intentionally drops. A fused
+        runtime tensor is reported by each of the checkpoint slices that build
+        it, in checkpoint order; ``load_weights`` and the checkpoint-mmap plan
+        both consume this rule, so the disk path fuses exactly what the
+        ordinary loader would have fused.
+        """
+        return self._map_weight_name(name)
+
     def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
         if name == "lm_head.weight" or name == "model.language_model.norm.weight":
             return None

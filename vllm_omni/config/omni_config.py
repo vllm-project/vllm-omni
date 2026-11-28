@@ -1134,7 +1134,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_loaded: dict[str, bool] = field(
         default_factory=lambda: {
             "transformer": True,
-            "vae": True,
+            "vae_decoder": True,
             "text_encoder": True,
             "vae_encoder": True,
         }

@@ -78,6 +78,12 @@ uses the ordinary loader and does not request DLO's direct-checkpoint mmap.
 Keep the compatibility DLO flags for a model-specific full-topology rank-local
 lifecycle; do not add resident layers solely to force backend selection.
 
+The disk-backed encoder path is rank-local and single-rank in this release.
+Checkpoint-mmap eligibility is resolved per component from its own transfer, so
+a rank-local text encoder joins the checkpoint-mmap plan beside a multi-rank
+AllGather DiT group as well. An encoder that uses multi-rank AllGather itself
+is not planned and keeps the ordinary loader.
+
 ```python
 from vllm_omni import Omni
 
@@ -151,21 +157,61 @@ DLO may still consume those TP-local tensors, but this is a compatibility path:
 it does not share checkpoint-backed runtime weights across DP replicas and
 provides no shared-mmap host-memory guarantee.
 
-The mmap plan skips only dedicated DiT weight sources. Other component sources,
-such as a text encoder loaded through the shared diffusion loader, continue to
-use their ordinary component loader. A checkpoint source that mixes DiT and
-non-DiT weights falls back completely rather than leaving an unplanned
-component uninitialized.
+The mmap plan skips only dedicated weight sources owned by a component the model
+declared for disk backing. Other component sources, such as a text encoder with
+no declaration, continue to use their ordinary component loader. A checkpoint
+source that mixes planned and unplanned weights falls back completely rather
+than leaving an unplanned component uninitialized.
 
 With direct checkpoint mmap, the loader:
 
 1. saves non-persistent buffers such as RoPE frequencies;
-2. moves the normally created transformer to the meta device;
+2. moves each planned component created by the ordinary path to the meta device;
 3. loads checkpoint tensors as mmap views backed by the shared OS page cache;
 4. applies any loader-owned bounded layout adapters while packing blocks;
-5. restores saved non-persistent buffers; and
-6. preserves `post_load_weights()` and `validate_loaded_weights()` lifecycle
+5. fuses multi-entry runtime tensors while packing blocks;
+6. restores saved non-persistent buffers; and
+7. preserves `post_load_weights()` and `validate_loaded_weights()` lifecycle
    hooks.
+
+### One-shot disk-backed components
+
+A component that runs one forward per request and reads each block once may
+declare a disk-streaming backing instead of pinning its full weight set:
+
+```python
+_offload_plan = OffloadPlan(
+    ...,
+    one_shot_component_paths=frozenset({TEXT_ENCODER_COMPONENT}),
+    component_backing={TEXT_ENCODER_COMPONENT: BackingKind.CHECKPOINT_MMAP},
+)
+```
+
+`one_shot` records the access pattern; `component_backing` records where the
+component's offloaded blocks live between residency windows. Resolution
+intersects the declaration with the user configuration and the parallel
+constraints. HSDP and a multi-rank AllGather transfer for that component resolve
+back to `PINNED` at plan-resolution time with a logged `fallback_reason`. TP
+greater than one and online quantization are loader-side preflights: the loader
+declines the mmap plan and keeps the ordinary loader, logging the reason. When
+only an encoder is affected and a DiT is selected, the DiT is still planned and
+the encoder alone keeps the ordinary loader. In every case the component keeps
+the ordinary loader. The declaration never changes how a component computes; it
+only selects where its weights are stored.
+
+MiniMax-H3's text encoder is the first declarer: it streams `vision.blocks` and
+`text_model.layers` from the checkpoint files with the same two bounded staging
+slots as the DiT, so peak host RAM follows the staging ring instead of the
+48–62GB BF16 weight set. (The `vision.blocks` stack is mechanically included by
+the component declaration; only the T2VA text stack is validated in this
+change.) Because the encoder runs once per prompt, the disk read is paid once
+and amortized over that single pass.
+
+A component whose loader fuses several checkpoint tensors into one runtime
+tensor (for example `q/k/v` into `qkv_proj`) declares that shape through the
+loader adapter. The plan then records a fused binding, and the bounded staging
+path concatenates those slices while packing a block. Nothing outside a staging
+slot is ever materialized at the fused runtime shape.
 
 For a DiT using `allgather` with a group larger than one, each process copies
 only its persistent shard and then releases the source mapping. For a DiT using

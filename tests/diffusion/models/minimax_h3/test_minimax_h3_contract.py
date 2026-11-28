@@ -428,6 +428,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.text_encoder = object()
+    pipeline.transformer = object()
     pipeline.encode_prompt = Mock(return_value=(torch.ones(1, 2), torch.ones(1, dtype=torch.long)))
     pipeline._quality_policy = Mock()
     pipeline._cache_dit_runtime = Mock()
@@ -471,6 +472,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = object()
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.partition = "fl2va"
@@ -900,6 +902,8 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     assert pipeline._encoder_modules == (["text_encoder"] if expect_encoder else [])
     assert ("text_encoder" in pipeline._offload_plan.encoder_block_attrs) is expect_encoder
     assert ("text_encoder" in pipeline._offload_plan.on_demand_component_paths) is expect_encoder
+    assert ("text_encoder" in pipeline._offload_plan.one_shot_component_paths) is expect_encoder
+    assert ("text_encoder" in pipeline._offload_plan.component_backing) is expect_encoder
     assert ("encode_prompt" in pipeline._PROFILER_TARGETS) is expect_encoder
     assert ("_encode_local_media" in pipeline._PROFILER_TARGETS) is expect_encoder
     assert component_options["video_vae"]["decode_only"] is not expect_encoder
@@ -963,6 +967,293 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
             "require_all": True,
         }
     ]
+
+
+def test_pipeline_allows_encoder_only_lifecycle_without_dit_or_vae(monkeypatch, tmp_path):
+    """Encoder-only lifecycle builds no DiT/VAE and emits no DiT weight source.
+
+    With ``transformer=false``, ``vae_decoder=false`` and ``text_encoder=true``
+    the pipeline must leave DiT and the VAEs unconstructed instead of eagerly
+    materializing them (RFC #10943 §enc-dec). The text encoder remains the only
+    declared weight source so the loader never streams the 61 GiB DiT.
+    """
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    for component in ("transformer", "video_vae", "audio_vae"):
+        (tmp_path / "FL2VA" / component).mkdir()
+
+    created: dict[str, list[Any]] = {"dit": [], "video_vae": [], "audio_vae": [], "text_encoder": []}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeDiT(FakeModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            created["dit"].append((args, kwargs))
+
+    def component_factory(name):
+        def create(path, *args, **kwargs):
+            created[name].append(str(path))
+            return FakeModule()
+
+        return create
+
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeDiT)
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3Qwen3VLEncoder", component_factory("text_encoder"))
+    monkeypatch.setattr(pipeline_module.Qwen2TokenizerFast, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_module.Qwen3VLProcessor, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3VideoVAE", component_factory("video_vae"))
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3AudioVAE", component_factory("audio_vae"))
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_module,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    od_config.model_loaded["transformer"] = False
+    od_config.model_loaded["text_encoder"] = True
+    od_config.model_loaded["vae_encoder"] = False
+    od_config.model_loaded["vae_decoder"] = False
+
+    pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
+
+    assert pipeline.transformer is None
+    assert pipeline.vae is None
+    assert pipeline.video_vae is None
+    assert pipeline.audio_vae is None
+    assert pipeline._dit_modules == []
+    assert created["dit"] == []
+    assert created["video_vae"] == []
+    assert created["audio_vae"] == []
+    assert created["text_encoder"] == [str(tmp_path / "FL2VA" / "text_encoder")]
+    assert [source.prefix for source in pipeline.weights_sources] == ["text_encoder."]
+
+
+def test_encoder_only_pipeline_rejects_media_requests_and_serves_text_only(monkeypatch, tmp_path):
+    """Media conditioning fails closed at request time without a VAE encoder.
+
+    With ``vae_encoder=false`` the VAEs stay unconstructed, so a request that
+    carries media inputs must surface as OmniClientError instead of a bare
+    ``AttributeError`` on the ``None`` VAE (RFC #10943 Phase 2), while
+    text-only requests still encode to an empty media conditioning.
+    """
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_SHAPE_PLANNER
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+        MiniMaxH3EncoderMediaInput,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    for component in ("transformer", "video_vae", "audio_vae"):
+        (tmp_path / "FL2VA" / component).mkdir()
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeDiT(FakeModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    def component_factory(name):
+        def create(path, *args, **kwargs):
+            return FakeModule()
+
+        return create
+
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3DiTModel", FakeDiT)
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3Qwen3VLEncoder", component_factory("text_encoder"))
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen2TokenizerFast, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen3VLProcessor, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3VideoVAE", component_factory("video_vae"))
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3AudioVAE", component_factory("audio_vae"))
+    monkeypatch.setattr(pipeline_minimax_h3, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_minimax_h3,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    od_config.model_loaded["transformer"] = False
+    od_config.model_loaded["text_encoder"] = True
+    od_config.model_loaded["vae_encoder"] = False
+    od_config.model_loaded["vae_decoder"] = False
+
+    pipeline = pipeline_minimax_h3.MiniMaxH3Pipeline(od_config=od_config)
+    assert pipeline.video_vae is None
+
+    num_frames = 124
+    shape = dict(
+        task="t2va",
+        height=768,
+        width=1344,
+        num_frames=num_frames,
+        latent_t=MINIMAX_H3_SHAPE_PLANNER.video_latent_t(num_frames),
+        audio_t=MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(num_frames / 24),
+    )
+    media_request = MiniMaxH3EncoderMediaInput(
+        images=(torch.zeros(768, 1344, 3, dtype=torch.uint8),),
+        **shape,
+    )
+    with pytest.raises(OmniClientError, match="VAE encoder"):
+        pipeline._encode_local_media(media_request)
+
+    video_request = MiniMaxH3EncoderMediaInput(
+        videos=(torch.zeros(9, 768, 1344, 3, dtype=torch.uint8),),
+        **shape,
+    )
+    with pytest.raises(OmniClientError, match="VAE encoder"):
+        pipeline._predict_visual_condition_shapes(video_request)
+
+    conditioning = pipeline._encode_local_media(MiniMaxH3EncoderMediaInput(**shape))
+    assert conditioning.visual_condition is None
+    assert conditioning.audio_condition is None
+    assert conditioning.ref_blocks == ()
+
+
+def test_encoder_only_pipeline_rejects_controlnet_at_startup(monkeypatch, tmp_path):
+    """Control needs the DiT; a transformer=false deployment must refuse it.
+
+    Without the gate the pipeline would start, silently skip the controlnet
+    weight source, and crash on the first control request when it reaches the
+    absent transformer.
+    """
+    from safetensors.torch import save_file
+
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    for component in ("transformer", "video_vae", "audio_vae"):
+        (tmp_path / "FL2VA" / component).mkdir()
+    controlnet_file = tmp_path / "control.safetensors"
+    save_file({}, str(controlnet_file))
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3DiTModel", FakeModule)
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen2TokenizerFast, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen3VLProcessor, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_minimax_h3,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+        controlnet_model_path=str(controlnet_file),
+    )
+    od_config.model_loaded["transformer"] = False
+    od_config.model_loaded["text_encoder"] = True
+    od_config.model_loaded["vae_encoder"] = False
+    od_config.model_loaded["vae_decoder"] = False
+
+    with pytest.raises(ValueError, match="H3 control"):
+        pipeline_minimax_h3.MiniMaxH3Pipeline(od_config=od_config)
+
+
+def test_pipeline_still_rejects_vae_decoder_without_vae_encoder(monkeypatch, tmp_path):
+    """The remaining VAE guard must still reject decoder-only requests."""
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    od_config.model_loaded["transformer"] = True
+    od_config.model_loaded["vae_encoder"] = True
+    od_config.model_loaded["vae_decoder"] = False
+
+    with pytest.raises(ValueError, match="external decoding requires vae_encoder=false"):
+        pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
 
 
 def test_combined_weight_loader_routes_each_contiguous_partition():
@@ -1275,6 +1566,9 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline._base_schedule_by_partition = schedules
+    # Generation admission requires a transformer; diffuse is stubbed below so a
+    # stand-in is enough, and the no-transformer case sets this to None itself.
+    pipeline.transformer = object()
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline._quality_policy = Mock()
@@ -1415,6 +1709,35 @@ def test_prepare_encode_checks_the_attention_schedule_before_any_step():
 
     with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"):
         pipeline.prepare_encode(state)
+
+
+@pytest.mark.parametrize("mode", ["request", "step"])
+def test_pipeline_without_a_transformer_rejects_text_only_generation(mode):
+    """An encoder-stage worker fails closed on generation before it touches the DiT.
+
+    ``model_loaded.transformer=false`` leaves the pipeline with no DiT (RFC #10943
+    Phase 2). Both execution modes prepare a request's inputs before denoising, so
+    a text-only generation request must surface there as an OmniClientError naming
+    the missing component, instead of handing ``None`` to the denoiser in request
+    mode or storing it as step state in step mode.
+    """
+    from vllm_omni.errors import OmniClientError
+
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.transformer = None
+    batch = _t2va_batch()
+    expected = "MiniMax H3 generation requires the transformer"
+
+    if mode == "request":
+        with pytest.raises(OmniClientError, match=expected):
+            pipeline.forward(batch)
+    else:
+        state = StepRequestState(request_id="no-transformer", prompt=batch.prompts[0], sampling=batch.sampling_params)
+        with pytest.raises(OmniClientError, match=expected):
+            pipeline.prepare_encode(state)
+        assert "minimax_h3_transformer" not in state.extra
+    assert diffuse_calls == []
 
 
 def test_inherited_default_range_past_the_sequence_end_is_not_rejected(monkeypatch):
@@ -4339,3 +4662,25 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
         pipeline.decode_to_mp4.assert_not_called()
     finally:
         registry.close()
+
+
+def test_resolve_model_loaded_defaults_every_component_to_loaded():
+    """An empty selection loads everything: the default lifecycle is unchanged."""
+    assert pipeline_minimax_h3._resolve_model_loaded({}) == (True, True, True, True)
+
+
+def test_resolve_model_loaded_returns_components_in_constructor_order():
+    assert pipeline_minimax_h3._resolve_model_loaded(
+        {"transformer": False, "text_encoder": True, "vae_encoder": False, "vae_decoder": False}
+    ) == (False, True, False, False)
+
+
+def test_resolve_model_loaded_rejects_unknown_components():
+    """A typo must fail closed instead of silently loading the named component."""
+    with pytest.raises(ValueError, match="Unknown model_loaded key"):
+        pipeline_minimax_h3._resolve_model_loaded({"vae_encoderr": False})
+
+
+def test_resolve_model_loaded_rejects_non_boolean_values():
+    with pytest.raises(TypeError, match="model_loaded.vae_decoder must be a bool"):
+        pipeline_minimax_h3._resolve_model_loaded({"vae_decoder": 0})

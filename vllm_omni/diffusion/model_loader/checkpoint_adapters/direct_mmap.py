@@ -4,21 +4,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Protocol
 
+import regex as re
 import torch
 from torch import nn
 
 
 @dataclass(frozen=True)
 class DirectMmapTensorPolicy:
-    """Loader-owned proof for one tensor's direct mmap behavior."""
+    """Loader-owned proof for one tensor's direct mmap behavior.
+
+    ``transform`` maps one checkpoint tensor to one runtime tensor.
+    ``fused_sources`` instead declares that the runtime tensor is fused from
+    several checkpoint slices named by these checkpoint sub-suffixes, in the
+    order ``fuse`` consumes them; the two are mutually exclusive.
+    """
 
     allow_custom_loader: bool = False
     transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    fused_sources: tuple[str, ...] | None = None
+    fuse: Callable[[Sequence[torch.Tensor]], torch.Tensor] | None = None
 
 
 class DirectMmapAdapter(Protocol):
@@ -32,6 +41,12 @@ class DirectMmapAdapter(Protocol):
 class _MiniMaxH3DirectMmapAdapter:
     """TP1 runtime-layout contract already enforced by MiniMax-H3's loader."""
 
+    # The text encoder builds ``qkv_proj``/``gate_up_proj`` by concatenating
+    # checkpoint slices along dim 0, so those runtime tensors are fused from
+    # several entries instead of being an mmap view of one entry.
+    _ENCODER_QKV = re.compile(r"^text_encoder\.text_model\.layers\.\d+\.self_attn\.qkv_proj\.weight$")
+    _ENCODER_GATE_UP = re.compile(r"^text_encoder\.text_model\.layers\.\d+\.mlp\.gate_up_proj\.weight$")
+
     def __init__(self, pipeline: nn.Module) -> None:
         self.pipeline = pipeline
 
@@ -41,6 +56,18 @@ class _MiniMaxH3DirectMmapAdapter:
         target: torch.Tensor,
     ) -> DirectMmapTensorPolicy:
         del target
+        if self._ENCODER_QKV.match(runtime_name):
+            return DirectMmapTensorPolicy(
+                allow_custom_loader=True,
+                fused_sources=("q_proj", "k_proj", "v_proj"),
+                fuse=_fuse_rows,
+            )
+        if self._ENCODER_GATE_UP.match(runtime_name):
+            return DirectMmapTensorPolicy(
+                allow_custom_loader=True,
+                fused_sources=("gate_proj", "up_proj"),
+                fuse=_fuse_rows,
+            )
         transform = None
         suffix = ".qkv_proj.weight"
         if runtime_name.endswith(suffix):
@@ -66,6 +93,11 @@ class _MiniMaxH3DirectMmapAdapter:
             allow_custom_loader=True,
             transform=transform,
         )
+
+
+def _fuse_rows(slices: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Concatenate checkpoint slices in projection order."""
+    return torch.cat(tuple(slices), dim=0)
 
 
 class _Cosmos3DirectMmapAdapter:
@@ -107,11 +139,17 @@ def get_direct_mmap_adapter(pipeline: nn.Module) -> DirectMmapAdapter | None:
     if any(isinstance(module, Magi2PreviewTransformer) for module in pipeline.modules()):
         return _Magi2DirectMmapAdapter()
 
+    # A pipeline may host only the text encoder (component-isolated encoding).
+    # The adapter owns both the DiT and encoder runtime layouts, so select it
+    # from either component instead of requiring a DiT (RFC #10943).
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MiniMaxH3Qwen3VLEncoder,
+    )
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3DiTModel,
     )
 
-    if any(isinstance(module, MiniMaxH3DiTModel) for module in pipeline.modules()):
+    if any(isinstance(module, (MiniMaxH3DiTModel, MiniMaxH3Qwen3VLEncoder)) for module in pipeline.modules()):
         return _MiniMaxH3DirectMmapAdapter(pipeline)
 
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (

@@ -162,7 +162,12 @@ def prepare_pipeline_components(
     staged_components: list[nn.Module],
     enable_encoder_blocks: Callable[[ResolvedComponent], bool],
 ) -> None:
-    """Apply the shared encoder/VAE/resident placement policy."""
+    """Apply the shared encoder/VAE/resident placement policy.
+
+    An unselected DiT only opts out of offloading. It still runs for
+    generation with device-side inputs, so it is placed on the accelerator
+    like any active module.
+    """
     for component in resolved.encoders:
         blockwise = bool(component.stacks) and enable_encoder_blocks(component)
         prepare_component(
@@ -191,3 +196,4 @@ def prepare_pipeline_components(
     for component in resolved.dits:
         if not component.selected:
             component.module.to(device)
+            continue

@@ -406,6 +406,26 @@ class MiniMaxH3EncoderMediaInput:
     audio_edit_mask: torch.Tensor | None = None
     timeline_guides: tuple[MiniMaxH3TimelineGuide, ...] = ()
 
+    @property
+    def requires_vae_encoder(self) -> bool:
+        """Whether any input needs the video/audio VAE encoders.
+
+        A request without any of these inputs encodes to an empty media
+        conditioning and never touches a VAE, so a pipeline that skipped the
+        VAE encoders (``model_loaded.vae_encoder=false``) can still serve it.
+        """
+        return bool(
+            self.images
+            or self.videos
+            or self.video_edit is not None
+            or self.video_edit_mask is not None
+            or self.audios
+            or self.audio_edit is not None
+            or self.audio_edit_mask is not None
+            or any(item is not None for item in self.video_audios)
+            or self.timeline_guides
+        )
+
     @classmethod
     def from_mm_tensors(
         cls,

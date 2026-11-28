@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, TypeVar
 
+from .offload_plan import BackingKind
+
 DIT_COMPONENT = "dit"
 TEXT_ENCODER_COMPONENT = "text_encoder"
 OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT})
@@ -445,3 +447,38 @@ def should_offload_component(config: Any, component: str) -> bool:
 def any_selected_component_uses_allgather(config: Any) -> bool:
     """Return whether an enabled layer backend requires weight collectives."""
     return resolve_offload(config).any_allgather
+
+
+def validate_disk_backing(
+    *,
+    backing: BackingKind,
+    one_shot: bool,
+    use_hsdp: bool,
+    dp_size: int,
+    uses_allgather: bool,
+) -> str | None:
+    """Return a fail-closed reason when a disk-streaming backing cannot be served.
+
+    HSDP needs the ordinary loader, and a component the loader will not plan
+    from the checkpoint must not keep its mmap declaration. That planning gate
+    is per component: the loader always plans a selected DiT, but it plans an
+    encoder only when that encoder's own transfer is rank-local, so
+    ``dp_size > 1`` with AllGather transport leaves no sequential mmap source
+    for an encoder and ``PINNED`` is the only safe answer. The loader-side
+    preflight in ``build_checkpoint_mmap_plan`` separately rejects TP>1 and
+    online quantization, so those constraints do not surface here.
+
+    ``DISK`` is a reserved declaration kind in this release: no backend can
+    serve it yet, so it always reports a reason and callers degrade to
+    ``PINNED``. ``one_shot`` is kept for that future disk-streaming backend;
+    it does not affect validation today.
+    """
+    if backing not in (BackingKind.CHECKPOINT_MMAP, BackingKind.DISK):
+        return None
+    if backing is BackingKind.DISK:
+        return "DISK backing is reserved and not servable in this release"
+    if use_hsdp:
+        return "HSDP requires the ordinary loader"
+    if dp_size > 1 and uses_allgather:
+        return "disk backing requires rank-local transfer"
+    return None
