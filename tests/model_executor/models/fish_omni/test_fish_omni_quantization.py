@@ -146,6 +146,14 @@ def test_npu_routed_experts_use_ascend_fp8(monkeypatch):
     sentinel = object()
     seen = {}
 
+    class _WeightFormat:
+        FP8 = "fp8"
+
+    class _Profile:
+        def supports_weight_format(self, fmt):
+            assert fmt == _WeightFormat.FP8
+            return True
+
     class _AscendFp8Config:
         def __init__(self, **kwargs):
             seen["kwargs"] = kwargs
@@ -159,6 +167,10 @@ def test_npu_routed_experts_use_ascend_fp8(monkeypatch):
         monkeypatch,
         **{
             "vllm_ascend.ops.linear": {"AscendUnquantizedLinearMethod": UnquantizedLinearMethod},
+            "vllm_ascend.device.hardware_profile": {
+                "WeightFormat": _WeightFormat,
+                "get_current_hardware_profile": lambda: _Profile(),
+            },
             "vllm_ascend.quantization.configs.fp8_config": {"AscendFp8Config": _AscendFp8Config},
         },
     )
@@ -213,6 +225,7 @@ def test_cpu_dequant_override_is_scoped_to_selected_scheme(monkeypatch):
         },
     )
     monkeypatch.setattr(quantization, "current_platform", SimpleNamespace(device_type="npu"))
+    monkeypatch.setattr(npu_quantization, "_supports_native_fp8_matmul", lambda: True)
     config = ExpertFp8Config.from_config(CHECKPOINT_QUANT_CONFIG)
     config.get_quant_method(torch.nn.Module(), "model.layers.0.mlp.experts")
 
@@ -224,6 +237,110 @@ def test_cpu_dequant_override_is_scoped_to_selected_scheme(monkeypatch):
     assert seen["args"] == (layer, "weight", "scale")
     assert seen["devices"] == ("cpu", "cpu")
     npu_quantization._dequantize_npu_block_fp8_on_cpu(None)
+
+
+def test_npu_routed_experts_dequantize_on_cpu_when_fp8_matmul_unsupported(monkeypatch):
+    """Devices without native FP8 matmul still dequantize Drama 3 experts on CPU."""
+    monkeypatch.setattr(quantization, "current_platform", SimpleNamespace(device_type="npu"))
+    bf16_processed: list[torch.nn.Module] = []
+    resolved_calls: list[tuple[str, str, tuple[str, str]]] = []
+    expanded = {
+        "w13_weight": torch.full((1, 2, 4), 2.0, dtype=torch.bfloat16),
+        "w2_weight": torch.full((1, 2, 4), 3.0, dtype=torch.bfloat16),
+    }
+
+    class _WeightFormat:
+        FP8 = "fp8"
+
+    class _Profile:
+        def supports_weight_format(self, fmt):
+            assert fmt == _WeightFormat.FP8
+            return False
+
+    class _Bf16Method:
+        def process_weights_after_loading(self, layer):
+            bf16_processed.append(layer)
+
+    class _UpstreamFp8BlockMoE:
+        def __init__(self, weight_block_size, moe_config):
+            raise NotImplementedError("Native block-wise FP8 checkpoints run on Ascend 950 only")
+
+        @property
+        def bf16_method(self):
+            if self._bf16_method is None:
+                self._bf16_method = _Bf16Method()
+            return self._bf16_method
+
+        def _resolve_experts(self, layer, weight_name, scale_name):
+            resolved_calls.append(
+                (
+                    weight_name,
+                    scale_name,
+                    (getattr(layer, weight_name).device.type, getattr(layer, scale_name).device.type),
+                )
+            )
+            return expanded[weight_name]
+
+    class _AscendFusedMoEMethod:
+        def __init__(self, scheme, moe_config):
+            self.quant_method = scheme
+            self.moe_config = moe_config
+
+        def process_weights_after_loading(self, layer):
+            self.quant_method.process_weights_after_loading(layer)
+
+    class _AscendFp8Config:
+        def __init__(self, **kwargs):
+            raise AssertionError("AscendFp8Config should not be used when native FP8 matmul is unsupported")
+
+    moe_config = SimpleNamespace(tag="drama3-moe")
+    layer = torch.nn.Module()
+    layer.moe_config = moe_config
+    for name in ("w13_weight", "w2_weight"):
+        layer.register_parameter(name, torch.nn.Parameter(torch.ones(1, 2, 4), requires_grad=False))
+        layer.register_parameter(f"{name}_scale_inv", torch.nn.Parameter(torch.ones(1, 1, 2), requires_grad=False))
+
+    _install_fake_ascend(
+        monkeypatch,
+        **{
+            "vllm_ascend.ops.linear": {"AscendUnquantizedLinearMethod": UnquantizedLinearMethod},
+            "vllm_ascend.device.hardware_profile": {
+                "WeightFormat": _WeightFormat,
+                "get_current_hardware_profile": lambda: _Profile(),
+            },
+            "vllm_ascend.quantization.utils": {"is_fused_moe_layer": lambda mod: mod is layer},
+            "vllm_ascend.quantization.configs.fp8_config": {"AscendFp8Config": _AscendFp8Config},
+            "vllm_ascend.quantization.method_adapters": {"AscendFusedMoEMethod": _AscendFusedMoEMethod},
+            "vllm_ascend.quantization.methods.w8a8.fp8_block": {"AscendFp8BlockFusedMoEMethod": _UpstreamFp8BlockMoE},
+        },
+    )
+
+    config = ExpertFp8Config.from_config(CHECKPOINT_QUANT_CONFIG)
+    assert config.get_quant_method(torch.nn.Module(), "model.embed_tokens") is None
+
+    fake_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
+    with patch("vllm.config.get_current_vllm_config", return_value=fake_vllm_cfg):
+        method = config.get_quant_method(layer, "model.layers.0.mlp.experts")
+
+    assert isinstance(method, _AscendFusedMoEMethod)
+    assert method.moe_config is moe_config
+    scheme = method.quant_method
+    assert isinstance(scheme, _UpstreamFp8BlockMoE)
+    assert scheme.use_mxfp8 is False
+    assert scheme.mxfp8_method is None
+    assert (scheme.block_n, scheme.block_k, scheme.group_size) == (128, 128, 128)
+    assert scheme.model_dtype is torch.bfloat16
+
+    method.process_weights_after_loading(layer)
+    assert resolved_calls == [
+        ("w13_weight", "w13_weight_scale_inv", ("cpu", "cpu")),
+        ("w2_weight", "w2_weight_scale_inv", ("cpu", "cpu")),
+    ]
+    assert torch.equal(layer.w13_weight, expanded["w13_weight"])
+    assert torch.equal(layer.w2_weight, expanded["w2_weight"])
+    assert not hasattr(layer, "w13_weight_scale_inv")
+    assert not hasattr(layer, "w2_weight_scale_inv")
+    assert bf16_processed == [layer]
 
 
 def test_int4_quantization_is_registered() -> None:
