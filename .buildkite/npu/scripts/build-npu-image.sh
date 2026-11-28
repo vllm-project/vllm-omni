@@ -44,7 +44,7 @@ buildctl \
   "${build_args[@]}" \
   --secret id=dockerconfig,src=/home/user/.docker/config.json \
   --import-cache "type=registry,ref=${cache_ref}" \
-  --export-cache "type=registry,ref=${cache_ref},mode=max" \
+  --export-cache "type=registry,ref=${cache_ref},mode=max,ignore-error=true" \
   --output "type=image,name=${image_registry}/${image_name}:${image_tag},push=true" \
   --progress=plain
 
