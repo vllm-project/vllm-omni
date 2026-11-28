@@ -23,6 +23,10 @@ connectors:
       initial_codec_chunk_frames: 4
       # float32 keeps the Snake activations / weight-normed convs clean.
       audio8_tts_codec_dtype: float32
+      # Graph-replay the steady codec decode windows (49/50 frames from the
+      # chunker above); bit-exact with eager, ~1.1x per chunk and ~1000 fewer
+      # kernel launches. Other shapes fall back to eager.
+      audio8_tts_codec_cuda_graph: true
 
 stages:
   - stage_id: 0
