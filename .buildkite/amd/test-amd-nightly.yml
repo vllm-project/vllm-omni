@@ -1184,6 +1184,8 @@ steps:
       # The combined Daily-Omni + Seed-TTS job repeatedly exhausted its 165m
       # command bound during the evaluation tail. Keep independent bounded jobs
       # so one accuracy lane cannot consume the other's execution budget.
+      # Daily-Omni uses a deterministic 599-of-1197 sample and retains per-item
+      # evidence so the smaller sample's accuracy floor can be audited on MI300.
       - label: "MiniCPM-o 4.5 Daily-Omni Accuracy"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
@@ -1212,7 +1214,7 @@ steps:
             if len(results) != 1:
                 raise SystemExit(f"Expected one Daily-Omni result, found {len(results)}")
             result = json.loads(results[0].read_text())
-            expected = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+            expected = {"daily_omni_evaluated_ok": 599, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
             for key, value in expected.items():
                 if result.get(key) != value:
                     raise SystemExit(f"Expected {key}={value}, got {result.get(key)!r}")

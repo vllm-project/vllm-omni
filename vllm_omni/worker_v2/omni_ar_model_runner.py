@@ -55,6 +55,12 @@ logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
 _SPARSE_AUDIO_META_FIELDS = frozenset({"req_id", "sparse_audio"})
 _SPARSE_AUDIO_PROTOCOL_KEYS = frozenset({"meta.req_id", "meta.sparse_audio"})
+# Per-request last-layer hidden states for opted-in requests ride the
+# ``multimodal_output`` channel (``CompletionOutput.multimodal_output``) under
+# this key. It is the name RL teacher consumers already read, and unlike
+# ``"hidden_states"`` it is not one of the reserved ``OmniPayload`` nests in
+# ``data_entry_keys`` (thinker -> talker ``hidden_states.*`` pooler entries).
+TEACHER_HIDDEN_STATES_KEY = "teacher_hidden_states"
 
 
 def _without_sparse_audio_protocol(payload: dict[str, Any]) -> dict[str, Any]:
@@ -169,8 +175,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_tokens = min(num_tokens, self.max_num_reqs * self.max_model_len)
         return super()._dummy_run(num_tokens, *args, **kwargs)
 
+    @property
+    def _model_state_drafts(self) -> bool:
+        """Whether the speculator drafts through the model state (Higgs audio)."""
+        return hasattr(self.speculator, "bind_model_state")
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
+        if self._model_state_drafts:
+            # The model state embeds and verifies these drafts in its sampler.
+            self.speculator.bind_model_state(self.model_state)
+            return
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
@@ -301,6 +316,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
+        # Per-request hidden-state opt-in (RL teacher rollouts): slice the
+        # logits-consumed tensor now, while input_batch still reflects this
+        # step's schedule; OmniAsyncOutput owns the D2H copy.
+        hidden_state_slices = self._collect_hidden_state_slices(text_hidden, input_batch)
         if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
             # The raw forward cannot publish this state: make_omni_output()
             # above creates the current feedback frame.
@@ -491,6 +510,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             request_errors=get_request_errors() if get_request_errors is not None else None,
             num_rejected_tokens=num_rejected if draft_inputs is not None else None,
             extra_multimodal_outputs=extra_outputs,
+            hidden_state_slices=hidden_state_slices,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -501,6 +521,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
             and (include_hidden or not sampling_output.owns_multimodal_outputs),
             async_chunk=async_chunk,
         )
+        if hidden_state_slices is not None:
+            # The slices view this step's hidden-states buffer, which the next
+            # CUDA graph replay overwrites, and unlike pooler payloads they are
+            # not snapshotted. Keep the main stream behind their copy in every
+            # mode.
+            self.main_stream.wait_event(async_output.copy_event)
 
         mm_inputs = None
         if self.speculator is not None and self.speculator.supports_mm_inputs and self.model_state.supports_mm_inputs:
@@ -555,6 +581,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> None:
         """Draft the next step's tokens, as the parent runner's ``sample_tokens`` does."""
         num_spec_tokens = draft.num_spec_tokens
+        if self._model_state_drafts:
+            proposal = self.speculator.reserve_audio_drafts(self.model_state, input_batch, num_sampled, num_spec_tokens)
+            if proposal is not None:
+                rows, control = proposal
+                self.req_states.draft_tokens[input_batch.idx_mapping[rows]] = control
+            return
         if self._kstep_frames > 1:
             # The placeholders reserve query positions for the next Talker
             # step. Only rows with confirmed codec state may enter that loop.
@@ -608,6 +640,68 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
         if self.pp_handler is not None:
             self.pp_handler.broadcast_drafts(self.req_states.draft_tokens, input_batch)
+
+    def _collect_hidden_state_slices(
+        self, text_hidden: torch.Tensor | None, input_batch: Any
+    ) -> dict[str, torch.Tensor] | None:
+        """GPU slices of the last-layer hidden states for opted-in requests.
+
+        Returns ``None`` when no scheduled request opted in, so ordinary
+        batches pay nothing. A request's prefill rows are collected exactly
+        once, on the step whose schedule completes its prefill. ``prefill_len``
+        counts the tokens the runner actually sees (multimodal placeholders
+        expanded), so the slice matches ``text_hidden`` for multimodal prompts.
+
+        Nothing is emitted on a guess. A later prefill chunk or a prefix-cache
+        resume needs rows that are not in this step's tensor, and without the
+        prefill counters a decode row cannot be told from a prefill row; a
+        partial or repeated slice would hand the consumer a wrong-shaped
+        payload, so those cases raise instead.
+        """
+        opted_in = self._hidden_state_req_ids
+        if not opted_in or text_hidden is None:
+            return None
+        num_reqs = input_batch.num_reqs
+        opted_in = opted_in.intersection(input_batch.req_ids[:num_reqs])
+        if not opted_in:
+            return None
+        prefill_len = getattr(input_batch, "prefill_len_np", None)
+        num_computed_prefill = getattr(input_batch, "num_computed_prefill_tokens_np", None)
+        if prefill_len is None or num_computed_prefill is None:
+            raise RuntimeError(
+                "return_hidden_states needs InputBatch.prefill_len_np and "
+                "num_computed_prefill_tokens_np to tell prefill rows from decode rows; "
+                f"got a {type(input_batch).__name__} without them."
+            )
+        query_start_loc = input_batch.query_start_loc_np
+        num_scheduled = input_batch.num_scheduled_tokens
+        slices: dict[str, torch.Tensor] = {}
+        for index in range(num_reqs):
+            req_id = input_batch.req_ids[index]
+            if req_id not in opted_in:
+                continue
+            done = int(num_computed_prefill[index])
+            total = int(prefill_len[index])
+            if done >= total:
+                # Decode row: the prefill step already delivered the payload.
+                continue
+            if done > 0:
+                raise RuntimeError(
+                    f"return_hidden_states cannot return the full prompt hidden states for req {req_id}: "
+                    f"{done} of its {total} prefill tokens were computed before this step (chunked prefill "
+                    "or a prefix-cache hit), so this step's tensor holds neither the complete prompt nor "
+                    "a rebuilt prefix. Run engines that return hidden states with "
+                    "enable_chunked_prefill=False and enable_prefix_caching=False."
+                )
+            rows = min(total, int(num_scheduled[index]))
+            if rows < total:
+                raise RuntimeError(
+                    f"return_hidden_states does not support chunked prefill (req={req_id}: {rows} of {total} "
+                    "prefill tokens scheduled). Launch the engine with enable_chunked_prefill=False."
+                )
+            start = int(query_start_loc[index])
+            slices[req_id] = text_hidden[start : start + rows]
+        return slices or None
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:
@@ -1006,6 +1100,38 @@ def _slice_pooler_value(
     return value
 
 
+def _merge_hidden_state_payloads(model_runner_output: Any, payloads: dict[str, torch.Tensor]) -> None:
+    """Merge per-request hidden-state opt-in payloads into the wire channel.
+
+    Writes ``multimodal_output[TEACHER_HIDDEN_STATES_KEY]`` per opted-in
+    request as a separate top-level key, so pooler entries already in that
+    slot (including the reserved ``hidden_states.*`` nest) are untouched.
+    """
+    req_ids = list(model_runner_output.req_ids)
+    req_id_to_index = {req_id: index for index, req_id in enumerate(req_ids)}
+    num_reqs = len(req_ids)
+    mm = list(model_runner_output.multimodal_outputs or ()) or [None] * num_reqs
+    while len(mm) < num_reqs:
+        mm.append(None)
+    for req_id, tensor in payloads.items():
+        index = req_id_to_index.get(req_id)
+        if index is None or index >= num_reqs:
+            continue
+        entry = mm[index]
+        if entry is None:
+            mm[index] = {TEACHER_HIDDEN_STATES_KEY: tensor}
+        elif isinstance(entry, dict):
+            merged_entry = dict(entry)
+            merged_entry[TEACHER_HIDDEN_STATES_KEY] = tensor
+            mm[index] = merged_entry
+        else:
+            raise RuntimeError(
+                f"cannot attach {TEACHER_HIDDEN_STATES_KEY} to req {req_id}: multimodal_outputs"
+                f"[{index}] already holds a {type(entry).__name__}."
+            )
+    model_runner_output.multimodal_outputs = mm
+
+
 def _ensure_tensor_values(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
     """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
 
@@ -1070,6 +1196,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
         request_errors: tuple[torch.Tensor, str] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
+        hidden_state_slices: dict[str, torch.Tensor] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -1258,6 +1385,21 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     pin_memory=pin_memory,
                 )
 
+            # Per-request hidden-state opt-in: non-blocking D2H of the sliced
+            # rows, on the same copy stream and event as the rest of the output.
+            self._hidden_state_payloads = (
+                {
+                    req_id: _async_copy_tensor(
+                        tensor,
+                        copy_stream=copy_stream,
+                        pin_memory=pin_memory,
+                    )
+                    for req_id, tensor in hidden_state_slices.items()
+                }
+                if hidden_state_slices
+                else None
+            )
+
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> OmniModelRunnerOutput:
@@ -1372,6 +1514,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             token_ranges = self._full_payload_token_ranges(num_output_rows)
             if token_ranges is not None:
                 self.model_runner_output.full_payload_token_ranges = token_ranges
+
+        if self._hidden_state_payloads:
+            _merge_hidden_state_payloads(self.model_runner_output, self._hidden_state_payloads)
 
         if self._request_errors is not None:
             flags, reason = self._request_errors
