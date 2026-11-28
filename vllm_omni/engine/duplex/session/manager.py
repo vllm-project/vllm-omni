@@ -87,6 +87,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Leave time for the next cleanup attempt within the realtime open deadline.
+_CLOSING_ADMISSION_WAIT_S = 15.0
+
 
 @dataclass(frozen=True)
 class _PendingRequestCleanup:
@@ -178,6 +181,8 @@ class DuplexSessionManager:
         self._closing: dict[str, _PendingSessionCleanup] = {}
         #: Session ids whose ``open`` passed the capacity check and is still awaiting the plugin.
         self._admitting: set[str] = set()
+        self._waiting_admissions: set[str] = set()
+        self._admission_changed = asyncio.Event()
         #: Opens whose caller gave up (control RPC timeout / cancellation) before
         #: admission finished. The open completes anyway -- it is already past
         #: the capacity check -- so it must tear itself down on arrival instead
@@ -242,6 +247,9 @@ class DuplexSessionManager:
         if not isinstance(message, self._CONTROL_TYPES):
             raise TypeError(f"Unsupported duplex control message: {type(message).__name__}")
         session_id = message.session_id
+        if isinstance(message, CloseDuplexSessionMessage) and session_id in self._waiting_admissions:
+            # Keep the close result ordered behind the open while waking the waiter.
+            self._abandon_open(session_id)
 
         async def handle_message() -> None:
             await self.handle(message)
@@ -627,6 +635,40 @@ class DuplexSessionManager:
     def _admission_count(self) -> int:
         return len(set(self.runners) | set(self._closing) | self._admitting)
 
+    def _notify_admission_change(self) -> None:
+        if self._waiting_admissions:
+            changed = self._admission_changed
+            self._admission_changed = asyncio.Event()
+            changed.set()
+
+    def _abandon_open(self, session_id: str) -> None:
+        self._abandoned_opens.add(session_id)
+        self._notify_admission_change()
+
+    def _release_session_admission(self, session_id: str) -> None:
+        self.stage_port.release_session(session_id)
+        self._closing.pop(session_id)
+        self._notify_admission_change()
+
+    async def _wait_for_closing_slot(self, session_id: str, limit: int) -> None:
+        # Bound the number of waiters to the capacity already being returned.
+        if len(self._waiting_admissions) >= len(self._closing):
+            return
+        self._waiting_admissions.add(session_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CLOSING_ADMISSION_WAIT_S
+        try:
+            while self._closing and self._admission_count() >= limit and session_id not in self._abandoned_opens:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._admission_changed.wait(), timeout=remaining)
+                except TimeoutError:
+                    break
+        finally:
+            self._waiting_admissions.remove(session_id)
+
     def _session_perf_ledger(self) -> SessionPerfLedger:
         names = getattr(self.stage_port, "duplex_stage_names", None)
         stage_names = list(names()) if callable(names) else []
@@ -644,13 +686,20 @@ class DuplexSessionManager:
         session_id = message.session_id
         session: DuplexEngineSession | None = None
         runner: DuplexSessionRunner | None = None
+        owns_open = False
         # Only the open that put the id in ``_admitting`` may take it out again:
         # a duplicate open must not release the slot the first one is holding.
         holds_admission_slot = False
         holds_replica_reservation = False
         try:
-            if session_id in self.runners or session_id in self._closing or session_id in self._admitting:
+            if (
+                session_id in self.runners
+                or session_id in self._closing
+                or session_id in self._admitting
+                or session_id in self._waiting_admissions
+            ):
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
+            owns_open = True
             max_sessions = self.admission_limit
             collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
             capabilities = apply_input_clock_capabilities(
@@ -663,12 +712,16 @@ class DuplexSessionManager:
             config = message.session_config.with_output_capabilities(capabilities)
             if self._admission_count() >= max_sessions:
                 self.stage_port.check_session_availability(session_id)
-                self.stage_port.reject_session("global_capacity_exhausted")
-                raise DuplexSessionError(
-                    f"duplex_session_capacity_exhausted: limit={max_sessions}",
-                    code="resource_exhausted",
-                    retryable=True,
-                )
+                await self._wait_for_closing_slot(session_id, max_sessions)
+                if session_id in self._abandoned_opens:
+                    raise DuplexSessionError(f"Duplex session open was abandoned: {session_id}", code="session_closed")
+                if self._admission_count() >= max_sessions:
+                    self.stage_port.reject_session("global_capacity_exhausted")
+                    raise DuplexSessionError(
+                        f"duplex_session_capacity_exhausted: limit={max_sessions}",
+                        code="resource_exhausted",
+                        retryable=True,
+                    )
             # Hold the slot across the plugin await: opens of different
             # sessions run concurrently and must not all pass the check above.
             self._admitting.add(session_id)
@@ -749,7 +802,10 @@ class DuplexSessionManager:
         finally:
             if holds_admission_slot:
                 self._admitting.discard(session_id)
-            self._abandoned_opens.discard(session_id)
+                if session_id not in self.runners and session_id not in self._closing:
+                    self._notify_admission_change()
+            if owns_open:
+                self._abandoned_opens.discard(session_id)
 
     async def _rollback_open(
         self,
@@ -812,10 +868,10 @@ class DuplexSessionManager:
         session_id = message.session_id
         runner = self.runners.get(session_id)
         if runner is None:
-            if session_id in self._admitting:
-                # The open is still awaiting the plugin. It cannot be cancelled
-                # from here, so leave a note it checks before returning.
-                self._abandoned_opens.add(session_id)
+            if session_id in self._admitting or session_id in self._waiting_admissions:
+                # Wake a capacity waiter or ask an open awaiting the plugin
+                # to tear itself down before returning.
+                self._abandon_open(session_id)
             # Already closing, or closed and forgotten: ids are never reused
             # (D16), so a repeated close is idempotent rather than an error.
             await self._put_result(message, operation="close", ok=True)
@@ -883,9 +939,8 @@ class DuplexSessionManager:
         attempt, in a ``finally``, including when the cleanup failed (the
         runner used to emit it before the stage requests were aborted). A
         client that sees the event can normally open a replacement session
-        right away, but after a failed cleanup the slot is still held until
-        the reaper succeeds, so a prompt reopen can be refused with
-        ``resource_exhausted``.
+        right away. After a failed cleanup, a replacement at capacity may
+        wait briefly for the reaper to release the slot.
         """
         session = runner.session
         submitted = tuple(session.resource_request_ids(submitted=True))
@@ -941,8 +996,7 @@ class DuplexSessionManager:
             await self._release_session_window(pending.session_id)
             if self._closing.get(pending.session_id) is not pending:
                 return
-            self.stage_port.release_session(pending.session_id)
-            self._closing.pop(pending.session_id, None)
+            self._release_session_admission(pending.session_id)
         self._session_snapshots.pop(pending.session_id, None)
 
     async def resume(self, message: ResumeDuplexSessionMessage) -> None:
@@ -1145,8 +1199,7 @@ class DuplexSessionManager:
                 session.release_all_requests()
                 session.close()
             if closing is not None:
-                self.stage_port.release_session(session_id)
-                self._closing.pop(session_id, None)
+                self._release_session_admission(session_id)
             self._unregister_session_requests(session_id)
 
     async def _release_session_window(self, session_id: str) -> None:

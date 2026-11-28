@@ -937,7 +937,7 @@ audio-slot limits and the no-empty-run fallback are unchanged.
 ```text
 open   DuplexOmni.open_session(config)
          -> engine.open_session_async(session_id, DuplexSessionConfig)      [RPC]
-         -> DuplexSessionManager.open: admission (max_sessions, closing sessions keep their slot),
+         -> DuplexSessionManager.open: admission (max_sessions, bounded wait for closing slots),
             plugin.validate_client_extra_body / prepare_runtime_config, DuplexEngineSession,
             Stage0 request id reserved (ensure_stage_request), DuplexSessionRunner.start()
          -> first event: SessionCreated (announces the allocated id)
@@ -958,8 +958,9 @@ close    DuplexOmni.close_session -> close RPC; the manager tears the runner dow
          (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result.
          SessionClosed is emitted after the cleanup attempt (in a finally), so it is also sent when the
          stage cleanup failed; in that case the admission slot is intentionally retained and the cleanup
-         is retried by the reaper, and opening a replacement session can still be refused with
-         resource_exhausted. Seeing the event therefore does not by itself guarantee a free slot.
+         is retried by the reaper. When the frontend is full, up to one open per closing slot
+         can wait up to 15 seconds for actual release. An open that finds no available slot
+         after that wait can still be refused with resource_exhausted.
 reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
 ```
 

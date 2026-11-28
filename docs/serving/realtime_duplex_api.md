@@ -2788,8 +2788,10 @@ them out into typed events before they reach a client.
 - `rate_limits.updated` is emitted for compatibility only and always carries
   an empty list.
 - Session capacity is bounded by `duplex_session.max_sessions` in the deploy
-  configuration; admission beyond it fails with `resource_exhausted`
-  (`rate_limit_error`, retryable).
+  configuration. When capacity is full and sessions are closing, the server
+  can wait up to 15 seconds for a slot to be released. If capacity is still
+  unavailable, the server returns retryable `resource_exhausted`
+  (`rate_limit_error`).
 - A duplex deployment serves the websocket route and, when supported by the
   model, ordinary `/v1/chat/completions` requests on the same engine without a
   session per request (see [Start the Server](#start-the-server)). Other
