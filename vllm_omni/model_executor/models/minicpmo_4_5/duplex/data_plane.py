@@ -258,21 +258,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     context=context,
                     runtime_result=runtime_result,
                 )
-                if not stale:
-                    control_result = None
-                    for result in projected:
-                        if interruption:
-                            control_result = result
-                        if not interruption or result.get("model_listen") is not True:
-                            yield result
-                    # A cumulative snapshot may include earlier LISTEN units.
-                    # Only its final control acknowledges this interruption.
-                    if control_result is not None and control_result.get("model_listen") is True:
-                        control_result["interruption_completed"] = True
-                        if context.model_turn_id is not None:
-                            control_result["model_turn_id"] = context.model_turn_id
-                        yield control_result
-                else:
+                if stale:
                     # Consume skipped tokens so their text and boundaries do not reach the next reply.
                     for _ in projected:
                         pass
@@ -280,6 +266,17 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     if snapshot_len > request_state.stage0_consumed_tokens:
                         request_state.stage0_consumed_tokens = snapshot_len
                         request_state.stage0_skip_open_unit = True
+                elif interruption:
+                    # Advance the decoder, but only the Stage 0 routing decision
+                    # can confirm the control and advance the producer turn.
+                    for result in projected:
+                        if result.get("error_code"):
+                            yield result
+                else:
+                    yield from projected
+            if not interruption or stale:
+                return
+        if interruption and direct_decision is None:
             return
         raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
         if stale:
@@ -443,11 +440,11 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 turn_has_text = text_turn_state is not None and text_turn_state.has_text
                 if not future_model_turn and not response_turn_bound and not turn_has_text:
                     if text_turn_state is not None:
-                        if tts_segment_end:
+                        if tts_segment_end or unit_end_of_turn:
                             text_turn_state.pending_audio_without_text.clear()
                         else:
                             text_turn_state.pending_audio_without_text.extend(audio_results)
-                    if tts_segment_end:
+                    if tts_segment_end or unit_end_of_turn:
                         terminal_result = dict(audio_results[-1])
                         terminal_result.update(
                             audio_data="",
@@ -489,6 +486,10 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     return
                 text_turn_state.pending_audio_without_text = pending_audio
 
+        # Terminal text gets the last chance to claim this turn's buffered PCM.
+        if unit_end_of_turn and text_turn_state is not None:
+            text_turn_state.pending_audio_without_text.clear()
+
         if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
             # Venus text also carries delegation control. Deliver it even
             # when a mixed speech unit reaches codec EOS without a waveform.
@@ -513,9 +514,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             return
 
         if tts_segment_end:
-            if unit_end_of_turn and text_turn_state is not None and text_turn_state.pending_audio_without_text:
-                text_turn_state.pending_audio_without_text[-1]["end_of_turn"] = True
-                text_turn_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
@@ -549,8 +547,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             return
 
         if request_id is not None and context.auto_responds and unit_end_of_turn and context.active_response_id is None:
-            if text_turn_state is not None and output_turn_id is None:
-                text_turn_state.pending_audio_without_text.clear()
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,

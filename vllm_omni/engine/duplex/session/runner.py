@@ -367,7 +367,7 @@ class DuplexSessionRunner:
             wait_for_append_tail=self._wait_for_append_tail,
         )
         self._resident_stage0_segments = 0
-        self._last_stage0_turn: int | None = None
+        self._resident_tts_drained_at_turn: int | None = 0
         #: Unit tracking of an input-clocked session (``extra_body.clock == "input"``,
         #: fixed at session creation); ``None`` for every other session.
         self._input_clock: InputClock | None = None
@@ -484,9 +484,6 @@ class DuplexSessionRunner:
             return True
         decision: DuplexOutputDecision | None = None
         project = False
-        if stage_id == 0 and context.final_stage_id > 0:
-            # An intermediate Thinker result can go straight to the Talker.
-            self._note_resident_stage0_end(request_id, context)
         if stage_id < context.final_stage_id or (stage_id == 0 and self.run.interruption_pending):
             decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
@@ -501,6 +498,8 @@ class DuplexSessionRunner:
             self.run.concurrent_turn_requests_released = True
         progress = self._input_clock_progress(stage_id, output, decision, context)
         consume = decision is not None or stage_id >= context.final_stage_id
+        if stage_id == 0 and not consume:
+            self._note_resident_stage0_end(request_id, context, forwarded=True)
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         project_output = consume or project or project_intermediate
         if not project_output:
@@ -544,14 +543,18 @@ class DuplexSessionRunner:
         # Projection-only must still forward to the next stage (return False).
         return consume
 
-    def _note_resident_stage0_end(self, request_id: str, context: DuplexOutputContext) -> None:
+    def _note_resident_stage0_end(self, request_id: str, context: DuplexOutputContext, *, forwarded: bool) -> None:
         if (
             context.segment_finished
             and context.identity.fence.epoch == self.session.epoch
             and request_id == self.manager.stage_request_id(context.identity.fence, stage_id=0)
         ):
             self._resident_stage0_segments += 1
-            self._last_stage0_turn = context.model_turn_id
+            if forwarded:
+                # Direct LISTENs leave any preceding Talker handoff outstanding.
+                self._resident_tts_drained_at_turn = (
+                    None if context.model_turn_id is None else context.model_turn_id + 1
+                )
 
     # ------------------------------------------------------------------ #
     # Input clock (``extra_body.clock == "input"``)                       #
@@ -1026,9 +1029,9 @@ class DuplexSessionRunner:
     async def _handle_item(self, item: DuplexCommand | StageOutput | StageProgress | _RefusedInput | _Internal) -> None:
         session = self.session
         if isinstance(item, StageOutput):
-            if item.stage_id == item.context.final_stage_id == 0:
-                # A final Thinker result still awaits delivery behind any earlier clear.
-                self._note_resident_stage0_end(item.request_id, item.context)
+            if item.stage_id == 0 and (item.context.final_stage_id == 0 or item.decision is not None):
+                # The clear ahead of a direct/final result still sees pending input.
+                self._note_resident_stage0_end(item.request_id, item.context, forwarded=False)
             if self.model.is_input_transcription(item.request_id) and not await self._wait_for_append_tail():
                 await self.model.finish_input_transcription(item, abandon=True)
                 return
@@ -1511,7 +1514,7 @@ class DuplexSessionRunner:
             self.run.pending_interruptions = 0
             self.run.interrupted_through_turn = None
             self._resident_stage0_segments = 0
-            self._last_stage0_turn = None
+            self._resident_tts_drained_at_turn = 0
             self.tool_calls.invalidate_epoch(new_epoch)
             if not closing_before:
                 retired = self._retire_pending_function_output()
@@ -2944,31 +2947,29 @@ class DuplexSessionRunner:
         playback = session.playback
         audio_ms = max(playback.sent_ms, playback.generated_ms)
         if (
-            session.turn_state != DuplexTurnState.IDLE
-            or session.last_response_id is None
+            session.turn_state not in (DuplexTurnState.IDLE, DuplexTurnState.USER_SPEAKING)
             or playback.committed_ms < audio_ms
             or helpers.response_in_progress(session, self.tasks)
             or self.run.interruption_pending
             or self.tasks.append_tasks
             or self._real_input_waiting()
             or self.model_state.committed_audio_payload is not None
+            or self._deferred_silence is not None
+            or any(t.get_name() == "duplex-continue" and not t.done() for t in self._background_tasks)
         ):
             return False
-        # A failed text reply releases its request binding without advancing
-        # the model turn. Stage 0 is its final stage, so check for queued input.
-        all_inputs_finished_stage0 = self._resident_stage0_segments == session.input_seq
-        if not session.capabilities.emits_audio and session.active_request_id is None:
-            return all_inputs_finished_stage0
-        # One completed turn can account for a single append. With pipelined
-        # input, its TTS terminal can precede the next input's first PCM.
-        # All accepted units must have left Stage 0 on already closed turns.
-        return session.turn_id > 0 and (
-            session.input_seq == 1
-            or (
-                all_inputs_finished_stage0
-                and self._last_stage0_turn is not None
-                and self._last_stage0_turn < session.turn_id
+        if self._resident_stage0_segments == session.input_seq and session.input_seq > 0:
+            return (
+                self._resident_tts_drained_at_turn is not None and session.turn_id >= self._resident_tts_drained_at_turn
             )
+        # A terminal from the only accepted input also proves that input drained
+        # when it reached the session before its Stage 0 notification.
+        return (
+            self._resident_stage0_segments == 0
+            and session.input_seq == 1
+            and session.turn_state == DuplexTurnState.IDLE
+            and session.last_response_id is not None
+            and session.turn_id > 0
         )
 
     async def _interrupt_resident_response(self, *, reason: str) -> bool:

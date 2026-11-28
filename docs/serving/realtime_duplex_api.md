@@ -672,8 +672,9 @@ creates the next response even while the model is confirming the interruption.
 Clients can cancel it immediately, and its ID stays the same when its answer
 arrives. Once input and playback have drained, each clear receives one
 `output_audio_buffer.cleared` acknowledgement. This also applies after a
-text-only reply fails or a cancellation finishes. If another input is still
-pending, the server acknowledges the clear and queues the interruption.
+text-only reply fails, a cancellation finishes, or the model only listens
+without opening a reply. If input or speech handed to TTS is still pending,
+the server acknowledges the clear and queues the interruption.
 No history prefill is needed for this interruption, on either local or hosted
 Stage-0 replicas. Normal sliding-window eviction still applies. As in the
 official native implementation, KV can contain generated speech the client has

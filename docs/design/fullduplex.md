@@ -1035,9 +1035,13 @@ for queue updates and the final validity check before delivery.
   closed unit rather than the new control unit. No request is aborted,
   no epoch is advanced, and no system/reference prefix or retained history is
   replayed. Buffered and already submitted input remains owned by that stream.
-  Output is suppressed until Stage 0 confirms the control; that boundary
-  advances the bridge's model turn, and later output from the cancelled turns
-  stays suppressed, including a Thinker length error from a cancelled unit.
+  Stage 0 confirms the marked control when its segment stops on LISTEN, even
+  if the previous segment reached its length limit immediately after turn EOS.
+  This routing decision advances the bridge and releases output suppression
+  for the next model turn. Late output from cancelled turns stays suppressed,
+  including a Thinker length error from a cancelled unit. Audio waiting for
+  its transcript can be delivered with terminal text on the same turn. The
+  projector releases any remaining buffered audio when that turn closes.
   Late cumulative PCM advances the cursor only while it still belongs to the
   same waveform. When a restarted waveform grows past its first real prefix,
   delivery resumes at the end of that prefix even if the new snapshot has

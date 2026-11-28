@@ -15,7 +15,7 @@ import pytest
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import MiniCPMO45DataPlaneSession
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import INTERRUPTION_KEY, MiniCPMO45DuplexPolicy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -71,6 +71,27 @@ def _decide(token_ids: list[int], *, text_input: bool = False):
 
 def test_plugin_forwards_speech_closed_by_listen_to_the_talker() -> None:
     assert _decide([TEXT, TEXT, TURN_EOS, LISTEN]) is None
+
+
+@pytest.mark.parametrize("final_stage", [0, 2])
+@pytest.mark.parametrize("token_ids", [[TEXT, TURN_EOS, LISTEN], [LISTEN, CHUNK_EOS]])
+def test_only_a_confirmed_interruption_listen_advances_the_bridge(final_stage: int, token_ids: list[int]) -> None:
+    tail = token_ids[-1]
+    output = _stage0_output([tail], text_input=True)
+    output.multimodal_output[INTERRUPTION_KEY] = True
+    output.outputs[0].cumulative_token_ids = token_ids
+    state = SimpleNamespace(bridge_states={"duplex": {"model_turn_id": 3}})
+    decision = MiniCPMO45DuplexPlugin(lambda *args: None).decide_output(
+        stage_id=0,
+        final_stage_id=final_stage,
+        segment_finished=True,
+        segment_token_ids=(tail,),
+        segment_output_metadata={},
+        output=output,
+        streaming_context=state,
+    )
+    assert (decision is not None) is (tail == LISTEN)
+    assert state.bridge_states["duplex"]["model_turn_id"] == (4 if tail == LISTEN else 3)
 
 
 def test_plugin_keeps_a_plain_listen_unit_a_listen_decision() -> None:

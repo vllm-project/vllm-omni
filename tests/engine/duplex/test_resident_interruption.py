@@ -236,30 +236,63 @@ async def test_control_uses_producer_turn_when_snapshot_includes_cancelled_units
     assert not h.runner.run.interruption_pending
 
 
-@pytest.mark.parametrize("h", [{"thinker_only": True, "stages": 1}], indirect=True)
-async def test_cancelled_thinker_length_stop_preserves_the_followup(h):
-    await h.run(append_audio())
-    request_id = h.stage0_request_id()
-    await h.deliver_and_settle(_stage0(request_id, [SPEAK, A], "嗯，", stop=False), stage_id=0, model_turn_id=0)
-    cancelled = find(await h.run(commands.CancelResponse()), "response.done")
-    assert cancelled.status == "cancelled"
-    new_id = find(await h.run(commands.AppendText(text="New question")), "response.created").response_id
-    assert new_id != cancelled.response_id
+@pytest.mark.parametrize("early_listen_step", [True, False])
+@pytest.mark.parametrize("capped_at_turn_eos", [True, False])
+async def test_cancelled_thinker_length_stop_preserves_the_followup(capped_at_turn_eos, early_listen_step):
+    orchestrator, clients, rpc, output_q = _build(stages=1, plugin=_plugin(True))
+    buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    try:
+        await _open(orchestrator, rpc, output_buffer=buffer, extra_body={"silence_continuation": False})
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        state = orchestrator.request_states[request_id]
+        session = orchestrator.session_manager.get(SESSION_ID)
+        bridge = state.streaming.bridge_states["duplex"]
 
-    capped = _capped_reply(request_id)
-    late = await h.deliver_and_settle(capped, stage_id=0, segment_finished=True, model_turn_id=0)
-    assert not {"error", "response.done", "response.output_text.delta"}.intersection(types(late))
-    assert h.session.active_response_id == new_id
+        async def deliver(output, *, finished=True):
+            output.is_segment_finished = finished
+            await orchestrator._intercept_stage_output(0, 0, output, state, None, None)
+            await _settle(orchestrator)
+            return await _drain_events(buffer, output_q)
 
-    tokens = [*capped.outputs[0].token_ids, LISTEN]
-    await h.deliver_and_settle(_control(request_id, tokens), stage_id=0, segment_finished=True, model_turn_id=0)
-    assert not h.runner.run.interruption_pending
-    reply = _stage0(request_id, [*tokens, SPEAK, B, TURN_EOS, CHUNK_EOS], "好的", stop=True)
-    events = await h.deliver_and_settle(reply, stage_id=0, segment_finished=True, model_turn_id=1)
-    delta = find(events, "response.output_text.delta")
-    done = find(events, "response.done")
-    assert delta.response_id == done.response_id == new_id
-    assert delta.delta == "好的" and done.status == "completed"
+        await deliver(_stage0(request_id, [SPEAK, A], "嗯，", stop=False), finished=False)
+        await _submit(orchestrator, commands.CancelResponse())
+        cancelled = find(await _drain_events(buffer, output_q), "response.done")
+        assert cancelled.status == "cancelled"
+        await _submit(orchestrator, commands.AppendText(text="New question"))
+        followup = await _drain_events(buffer, output_q)
+        new_id = find(followup, "response.created").response_id
+        assert new_id != cancelled.response_id
+
+        capped = _capped_reply(request_id)
+        if not capped_at_turn_eos:
+            capped.outputs[0].token_ids.pop()
+        late = await deliver(capped)
+        tokens = [*capped.outputs[0].token_ids, LISTEN]
+        control = _control(request_id, tokens)
+        control.outputs[0].cumulative_token_ids = tokens
+        control.outputs[0].token_ids = [LISTEN]
+        # A streaming step can already contain LISTEN before the segment stop.
+        if early_listen_step:
+            late += await deliver(control, finished=False)
+            assert bridge["model_turn_id"] == session.turn_id == 0
+        late += await deliver(control)
+        assert not {"error", "response.done", "response.output_text.delta"}.intersection(types(late))
+        assert bridge["model_turn_id"] == session.turn_id == 1
+        assert session.active_response_id == new_id
+
+        reply = _stage0(request_id, [*tokens, SPEAK, B, TURN_EOS, CHUNK_EOS], "好的", stop=True)
+        reply.multimodal_output["duplex_text_input"] = True
+        followup += await deliver(reply)
+        assert types(followup).count("response.created") == types(followup).count("response.done") == 1
+        delta = find(followup, "response.output_text.delta")
+        done = find(followup, "response.done")
+        assert delta.response_id == done.response_id == new_id
+        assert delta.delta == "好的" and done.status == "completed"
+        assert orchestrator.request_states[request_id] is state
+        assert all(not client.abort_calls for client in clients)
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -441,6 +474,106 @@ async def test_clear_after_failed_thinker_reply(h, next_input):
         events = await h.run(commands.ClearOutputAudio())
         assert types(events) == ["output_audio_buffer.cleared"] and events[0].response_id == failed.response_id
         assert len(h.port.submissions) == submissions
+
+
+@pytest.mark.parametrize("h", [{"thinker_only": True, "stages": 1}, {"stages": 3}], indirect=True)
+@pytest.mark.parametrize("after_reply", [False, True])
+async def test_clear_after_passive_listen(h, after_reply):
+    request_id = h.stage0_request_id()
+    tokens = []
+    response_id = None
+    if after_reply:
+        await h.run(append_audio())
+        tokens = [SPEAK, A, TURN_EOS, CHUNK_EOS]
+        events = await h.deliver_and_settle(
+            _stage0(request_id, tokens, "嗯，", stop=True), stage_id=0, segment_finished=True, model_turn_id=0
+        )
+        if not h.runner.plugin.data_plane.thinker_only:
+            events = await h.deliver_and_settle(tts_output(request_id, turn_end=True), stage_id=2)
+        response_id = find(events, "response.done").response_id
+        await h.run(commands.AckPlayback(response_id=response_id, played_ms=1000))
+
+    await h.run(append_audio())
+    turn_id = h.session.turn_id
+    await h.deliver_and_settle(
+        _stage0(request_id, [*tokens, LISTEN], "", stop=True),
+        stage_id=0,
+        segment_finished=True,
+        model_turn_id=turn_id,
+    )
+    submissions = len(h.port.submissions)
+    for _ in range(2):
+        cleared = await h.run(commands.ClearOutputAudio())
+        assert types(cleared) == ["output_audio_buffer.cleared"] and cleared[0].response_id == response_id
+        assert h.session.turn_id == turn_id and not h.runner.run.interruption_pending
+        assert len(h.port.submissions) == submissions
+
+
+@pytest.mark.parametrize("h", [{"stages": 3}], indirect=True)
+async def test_clear_precedes_a_queued_passive_listen(h):
+    await h.run(append_audio())
+    count = len(h.port.submissions)
+    h.submit(commands.ClearOutputAudio())
+    h.deliver(_stage0(h.stage0_request_id(), [LISTEN], "", stop=True), stage_id=0, segment_finished=True)
+    assert types(await h.settle()) == ["output_audio_buffer.cleared"]
+    assert h.runner.run.interruption_pending and len(h.port.submissions) == count + 1
+
+
+@pytest.mark.parametrize("h", [{"stages": 3}], indirect=True)
+async def test_passive_listen_does_not_hide_pending_tts(h):
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    await h.deliver_and_settle(_speak_segment_end(request_id), stage_id=0, segment_finished=True, model_turn_id=0)
+    await h.run(append_audio())
+    await h.deliver_and_settle(
+        _stage0(request_id, [LISTEN], "", stop=True), stage_id=0, segment_finished=True, model_turn_id=0
+    )
+    count = len(h.port.submissions)
+    assert types(await h.run(commands.ClearOutputAudio())) == ["output_audio_buffer.cleared"]
+    assert h.runner.run.interruption_pending and len(h.port.submissions) == count + 1
+
+
+@pytest.mark.parametrize("h", [{"stages": 3}], indirect=True)
+@pytest.mark.parametrize("last_chunk", [True, False])
+async def test_retired_turn_releases_audio_and_terminal_text_flushes_once(h, last_chunk):
+    request_id = h.stage0_request_id()
+    samples = 0
+    for turn_id in range(4):
+        await h.run(append_audio())
+        samples += 24000
+        events = await h.deliver_and_settle(
+            tts_output(request_id, samples=samples, text="", turn_id=turn_id), stage_id=2
+        )
+        assert "response.output_audio.delta" not in types(events)
+        turn_state = h.runner.plugin.data_plane._requests[request_id].turns[turn_id]
+        assert turn_state.pending_audio_without_text
+
+        text = "answer" if turn_id % 2 else ""
+        # A turn boundary may also bring the last piece of the waveform.
+        if turn_id >= 2:
+            samples += 12000
+        terminal = tts_output(
+            request_id, samples=samples, text=text, turn_end=True, turn_id=turn_id, tts_is_last_chunk=last_chunk
+        )
+        events = await h.deliver_and_settle(terminal, stage_id=2)
+        assert h.session.turn_id == turn_id + 1
+        assert not turn_state.pending_audio_without_text
+        if text:
+            done = find(events, "response.done")
+            assert done.status == "completed"
+            transcript = [event for event in events if event.type == "response.output_audio_transcript.delta"]
+            assert "".join(event.delta for event in transcript) == text
+            assert all(event.response_id == done.response_id for event in transcript)
+            packets = [event for event in events if event.type == "response.output_audio.delta"]
+            assert packets and all(packet.response_id == done.response_id for packet in packets)
+            assert [packet.delta for packet in packets] == (
+                ["wav-24000", "wav-12000"] if turn_id >= 2 else ["wav-24000"]
+            )
+            await h.run(commands.AckPlayback(response_id=done.response_id, played_ms=1500 if turn_id >= 2 else 1000))
+        else:
+            assert "response.created" not in types(events) and "response.output_audio.delta" not in types(events)
+        replay = await h.deliver_and_settle(terminal, stage_id=2)
+        assert not {"response.output_audio.delta", "response.done"}.intersection(types(replay))
 
 
 @pytest.mark.parametrize("pending", ["none", "queued", "completed", "awaiting-tts"])
