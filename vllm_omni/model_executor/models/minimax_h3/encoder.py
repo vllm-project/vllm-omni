@@ -216,7 +216,7 @@ class MiniMaxH3Encoder(MiniMaxH3TextEncoderBackbone):
                 raise RuntimeError("MiniMax H3 encoder components did not produce conditioning")
             per_request.append(cached.to_omni_components())
 
-        if release_workspace:
+        if release_workspace and torch.accelerator.is_available():
             torch.accelerator.empty_cache()
         if not self._component_leader:
             return output
