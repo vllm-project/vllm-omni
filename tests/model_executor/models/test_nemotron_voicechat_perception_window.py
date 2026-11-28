@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Rolling-window mel slicing must match full-history slicing bit-for-bit.
+"""Rolling-window mel slicing must match full-history slicing to float tolerance.
 
 The duplex thinker keeps a bounded trailing audio window instead of the full
 session history (the mel featurizer is local: hop-aligned STFT columns, no
@@ -110,7 +110,18 @@ def test_windowed_mel_chunks_match_full_history(streaming_cfg):
         )
         assert actual_drop == expected_drop
         assert actual.shape == expected.shape, f"frame {frame_idx}"
-        assert torch.equal(actual, expected), f"frame {frame_idx} mel chunk diverged (window_col0={window_col0})"
+        # Not torch.equal: the trimmed window and the full history are
+        # different-length signals through the STFT, so the FFT path and its
+        # vectorisation differ and the results agree only to float tolerance
+        # (~1e-6 here, 1-2 ULP). Bitwise equality is platform/build dependent
+        # and made this test fail on hosts where the two paths round
+        # differently. The tolerance is ~10x the observed noise and far below
+        # anything a real windowing regression would move, and shape/drop are
+        # still asserted exactly above.
+        assert torch.allclose(actual, expected, atol=1e-5, rtol=0), (
+            f"frame {frame_idx} mel chunk diverged (window_col0={window_col0}, "
+            f"max_abs_diff={(actual.float() - expected.float()).abs().max().item():.3e})"
+        )
 
     assert trimmed, "test never exercised the trimmed-window path"
     # The rolling window must stay bounded instead of growing with the stream.
