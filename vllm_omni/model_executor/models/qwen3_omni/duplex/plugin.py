@@ -1149,18 +1149,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if self._history_runtime.behavior.audio_retention == "original":
             return current_is_in_history
         has_audio = bool(payload.get("audio"))
-        # Reserve one of the four audio slots for the actual submitted input,
+        # Reserve one cache slot for the actual submitted input,
         # including when deferred input has no trailing user history entry.
-        history_limit = self._history_runtime.behavior.audio_cache_items
-        assert history_limit is not None
+        history_limit = self._history_runtime.behavior.audio_cache_items or self._history_runtime.limits.max_audio_items
         history_limit -= int(has_audio and not current_is_in_history)
         retained = state.audio_history[-history_limit:] if history_limit else []
-        byte_limit = self._history_runtime.behavior.audio_cache_bytes
-        while (
-            byte_limit is not None
-            and len(retained) > 1
-            and sum(len(value.get("audio", "")) for _, value in retained) > byte_limit
-        ):
+        byte_limit = self._history_runtime.behavior.audio_cache_bytes or self._history_runtime.limits.max_audio_bytes
+        while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > byte_limit:
             retained.pop(0)
         state.audio_history = retained
         return current_is_in_history

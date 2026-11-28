@@ -9,6 +9,10 @@ from ..utils.logging import get_connector_logger
 logger = get_connector_logger(__name__)
 
 
+class PermanentTransferError(RuntimeError):
+    """A transfer that cannot succeed by retrying the same get or put."""
+
+
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 

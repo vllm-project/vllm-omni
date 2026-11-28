@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 
 import json
@@ -143,7 +143,7 @@ class OmniCoordinator:
     def _check_heartbeat_timeouts(self) -> None:
         """Mark replicas as ERROR if their heartbeat has timed out."""
         now = time()
-        timed_out = False
+        timed_out: list[tuple[int, str, float]] = []
         gc_ttl = 600.0  # 10 minutes
 
         with self._lock:
@@ -152,12 +152,22 @@ class OmniCoordinator:
             for input_addr, info in self._replicas.items():
                 if info.status == ReplicaStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
                     self._mark_replica_error_locked(info)
-                    timed_out = True
+                    timed_out.append((info.stage_id, input_addr, info.last_heartbeat))
                 elif info.status in (ReplicaStatus.DOWN, ReplicaStatus.ERROR) and now - info.last_heartbeat > gc_ttl:
                     to_delete.append(input_addr)
 
             for input_addr in to_delete:
                 del self._replicas[input_addr]
+        for stage_id, input_addr, last_heartbeat in timed_out:
+            logger.warning(
+                "Replica heartbeat timed out: stage=%d input_addr=%s last_heartbeat=%.3f "
+                "elapsed=%.3fs timeout=%.3fs; marking replica ERROR",
+                stage_id,
+                input_addr,
+                last_heartbeat,
+                now - last_heartbeat,
+                self._heartbeat_timeout,
+            )
         if timed_out:
             # Replica liveness changed; request broadcast.
             self._schedule_broadcast()
@@ -321,14 +331,28 @@ class OmniCoordinator:
 
             # Check-and-act under single lock to avoid TOCTOU race (duplicate
             # registration when concurrent events arrive for the same replica).
+            down_transition: tuple[int, ReplicaStatus] | None = None
             with self._lock:
                 if input_addr not in self._replicas:
                     self._add_new_replica_locked(event)
                 else:
                     if event.status == ReplicaStatus.DOWN:
+                        info = self._replicas[input_addr]
+                        if info.status != ReplicaStatus.DOWN:
+                            down_transition = (info.stage_id, info.status)
                         self._remove_replica_locked(event)
                     else:
                         self._update_replica_info_locked(event)
+
+            if down_transition is not None:
+                stage_id, previous_status = down_transition
+                logger.info(
+                    "Replica reported DOWN: stage=%d input_addr=%s previous_status=%s event_type=%s",
+                    stage_id,
+                    input_addr,
+                    previous_status.value,
+                    event.event_type,
+                )
 
             # Any non-heartbeat state change that affects the active list
             # is coalesced and flushed via the periodic loop.

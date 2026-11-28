@@ -37,6 +37,7 @@ Common `StagePipelineConfig` fields include:
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
+| `scheduler_window_policy` | Optional dotted class path implementing `SchedulerWindowPolicy`. The scheduler creates one instance for this stage to handle window admission, appends and request lifecycle events. Defaults to `None`; the MiniCPM-o duplex Thinker stage supplies a policy. |
 | `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |
@@ -105,7 +106,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by platform (`cuda`, `npu`, `rocm`, `xpu`, etc.). Per-platform `stages:` and named `connectors:` overrides are applied on top of the shared defaults. |
+| `platforms` | dict | optional | `null` | Keyed by platform (`cuda`, `npu`, `rocm`, `xpu`, etc.). Each platform may provide `stages:` overrides, a `model_runner` selection, and named `connectors:` overrides deep-merged into the shared defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -163,11 +164,17 @@ Placement selects an eligible group by its highest reserved-to-capacity ratio,
 then its total reserved count, with round-robin tie-breaking. Sessions keep
 their group across turns, cancellation, epochs and reconnects. Idle sessions
 hold their slots, and closing sessions release them after cleanup completes.
-If a complete group is still live but session capacity is exhausted, opening
-a session returns the retryable `resource_exhausted` error. If replica failures leave this frontend with no
-complete group, opening a session returns `replica_unavailable`. A frontend
-that starts in this state logs a warning and skips duplex warmup. With multiple
-frontends, the client can reconnect to try another frontend.
+When a complete group is live and the frontend reaches its session limit, up
+to one open per closing session can wait up to 15 seconds for a slot. The
+server returns retryable `resource_exhausted` if no waiting position is
+available or the frontend is still full when the wait ends. It also returns
+this error if complete groups are live but none has enough replica capacity
+to admit the session.
+
+If replica failures leave this frontend with no complete group, opening a
+session returns `replica_unavailable`. A frontend that starts in this state
+logs a warning and skips duplex warmup. With multiple frontends, the client
+can reconnect to try another frontend.
 
 `least_sessions` supports replicas attached through distributed runtimes,
 including multiple runtimes serving the same stage across hosts. Declare the
@@ -698,6 +705,40 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
+
+## Higgs-Audio V3 with Model Runner V2
+
+Higgs-Audio V3 uses `model_runner: v2`, the only runner available with vLLM
+0.34. Its `audio_mrv2_*` and `audio_async_*` switches are tri-state fields of
+`HiggsAudioV3Config`: omitted values follow the runner selection, and explicit
+values remain tuning overrides. `audio_async_payload` and
+`audio_async_prompt_mode` are structural under V2 and cannot be disabled.
+The talker requires `async_scheduling: true`.
+
+| Profile | Runner | Intended use |
+| --- | --- | --- |
+| `higgs_multimodal_qwen3.yaml` | V2 | Default CUDA graph shape scaled to 16 sequences |
+| `higgs_multimodal_qwen3_mrv2_h200.yaml` | V2 | Large-card tuning (64-sequence capacities, MPS) |
+
+The default CUDA connector uses 25-frame chunks, 8-frame left context, and an
+8-frame first chunk, matching the Stage-1 codec graph windows `[8, 33]`.
+Non-CUDA platform overrides retain eager execution, prefix caching and the
+previous connector geometry (25-frame context, 4-frame holdback, 1-frame first
+chunk). They keep V2 and async scheduling enabled, but disable the six new
+CUDA-tuned `audio_mrv2_*` optimizations. This preserves configuration behavior;
+NPU, XPU, ROCm and MUSA hardware validation remains separate.
+
+The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for
+compatibility, but both files are V2 profiles on vLLM 0.34. The former keeps
+the eager local MLP graph; the latter uses the external `FULL_DECODE_ONLY`
+graph. Neither file is a V1 opt-out. Use the default or H200 profile above;
+selecting `model_runner: v1` is rejected.
+
+The V2 sampler supports `temperature`, `top_p`, `top_k` and `seed`. Non-neutral
+penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias
+are rejected at startup when present in `default_sampling_params`, or before
+queue admission for individual requests. Remove unsupported parameters;
+there is no V1 fallback.
 
 ## Qwen3-TTS with Model Runner V2
 

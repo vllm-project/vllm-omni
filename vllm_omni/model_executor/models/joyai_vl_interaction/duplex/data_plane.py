@@ -19,7 +19,6 @@ from vllm_omni.engine.duplex.visual_memory import (
     VisualMemory,
     VisualMemorySource,
 )
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
     delegation_arguments,
@@ -30,6 +29,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     SUMMARY_CHUNK_MESSAGES,
     JoyAISummaryMemory,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
     spoken_text_ready,
 )
@@ -66,6 +66,8 @@ class WorkingObservation:
     query_item_id: str | None = None
     history_anchor_item_ids: tuple[str, ...] = ()
     response_item_id: str | None = None
+    transcript_item_id: str | None = None
+    user_item_sources: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -135,6 +137,8 @@ class Observation:
     query_reference: QueryReference | None = None
     response_frame_id: int = -1
     response_time_s: float = 0.0
+    transcript_item_id: str | None = None
+    user_item_sources: tuple[tuple[str, int], ...] = ()
 
     def absorb(self, output: object) -> tuple[str, bool]:
         """Fold one stage output into the cumulative action text.

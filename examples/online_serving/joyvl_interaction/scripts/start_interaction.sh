@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch the interaction orchestrator in front of a running model server.
 set -euo pipefail
 
@@ -15,7 +18,7 @@ EXTRA=()
 [[ -n "${SUMMARIZER_MODEL:-}" ]] && EXTRA+=(--summarizer-model "${SUMMARIZER_MODEL}")
 [[ "${NO_MEMORY:-0}" == "1" ]] && EXTRA+=(--no-memory)
 
-python -m vllm_omni.experimental.fullduplex.joyvl.serving.server \
+python -m vllm_omni.entrypoints.joyvl.serving.server \
     --port "${PORT}" \
     --main-backend-url "${MAIN_BACKEND_URL}" \
     --main-model "${MAIN_MODEL}" \

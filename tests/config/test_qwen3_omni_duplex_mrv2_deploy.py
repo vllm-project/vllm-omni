@@ -32,7 +32,7 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True, True]
     assert [stage.yaml_engine_args["session_mode"] for stage in stages] == ["duplex", "duplex", "duplex"]
     assert all(stage.yaml_engine_args["async_chunk"] for stage in stages)
-    assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {"audio": 4, "image": 8}
+    assert "limit_mm_per_prompt" not in stages[0].yaml_engine_args
     connector = config.connectors["connector_of_shared_memory"]["extra"]
     assert connector["talker_first_audio"] is True
 

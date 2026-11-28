@@ -361,7 +361,7 @@ identities. With this option, `--num-prompts 0` selects exactly `N` samples,
 rather than the full dataset. The same pool behavior applies to OmniInteract;
 answer evaluation and oversampling with `--no-oversample` are rejected.
 
-For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex.yaml`,
+For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml`,
 use the same entrypoint with server-detected turns and no reference audio:
 
 ```bash
@@ -422,14 +422,14 @@ This is an annotation-based compatibility selection, not a claim that every
 sample has passed model validation. The job streams question audio with video;
 RTD, future-event reminders and continuous monitoring are outside this workload.
 
-The `c8_accuracy_response_stats_v5` workload uses `--duplex-metric-aggregation response`
+The `c8_accuracy_response_stats` workload uses `--duplex-metric-aggregation response`
 and `--metric-percentiles 50,95` to pool responses for TTFT, audio TTFP and RTF.
 Missing measurements are excluded, never substituted with zero. All sessions
 must finish, publish artifacts and provide measured text/audio latency. The
 judge must evaluate all 120 corrections successfully and produce a finite
 correction success rate. Judging runs after the measured replay and does not
-enter its duration. No calibrated score floor or hardware latency baseline is
-checked in for this expanded workload; establish fresh H100 and B200 baselines.
+enter its duration. See the [Qwen3-Omni benchmark configuration](../../contributing/ci/qwen3_omni_benchmark.md)
+for the hardware-specific accuracy and performance baselines.
 `--dataset-path repo/id@revision` pins a remote Omni-DuplexEval source; local
 directory and parquet paths retain their existing behavior.
 
@@ -689,7 +689,7 @@ Serve with the duplex deployment, which needs the Silero VAD artifact in the Hug
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 
 vllm bench serve --omni \
   --backend openai-realtime-duplex \
@@ -870,7 +870,7 @@ signal, not a transport failure. Accuracy must finish with `status=ok`, `failed=
 IA-QTF1 floor; skipped sessions from the official eligibility policy do not fail the job.
 
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
-using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via
+using the existing `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` via
 `server_params.extra_cli_args`. Inline `server_params.update` values select
 `model_runner: v2`, `async_chunk: true`, Thinker prefix caching,
 `duplex_session.max_sessions: 8`, and `duplex_session.collect_stats: true`.
@@ -926,8 +926,6 @@ emitted audio duration. Stall ratio is engine-resident time outside that work
 union divided by emitted audio duration; it is not a playback-underrun ratio.
 These client/server response metrics display mean, median and P99. The harness
 requires nonempty, finite measurements; missing stats do not pass as zeros.
-The stats-enabled workload is named `c8_accuracy_response_stats_v5`; it needs a
-new measured baseline rather than reusing the earlier stats-disabled results.
 
 OmniInteract judging uses the same formal outputs as the performance report and
 records All Global IA-QTF1 plus evaluated/skipped counts. The official eligibility
@@ -954,12 +952,8 @@ The `max_concurrent_requests` statistic counts sessions touching each whole-seco
 bucket. At a wave boundary it can exceed the instantaneous concurrency because
 ending and starting sessions in the same second share a bucket.
 
-The configuration is named `c8_accuracy_response_stats_v5` to distinguish its sample
-selection and judging from older workloads. Use matching hardware and workload
-versions for comparisons; previous C1/C8/C16 16-source-pool results are not baselines
-for these expanded jobs. The earlier `c8_accuracy_response_v3` runs used V1
-with Thinker prefix caching disabled; record the runner and cache settings when
-comparing results.
+For performance comparisons, match the hardware, sample IDs, concurrency, model runner,
+prefix caching and session statistics settings.
 
 ### Seed-TTS reference speech as real audio input
 
@@ -976,7 +970,7 @@ the accompanying text rather than transcribe or answer the audio. This is what m
 conversation turn rather than a TTS call. It requires `--backend openai-realtime-chat`.
 
 For Qwen3-Omni, use a server running the
-[`qwen3_omni_duplex.yaml` deployment](gh-file:vllm_omni/deploy/qwen3_omni_duplex.yaml) with async chunking enabled.
+[`qwen3_omni_duplex_mrv2.yaml` deployment](gh-file:vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml) with async chunking enabled.
 Each dataset entry uses an independent WebSocket session at `/v1/realtime?duplex=1` with one audio turn and one response.
 
 ```bash

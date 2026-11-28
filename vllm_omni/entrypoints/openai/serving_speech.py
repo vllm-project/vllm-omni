@@ -71,7 +71,12 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, conditioning_cache_salt, validate_tts_request
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    IncrementalTTSInput,
+    conditioning_cache_salt,
+    validate_tts_request,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
@@ -2435,6 +2440,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str | None = None,
         has_inline_ref_audio: bool | None = None,
         arrival_time: float | None = None,
+        *,
+        incremental_input: IncrementalTTSInput | None = None,
+        input_complete: bool = False,
+        submitted: asyncio.Future[None] | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
@@ -2444,6 +2453,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate_error = self._validate_speech_sample_rate(request)
         if sample_rate_error is not None:
             raise ValueError(sample_rate_error)
+
+        adapter = self._get_tts_adapter()
+        if adapter is not None and request.temperature is not None and not adapter.supports_temperature:
+            raise ValueError(f"Model '{adapter.name}' does not support 'temperature'")
 
         request_id = request_id or f"speech-{random_uuid()}"
 
@@ -2516,12 +2529,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         additional_prompts: list[dict[str, Any]] = []
         segment_silence_ms = 200
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
-        if (adapter := self._get_tts_adapter()) is not None:
+        if adapter is not None:
             adapter.normalize(request)
             validation_error = validate_tts_request(adapter, request)
             if validation_error:
                 raise ValueError(validation_error)
-            prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
+            prepared = (
+                await incremental_input.build(request.input, final=input_complete)
+                if incremental_input is not None
+                else await adapter.build(request, sampling_params_list, has_inline_ref_audio)
+            )
             prompt = prepared.prompt
             tts_params = prepared.tts_params
             model_type = prepared.model_type
@@ -2629,6 +2646,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sampling_params_list=sampling_params_list,
                 output_modalities=output_modalities,
                 arrival_time=arrival_time,
+                **({"submitted": submitted} if submitted is not None else {}),
                 watermarking=request.watermarking,
             )
         # Only the non-streaming path consumes output policies (in
@@ -2654,6 +2672,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         target_sample_rate: int | None = None,
         cumulative_audio: bool = False,
         audio_format: dict[str, int] | None = None,
+        usage_acc: SpeechOutputTokenCounter | None = None,
     ):
         """Yield raw PCM byte chunks from the engine generator.
 
@@ -2675,6 +2694,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 target_sample_rate=target_sample_rate,
                 cumulative_audio=cumulative_audio,
                 audio_format=audio_format,
+                usage_acc=usage_acc,
             )
         ) as chunks:
             async for chunk in chunks:
@@ -2893,6 +2913,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             adapter = self._get_tts_adapter()
             if adapter is None:
                 raise ValueError(f"Model {self._diffusion_model_name!r} does not provide a diffusion TTS adapter.")
+
+            if request.temperature is not None:
+                raise ValueError("Diffusion TTS models do not support 'temperature'")
 
             adapter.normalize(request)
 

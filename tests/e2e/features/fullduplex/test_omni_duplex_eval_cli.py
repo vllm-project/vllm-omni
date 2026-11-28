@@ -27,6 +27,7 @@ from vllm_omni.benchmarks.duplex_session_metrics import (
     merge_duplex_metrics_report,
     read_duplex_metrics_report,
 )
+from vllm_omni.clients import duplex as duplex_client
 from vllm_omni.clients.duplex import EventCollector
 from vllm_omni.entrypoints.cli.benchmark import omni_duplex_eval as cli
 from vllm_omni.entrypoints.cli.benchmark.omni_duplex_eval import OmniDuplexEvalSubcommand
@@ -947,7 +948,7 @@ async def test_generate_accepts_settled_terminal_silence_only_after_the_drain_ti
                 await websocket.send(json.dumps({"type": "session.closed"}))
                 return
 
-    monkeypatch.setattr(runner, "wait_for", full_timeout)
+    monkeypatch.setattr(duplex_client, "wait_for_condition", full_timeout)
     monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
     monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
     monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
@@ -1544,18 +1545,6 @@ def test_collect_duplex_session_metrics_matches_omniinteract_window():
     )
     assert report["duplex_stream_ttft_ms"]["mean"] == 200.0
     assert report["duplex_stream_ttfp_ms"]["mean"] == 300.0
-
-
-def test_event_collector_from_realtime_copies_client_appends():
-    from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
-
-    source = RealtimeEventCollector()
-    stamp = {"sent_at_s": 9.8, "event_id": "evt-1"}
-    source.note_client_append(stamp)
-    source.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=10.0)
-    copied = runner._event_collector_from_realtime(source)
-    assert copied.client_appends == [stamp]
-    assert copied.response_ids == ["r1"]
 
 
 def test_collect_duplex_session_metrics_keeps_all_engine_stages():

@@ -29,7 +29,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import ParsedAction
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import ParsedAction
 
 #: The one function JoyAI declares.
 DELEGATION_TOOL_NAME = "delegate"

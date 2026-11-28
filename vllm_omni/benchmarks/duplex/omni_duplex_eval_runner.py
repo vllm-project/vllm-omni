@@ -23,6 +23,7 @@ from uuid import uuid4
 
 import pybase64 as base64
 from vllm.logger import init_logger
+from websockets.exceptions import ConnectionClosed
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex_session_inputs import (
@@ -38,18 +39,9 @@ from vllm_omni.benchmarks.duplex_session_inputs import (
     session_turn_detection,
     turn_activity_count,
 )
-from vllm_omni.experimental.fullduplex.client import (
-    PCM16_BYTES_PER_SAMPLE,
-    PCM16_SAMPLE_RATE,
-    ConnectionClosed,
-    RealtimeDuplexClient,
-    RealtimeEventCollector,
-    build_realtime_url,
-    wait_for,
-)
 
 if TYPE_CHECKING:
-    from vllm_omni.clients.duplex import EventCollector
+    from vllm_omni.clients.realtime import RealtimeDuplexClient
 
 from .omni_duplex_eval_clock import extract_timed_chunks, extract_timed_sentences, has_response_chunks
 from .omni_duplex_eval_media import (
@@ -261,22 +253,6 @@ def write_failed_sample_diagnostics(result: GenerateSampleResult) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return diagnostics
-
-
-def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventCollector:
-    """Replay experimental collector events onto the public EventCollector."""
-    from vllm_omni.clients.duplex import EventCollector
-
-    collector = EventCollector()
-    for event, received_at_s in zip(source.events, source.event_received_at_s, strict=True):
-        collector.add(event, received_at_s=received_at_s)
-    for record in source.client_appends:
-        sent_at_s = record.get("sent_at_s")
-        event_id = record.get("event_id")
-        if not isinstance(sent_at_s, int | float) or not isinstance(event_id, str):
-            continue
-        collector.note_client_append({"sent_at_s": float(sent_at_s), "event_id": event_id})
-    return collector
 
 
 def _with_sample_identity(payload: dict[str, object], sample: DuplexSample) -> dict[str, object]:
@@ -782,6 +758,11 @@ async def generate_sample(
     Metadata written before mix was recorded counts as ``question``. RTD only
     reads sentences, so its bare sentence lists are still reused.
     """
+    # The CLI imports this module while composing the server. Load client
+    # libraries only when a benchmark session actually runs.
+    from vllm_omni.clients.duplex import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE, wait_for_condition
+    from vllm_omni.clients.realtime import RealtimeDuplexClient, build_realtime_url
+
     if pace not in {"realtime", "as-fast-as-possible"}:
         raise ValueError("pace must be realtime or as-fast-as-possible")
     if turn_detection not in TURN_DETECTION_MODES:
@@ -851,6 +832,8 @@ async def generate_sample(
             extra_body=extra_body,
             auto_response=not server_turns,
             turn_detection=session_turn_detection(turn_detection),
+            # Use the deployment default; a text-only deployment rejects audio.
+            modalities=None,
         )
         frame_transport = select_frame_transport(_session_capabilities(client))
         if not server_turns:
@@ -932,7 +915,7 @@ async def generate_sample(
                 else:
                     silence_task, commit_timeout = await _commit_clip_then_pad(client, period_ms, silence_stop)
                     input_committed = commit_timeout is None
-                    await wait_for(
+                    await wait_for_condition(
                         responses_finished,
                         timeout_s=_drain_timeout_s(prepared.duration),
                         label="response.done",
@@ -1007,7 +990,7 @@ async def generate_sample(
             close_timeout = str(exc)
             logger.warning("DuplexEval: session close not delivered for sample %s: %s", sample.id, exc)
         events = list(client.events.events)
-        collector = _event_collector_from_realtime(client.events)
+        collector = client.events
     if drain_timeout_state is not None:
         drain_timeout_state["completion_state_events_after_timeout"] = _completion_diagnostics(
             events,
@@ -1078,7 +1061,13 @@ async def generate_sample(
             finished.add(response.get("id"))
             # Barge-in cancels an individual turn, not the input clip. Its
             # preceding responses and already emitted text remain judge input.
-            if response.get("status", "completed") not in {"completed", "cancelled"}:
+            status = response.get("status", "completed")
+            details = response.get("status_details")
+            # A reply stopped at the continuation limit keeps the text it already emitted.
+            at_limit = (
+                status == "incomplete" and isinstance(details, dict) and details.get("reason") == "continuation_limit"
+            )
+            if status not in {"completed", "cancelled"} and not at_limit:
                 errors.append(f"Response did not complete: {response}")
     # A turn may be created while closing the continuous session. Record this
     # boundary in metadata; drain/close timeouts and server errors above still

@@ -9,8 +9,9 @@ This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
 The endpoint requires a duplex plugin and a deployment with `session_mode: duplex`.
-See [supported models and deployments](full_duplex_api.md#enable-full-duplex)
-and the [runtime architecture](../design/fullduplex.md).
+See [supported models and deployments](full_duplex_api.md#enable-full-duplex),
+the [runtime architecture](../design/fullduplex.md), and the
+[Duplex-MPE multi-party selective participation benchmark](gh-file:benchmarks/duplex_mpe/README.md).
 
 ## Qwen3-Omni conversation history
 
@@ -45,6 +46,12 @@ reuses those media features for inference. Overflow returns the recoverable
 items and retry. It does not silently switch to a smaller history window. Original
 input audio remains retained while its source items exist, so session storage can
 grow with the conversation. Session input-admission limits also remain in effect.
+
+The MRv2 deployment does not impose the legacy four-audio/eight-image request
+window. It inherits vLLM's media-count defaults (currently 999 per modality).
+Set `stages[0].limit_mm_per_prompt` in a deployment overlay to impose smaller
+counts. Session image admission remains capped at 200 images / 32 MiB of encoded
+URLs by default, separately from per-request counts and context tokens.
 
 To restore the previous clipping behavior, select `recent` in a deployment overlay:
 
@@ -108,7 +115,7 @@ Save this as `qwen3_history.yaml`, replacing `base_config` with the absolute pat
 to the repository's Qwen3-Omni duplex deployment:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   history_ms_per_token: 383
   history_calibration_timeout_ms: 1000
@@ -168,7 +175,7 @@ short calibration deadline.
 Use this overlay as `qwen3_history.yaml` instead of the fixed-rate overlay:
 
 ```yaml
-base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   history_asr_url: http://127.0.0.1:18942/v1/audio/transcriptions
   history_asr_model: history-asr
@@ -658,6 +665,23 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
+On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
+old output. Its replacement re-prefills the accepted Thinker context before
+processing its first input, including the processed rows of an unfinished
+unit. If the first new input is unforced text or carries a delegated tool
+result, it can open a reply on that same unit. In `"off"` mode, if the
+full prefix and new input leave insufficient
+room to sample within the model context limit, the session ends with
+`context_length_exceeded`. The session keeps the snapshot
+on its Stage-0 replica until replacement or session cleanup. Model text can
+include speech the client has not played yet, and a new response can return to
+the interrupted topic. A replica failure still ends the session.
+
+An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
+and `"context"`: the same replica can offer completed units for 10 seconds
+from the abort, subject to a limit of 32 waiting windows. In `"off"` mode this
+deployment starts the replacement from the system turn and reference audio.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
@@ -1024,7 +1048,7 @@ With the serving environment active, start Qwen's duplex server:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml --port 8099
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml --port 8099
 ```
 
 In your working directory, define an async tool and its declaration:
@@ -1223,6 +1247,49 @@ extensions that a stock OpenAI client ignores; **3** means vLLM-Omni only,
 with no OpenAI counterpart.
 
 ### Capability negotiation by model
+
+Output availability is deployment-specific. `capabilities` includes
+`supported_output_modalities` and `default_output_modalities`. Omitting both
+`modalities` and `output_modalities` uses the deployment defaults. Explicit
+lists must be nonempty and contain `text` and/or `audio`. Names are
+case-insensitive and normalized to lowercase, so `["Audio", "Text"]` remains
+accepted by speech deployments. Duplicate entries after normalization and
+non-list values are rejected explicitly. If both aliases are supplied they
+must agree after normalization. A request for unavailable output fails with
+`unsupported_output_modality` at session open, `session.update`, or
+`response.create`, including the inline Python API. Rejected updates preserve
+the current configuration and rejected output requests allocate no model work.
+
+A deployment with one final text stage defaults to `text` and disables playback
+ACKs, audio truncation, and inter-stage handoff. Synthesis-only `voice` and
+non-default `speed` fail with `unsupported_parameter`; audio format defaults
+remain accepted for client compatibility. Text replies commit the emitted text
+without playback ACKs even under `ack_only`; cancellation retains the emitted
+prefix and discards stale output. Whitespace-only replies are not stored as
+assistant turns; meaningful text retains its emitted whitespace verbatim.
+On text-only deployments, when a reply starts before its input commits,
+history places the owning input before that reply and subsequent input
+after it. A terminal native LISTEN uses the same history policy as normal
+completion, including when the continuation budget is exhausted;
+`conversation: "none"` keeps its text out of history and releases
+zero-audio response state without an ACK.
+The unconditional playback-policy bypass applies to deployments without audio
+output. On speech deployments, text replies with zero generated/sent audio and
+no audio-completion dependency commit without an ACK. Text that depends on
+complete audio follows alignment and playback checks. A text modality override
+alone does not implement per-request TTS skipping.
+Targeted playback ACKs for text-only items
+and audio truncation on text-only deployments fail with `unsupported_operation`
+without modifying history. The default MiniCPM three-stage deployment continues
+to advertise text and audio. `minicpmo_4_5_duplex_thinker_only.yaml`
+advertises text only. Text arrives as `response.output_text.delta` events; a
+delta does not mark a unit or reply boundary. `response.done` carries engine
+metrics under `metadata.vllm_omni.stage_metrics`, and the first non-empty text
+delta carries server TTFT under `metadata.vllm_omni.response_request_metrics`.
+A reply that ends without audio (continuation limit, failure, cancellation, or
+`conversation: "none"`) releases its playback state; uncommitted text is
+discarded. A late ACK for it fails with `playback_item_not_found` (or
+`unsupported_operation` on text-only deployments).
 
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must
@@ -1658,6 +1725,7 @@ A stock client ignores the extra keys; the extensions are additive.
 | `session.created` / `session.updated` | top-level `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
 | `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`), whose `response.created` carries `response_request_metrics` (`ttft_ms` / `ttfp_ms` once known, `measurement_origin`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
 | `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback, vllm_omni.response_request_metrics}` |
+| `response.output_text.delta` | optional `metadata.vllm_omni.response_request_metrics` with server TTFT |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |
@@ -1832,13 +1900,13 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.speak` | 3 | Model chose to speak (native lane); at most once per response, before the first audio delta. |
 | `response.output_audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
 | `response.output_audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
-| `response.output_text.delta` | 1 | Text delta for text-modality responses. |
+| `response.output_text.delta` | 2 | Text delta for text-modality responses; optional server TTFT under `metadata.vllm_omni.response_request_metrics`. |
 | `response.output_text.done` | 1 | Final text of a text-modality response. |
 | `response.output_audio.done` | 1 | Audio stream closed for the response. |
 | `response.output_audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
 | `response.content_part.done` | 1 | Content part finalized with its transcript/text. |
 | `response.output_item.done` | 1 | Assistant item finalized. |
-| `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `cancelled` \| `failed`. OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
+| `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `incomplete` \| `cancelled` \| `failed` (`incomplete` with `status_details.reason: "continuation_limit"` when the continuation budget ends the response). OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
 | `rate_limits.updated` | 1 | Compatibility event after every `response.done`; always an empty list. |
 | `response.listen` | 3 | Model chose to keep listening at a unit boundary or after a silence commit. Carries `response_id` when the decision terminates a precreated response (a `response.done` with the same id follows); otherwise no `response.created` precedes it. |
 | `response.function_call_arguments.delta` | 1 | Tool-call arguments delta (Nemotron VoiceChat). |
@@ -2726,8 +2794,10 @@ them out into typed events before they reach a client.
 - `rate_limits.updated` is emitted for compatibility only and always carries
   an empty list.
 - Session capacity is bounded by `duplex_session.max_sessions` in the deploy
-  configuration; admission beyond it fails with `resource_exhausted`
-  (`rate_limit_error`, retryable).
+  configuration. When capacity is full and sessions are closing, the server
+  can wait up to 15 seconds for a slot to be released. If capacity is still
+  unavailable, the server returns retryable `resource_exhausted`
+  (`rate_limit_error`).
 - A duplex deployment serves the websocket route and, when supported by the
   model, ordinary `/v1/chat/completions` requests on the same engine without a
   session per request (see [Start the Server](#start-the-server)). Other

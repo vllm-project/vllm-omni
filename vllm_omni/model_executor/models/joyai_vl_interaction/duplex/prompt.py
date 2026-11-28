@@ -5,7 +5,7 @@
 import regex as re
 
 from vllm_omni.errors import OmniClientError
-from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import USER_QUERY_HEADER
 
 
 def validate_working_messages(messages: object, history: list[dict[str, object]], image_count: int) -> None:

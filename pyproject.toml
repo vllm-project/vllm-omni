@@ -193,6 +193,7 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 # only import vllm, not vllm_omni) will still pick up the omni archs.
 [project.entry-points."vllm.general_plugins"]
 vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
+vllm_omni_kimi_audio_renderer = "vllm_omni.model_executor.models.kimi_audio.pipeline:register_kimi_audio_renderer"
 
 
 [tool.setuptools]
@@ -210,10 +211,12 @@ include = ["vllm_omni*"]
     "deploy/*.md",
     "deploy/*.yaml",
     "diffusion/models/hy_nomas/camera_trajectories.json",
+    "model_executor/models/aura_omni/duplex/*.pcm",
     "model_executor/models/covo_audio/speaker_prompt/*.npy",
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
+"vllm_omni.model_executor.models.kimi_audio" = ["NOTICE"]
 "vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 
 [tool.setuptools_scm]
@@ -268,7 +271,7 @@ ignore = [
 # legacy typing, whitespace, unused-import shims) is exempted. TID251 and the
 # F-correctness rules still apply.
 "vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
-"vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
+"vllm_omni/model_executor/models/joyai_vl_interaction/duplex/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 # Kandinsky 6 keeps native/BigVGAN names (T/H/W, `l`) and NVIDIA vocoder
 # docstring length so the port stays diffable against the source modules.
 "vllm_omni/diffusion/models/kandinsky6/kandinsky6_transformer.py" = ["N803", "E741"]
