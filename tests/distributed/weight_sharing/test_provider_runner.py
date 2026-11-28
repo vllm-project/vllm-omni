@@ -28,7 +28,7 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
         "vllm_omni/worker_v2/omni_model_runner.py",
         "OmniGPUModelRunner",
         ["load_model", "reload_weights", "_publish_shared_backbone_if_configured"],
-        {"logger": Mock(), "_model_state_patch_lock": nullcontext()},
+        {"logger": Mock(), "_model_state_patch_lock": nullcontext(), "_UPSTREAM_HAS_MODEL_STATE_HOOK": True},
         base_class=UpstreamRunner,
     )
     for name in ("vllm", "vllm.v1", "vllm.v1.worker", "vllm.v1.worker.gpu", "vllm.v1.worker.gpu.model_runner"):
