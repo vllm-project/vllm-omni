@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 set -euo pipefail
 
 # Default query type
@@ -33,16 +36,9 @@ thinker_sampling_params='{
   "detokenize": true,
   "repetition_penalty": 1.1
 }'
-
-talker_sampling_params='{
-  "temperature": 0.0,
-  "top_p": 1.0,
-  "top_k": -1,
-  "max_tokens": 1,
-  "seed": 42,
-  "detokenize": false
-}'
-# Above is optional; defaults live in vllm_omni/deploy/minicpmo_4_5.yaml.
+# Optional Thinker (stage 0) overrides. The server fills the Talker and Code2Wav
+# stages with the defaults in vllm_omni/deploy/minicpmo_4_5.yaml, which set the
+# Talker's codec sampling.
 
 MARY_HAD_LAMB_AUDIO_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
 CHERRY_BLOSSOM_IMAGE_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
@@ -102,8 +98,7 @@ case "$QUERY_TYPE" in
 esac
 
 sampling_params_list='[
-  '"$thinker_sampling_params"',
-  '"$talker_sampling_params"'
+  '"$thinker_sampling_params"'
 ]'
 
 # TTS speech path needs use_tts_template at the request root (curl does not
