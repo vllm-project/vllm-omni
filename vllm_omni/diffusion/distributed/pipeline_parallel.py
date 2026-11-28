@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -236,11 +236,14 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             all_kwargs: list[dict[str, Any] | None] = [
                 positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs
             ]
+            branches = ["positive" if get_classifier_free_guidance_rank() == 0 else "negative"]
         else:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
             all_kwargs = [positive_kwargs]
+            branches = ["positive"]
             if do_true_cfg:
                 all_kwargs.append(negative_kwargs)
+                branches.append("negative")
 
         # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
@@ -251,13 +254,20 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
-            for kwargs, it in zip(all_kwargs, its):
-                result = self.predict_noise(**kwargs, intermediate_tensors=it)
+            for branch, kwargs, it in zip(branches, all_kwargs, its):
+                result = CFGParallelMixin._predict_noise_for_cfg_branch(
+                    cast(CFGParallelMixin, self), branch, {**cast(dict[str, Any], kwargs), "intermediate_tensors": it}
+                )
                 self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
         # Last rank: run full forward
-        noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
+        noise_preds = [
+            CFGParallelMixin._predict_noise_for_cfg_branch(
+                cast(CFGParallelMixin, self), branch, {**cast(dict[str, Any], kwargs), "intermediate_tensors": it}
+            )
+            for branch, kwargs, it in zip(branches, all_kwargs, its)
+        ]
 
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
