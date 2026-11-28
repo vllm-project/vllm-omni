@@ -540,6 +540,18 @@ unless noted; 4× NVIDIA H200):
   (keeping 25% overlap) and decoding retried, down to 128px tiles. Tile sizes
   are not yet exposed as engine arguments.
 
+## Optional NPU FlexAttention
+
+On Ascend 950, use a FlexAttention-enabled MindIE-SD build with compatible
+FA4 and CATLASS DSL runtimes. Select the `FLASH_ATTN` backend and set
+`QwenImage21Pipeline._DEFAULT_ATTN_PATH = "flex"` in
+`vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py`.
+This is a source-level opt-in, not a CLI option. The default `auto` path
+and cached-prefix decode are unchanged.
+
+FlexAttention supports eager block-causal prefill for one BF16 sample with
+head dimension 128, without sequence parallelism or attention quantization.
+
 ## NPU performance defaults
 
 Qwen-Image-2.1 enables the following optimizations automatically on eligible
