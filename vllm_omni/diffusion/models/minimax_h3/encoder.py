@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -1137,6 +1138,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         load_model: bool,
         encoder_group: Any | None = None,
         quant_config: QuantizationConfig | None = None,
+        text_model_init_device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.device_target = device
@@ -1189,13 +1191,18 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         self.vision.to(dtype=dtype)
-        self.text_model = MiniMaxH3Qwen3VLTextModel(
-            encoder_group,
-            config.text_config,
-            MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
-            dtype,
-            quant_config=quant_config,
-        )
+        # A loader may quantize the DiT on the accelerator while keeping this
+        # unquantized text tower on CPU. Vision initialization stays outside
+        # this scope so its fixed FP32 rotary table keeps the original math.
+        text_init_context = text_model_init_device if text_model_init_device is not None else nullcontext()
+        with text_init_context:
+            self.text_model = MiniMaxH3Qwen3VLTextModel(
+                encoder_group,
+                config.text_config,
+                MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
+                dtype,
+                quant_config=quant_config,
+            )
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
