@@ -103,7 +103,10 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     encode_media,
     prepare_encoder_inputs,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    check_continuation_conditions,
+    validate_encoded_frame_limit,
+)
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     build_minimax_h3_presentation,
     load_minimax_h3_images,
@@ -134,7 +137,9 @@ from .continuation import (
     ContinuationWindow,
     LatentPrefix,
     _audio_t,
+    continuation_uses_timeline_guides,
     diffuse_continuation,
+    later_windows_drop_text_images,
     plan_continuation_windows,
     resolve_continuation,
     window_args,
@@ -607,6 +612,29 @@ def _dit_rank_world() -> tuple[Any, int, int]:
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
+def _dit_cpu_rank_world() -> tuple[Any, int, int]:
+    """Return the CPU (gloo) group with the DiT ranks' view of rank and world size.
+
+    ``broadcast_object_list`` serializes Python objects and runs two
+    collectives, so it needs a group that can carry host buffers. On a device
+    group it instead allocates device buffers and drives the device backend,
+    which is what fails with ``EI0006 Communication_Error_Get_Socket`` on
+    ``HcclBroadcast`` when the device backend has to reach across interconnect
+    domains (issue #10645). The CPU group keeps the transfer host-side.
+
+    The ranks and the world size are the same as the device group's; only the
+    backend differs, so the two views stay consistent.
+    """
+    if not dist.is_initialized():
+        # A single process has no gloo group at all, and the callers take their
+        # world_size == 1 path, which is the same outcome a single-rank boot
+        # reaches. The device view degrades the same way, so the two views
+        # stay symmetric here.
+        return None, 0, 1
+    group = get_world_group().cpu_group
+    return group, dist.get_rank(group), dist.get_world_size(group)
+
+
 def _broadcast_rank0_exception(exc: Exception | None) -> None:
     """Synchronize a rank-0-only exception across every DiT rank.
 
@@ -618,7 +646,7 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
     rank-0-only work, before any subsequent collective, so all ranks either
     raise the same error together or all continue.
     """
-    group, rank, world_size = _dit_rank_world()
+    group, rank, world_size = _dit_cpu_rank_world()
     if world_size == 1:
         if exc is not None:
             raise exc
@@ -1517,7 +1545,10 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
         needs_component_cache = legacy_manual_components or offloads_text_encoder
-        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
+        if (
+            resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+            and needs_component_cache
+        ):
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
             if legacy_manual_components:
                 _register_dlo_component_cache(
@@ -1938,6 +1969,12 @@ class MiniMaxH3Pipeline(
         return component is getattr(self, "text_encoder", None) and should_offload_component(
             od_config, TEXT_ENCODER_COMPONENT
         )
+
+    def _text_encoder_uses_distributed_layerwise_offload(self) -> bool:
+        text_encoder = getattr(self, "text_encoder", None)
+        if text_encoder is None or not self._uses_manual_component_offload(text_encoder):
+            return False
+        return resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
 
     def enable_omni_model_cpu_offload(
         self,
@@ -3145,7 +3182,7 @@ class MiniMaxH3Pipeline(
         )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         if world_size == 1:
             assert media is not None
             return media
@@ -3167,7 +3204,7 @@ class MiniMaxH3Pipeline(
     def _broadcast_media_conditioning(
         self, conditioning: MiniMaxH3EncoderMediaConditioning | None
     ) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         if world_size == 1:
             assert conditioning is not None
             return conditioning
@@ -3203,7 +3240,10 @@ class MiniMaxH3Pipeline(
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        # The error-status gather moves Python objects, so it has to travel
+        # host-side over the gloo group like every other object collective
+        # here (issue #10645). The tensor broadcasts keep the device group.
+        group, rank, world_size = _dit_cpu_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
             media = self._distribute_media_inputs(media)
@@ -3368,12 +3408,14 @@ class MiniMaxH3Pipeline(
         Returns initial conditioning and optional request-owned window embeddings.
         Invalid continuation prompts are broadcast before any encoder collective.
         """
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
         prepared = text_conditioning = None
         initial_noise_params = None
         visual_noise_params = None
         base_encode_needed = False
+        text_only_windows = 0
+        later_prepared = None
         error = None
         if rank == 0:
             try:
@@ -3422,7 +3464,8 @@ class MiniMaxH3Pipeline(
                 # continuation resolves before the normalize call so the
                 # helper can reject the combination with zero encoder passes.
                 continuation = None
-                if prompts is not None or (request_context is not None and task == "ref2va"):
+                if prompts is not None or request_context is not None:
+                    # Before any encoder collective, for every task that can window.
                     continuation = resolve_continuation(
                         sampling.extra_args or {},
                         task=task,
@@ -3460,9 +3503,32 @@ class MiniMaxH3Pipeline(
                         or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)
                     ):
                         raise OmniClientError(f"continuation_prompts must contain exactly {count} non-empty strings")
+                    if (
+                        count > 1
+                        and continuation_uses_timeline_guides(task)
+                        and self._text_encoder_uses_distributed_layerwise_offload()
+                    ):
+                        # These windows encode text only, one prompt after another. Under
+                        # distributed layerwise offload a text-only pass that directly follows
+                        # another does not re-fetch the group's first block and runs on
+                        # released placeholders. Ref2VA prompts are separated by a vision pass.
+                        raise OmniClientError(
+                            "MiniMax H3 continuation_prompts for T2VA and FL2VA is not supported while the text "
+                            "encoder uses distributed layerwise offload; send a single prompt"
+                        )
                     prepared = replace(prepared, prompt=prompts[0])
                     # External text belongs to the main prompt, not the first window.
                     text_conditioning = None
+                later_prepared = prepared
+                if continuation is not None and later_windows_drop_text_images(task):
+                    # Later windows drop the request's keyframes, so their text is the
+                    # text-only presentation, without the images.
+                    later_prepared = replace(
+                        prepared, images=[], condition_labels=[], media=replace(prepared.media, task="t2va")
+                    )
+                    later_windows = len(plan_continuation_windows(prepared.media.num_frames, *continuation)) - 1
+                    if prompts is None and later_windows and self.load_text_encoder:
+                        text_only_windows = later_windows
                 if (
                     request_context is not None
                     and task == "ref2va"
@@ -3493,10 +3559,18 @@ class MiniMaxH3Pipeline(
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
-        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params, base_encode_needed)]
+        header = [
+            (
+                text_conditioning is not None,
+                initial_noise_params,
+                visual_noise_params,
+                base_encode_needed,
+                text_only_windows,
+            )
+        ]
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
-        reuse_text, initial_noise_params, visual_noise_params, base_encode_needed = header[0]
+        reuse_text, initial_noise_params, visual_noise_params, base_encode_needed, text_only_windows = header[0]
         executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
             if initial_noise_params is not None
@@ -3514,6 +3588,11 @@ class MiniMaxH3Pipeline(
                 if visual_noise_params is not None
                 else None
             )
+            later_text = None
+            if text_only_windows:
+                # Ahead of the request's own encode: its image pass then separates the two text passes.
+                logger.info("MiniMax H3 encoding the text-only prompt of %d later windows", text_only_windows)
+                later_text = self.encode_prompt(later_prepared)
             if reuse_text:
                 hidden = _broadcast_tensor(
                     text_conditioning.hidden_states if rank == 0 else None,
@@ -3544,7 +3623,11 @@ class MiniMaxH3Pipeline(
                 window_text = [(hidden, tags)]
                 for index, prompt in enumerate(prompts[1:], start=2):
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
-                    window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
+                    window_text.append(
+                        self.encode_prompt(replace(later_prepared, prompt=prompt) if rank == 0 else None)
+                    )
+            elif later_text is not None:
+                window_text = [(hidden, tags), *([later_text] * text_only_windows)]
             media = self._encode_local_media(prepared.media if prepared is not None else None)
             if initial_noise is not None:
                 assert request_context is not None
@@ -3604,6 +3687,13 @@ class MiniMaxH3Pipeline(
                 raise OmniClientError("MiniMax H3 latent_refine requires the original FL2VA keyframe images")
         if window_text is not None:
             context["continuation_text_conditioning"] = window_text
+        elif context.get("continuation") is not None and later_windows_drop_text_images(context["task"]):
+            window, overlap = context["continuation"]
+            if len(plan_continuation_windows(context["num_frames"], window, overlap)) > 1:
+                raise OmniClientError(
+                    "MiniMax H3 FL2VA continuation encodes the prompt again without the first frame for later "
+                    "windows, which requires a local text encoder; use long_video_mode=full"
+                )
         return context
 
     @staticmethod
@@ -3649,6 +3739,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 "MiniMax H3 continuation does not support latent-mask editing; use long_video_mode=full"
             )
+        if continuation is not None:
+            check_continuation_conditions(conditioning.task, conditioning.keyframe_frame_indices)
         if extra.get("audio_mode") == "lock_source" and conditioning.audio_edit_clean_rows is not None:
             raise OmniClientError("MiniMax H3 audio_mode=lock_source cannot be combined with audio latent-mask editing")
         requested_task = extra.get("task")
@@ -4455,6 +4547,8 @@ class MiniMaxH3Pipeline(
                     overlap_frames=overlap_frames,
                     text_conditioning=context.get("continuation_text_conditioning"),
                     prefix=prefix,
+                    # Ref2VA appends each tail as a latent_guide reference.
+                    timeline_guides=continuation_uses_timeline_guides(context["task"]),
                 )
             check_request_cancellation()
             # Continuations stay on the base canvas, so an upscaled clip is cached
@@ -4623,11 +4717,15 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"MiniMax H3 step execution produces one output per request, got num_outputs_per_prompt={num_outputs}"
             )
-        if getattr(self, "_dlo_residency_controller", None) is not None:
+        if getattr(self, "_dlo_residency_controller", None) is not None or (
+            (od_config := getattr(self, "od_config", None)) is not None
+            and resolve_offload_strategy(od_config)
+            in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+        ):
             raise ValueError(
-                "MiniMax H3 step execution is not compatible with distributed layerwise offload; "
-                "the resident-layer window spans a whole denoise loop, so per-step streaming would "
-                "reload the DiT every step. Drop --step-execution or --enable-distributed-layerwise-offload."
+                "MiniMax H3 step execution is not compatible with distributed layerwise offload or submodule offload; "
+                "the offload residency window spans a whole denoise loop, so per-step streaming would "
+                "reload the DiT every step. Drop --step-execution or the offload flag."
             )
         # Request-scoped Cache-DiT (quality=high) mutates hook state on the
         # shared transformer rather than on ``StepRequestState``. In step mode

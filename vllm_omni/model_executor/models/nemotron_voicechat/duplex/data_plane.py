@@ -40,6 +40,7 @@ class NemotronVoiceChatDataPlaneContext:
 class _RequestState:
     text_frames: int = 0
     audio_frames: int = 0
+    suppressed_audio_frames: set[int] = field(default_factory=set)
     pending_speech_end_frames: list[int] = field(default_factory=list)
     function_active: bool = False
     function_tokens: list[int] = field(default_factory=list)
@@ -254,6 +255,10 @@ class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
                 )
             for token_id in text_ids[-1:]:
                 state.text_frames += 1
+                # Bind suppression to the originating acoustic frame, not to
+                # the session's current call state when the codec catches up.
+                if _coerce_ints(metadata.get("nvc_function_fast_path"))[-1:] == [1]:
+                    state.suppressed_audio_frames.add(state.text_frames)
                 if token_id == ids["eos"]:
                     if state.audio_frames >= state.text_frames:
                         yield _speech_end_event(request_id)
@@ -291,11 +296,6 @@ class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
         audio = _audio_value(metadata)
         sample_rate = _sample_rate(metadata)
         sample_count = _audio_samples(audio)
-        encoded = (
-            self._encode_audio(audio, sample_rate, context.response_format, context.speed)
-            if wants_audio and audio is not None
-            else None
-        )
         audio_chunk_complete = sample_count > 0
         if audio_chunk_complete:
             # A native-duplex Stage-2 segment can contain one or more 80 ms
@@ -304,7 +304,33 @@ class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
             # ``finished=False`` across scheduler wakes; a non-empty decoded
             # chunk, not request lifetime, is the audio-coverage signal.
             duration_ms = sample_count * 1000 / max(1, sample_rate)
-            state.audio_frames += max(1, round(duration_ms / 80))
+            frame_count = max(1, round(duration_ms / 80))
+            # The causal codec preserves per-request acoustic order; Stage 0
+            # and Stage 2 can be arbitrarily far apart on that same timeline.
+            first_frame = state.audio_frames + 1
+            state.audio_frames += frame_count
+            suppressed = state.suppressed_audio_frames.intersection(range(first_frame, state.audio_frames + 1))
+            if suppressed:
+                audio = audio.reshape(-1) if isinstance(audio, torch.Tensor) else np.asarray(audio).reshape(-1)
+                samples_per_frame = max(1, round(sample_rate * 0.08))
+                kept = [
+                    audio[offset * samples_per_frame : (offset + 1) * samples_per_frame]
+                    for offset in range(frame_count)
+                    if first_frame + offset not in suppressed
+                ]
+                if not kept:
+                    audio = None
+                elif isinstance(audio, torch.Tensor):
+                    audio = torch.cat(kept)
+                else:
+                    audio = np.concatenate(kept)
+                state.suppressed_audio_frames.difference_update(suppressed)
+                sample_count = _audio_samples(audio)
+        encoded = (
+            self._encode_audio(audio, sample_rate, context.response_format, context.speed)
+            if wants_audio and audio is not None
+            else None
+        )
         end_of_turn = bool(state.pending_speech_end_frames) and state.audio_frames >= state.pending_speech_end_frames[0]
         if encoded:
             yield {

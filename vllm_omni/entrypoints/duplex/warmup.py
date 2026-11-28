@@ -39,6 +39,8 @@ logger = init_logger(__name__)
 # First-request compiles (Triton mRoPE, vision pos-embed, Talker torch.compile,
 # Code2Wav) landed ~30–40 s after the socket was already "ready" on a cold
 # process, then the short reply still has to be spoken. Hold clients past that.
+# The probe sends one commit and then only receives, so the throwaway session's
+# idle timeout must cover this same wait or the server drops the socket first.
 DUPLEX_WARMUP_CLIENT_WAIT_S = 180
 DUPLEX_WARMUP_AUDIO_WAIT_S = 150
 
@@ -124,6 +126,15 @@ class _ProcessWarmupProfile:
 
     def silence_unit_payload(self) -> dict[str, object]:
         return dict(self.engine.metadata.warmup_audio)
+
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """The spoken clip captured in the worker, or None when the plugin has none.
+
+        The API process never loads the model plugin, so this is the same
+        metadata channel ``warmup_audio`` already uses.
+        """
+        turn = getattr(self.engine.metadata, "warmup_turn", None)
+        return dict(turn) if isinstance(turn, dict) and turn else None
 
 
 def lookup_duplex_plugin(engine_client: object) -> object | None:
@@ -219,6 +230,45 @@ _DEFAULT_SILENCE_SAMPLES = 16000
 _DEFAULT_SILENCE_SAMPLE_RATE_HZ = 16000
 
 
+def video_warmup_turn(plugin: object | None) -> dict[str, object]:
+    """The one append a video-required warmup sends.
+
+    ``audio`` is base64. A plugin ``startup_warmup_turn`` replaces the shared
+    tone when it returns audio and a format; anything incomplete keeps the tone.
+    The shared frame and instructions fill keys the plugin leaves out.
+    """
+    factory = getattr(plugin, "startup_warmup_turn", None)
+    candidate = factory() if callable(factory) else None
+    if (
+        isinstance(candidate, dict)
+        and isinstance(candidate.get("audio"), str)
+        and candidate["audio"]
+        and isinstance(candidate.get("format"), str)
+        and candidate["format"]
+    ):
+        rate = candidate.get("sample_rate_hz", _WARMUP_SAMPLE_RATE_HZ)
+        frames = candidate.get("video_frames")
+        instructions = candidate.get("instructions")
+        return {
+            "audio": candidate["audio"],
+            "format": candidate["format"],
+            "sample_rate_hz": int(rate) if isinstance(rate, int) else _WARMUP_SAMPLE_RATE_HZ,
+            "is_speech": candidate.get("is_speech", True) is not False,
+            "video_frames": frames if isinstance(frames, list) and frames else [_warmup_jpeg_b64()],
+            "instructions": (
+                instructions if isinstance(instructions, str) and instructions.strip() else _WARMUP_INSTRUCTIONS
+            ),
+        }
+    return {
+        "audio": _short_pcm_f32le_b64(),
+        "format": "pcm_f32le",
+        "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
+        "is_speech": True,
+        "video_frames": [_warmup_jpeg_b64()],
+        "instructions": _WARMUP_INSTRUCTIONS,
+    }
+
+
 def warmup_silence_unit(plugin: object | None) -> dict[str, object]:
     """The append the silent-frames warmup sends: the plugin's silence unit, or the 16 kHz default."""
     factory = getattr(plugin, "silence_unit_payload", None)
@@ -289,7 +339,7 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
         "output_audio_format": "pcm16",
         "sample_rate_hz": unit["sample_rate_hz"],
         "audio": {"input": {"sample_rate_hz": unit["sample_rate_hz"]}},
-        "idle_timeout_s": 60,
+        "idle_timeout_s": DUPLEX_WARMUP_CLIENT_WAIT_S,
         "turn_detection": None,
         "extra_body": {"auto_response": native_append},
     }
@@ -299,19 +349,21 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
         "sample_rate_hz": int(cast(int, unit["sample_rate_hz"])),
     }
     if kind == "video_turn":
+        turn = video_warmup_turn(plugin)
+        sample_rate_hz = int(cast(int, turn["sample_rate_hz"]))
         session.update(
-            input_audio_format="pcm_f32le",
-            sample_rate_hz=_WARMUP_SAMPLE_RATE_HZ,
-            audio={"input": {"sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ}},
-            instructions=_WARMUP_INSTRUCTIONS,
+            input_audio_format=str(turn["format"]),
+            sample_rate_hz=sample_rate_hz,
+            audio={"input": {"sample_rate_hz": sample_rate_hz}},
+            instructions=str(turn["instructions"]),
             extra_body={"auto_response": True},
         )
-        audio = base64.b64decode(_short_pcm_f32le_b64())
+        audio = base64.b64decode(str(turn["audio"]))
         append_kwargs = {
-            "format": "pcm_f32le",
-            "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
-            "is_speech": True,
-            "video_frames": [_warmup_jpeg_b64()],
+            "format": str(turn["format"]),
+            "sample_rate_hz": sample_rate_hz,
+            "is_speech": bool(turn["is_speech"]),
+            "video_frames": cast(list[str], turn["video_frames"]),
         }
     text_only = "audio" not in _warmup_modalities(engine_client)
     if text_only:
@@ -482,7 +534,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             "modalities": _warmup_modalities(engine_client),
             "input_audio_format": "pcm_f32le",
             "output_audio_format": "pcm16",
-            "idle_timeout_s": 60,
+            "idle_timeout_s": DUPLEX_WARMUP_CLIENT_WAIT_S,
             "turn_detection": None,
             "extra_body": {"auto_response": native_append},
         }
@@ -490,12 +542,13 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             session["input_audio_format"] = unit["format"]
             session["sample_rate_hz"] = unit["sample_rate_hz"]
             session["audio"] = {"input": {"sample_rate_hz": unit["sample_rate_hz"]}}
-        if kind == "video_turn":
-            # The default AURA prompt answers with <|silent|> unless the user
-            # asked for something. This session is thrown away; force one short
-            # spoken reply so Talker and Code2Wav compile too. auto_response
-            # matches the web demo: a commit must actually start a turn.
-            session["instructions"] = _WARMUP_INSTRUCTIONS
+        spoken_turn = video_warmup_turn(plugin) if kind == "video_turn" else None
+        if spoken_turn is not None:
+            # auto_response matches the web demo: a commit must actually start a turn.
+            session["input_audio_format"] = spoken_turn["format"]
+            session["sample_rate_hz"] = spoken_turn["sample_rate_hz"]
+            session["audio"] = {"input": {"sample_rate_hz": spoken_turn["sample_rate_hz"]}}
+            session["instructions"] = spoken_turn["instructions"]
             session["extra_body"] = {"auto_response": True}
         text_only = "audio" not in _warmup_modalities(engine_client)
         if text_only:
@@ -520,16 +573,16 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             if not await _recv_until(lambda e: e.get("type") == "session.created", 30):
                 logger.warning("Duplex warmup: no session.created within 30 s; aborting warmup.")
                 return
-            if kind == "video_turn":
+            if spoken_turn is not None:
                 await ws.send(
                     json.dumps(
                         {
                             "type": "input_audio_buffer.append",
-                            "audio": _short_pcm_f32le_b64(),
-                            "format": "pcm_f32le",
-                            "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
-                            "is_speech": True,
-                            "video_frames": [_warmup_jpeg_b64()],
+                            "audio": spoken_turn["audio"],
+                            "format": spoken_turn["format"],
+                            "sample_rate_hz": spoken_turn["sample_rate_hz"],
+                            "is_speech": spoken_turn["is_speech"],
+                            "video_frames": spoken_turn["video_frames"],
                         }
                     )
                 )

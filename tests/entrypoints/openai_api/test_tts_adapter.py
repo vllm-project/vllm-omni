@@ -10,7 +10,7 @@ import base64
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, call
 
 import numpy as np
 import pytest
@@ -1209,6 +1209,33 @@ def test_step_audio2_request_budget_reaches_engine(limit):
     assert observed[1].max_tokens == 1
     assert default.max_tokens == 256
     assert decoder_default.max_tokens == 1
+
+
+def _step_audio2_engine(variant, encode=None):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(step_audio2_variant=variant)),
+        get_tokenizer=AsyncMock(return_value=SimpleNamespace(encode=encode)),
+    )
+
+
+def test_step_audio2_base_encodes_upstream_segments():
+    encode = Mock(side_effect=[[11], [22, 33]])
+    adapter = StepAudio2Adapter(SimpleNamespace(engine_client=_step_audio2_engine("base", encode)))
+
+    prepared = asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello", instructions="Read."), [], False))
+
+    assert prepared.prompt == {"prompt_token_ids": [11, 22, 33]}
+    assert encode.call_args_list == [
+        call("Read.\n", add_special_tokens=False),
+        call("hello<tts_start>", add_special_tokens=False),
+    ]
+    assert prepared.model_type == "step_audio2"
+
+
+def test_step_audio2_rejects_unknown_variant():
+    adapter = StepAudio2Adapter(SimpleNamespace(engine_client=_step_audio2_engine("unknown")))
+    with pytest.raises(ValueError, match="unknown"):
+        asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False))
 
 
 def test_voxtral_prompt_builder_is_sync():
