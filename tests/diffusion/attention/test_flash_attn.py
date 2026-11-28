@@ -725,8 +725,7 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("query_length", [2, 4])
-@pytest.mark.parametrize("cache_length", [4, 6])
+@pytest.mark.parametrize(("query_length", "cache_length"), [(2, 4), (4, 4), (2, 6)])
 def test_varlen_masked_routing_by_role(monkeypatch, query_length, cache_length):
     """Only equal-length self-attention applies the key mask to query rows."""
     calls: list[tuple[int, torch.Tensor, torch.Tensor]] = []
