@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: ACVLab (Amap CV Lab)
-- Model: `acvlab/ABot-World-0-5B-LF`
+- Model: `acvlab/ABot-World-0-5B-LF`; `acvlab/ABot-World-0-5-5B-Iris` (see [ABot-World 0.5 Iris](#abot-world-05-iris))
 - Task: image-conditioned interactive world generation
 - Modes: offline generation and stepwise chunk output, with mid-generation camera keys over `WS /v1/realtime/video`
 - Maintainer: Community
@@ -34,7 +34,8 @@ FlashAttention paged-KV kernel requires this page size to be a multiple of 16.
 480x832 (390 tokens) and 448x832 (364 tokens) are therefore rejected before
 model execution.
 
-Offline whole-clip frame counts must be `9 + 12k`, up to 117 frames. This
+Offline whole-clip frame counts must be `9 + 12k`, up to 117 frames when
+decoding to pixels; `output_type="latent"` skips the decode and the cap. This
 whole-clip safeguard is not a ten-tick limit on stepwise rollouts, which
 decode 9 frames in the opening chunk and 12 in each subsequent chunk.
 
@@ -137,6 +138,101 @@ must be omitted or zero, and a request that carries `camera_action_script`
 rejects live camera updates. Chunk metadata acknowledges updates through
 `started_event_ids`, `active_event_ids` and `completed_event_ids`; an update
 replaced before any chunk used it is reported in `coalesced_event_ids`.
+
+## ABot-World 0.5 Iris
+
+`acvlab/ABot-World-0-5-5B-Iris` runs on the same pipeline. Its `config.json`
+sets `use_relative_rope`, which switches on relative RoPE, up to five
+512 px reference-image slots, and Iris's prompt layout: a 384-token global
+prompt row plus a 128-token local row. Iris has been validated on AMD MI300X, CUDA, and Huawei Ascend NPU (Atlas A2 / 910B2).
+
+Iris uses 704x1280 (880 tokens per latent frame). It commits the source frame
+first, so every chunk adds 12 frames and a rollout has `1 + 12k` frames (13 for
+one chunk, 421 for 35). Offline requests pass `reference_images` (up to five
+images) in `multi_modal_data`; empty slots are masked.
+
+```bash
+vllm serve /path/to/ABot-World-0-5-5B-Iris \
+  --omni \
+  --deploy-config vllm_omni/deploy/abot_world_iris_stepwise.yaml \
+  --port 8000
+```
+
+`session.start` takes `width: 1280`, `height: 704` and `num_frames: 12k + 1`.
+`image_reference` carries the first frame only, so reference slots stay empty
+over WebSocket. Camera keys work as above.
+
+Iris also changes its text mid-generation; ABot-World-0 rejects these updates.
+All three apply at the next chunk boundary, re-encode only the changed row and
+rebuild the text cross-attention cache while the video and reference KV stay:
+
+- `event.prompt` replaces the global row (Prompt Switch); the latest prompt
+  before a boundary wins.
+- `event.multi_modal_data.skill` with `{"prompt": ...}` fills the local row for
+  four chunks. A second skill is rejected with `interaction_failed` while one
+  is pending or active, and a tap of any key below cancels the active skill.
+- `state` camera transitions may also carry `Ctrl`, `Shift`, `Space`,
+  `MouseLeft`, `MouseRight` and `Alt`. They never reach the action latent:
+  when no skill is active, the held or tapped keys select the caption in the
+  local row, as the official client does. A tap of `Space` captions one chunk
+  and a tap of `Alt` or `MouseLeft` two; `Shift`+`Space`, `MouseRight`+`MouseLeft`
+  and `Ctrl`+`Shift` have their own captions.
+
+```json
+{"type": "session.interaction",
+ "interaction": {"event_id": "sprint-jump",
+                 "event": {"multi_modal_data": {"camera": {
+                   "mode": "state",
+                   "transitions": [{"actions": ["w", "Shift", "Space"]},
+                                   {"actions": ["w", "Shift"]}]}}}}}
+```
+
+### Ascend NPU serving and validation (Atlas A2 / 910B2, 2026-11-28)
+
+On Huawei Ascend NPU (Atlas A2 / 910B2, 64 GiB HBM), ABot-World 0.5 Iris runs
+offline, stepwise, and over `WS /v1/realtime/video` on a single NPU without
+CPU offload using the shipped stepwise deploy config:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+export LD_PRELOAD=libjemalloc.so.2
+export VLLM_TARGET_DEVICE=npu
+export VLLM_OMNI_TARGET_DEVICE=npu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# Live WS /v1/realtime/video serving (704x1280, abot_vae: wan; switch to taew2_2 in yaml for higher FPS / lower HBM)
+vllm serve /path/to/ABot-World-0-5-5B-Iris \
+  --omni \
+  --deploy-config vllm_omni/deploy/abot_world_iris_stepwise.yaml \
+  --port 8000
+```
+
+**Pinned revisions and environment:**
+- Hardware: 1x **Ascend 910B2** (Atlas A2, 64 GiB HBM, 60.96 GiB PyTorch-visible), 32 vCPU, 32 GiB container RAM, Driver `26.1.1`, CANN `9.3.0` (`V100R001C13B060`).
+- Software: Python `3.12.13`, PyTorch `2.10.0` + `torch-npu 2.10.0.post7`, `vLLM 0.34.0`, `vLLM-Ascend 0.19.1rc2.dev3635+g19c063b54`, `mindiesd 3.3.0`, `triton-ascend 3.6.0.post2`, `diffusers 0.42.0`, `transformers 5.19.0`, BF16 eager, TP=1.
+- Code base: M1 (`#11265`, `d6216b09b`) + M3 (`#11271`, `979e4401b`) plus NPU CPU-fallback guards in `LayerNorm.forward_npu` and `RMSNormVAE.forward_npu` (with `gamma_rmsnorm` device/dtype refresh) and NPU float32 sinusoidal timestep frequencies.
+- Checkpoint: `acvlab/ABot-World-0-5-5B-Iris` pinned at `d2a58150d2362d36bbbe30093a6120e688707280` (`diffusion_pytorch_model.safetensors` SHA256 `b703b841...2079f97`, `Wan2.2_VAE.pth` SHA256 `20eb7896...13892b36`, `taew2_2.pth` SHA256 `d053e216...82a773b7`, `FantasyDecoder/model.pt` SHA256 `4a1ddda3...ef899fb8`).
+- Matched scene input: `amap-cvlab/ABot-World` (`bb5303e`) scene `9810c7b50f90eb92` (`examples/first_frames/9810c7b50f90eb92.png`, 5-slot `examples/references/9810c7b50f90eb92/{head,front,left,right,back}.jpg`, seed `42`, `flow_shift=5.0`, 4 DMD steps, `704x1280`).
+
+**Measured real-weight results on Ascend 910B2 (704x1280):**
+
+| Mode | Decoder / Variant | Geometry / Rollout | Steady Throughput / Wall Time | Parity / Quality / Verification |
+| --- | --- | --- | --- | --- |
+| Offline | `wan` (no ref) | 37f (3 chunks) | 27.29s cold / 8.70s warm | Finite RGB, `mean=54.68`, `per_frame_min_std=44.33` |
+| Offline | `wan` + 5-slot `reference_images` | 37f (3 chunks) | 8.70s warm (DiT 3.62s) | Active ref conditioning vs no-ref (`PSNR=34.45 dB`, `SSIM=0.9937`) |
+| Offline | `wan` past-window (`> local_attn_size=21`) | 97f (8 chunks, 25 latent frames) | 24.37s | First 37f bit-exact vs 37f run (`MSE=0.0`, `PSNR=inf`, `SSIM=1.0`) |
+| Offline | `taew2_2` | 37f (3 chunks) | 33.49s cold | vs `wan`: `PSNR=24.69 dB`, `global_ssim=0.9432` |
+| Offline (`latent`) + standalone `FantasyDecoder` | `FantasyDecoder/model.pt` (pre-M2 standalone decode of Iris-5B latents) | 37f (1+12+12+12) | 4.18s DiT + **15.39 FPS** decode (0.78s/12f, 4.32 GiB peak HBM) | vs `wan`: `PSNR=27.45 dB`, `global_ssim=0.9690`, `mean_frame_diff=1.81` |
+| Stepwise (`ARDiffusionEngine`) | `wan` (neutral, past-window) | 97f (8 ticks: 13+7×12) | **3.84 FPS** steady (3.12s/chunk; 3.38s full-window plateau) | All 97f bit-exact vs offline (`MSE=0.0`, `PSNR=inf`, `SSIM=1.0`); `boundary_diff=2.31` vs `interior_diff=1.64` |
+| Stepwise (`ARDiffusionEngine`) | `taew2_2` (neutral, past-window) | 97f (8 ticks: 13+7×12) | **6.79 FPS** steady (1.77s/chunk; 2.03s full-window plateau; 8.02 FPS 4-tick warm) | First 37f bit-exact vs offline (`PSNR=inf`); 97f vs `wan`: `PSNR=24.96 dB`, `global_ssim=0.9491` |
+| Stepwise (`ARDiffusionEngine`) | `wan` / `taew2_2` camera script (`W -> J -> D -> W+L`) | 49f (4 ticks) | 4.19 FPS (`wan`) / 8.02 FPS (`taew2_2`) | Strong response vs neutral (`PSNR=15.22 / 15.43 dB`) |
+| Live `WS /v1/realtime/video` | `wan` (`abot_world_iris_stepwise.yaml`) | 73f (6 chunks, fMP4) | **3.79 FPS** (54.97 GiB HBM resident) | Control, `W+J` camera (`PSNR=15.29 dB`), `event.prompt` Prompt Switch (`PSNR=34.85 dB`), `skill` + overlapping-skill `interaction_failed` + `Shift+Space` cancel (`PSNR=22.80 dB`), disconnect abort + bit-exact follow-up (`PSNR=inf`) all passed |
+| Live `WS /v1/realtime/video` | `taew2_2` | 73f (6 chunks, fMP4) | **6.76 FPS** (37.20 GiB HBM resident) | Control + mid-rollout `W+J` (`chunk0` bit-exact, tail `PSNR=15.43 dB`) passed |
+
+- **Host memory & upstream note:** Across offline, stepwise, and live WS runs, `vllm-omni` container anonymous RSS stayed within **13.2–14.7 GiB** (well within the 32 GiB container limit). Unmodified upstream `amap-cvlab/ABot-World` (`bb5303e`, `stream_cli.py`) resolved cleanly to PyTorch `sdpa` under `torch_npu.contrib.transfer_to_npu`, but was OOM-killed (`exit 137`, cgroup `oom_kill=1`) during FP32 CPU model instantiation on the same 32 GiB container before its first block.
+- **NPU operator & unit checks:** On Ascend 910B2, `RotaryEmbeddingWan` FP32 interleaved relative RoPE matched the CPU reference with `max_abs=0.0`, and real-NPU BF16 dense vs. paged relative RoPE with reference sink matched across 13 calls sliding past the local window with `max_abs=0.0`. Focused CPU regressions (`tests/diffusion/models/abot_world`, `tests/config/test_abot_world_stepwise_deploy.py`, `tests/diffusion/layers/test_norm.py`, `tests/diffusion/ar_diffusion/test_capability_runner.py`) passed on the Ascend NPU host.
+- **Pending M2:** `FantasyDecoder` was verified standalone on real Iris-5B latents on Ascend 910B2 above; pipeline-integrated `FantasyDecoder` validation on Ascend NPU will follow once M2 lands.
 
 ## Reproduce review evidence
 
@@ -308,14 +404,15 @@ by the existing Buildkite `tests/diffusion -m 'core_model and cpu'` sweep.
 
 ## Current limitations
 
-- Only the `ABot-World-0-5B-LF` causal student checkpoint is supported.
-- Mid-generation updates cover camera keys only; prompt updates are not wired
-  on the stepwise path.
+- Only the `ABot-World-0-5B-LF` and `ABot-World-0-5-5B-Iris` causal student
+  checkpoints are supported; the Iris-BiT teacher and FantasyDecoder are not.
+- Mid-generation prompt, skill and text-action updates need an Iris
+  checkpoint; ABot-World-0 takes camera keys only.
 - AR-Diffusion stages require one replica.
 - Stepwise mode emits multiple blocks from one request, and `max_num_seqs`
   must be one.
 - SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization, Cache-DiT, and TeaCache are not supported.
-- No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
+- ABot-World 0.5 Iris has been validated on Ascend NPU (Atlas A2 / 910B2); ABot-World-0 on Ascend NPU and Intel GPU remain unvalidated, and ROCm/MI300X qualification is tracked separately.
 - DiT, clean-context KV commit, and VAE decode are serial; no asynchronous
   decode speedup is claimed.
 - Reference images (5-view surround) are not yet integrated.

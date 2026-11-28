@@ -49,6 +49,8 @@ class LayerNorm(nn.LayerNorm, CustomOp):
         return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if not _is_npu_tensor(x):
+            return self.forward_native(x)
         if _HAS_MINDIESD:
             try:
                 from mindiesd import fast_layernorm

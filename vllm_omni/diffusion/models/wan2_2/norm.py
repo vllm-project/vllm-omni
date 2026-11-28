@@ -48,9 +48,15 @@ class RMSNormVAE(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if x.device.type != "npu":
+            return self.forward_native(x)
         import torch_npu
 
-        if self.gamma_rmsnorm is None:
+        if (
+            self.gamma_rmsnorm is None
+            or self.gamma_rmsnorm.device != self.gamma.device
+            or self.gamma_rmsnorm.dtype != self.gamma.dtype
+        ):
             self.gamma_rmsnorm = self.gamma.reshape(-1)
 
         if self.channel_first:

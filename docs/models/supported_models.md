@@ -55,6 +55,7 @@ th {
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
+| `ABotWorldCausalPipeline` | ABot-World 0.5 Iris (experimental) | `acvlab/ABot-World-0-5-5B-Iris` | | Experimental | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md#abot-world-05-iris) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Cosmos3MultiviewPipeline` | Cosmos3 multiview T2V, I2V, WSM transfer, view completion, optional joint LiDAR | `Cosmos3-Nano-Transfer-Auto` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) |
 | `Flux3Pipeline` | Flux3 — T2I, I2I | — | ✅︎ | | | | — |

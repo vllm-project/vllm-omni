@@ -309,8 +309,11 @@ tokens are not admitted:
 be combined in one interaction event.
 
 ABot-World instead conditions on W/A/S/D/I/J/K/L key actions, sent in `state`
-or `script` mode, and registers only the camera modality; see the
+or `script` mode; see the
 [ABot-World recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md#realtime-serving).
+ABot-World 0.5 Iris also takes prompt switches, a `skill` modality and text
+action keys; see
+[ABot-World 0.5 Iris](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md#abot-world-05-iris).
 
 The example client's `--prompt-updates` and `--camera-updates` schedules assign
 a distinct `event_id` to each entry within the session, including entries with
