@@ -886,9 +886,9 @@ class HunYuanRotary2DEmbedder:
         q = self.rope(q.to(torch.float32), cos, sin)
         k = self.rope(k.to(torch.float32), cos, sin)
 
-        # 5. Restore original shape + convert to bfloat16
-        q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
-        k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
+        # The attention layer chooses the rounding point for image Q/K.
+        q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim)
+        k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim)
         hidden_states = hidden_states.reshape(hidden_states_shape)
         return q, k
 
@@ -957,8 +957,8 @@ class ImageKVCacheManager(nn.Module):
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
             paged_kv_cache_role="primary",
-            # Hunyuan image RoPE produces bfloat16 K and denoising runs under
-            # bfloat16 autocast, independent of the weight-loading dtype.
+            # Denoising runs under bfloat16 autocast and image attention
+            # receives bfloat16 K, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
         # The dense image attention path always sends a 4D mask together with full_attn_spans.
@@ -1923,17 +1923,27 @@ class HunYuanAttention(nn.Module):
             value_states = v.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             cache_kwargs = {"cache_position": position_ids}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_id, cache_kwargs)
-        # for image_generation
-        if kwargs.get("mode", "gen_text") == "gen_image":
-            # assert positions is None, "positions should be None for image attention"
+        is_image = kwargs.get("mode", "gen_text") == "gen_image"
+        # The reference keeps rotated Q/K in FP32 through RMSNorm.
+        fp32_image_qk_norm = (
+            is_image
+            and self.use_qk_norm
+            and v.dtype == torch.bfloat16
+            and v.is_cuda
+            and current_omni_platform.is_cuda()
+        )
+        if is_image:
             q, k = self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb, **kwargs)
+            if not fp32_image_qk_norm:
+                q, k = q.bfloat16(), k.bfloat16()
         else:
             q, k = self.rotary_emb(positions, q, k)
         if self.use_qk_norm:
             q = self.query_layernorm(q.view(-1, self.num_heads, self.head_dim).contiguous())
             k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
-        # for image_generation
-        if kwargs.get("mode", "gen_text") == "gen_image":
+        if is_image:
+            if fp32_image_qk_norm:
+                q, k = q.to(v.dtype), k.to(v.dtype)
             attn_output = self.image_attn(q, k, v, attention_mask=attention_mask, **kwargs)
         else:
             attn_output = self.attn(q, k, v)
