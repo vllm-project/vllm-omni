@@ -62,6 +62,7 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
 )
 from vllm_omni.platforms import current_omni_platform
 
+from .component_cache_policy import resolve_component_cache_reuse
 from .denoise_loop import (
     MINIMAX_H3_AUDIO_ROW_WIDTH,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
@@ -429,6 +430,7 @@ class MiniMaxH3ImagePipeline(
             device=self.device,
             load_model=rank < tp_size,
             encoder_group=self.text_encoder_group,
+            component_cache_reuse=resolve_component_cache_reuse(additional),
         )
         if rank >= tp_size:
             # Ranks outside the text-encoder TP group hold no encoder weights.

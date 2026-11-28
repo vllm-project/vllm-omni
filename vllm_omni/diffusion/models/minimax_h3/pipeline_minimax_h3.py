@@ -128,6 +128,7 @@ from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config as _resolve_encoder_quant_config,
 )
 
+from .component_cache_policy import resolve_component_cache_reuse
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
@@ -1128,6 +1129,7 @@ class MiniMaxH3Pipeline(
         # rejects; fail here instead of on every such request.
         service_schedule = od_config.diffusion_attention_schedule
         additional_config = od_config.additional_config or {}
+        component_cache_reuse = resolve_component_cache_reuse(additional_config)
         if (
             service_schedule is not None
             and service_schedule.default
@@ -1471,6 +1473,7 @@ class MiniMaxH3Pipeline(
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                component_cache_reuse=component_cache_reuse,
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
@@ -1502,6 +1505,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                component_cache_reuse=component_cache_reuse,
                 decoder_source=(od_config.additional_config or {}).get(
                     "video_vae_decoder",
                     str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")
@@ -1522,6 +1526,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                component_cache_reuse=component_cache_reuse,
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae

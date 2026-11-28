@@ -7,9 +7,12 @@ their dtype, values, synchronization, or CPU-master rebinding. Explicit bounded
 cache owners and failure cleanup remain authoritative.
 """
 
-import os
+from collections.abc import Mapping
 
 
-def release_component_cache() -> bool:
-    """Keep the default purge unless the legacy cache-reuse switch is enabled."""
-    return os.environ.get("H3_COMPONENT_CACHE_REUSE", "0") != "1"
+def resolve_component_cache_reuse(additional_config: Mapping[str, object] | None) -> bool:
+    """Read the optional boolean allocator policy at model construction."""
+    value = (additional_config or {}).get("component_cache_reuse", False)
+    if not isinstance(value, bool):
+        raise ValueError("additional_config.component_cache_reuse must be a boolean")
+    return value

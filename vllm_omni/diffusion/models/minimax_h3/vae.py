@@ -34,7 +34,6 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
-from .component_cache_policy import release_component_cache
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
@@ -352,6 +351,7 @@ class _VideoVAEPartProxy(nn.Module):
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
+    _component_cache_reuse: bool = False
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     stack_decode_tiles: bool = True
@@ -372,9 +372,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
         stack_decode_tiles: bool = True,
+        component_cache_reuse: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
+        self._component_cache_reuse = component_cache_reuse
         self.stack_decode_tiles = bool(stack_decode_tiles)
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
@@ -550,10 +552,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def _offload_part_to_cpu(self, part: str) -> None:
         stager = self._part_stager(part)
         if stager is not None:
-            stager.offload(release_cache=release_component_cache())
+            stager.offload(release_cache=not self._component_cache_reuse)
             return
         if self._stager is not None:
-            self._stager.offload(release_cache=release_component_cache())
+            self._stager.offload(release_cache=not self._component_cache_reuse)
             return
         self.remote.to("cpu")
         self._release_component_cache()
@@ -562,7 +564,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         cache = getattr(self, "_omni_component_cache", None)
         if cache is not None:
             cache.release_if_needed()
-        elif release_component_cache():
+        elif not self._component_cache_reuse:
             torch.accelerator.empty_cache()
 
     def load_to_device(self) -> None:
@@ -582,10 +584,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     def offload_to_cpu(self) -> None:
         if self._encoder_stager is not None:
-            self._encoder_stager.offload(release_cache=release_component_cache())
-            self._decoder_stager.offload(release_cache=release_component_cache())
+            self._encoder_stager.offload(release_cache=not self._component_cache_reuse)
+            self._decoder_stager.offload(release_cache=not self._component_cache_reuse)
         elif self._stager is not None:
-            self._stager.offload(release_cache=release_component_cache())
+            self._stager.offload(release_cache=not self._component_cache_reuse)
         else:
             self.remote.to("cpu")
             self._release_component_cache()
@@ -1412,6 +1414,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
 
 class MiniMaxH3AudioVAE(nn.Module):
+    _component_cache_reuse: bool = False
+
     def __init__(
         self,
         component_path: str,
@@ -1421,9 +1425,11 @@ class MiniMaxH3AudioVAE(nn.Module):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        component_cache_reuse: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
+        self._component_cache_reuse = component_cache_reuse
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
@@ -1463,13 +1469,13 @@ class MiniMaxH3AudioVAE(nn.Module):
 
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
-            self._stager.offload(release_cache=release_component_cache())
+            self._stager.offload(release_cache=not self._component_cache_reuse)
         else:
             self.remote.to("cpu")
             cache = getattr(self, "_omni_component_cache", None)
             if cache is not None:
                 cache.release_if_needed()
-            elif release_component_cache():
+            elif not self._component_cache_reuse:
                 torch.accelerator.empty_cache()
 
     @torch.inference_mode()
