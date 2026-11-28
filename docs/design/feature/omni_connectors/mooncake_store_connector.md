@@ -203,7 +203,27 @@ The consumer-side flow is:
 5. If data is found, deserialize it and return `(data, payload_size)`.
 6. If all retries are exhausted, record a timeout and return `None`.
 
-This design gives the connector a bounded waiting model rather than an indefinite blocking get.
+The retry count bounds connector-controlled polling, but does not bound the
+duration of an individual native `store.get()` call.
+
+#### 6.3 Consumer Flow: `get_with_deadline()`
+
+Synchronous stage-payload receivers use `get_with_deadline(..., deadline=...)`.
+It shares the same retrieval path and 20-attempt limit as `get()`, but checks
+the caller's absolute monotonic deadline before each store access and clamps
+each retry sleep to the remaining budget. An expired deadline returns `None`
+without accessing the store. Exhausting either the deadline or the retry limit
+increments the timeout metric once per call.
+
+Native store calls and deserialization are not preempted. A payload returned by
+an in-flight call is delivered even if that call finishes after the deadline;
+an unsuccessful call cannot start another retry after the deadline. This is
+the same cooperative deadline contract used by
+[cross-stage payload transport](stage_payload.md#api-contracts), not a hard
+wall-clock timeout. No background receive thread is started.
+
+This capability applies to `MooncakeStoreConnector`; it does not add
+deadline-aware receive to `MooncakeTransferEngineConnector`.
 
 ### 7. Integration with Stage Communication
 
