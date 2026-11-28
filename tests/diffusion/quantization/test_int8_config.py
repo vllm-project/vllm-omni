@@ -514,6 +514,7 @@ class TestNPUInt8LinearMethod:
     def mock_torch_npu(self, mocker):
         torch_npu = mocker.MagicMock()
 
+        mocker.patch("vllm_omni.quantization.int8_config._is_npu_310p", return_value=False)
         mocker.patch("vllm_omni.quantization.int8_config.torch_npu", return_value=torch_npu)
         mocker.patch(
             "vllm_omni.quantization.int8_config.torch_npu.npu_dynamic_quant",
@@ -563,6 +564,151 @@ class TestNPUInt8LinearMethod:
         assert torch.equal(mock_layer.weight_scale, self.scale_mock)
 
 
+class TestNPU310PInt8LinearMethod:
+    """CPU unit tests for Ascend 310P dynamic W8A8 weight layout and dispatch."""
+
+    @pytest.fixture
+    def mock_quant_config(self, mocker: MockerFixture):
+        return mocker.Mock()
+
+    @pytest.fixture
+    def mock_npu_310p(self, mocker: MockerFixture):
+        fake_torch_npu = mocker.MagicMock()
+        mocker.patch("vllm_omni.quantization.int8_config.torch_npu", fake_torch_npu)
+        mocker.patch("vllm_omni.quantization.int8_config._is_npu_310p", return_value=True)
+        return fake_torch_npu
+
+    def test_310p_offline_process_weights_keeps_nk_nd_layout(self, mock_quant_config, mock_npu_310p):
+        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+        layer = Module()
+        raw_weight = torch.randint(-127, 127, (64, 128), dtype=torch.int8).t()  # non-contiguous (128, 64)
+        layer.weight = Parameter(raw_weight, requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones((128, 1), dtype=torch.float16), requires_grad=False)
+
+        method = NPUInt8LinearMethod(mock_quant_config)
+        method.process_weights_after_loading(layer)
+
+        assert layer.weight.shape == (128, 64)
+        assert layer.weight.is_contiguous()
+        assert layer.weight_scale.shape == (128,)
+        assert layer.weight_scale.dtype == torch.float32
+        assert layer.weight_scale.is_contiguous()
+
+    def test_310p_online_process_weights_keeps_nk_nd_layout(self, mock_quant_config, mock_npu_310p):
+        from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
+
+        qweight = torch.randint(-127, 127, (128, 64), dtype=torch.int8)
+        scale = torch.ones((128, 1), dtype=torch.float16)
+        mock_npu_310p.npu_dynamic_quant.return_value = (qweight, scale)
+
+        layer = Module()
+        layer.weight = Parameter(torch.randn(128, 64, dtype=torch.float16), requires_grad=False)
+
+        method = NPUInt8OnlineLinearMethod(mock_quant_config)
+        method.process_weights_after_loading(layer)
+
+        mock_npu_310p.npu_dynamic_quant.assert_called_once()
+        assert layer.weight.shape == (128, 64)
+        assert layer.weight.dtype == torch.int8
+        assert layer.weight.is_contiguous()
+        assert layer.weight_scale.shape == (128,)
+        assert layer.weight_scale.dtype == torch.float32
+        assert layer.weight_scale.is_contiguous()
+        assert layer._already_called_process_weights_after_loading is True
+
+    @pytest.mark.parametrize("shape", [(4, 64), (2, 8, 64)])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_310p_apply_uses_dequant_and_post_adds_bias(
+        self,
+        mock_quant_config,
+        mock_npu_310p,
+        shape,
+        with_bias,
+    ):
+        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+        out_features = 128
+        rows = math.prod(shape[:-1])
+        base_out = torch.arange(rows * out_features, dtype=torch.float16).reshape(rows, out_features)
+        mock_npu_310p.npu_quant_matmul_dequant.return_value = base_out
+
+        layer = Module()
+        layer.weight = Parameter(torch.randint(-127, 127, (out_features, 64), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones(out_features, dtype=torch.float32), requires_grad=False)
+
+        # Transpose to exercise non-contiguous activations reaching the 310P kernel.
+        x = torch.randn((*shape[:-2], shape[-1], shape[-2]), dtype=torch.float16).transpose(-1, -2)
+        bias = torch.full((out_features,), 2.0, dtype=torch.float16) if with_bias else None
+
+        method = NPUInt8LinearMethod(mock_quant_config)
+        output = method.apply(layer, x, bias=bias)
+
+        mock_npu_310p.npu_dynamic_quant.assert_not_called()
+        mock_npu_310p.npu_quant_matmul.assert_not_called()
+        mock_npu_310p.npu_quant_matmul_dequant.assert_called_once()
+        call_args, call_kwargs = mock_npu_310p.npu_quant_matmul_dequant.call_args
+        assert call_args[0].shape == (rows, 64)
+        assert call_args[0].is_contiguous()
+        assert call_args[1] is layer.weight
+        assert call_args[2] is layer.weight_scale
+        assert call_kwargs == {"bias": None, "quant_mode": "pertoken"}
+
+        expected = (base_out + bias if bias is not None else base_out).reshape(*shape[:-1], out_features)
+        assert output.shape == (*shape[:-1], out_features)
+        assert torch.equal(output, expected)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_310p_apply_rejects_non_fp16_activations(
+        self,
+        mock_quant_config,
+        mock_npu_310p,
+        dtype,
+    ):
+        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+        layer = Module()
+        layer.weight = Parameter(torch.randint(-127, 127, (128, 64), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones(128, dtype=torch.float32), requires_grad=False)
+
+        x = torch.randn(4, 64, dtype=dtype)
+        method = NPUInt8LinearMethod(mock_quant_config)
+
+        with pytest.raises(NotImplementedError, match="only supports torch.float16 activations"):
+            method.apply(layer, x)
+
+        mock_npu_310p.npu_quant_matmul_dequant.assert_not_called()
+
+    def test_non_310p_keeps_quant_matmul_path(self, mocker: MockerFixture, mock_quant_config):
+        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+        fake_torch_npu = mocker.MagicMock()
+        fake_torch_npu.npu_dynamic_quant.return_value = (
+            torch.zeros((8, 64), dtype=torch.int8),
+            torch.ones(8, dtype=torch.float32),
+        )
+        fake_torch_npu.npu_quant_matmul.return_value = torch.ones((8, 128), dtype=torch.float16)
+        mocker.patch("vllm_omni.quantization.int8_config.torch_npu", fake_torch_npu)
+        mocker.patch("vllm_omni.quantization.int8_config._is_npu_310p", return_value=False)
+
+        layer = Module()
+        layer.weight = Parameter(torch.randint(-127, 127, (128, 64), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones((128, 1), dtype=torch.float32), requires_grad=False)
+
+        method = NPUInt8LinearMethod(mock_quant_config)
+        method.process_weights_after_loading(layer)
+        assert layer.weight.shape == (64, 128)
+
+        x = torch.randn(2, 4, 64, dtype=torch.float16)
+        bias = torch.zeros(128, dtype=torch.float16)
+        output = method.apply(layer, x, bias=bias)
+
+        assert output.shape == (2, 4, 128)
+        fake_torch_npu.npu_quant_matmul_dequant.assert_not_called()
+        fake_torch_npu.npu_dynamic_quant.assert_called_once()
+        fake_torch_npu.npu_quant_matmul.assert_called_once()
+
+
 @pytest.fixture
 def quant_config():
     """Shared quant config fixture for smoke tests."""
@@ -606,19 +752,21 @@ class TestNPUInt8Smoke:
 
     def test_real_npu_online_process_weights_after_loading(self, quant_config, real_layer):
         """Smoke test: full process_weights_after_loading with real torch_npu."""
+        from vllm_omni.platforms.npu._310p import is_310p
         from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
 
         method = NPUInt8OnlineLinearMethod(quant_config)
 
         method.process_weights_after_loading(real_layer)
 
-        assert real_layer.weight.shape == (64, 128)
+        expected_shape = (128, 64) if is_310p() else (64, 128)
+        assert real_layer.weight.shape == expected_shape
         assert real_layer.weight.dtype == torch.int8
         assert hasattr(real_layer, "weight_scale")
         assert real_layer.weight_scale.shape == (128,)
 
     def test_real_npu_int8_apply_forward(self, quant_config):
-        """Smoke test: forward pass with real npu_quant_matmul."""
+        """Smoke test: forward pass with real NPU int8 matmul."""
         import torch_npu
 
         from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
@@ -629,8 +777,9 @@ class TestNPUInt8Smoke:
         layer = torch.nn.Module()
         weight_fp16 = torch.randn(128, 64, dtype=torch.float16, device="npu")
         qweight, scale = torch_npu.npu_dynamic_quant(weight_fp16)
-        layer.weight = torch.nn.Parameter(qweight.t().contiguous(), requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(scale.squeeze(), requires_grad=False)
+        layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+        method.process_weights_after_loading(layer)
 
         # Forward pass on NPU
         x = torch.randn(2, 16, 64, dtype=torch.float16, device="npu")

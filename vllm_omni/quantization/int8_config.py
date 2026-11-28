@@ -495,6 +495,13 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         return output.reshape(*x.shape[:-1], output.shape[-1])
 
 
+def _is_npu_310p() -> bool:
+    """Return True when running on an Ascend 310P device."""
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    return is_310p()
+
+
 class NPUInt8LinearMethod(BaseInt8LinearMethod):
     """
     NPU Linear method for Int8
@@ -506,6 +513,7 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
 
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
+        self._is_310p: bool = _is_npu_310p()
 
     def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
         if _fell_back_to_unquantized_npu(layer, *args, **kwargs):
@@ -513,8 +521,16 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
         super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        layer.weight.data = layer.weight.data.t().contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.squeeze()
+        if self._is_310p:
+            # Ascend 310P rejects transposed ND int8 weights in npu_quant_matmul
+            # (aclnnQuantMatmulV5 error 161002). Keep (N, K) contiguous ND
+            # weights for npu_quant_matmul_dequant, which also remains
+            # compatible with 310P's process-wide disable_internal_format().
+            layer.weight.data = layer.weight.data.contiguous()
+            layer.weight_scale.data = layer.weight_scale.data.flatten().to(torch.float32).contiguous()
+        else:
+            layer.weight.data = layer.weight.data.t().contiguous()
+            layer.weight_scale.data = layer.weight_scale.data.squeeze()
 
     def apply(
         self,
@@ -526,6 +542,25 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
         ori_dtype = x.dtype
 
         x = x.reshape(-1, ori_shape[-1])
+        if self._is_310p:
+            if ori_dtype != torch.float16:
+                raise NotImplementedError(
+                    "Ascend 310P INT8 linear (npu_quant_matmul_dequant) only supports "
+                    f"torch.float16 activations, got {ori_dtype}."
+                )
+            # npu_quant_matmul_dequant has no output_dtype argument; on 310P it
+            # preserves the float16 activation dtype.
+            output = torch_npu.npu_quant_matmul_dequant(
+                x.contiguous(),
+                layer.weight,
+                layer.weight_scale,
+                bias=None,
+                quant_mode="pertoken",
+            )
+            if bias is not None:
+                output = output + bias
+            return output.reshape(*ori_shape[:-1], -1)
+
         quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
 
         output = torch_npu.npu_quant_matmul(
@@ -607,7 +642,11 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
         weight = layer.weight
         qweight, weight_scale = torch_npu.npu_dynamic_quant(weight)
 
-        qweight = qweight.t().contiguous()
+        if self._is_310p:
+            qweight = qweight.contiguous()
+            weight_scale = weight_scale.flatten().to(torch.float32).contiguous()
+        else:
+            qweight = qweight.t().contiguous()
 
         # Update layer with new values.
         replace_parameter(layer, "weight", qweight)
