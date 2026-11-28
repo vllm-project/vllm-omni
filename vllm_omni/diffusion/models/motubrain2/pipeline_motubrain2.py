@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import threading
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
@@ -93,12 +94,30 @@ def _load_policy(config: Mapping[str, Any], model_root: str, device: torch.devic
         raise ValueError("Choose either model_config.profile or model_config.embodiment.")
     if embodiment is None:
         profile = Path(profile or root / "profile.json")
-    files = [bundle] if bundle.is_file() else [bundle / "config.json", bundle / "model.safetensors"]
+    mxfp8 = config.get("mxfp8", False)
+    if type(mxfp8) is not bool:
+        raise ValueError("model_config.mxfp8 must be true or false.")
+    if config.get("video_mxfp8") or config.get("video_mxfp8_overlay"):
+        raise ValueError("Use model_config.mxfp8 with a standalone MXFP8 checkpoint.")
+    if mxfp8 and bundle.is_file():
+        raise ValueError("model_config.mxfp8 requires a Motubrain bundle directory.")
+    weight_file = "model-mxfp8.safetensors" if mxfp8 else "model.safetensors"
+    files = [bundle] if bundle.is_file() else [bundle / "config.json", bundle / weight_file]
     if profile is not None:
         files.append(profile)
     for path in files:
         if not path.is_file():
             raise FileNotFoundError(f"Motubrain serving bundle is missing {path}")
+    if mxfp8:
+        if dtype != torch.bfloat16:
+            raise ValueError("Motubrain MXFP8 requires a bfloat16 denoiser.")
+        # Older native runtimes silently ignore unfamiliar options and load BF16.
+        from motubrain2.inference.__main__ import add_policy_options
+
+        parser = argparse.ArgumentParser(add_help=False)
+        add_policy_options(parser)
+        if parser.get_default("mxfp8") is not False:
+            raise ImportError("Install the Motubrain runtime with standalone --mxfp8 support.")
     for name in ("wan", "text_encoder"):
         if not config.get(name):
             raise ValueError(f"Motubrain requires model_config.{name} for its frozen encoders.")
@@ -131,8 +150,7 @@ def _load_policy(config: Mapping[str, Any], model_root: str, device: torch.devic
         dit_cache_skip_steps_2=config.get("dit_cache_skip_steps_2", 2),
         dit_cache_damping=config.get("dit_cache_damping", 0.25),
         bf16=dtype == torch.bfloat16,
-        video_mxfp8=config.get("video_mxfp8", False),
-        video_mxfp8_overlay=config.get("video_mxfp8_overlay"),
+        mxfp8=mxfp8,
         seed=0,
         compile=config.get("compile", False),
         multistream=config.get("multistream", "off"),
@@ -173,9 +191,7 @@ class Motubrain2Pipeline(nn.Module):
         if od_config.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(f"Motubrain supports float32 and bfloat16 denoiser weights, got {od_config.dtype}.")
         if od_config.quantization_config:
-            raise ValueError("Use model_config.video_mxfp8 for native Motubrain weight quantization.")
-        if config.get("video_mxfp8") and od_config.dtype != torch.bfloat16:
-            raise ValueError("Motubrain video MXFP8 requires a bfloat16 denoiser.")
+            raise ValueError("Use model_config.mxfp8 for native Motubrain weight quantization.")
         if od_config.parallel_config.world_size != 1:
             raise ValueError("Motubrain2Pipeline requires a single diffusion worker without model parallelism.")
         if config.get("compile") and od_config.enforce_eager:

@@ -69,7 +69,7 @@ directory to the worker's Python path lets it share vLLM's NumPy 2 environment.
 
 ```bash
 git clone https://github.com/shengshu-ai/Motubrain-2.0.git /opt/Motubrain-2.0
-git -C /opt/Motubrain-2.0 checkout 4521dbcee712dec0783eb6b70188dfdcb81542f3
+git -C /opt/Motubrain-2.0 checkout 308137cd0ce9de48ec5e6ed3bd0619859db22c9f
 uv pip install /opt/Motubrain-2.0 einops omegaconf addict
 git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git /opt/Depth-Anything-3
 git -C /opt/Depth-Anything-3 checkout 3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
@@ -88,11 +88,16 @@ When the policy bundle embeds robot profiles, select one with
 `model_config.embodiment`; otherwise supply `model_config.profile` or the
 serving directory's profile. Set `async_io` for native pinned CUDA transfers.
 
-The tested configurations use BF16. The optional native `video_mxfp8` mode
-uses Blackwell video-stream GEMMs and accepts `video_mxfp8_overlay`. The
-native MXFP8 extra pins FlashInfer 0.7.5, while vLLM 0.34.0 pins 0.7.3.
-The standard BF16 setup installs the base Motubrain package. Quantized
-serving and alternative FlashInfer combinations have not been qualified.
+On Blackwell, set `mxfp8: true` under
+`stages[0].engine_extras.model_config` to load the standalone
+`model-mxfp8.safetensors` in the native policy bundle. The bundle also
+requires the matching `manifest.json`, `config.json` and `sampling.json`.
+Keep the stage dtype at `bfloat16`. By default the worker loads
+`model.safetensors`, including when both checkpoints are present.
+
+The native MXFP8 extra requires FlashInfer 0.7.5. vLLM 0.34.0 pins
+FlashInfer 0.7.3 in its standard CUDA environment. Use a dedicated Motubrain
+worker environment with the 0.7.5 CUTLASS MXFP8 kernels for your GPU.
 [vLLM CUDA dependency pin](https://github.com/vllm-project/vllm/blob/v0.34.0/requirements/cuda.txt#L13)
 
 Omitting `dit_cache_enabled` (or setting it to null) enables caching for

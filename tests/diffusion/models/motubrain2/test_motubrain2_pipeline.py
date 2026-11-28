@@ -87,6 +87,43 @@ def test_load_policy_native_dit_cache(monkeypatch, tmp_path, options, support, s
     assert {name: getattr(loaded, name) for name in defaults} == expected
 
 
+@pytest.mark.parametrize(
+    ("mxfp8", "files", "missing"),
+    [
+        (None, ["model.safetensors", "model-mxfp8.safetensors"], None),
+        (False, ["model.safetensors"], None),
+        (False, ["model-mxfp8.safetensors"], "model.safetensors"),
+        (True, ["model.safetensors", "model-mxfp8.safetensors"], None),
+        (True, ["model-mxfp8.safetensors"], None),
+        (True, ["model.safetensors"], "model-mxfp8.safetensors"),
+    ],
+)
+def test_load_policy_selects_checkpoint(monkeypatch, tmp_path, mxfp8, files, missing):
+    policy = SimpleNamespace(from_options=lambda args: args)
+    monkeypatch.setitem(sys.modules, "motubrain2.inference.policy", SimpleNamespace(RawPolicy=policy))
+    cli = SimpleNamespace(add_policy_options=lambda p: p.add_argument("--mxfp8", action="store_true"))
+    monkeypatch.setitem(sys.modules, "motubrain2.inference.__main__", cli)
+    monkeypatch.setattr(pipeline_motubrain2, "_check_native_dit_cache", lambda args: None)
+    for name in ["config.json", "profile.json", *files]:
+        (tmp_path / name).touch()
+    config = {"bundle": str(tmp_path), "text_encoder": "text", "wan": "wan"}
+    if mxfp8 is not None:
+        config["mxfp8"] = mxfp8
+    args = (config, str(tmp_path), torch.device("cpu"), torch.bfloat16)
+    if missing:
+        with pytest.raises(FileNotFoundError) as err:
+            pipeline_motubrain2._load_policy(*args)
+        assert str(tmp_path / missing) in str(err.value)
+        return
+    loaded = pipeline_motubrain2._load_policy(*args)
+    assert loaded.mxfp8 is bool(mxfp8)
+    if mxfp8:
+        # A BF16-only native parser accepts the namespace but ignores mxfp8.
+        monkeypatch.setattr(cli, "add_policy_options", lambda p: None)
+        with pytest.raises(ImportError, match="standalone --mxfp8"):
+            pipeline_motubrain2._load_policy(*args)
+
+
 class _RecordingPolicy:
     def __init__(self, field=None):
         self.model = torch.nn.Linear(1, 1)
