@@ -26,6 +26,11 @@ primary_code_path_owners:
       - vllm_omni/platforms/rocm/**
     owners:
       - "@haic0"
+  # Additional owner for the MUSA platform tree
+  - paths:
+      - vllm_omni/platforms/musa/**
+    owners:
+      - "@yeahdongcn"
 related_code_paths: []
 depends_on:
   - ar_runtime.md
@@ -70,3 +75,54 @@ from the common or upstream implementation.
 
 Validate common import paths without the target accelerator and run focused
 tests in a fresh `uv` environment on every affected device platform.
+
+## MiniCPM-o Ascend shared KV
+
+The MiniCPM-o MRv2 Thinker worker extends Ascend's shared-attention eligibility
+before KV budgeting and allocation. Both call the same predicate and reuse
+Ascend's existing standardized backing allocator; installed `vllm-ascend`
+sources remain unchanged. The extension accepts only DSpark full-attention
+and native duplex-window groups with identical, unpadded FP16/BF16 pages.
+KV transfer, context parallelism, KVPP and sparse SFA retain their original
+paths. Other models, stages and MRv1 also retain Ascend's original predicate.
+The scheduler still owns block lifetimes and each group's block table;
+sharing the backing does not share live request contents or shorten context.
+Without DSpark the new mixed-group path is inactive.
+Focused coverage lives in `tests/platforms/npu/test_minicpmo_shared_kv.py`.
+
+MiniCPM-o qualifies common exact-prefill shapes during startup and other
+eligible graphs on first use. Qualification returns the reference result
+while comparing hidden state and KV or codec, stop and KV state. Successful
+checks enable later replay. See the [Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md).
+
+## MiniMax H3 image NPU adapter
+
+The NPU model-patch hook defaults the image pipeline to single-tile VAE decoder
+graphs and the native FP32 encoder. Reduced encoder precision and tile batching
+are approximate and require explicit configuration. Multiple decoder streams
+remain an alternative to batching. Graph disable/eager overrides retain native
+VAE execution, and explicit batching/stream or FP32/batching conflicts are rejected.
+Implicit graphs fall back to native VAE execution with a warning when NPUGraph
+APIs are unavailable, `TASK_QUEUE_ENABLE=2`, or `ASCEND_LAUNCH_BLOCKING=1`.
+Explicit graph enablement rejects these conditions before installing wrappers.
+Environment variables must be fixed before NPU runtime initialization.
+Other platforms and pipelines retain their existing behavior. Graph buffers
+belong to the VAE instance, and weight relocation invalidates its captures.
+User configuration and precision limits are documented in the
+[Ascend image guide](../../user_guide/diffusion/minimax_h3_image_npu.md).
+
+H3 deterministic execution defaults on and restores the caller's enabled and
+warn-only modes when forward returns or raises. NPU internal formats and JIT
+compilation are disabled for graph-enabled forwards and restored on exit as well;
+setup does not modify them. `npu_disable_internal_format` and
+`npu_disable_jit_compile` independently apply the same forward-scoped settings to
+graph-off controls. Both options default to false. All three settings apply to the
+worker's full forward, including the DiT; runtime controls also work with
+determinism disabled. This preserves caller settings after failed initialization
+and inline engine teardown. Graph replica outputs are copied on the producer
+stream before reuse, then joined to the consumer stream.
+
+AdaLN host staging defaults on only for the NPU H3 image pipeline when its
+projection cache is enabled, weights are unquantized and DiT offload/HSDP is
+absent. Explicit `minimax_h3_adaln_offload=false` keeps weights resident;
+existing CUDA SM120 defaults and other pipeline defaults are unchanged.

@@ -22,7 +22,8 @@ Weight loading maps from the HF checkpoint's prefixes:
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -34,8 +35,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.platforms import current_platform
-from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -52,6 +51,18 @@ logger = init_logger(__name__)
 BOC_ID = 1024  # beginning of codebook
 EOC_ID = 1025  # end of codebook
 
+
+@dataclass
+class HiggsAudioSamplingParams:
+    """Request-owned controls for Higgs codebook sampling, separate from text sampling."""
+
+    temperature: torch.Tensor | None
+    top_k: torch.Tensor | None
+    top_p: torch.Tensor | None
+    all_greedy: bool
+    generators: dict[int, torch.Generator]
+
+
 # Checkpoint prefix mapping
 _BACKBONE_PREFIX_MAP = {
     "tied.embedding.text_embedding.": "model.embed_tokens.",
@@ -62,6 +73,94 @@ _BACKBONE_PREFIX_MAP = {
 _MODALITY_EMBEDDING_PREFIX = "tied.embedding.modality_embeddings.0.embedding."
 _MODALITY_HEAD_PREFIX = "tied.head.modality_heads.0."
 _CODEC_PREFIX = "tied.embedding.modality_embeddings.0.model."
+
+
+def _mask_delayed_logits(cb_logits, delay, rem, q, num_codebooks):
+    if delay.dtype != torch.long:
+        delay = delay.to(torch.long)
+    if rem.dtype != torch.long:
+        rem = rem.to(torch.long)
+    ramp = rem >= 0
+
+    bos = BOC_ID
+    eos = EOC_ID
+
+    # Ramp-down: codebooks already behind the EOC wave are locked to EOC.
+    lock_until = num_codebooks - rem
+    locked = ramp.unsqueeze(1) & (q < lock_until.unsqueeze(1))
+    eoc_logits = cb_logits[:, :, eos].clone()
+    cb_logits.masked_fill_(locked.unsqueeze(-1), float("-inf"))
+    cb_logits[:, :, eos] = torch.where(locked, eoc_logits, cb_logits[:, :, eos])
+
+    # Ramp-down tail: active codebooks cannot emit stream specials.
+    ramp_tail = ramp.unsqueeze(1) & (q >= lock_until.unsqueeze(1))
+    cb_logits[:, :, bos] = torch.where(
+        ramp_tail,
+        torch.full_like(cb_logits[:, :, bos], float("-inf")),
+        cb_logits[:, :, bos],
+    )
+    cb_logits[:, :, eos] = torch.where(
+        ramp_tail,
+        torch.full_like(cb_logits[:, :, eos], float("-inf")),
+        cb_logits[:, :, eos],
+    )
+
+    # Normal generation: delayed codebooks are forced to BOC.
+    normal = ~ramp
+    allowed_until = torch.clamp(delay + 1, max=num_codebooks)
+    delayed = normal.unsqueeze(1) & (q >= allowed_until.unsqueeze(1))
+    boc_logits = cb_logits[:, :, bos].clone()
+    cb_logits.masked_fill_(delayed.unsqueeze(-1), float("-inf"))
+    cb_logits[:, :, bos] = torch.where(delayed, boc_logits, cb_logits[:, :, bos])
+
+    # Normal active codebooks: BOC is disallowed; EOC is only allowed on cb0.
+    allowed = normal.unsqueeze(1) & (q < allowed_until.unsqueeze(1))
+    cb_logits[:, :, bos] = torch.where(
+        allowed,
+        torch.full_like(cb_logits[:, :, bos], float("-inf")),
+        cb_logits[:, :, bos],
+    )
+    nonzero_allowed = allowed & (q > 0)
+    cb_logits[:, :, eos] = torch.where(
+        nonzero_allowed,
+        torch.full_like(cb_logits[:, :, eos], float("-inf")),
+        cb_logits[:, :, eos],
+    )
+
+
+def _advance_delay_state(codes, prev_delay, prev_rem, q, num_codebooks):
+    ramp = prev_rem >= 0
+
+    codes = codes.to(torch.long)
+
+    # Leading BOC delay pad.
+    delay_active = (~ramp) & ((prev_delay + 1) < num_codebooks)
+    delay_mask = delay_active.unsqueeze(1) & (q > prev_delay.unsqueeze(1))
+    codes = torch.where(delay_mask, torch.full_like(codes, BOC_ID), codes)
+    next_delay = torch.where(delay_active, prev_delay + 1, prev_delay)
+
+    # Trailing EOC ramp-down.
+    lock_until = num_codebooks - prev_rem
+    ramp_mask = ramp.unsqueeze(1) & (q < lock_until.unsqueeze(1))
+    codes = torch.where(ramp_mask, torch.full_like(codes, EOC_ID), codes)
+    ramp_next_rem = prev_rem - 1
+
+    # New EOC detection in normal mode. This avoids tensor->Python control
+    # flow; ties are impossible for the index because q is monotonic.
+    eos_mask = (~ramp).unsqueeze(1) & (codes == EOC_ID)
+    eos_idx_values = torch.where(eos_mask, q.expand_as(codes), torch.full_like(codes, -1))
+    last_eos_idx = eos_idx_values.max(dim=1).values
+    has_eos = last_eos_idx >= 0
+    eos_prefix = has_eos.unsqueeze(1) & (q <= last_eos_idx.unsqueeze(1))
+    codes = torch.where(eos_prefix, torch.full_like(codes, EOC_ID), codes)
+    normal_next_rem = torch.where(has_eos, num_codebooks - last_eos_idx - 1, torch.full_like(last_eos_idx, -1))
+
+    next_rem = torch.where(ramp, ramp_next_rem, normal_next_rem)
+    done = next_rem == 0
+
+    next_delay = torch.where(done, torch.zeros_like(next_delay), next_delay)
+    next_rem = torch.where(done, torch.full_like(next_rem, -1), next_rem)
+    return codes, next_delay, next_rem, done
 
 
 class HiggsFusedMultiTextEmbedding(nn.Module):
@@ -108,6 +207,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     prefer_model_sampler: bool = True
     # Tell the runner to call postprocess() to emit per-step audio codes.
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_postprocess: bool = False
     skips_model_sampler_output_token_history: bool = True
     postprocess_uses_hidden_states: bool = False
@@ -141,21 +241,24 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config = hf_config
         else:
             self.config = HiggsAudioV3Config(**hf_config.to_dict())
-        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults(
-            use_v2_model_runner=bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        )
-        self.use_async_omni_output = getattr(self.config, "audio_async_payload", False) is True
+        use_v2_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
+        self.mrv2_options = self.config.resolve_mrv2_defaults(use_v2_model_runner=use_v2_runner)
+        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults(use_v2_model_runner=use_v2_runner)
+        self.use_async_omni_output = self.mrv2_options.audio_async_payload
         self.supports_async_whole_payload = self.use_async_omni_output
-        if self.use_async_omni_output:
-            if not vllm_config.scheduler_config.async_scheduling:
-                raise ValueError("audio_async_payload requires async scheduling")
-            if getattr(self.config, "audio_async_prompt_mode", False) is not True:
-                raise ValueError("audio_async_payload requires audio prompt mode classification")
+        if self.use_async_omni_output and not vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "Higgs Audio v3 model_runner: v2 requires async_scheduling: true on the talker stage; "
+                "enable it in the deploy profile"
+            )
         self._async_audio_gpu_staging = None
         model_config = getattr(vllm_config, "model_config", None)
         compilation_config = getattr(vllm_config, "compilation_config", None)
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
         mode_name = getattr(cudagraph_mode, "name", str(cudagraph_mode)).upper()
+        # The external decode graph follows the capture config. In particular,
+        # the V2 high-throughput profile is eager and keeps the local MLP graph;
+        # only the non-eager profile uses the external decode graph.
         self._use_external_decode_cudagraph = (
             not bool(getattr(model_config, "enforce_eager", True))
             and cudagraph_mode is not None
@@ -381,9 +484,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     ) -> None:
         """Update per-step metadata before runner forward or CUDA graph replay."""
         _ = positions, inputs_embeds
-        self._step_audio_mode_rows = (
-            audio_prompt_mode_rows if getattr(self.config, "audio_async_prompt_mode", False) is True else 0
-        )
+        self._step_audio_mode_rows = audio_prompt_mode_rows if self.mrv2_options.audio_async_prompt_mode else 0
         self._step_audio_tail_rows = 0
         if cpu_input_tail_ids:
             self._resolve_token_ids()
@@ -440,7 +541,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         # A fresh pinned allocation is owned by PyTorch's host allocator until
         # its asynchronous copy completes; never overwrite a shared CPU staging
         # buffer while the previous decode step may still be reading it.
-        if device.type == "cuda" and getattr(self.config, "audio_mrv2_async_state_indices", False):
+        if device.type == "cuda" and self.mrv2_options.audio_mrv2_async_state_indices:
             return torch.tensor(rows, dtype=torch.long, pin_memory=True).to(device, non_blocking=True)
         return torch.tensor(rows, dtype=torch.long, device=device)
 
@@ -451,7 +552,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         if (
             device.type == "cuda"
-            and getattr(self.config, "audio_mrv2_fused_state", False)
+            and self.mrv2_options.audio_mrv2_fused_state
             and (previous_req_ids != req_ids or any(r not in self._state_pool_indices for r in req_ids))
         ):
             from .mrv2_state_kernels import sync_state
@@ -680,6 +781,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             with torch.inference_mode(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 normed, static_residual_out = layer.post_attention_layernorm(static_hidden, static_residual)
                 static_output = layer.mlp(normed)
+            # Capture only records kernels. The first request at a new batch
+            # size must execute them before consuming the graph's outputs.
+            graph.replay()
             self._mlp_graphs[key] = {
                 "graph": graph,
                 "static_hidden": static_hidden,
@@ -714,7 +818,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if (
             self._audio_continuation_id is not None
             and sampling_metadata is not None
-            and getattr(sampling_metadata, "no_penalties", False)
+            and getattr(sampling_metadata, "no_penalties", True)
             and (
                 (isinstance(ids, torch.Tensor) and ids.numel() == rows and self._fast_audio_direct_rows == rows)
                 or getattr(self, "_step_audio_tail_rows", 0) == rows
@@ -1137,7 +1241,16 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         logits.scatter_(1, target, target_values)
 
     # ------------------------------------------------------------------ sampling
-    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: HiggsAudioSamplingParams,
+        *,
+        sample_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        draft_rows: torch.Tensor | None = None,
+        restored_rows: torch.Tensor | None = None,
+        audio_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Model-owned sampler with delay-pattern audio dispatch.
 
         Mirrors v2's pattern: bias LM logits to force audio continuation,
@@ -1149,14 +1262,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         audio_id = self._audio_continuation_id
 
-        def run_stock_sampler() -> Any:
-            sampler = getattr(self, "_stock_sampler", None)
-            if sampler is None:
-                from vllm.v1.sample.sampler import Sampler
-
-                sampler = Sampler()
-                self._stock_sampler = sampler
-            return sampler(logits=logits, sampling_metadata=sampling_metadata)
+        def run_stock_sampler() -> torch.Tensor:
+            if sample_text is None:
+                raise RuntimeError("Higgs text sampling requires the current V2 sampler callback")
+            return sample_text(logits)
 
         hidden = self._last_logits_hidden
         self._last_logits_hidden = None
@@ -1171,12 +1280,14 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         decode_only = isinstance(ids, torch.Tensor) and int(ids.numel()) == num_rows
         prompt_mode_rows = getattr(self, "_step_audio_mode_rows", 0) == num_rows
         graph_forced_audio = getattr(self, "_step_audio_tail_rows", 0) == num_rows or prompt_mode_rows
+        dense_draft = draft_rows is not None and draft_rows.numel() == num_rows and prompt_mode_rows
         use_sample_graph = bool(
             getattr(self, "_sample_graph_enabled", False)
+            and (draft_rows is None or dense_draft)
             and not getattr(self, "_in_audio_sample_graph", False)
             and hidden.is_cuda
             and (graph_forced_audio or (decode_only and self._fast_audio_direct_rows == num_rows))
-            and getattr(sampling_metadata, "no_penalties", False)
+            and getattr(sampling_metadata, "no_penalties", True)
             and self._fast_audio_sampler_gpu_fallback_reason(
                 logits=logits, sampling_metadata=sampling_metadata, num_rows=num_rows
             )
@@ -1185,6 +1296,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         qsl = self._last_step_query_start_loc
         fused_guard = (
             use_sample_graph
+            and not dense_draft
+            and restored_rows is None
             and graph_forced_audio
             and self._eos_token_id is not None
             and (decode_only or (isinstance(qsl, torch.Tensor) and int(qsl.numel()) == num_rows + 1))
@@ -1202,26 +1315,35 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 actual_audio = self._audio_seed_mask_from_step_input(num_rows, hidden.device)
                 if getattr(self, "_step_audio_mode_rows", 0) == num_rows:
                     # Reset new prefill rows before accepting old active state.
-                    if not decode_only:
-                        self._reset_decode_state_rows(
-                            self._prefill_row_mask(num_rows, hidden.device), num_rows, hidden.device
-                        )
+                    if not decode_only and not dense_draft:
+                        pfmask = self._prefill_row_mask(num_rows, hidden.device)
+                        if restored_rows is not None:
+                            pfmask[restored_rows] = False
+                        self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
                     actual_audio = (
                         actual_audio | self._decode_has_codes[:num_rows] | self._decode_generation_done[:num_rows]
                     )
                 torch._assert_async(actual_audio.all(), "CPU/GPU Higgs graph audio tail mismatch")
-            if not decode_only:
+            if not decode_only and not dense_draft:
                 if not fused_guard:
                     pfmask = self._prefill_row_mask(num_rows, hidden.device)
+                    if restored_rows is not None:
+                        pfmask[restored_rows] = False
                     self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
                 self._fast_audio_direct_rows = num_rows
-            sampled = run_dense_sample(self, hidden, logits, sampling_metadata, force_audio_inputs=graph_forced_audio)
+            sampled = run_dense_sample(
+                self, hidden, logits, sampling_metadata, force_audio_inputs=graph_forced_audio, audio_noise=audio_noise
+            )
             if sampled is not None:
                 return sampled
             self._last_logits_hidden = None
         if not decode_only:
             self._fast_audio_direct_rows = 0
             pfmask = self._prefill_row_mask(num_rows, hidden.device)
+            if draft_rows is not None:
+                pfmask[draft_rows] = False
+            if restored_rows is not None:
+                pfmask[restored_rows] = False
             self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
         prev_audio_mask = self._audio_seed_mask_from_step_input(num_rows, hidden.device)
         if prev_audio_mask is None:
@@ -1244,7 +1366,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             mixed_direct = (
                 getattr(self, "_step_audio_tail_rows", 0) == num_rows
                 or getattr(self, "_step_audio_mode_rows", 0) == num_rows
-            ) and getattr(sampling_metadata, "no_penalties", False)
+            ) and getattr(sampling_metadata, "no_penalties", True)
             if mixed_direct:
                 # Guard the CPU classification against runner/device drift.
                 torch._assert_async(
@@ -1260,22 +1382,16 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     eos_tokens = torch.full_like(audio_tokens, int(self._eos_token_id))
                     audio_tokens = torch.where(done_mask, eos_tokens, audio_tokens)
                 sampled = audio_tokens.unsqueeze(-1)
-                sampler_output = SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+                sampler_output = sampled
             else:
                 self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
                 sampler_output = run_stock_sampler()
-                sampled = getattr(sampler_output, "sampled_token_ids", None)
-                if sampled is None:
-                    self._clear_last_audio_outputs()
-                    return sampler_output
+                sampled = sampler_output
         elif use_gpu_audio_mode:
             self._fast_audio_direct_rows = 0
             self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
             sampler_output = run_stock_sampler()
-            sampled = getattr(sampler_output, "sampled_token_ids", None)
-            if sampled is None:
-                self._clear_last_audio_outputs()
-                return sampler_output
+            sampled = sampler_output
         else:
             self._fast_audio_direct_rows = 0
             sampler_output = run_stock_sampler()
@@ -1327,6 +1443,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             cb_logits_2d,
             sampling_metadata,
             int(cb_logits.shape[1]),
+            noise=audio_noise,
         )
         codes_flat = codes_2d.view(cb_logits.shape[0], cb_logits.shape[1]).to(torch.long)
 
@@ -1548,56 +1665,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         else:
             delay = self._decode_delay_count.index_select(0, rows)
             rem = self._decode_eoc_countdown.index_select(0, rows)
-        if delay.dtype != torch.long:
-            delay = delay.to(torch.long)
-        if rem.dtype != torch.long:
-            rem = rem.to(torch.long)
-        ramp = rem >= 0
-
-        bos = BOC_ID
-        eos = EOC_ID
-
-        # Ramp-down: codebooks already behind the EOC wave are locked to EOC.
-        lock_until = num_codebooks - rem
-        locked = ramp.unsqueeze(1) & (q < lock_until.unsqueeze(1))
-        eoc_logits = cb_logits[:, :, eos].clone()
-        cb_logits.masked_fill_(locked.unsqueeze(-1), float("-inf"))
-        cb_logits[:, :, eos] = torch.where(locked, eoc_logits, cb_logits[:, :, eos])
-
-        # Ramp-down tail: active codebooks cannot emit stream specials.
-        ramp_tail = ramp.unsqueeze(1) & (q >= lock_until.unsqueeze(1))
-        cb_logits[:, :, bos] = torch.where(
-            ramp_tail,
-            torch.full_like(cb_logits[:, :, bos], float("-inf")),
-            cb_logits[:, :, bos],
-        )
-        cb_logits[:, :, eos] = torch.where(
-            ramp_tail,
-            torch.full_like(cb_logits[:, :, eos], float("-inf")),
-            cb_logits[:, :, eos],
-        )
-
-        # Normal generation: delayed codebooks are forced to BOC.
-        normal = ~ramp
-        allowed_until = torch.clamp(delay + 1, max=num_codebooks)
-        delayed = normal.unsqueeze(1) & (q >= allowed_until.unsqueeze(1))
-        boc_logits = cb_logits[:, :, bos].clone()
-        cb_logits.masked_fill_(delayed.unsqueeze(-1), float("-inf"))
-        cb_logits[:, :, bos] = torch.where(delayed, boc_logits, cb_logits[:, :, bos])
-
-        # Normal active codebooks: BOC is disallowed; EOC is only allowed on cb0.
-        allowed = normal.unsqueeze(1) & (q < allowed_until.unsqueeze(1))
-        cb_logits[:, :, bos] = torch.where(
-            allowed,
-            torch.full_like(cb_logits[:, :, bos], float("-inf")),
-            cb_logits[:, :, bos],
-        )
-        nonzero_allowed = allowed & (q > 0)
-        cb_logits[:, :, eos] = torch.where(
-            nonzero_allowed,
-            torch.full_like(cb_logits[:, :, eos], float("-inf")),
-            cb_logits[:, :, eos],
-        )
+        _mask_delayed_logits(cb_logits, delay, rem, q, num_codebooks)
 
     def _update_delay_state_batched(
         self,
@@ -1642,39 +1710,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             update_mask = code_row_mask.to(device=device, dtype=torch.bool)[:num_audio_rows]
         else:
             update_mask = code_row_mask.to(device=device, dtype=torch.bool).index_select(0, rows)
-        ramp = prev_rem >= 0
-
-        codes = codes_flat.to(device=device, dtype=torch.long).clone()
-
-        # Leading BOC delay pad.
-        delay_active = (~ramp) & ((prev_delay + 1) < num_codebooks)
-        delay_mask = delay_active.unsqueeze(1) & (q > prev_delay.unsqueeze(1))
-        codes = torch.where(delay_mask, torch.full_like(codes, BOC_ID), codes)
-        next_delay = torch.where(delay_active, prev_delay + 1, prev_delay)
-
-        # Trailing EOC ramp-down.
-        lock_until = num_codebooks - prev_rem
-        ramp_mask = ramp.unsqueeze(1) & (q < lock_until.unsqueeze(1))
-        codes = torch.where(ramp_mask, torch.full_like(codes, EOC_ID), codes)
-        ramp_next_rem = prev_rem - 1
-
-        # New EOC detection in normal mode. This avoids tensor->Python control
-        # flow; ties are impossible for the index because q is monotonic.
-        eos_mask = (~ramp).unsqueeze(1) & (codes == EOC_ID)
-        eos_idx_values = torch.where(eos_mask, q.expand_as(codes), torch.full_like(codes, -1))
-        last_eos_idx = eos_idx_values.max(dim=1).values
-        has_eos = last_eos_idx >= 0
-        eos_prefix = has_eos.unsqueeze(1) & (q <= last_eos_idx.unsqueeze(1))
-        codes = torch.where(eos_prefix, torch.full_like(codes, EOC_ID), codes)
-        normal_next_rem = torch.where(has_eos, num_codebooks - last_eos_idx - 1, torch.full_like(last_eos_idx, -1))
-
-        next_rem = torch.where(ramp, ramp_next_rem, normal_next_rem)
-        done = ((next_rem >= 0) & (next_rem <= 0)) & update_mask
+        codes, next_delay, next_rem, done = _advance_delay_state(
+            codes_flat.to(device=device), prev_delay, prev_rem, q, num_codebooks
+        )
+        done = done & update_mask
         valid = update_mask
-
-        next_delay = torch.where(done, torch.zeros_like(next_delay), next_delay)
-        next_rem = torch.where(done, torch.full_like(next_rem, -1), next_rem)
-        output_codes = codes
 
         write_delay = torch.where(update_mask, next_delay, prev_delay)
         write_rem = torch.where(update_mask, next_rem, prev_rem)
@@ -1695,7 +1735,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._decode_last_codes.index_copy_(0, rows, write_codes)
             self._decode_has_codes.index_copy_(0, rows, write_has_codes)
 
-        staged_codes = torch.where(update_mask.unsqueeze(1), output_codes, torch.full_like(output_codes, -1))
+        staged_codes = torch.where(update_mask.unsqueeze(1), codes, torch.full_like(codes, -1))
         if all_rows:
             valid_full = valid
             done_full = done
@@ -1753,7 +1793,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     @staticmethod
     def _expand_audio_sampling_params(
-        sampling_metadata: SamplingMetadata, logits_2d: torch.Tensor, num_codebooks: int
+        sampling_metadata: HiggsAudioSamplingParams, logits_2d: torch.Tensor, num_codebooks: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, remainder = divmod(int(logits_2d.shape[0]), num_codebooks)
         if remainder:
@@ -1773,7 +1813,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         )
 
     def _sample_audio_codes(
-        self, logits_2d: torch.Tensor, sampling_metadata: SamplingMetadata, num_codebooks: int = 8
+        self,
+        logits_2d: torch.Tensor,
+        sampling_metadata: HiggsAudioSamplingParams,
+        num_codebooks: int = 8,
+        *,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Replicate upstream sampling: temperature → top-k → top-p → multinomial."""
         x = logits_2d.float()
@@ -1794,9 +1839,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         fallback = x.argmax(dim=-1)
         safe_x = torch.where(all_masked.unsqueeze(-1), torch.zeros_like(x), x)
         probs = safe_x.softmax(dim=-1)
-        if getattr(self, "_audio_graph_noise", None) is not None:
+        if noise is None:
+            noise = getattr(self, "_audio_graph_noise", None)
+        if noise is not None:
             torch._assert_async(torch.isfinite(probs).all(), "Audio sampling probabilities must be finite")
-            sampled = probs.div(self._audio_graph_noise).argmax(dim=-1)
+            sampled = probs.div(noise).argmax(dim=-1)
         elif probs.is_cuda:
             # Match torch.multinomial's single-sample exponential race, but
             # validate the whole batch asynchronously. The original per-request

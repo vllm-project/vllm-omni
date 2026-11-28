@@ -11,6 +11,12 @@ owners:
 primary_code_paths:
   - vllm_omni/diffusion/models/**
   - vllm_omni/diffusion/model_loader/**
+primary_code_path_owners:
+  # Additional owner for model pipelines, not the shared loader
+  - paths:
+      - vllm_omni/diffusion/models/**
+    owners:
+      - "@wtz2333"
 related_code_paths:
   - vllm_omni/diffusion/layers/**
   - vllm_omni/diffusion/lora/**
@@ -38,7 +44,9 @@ loading, adapters, shared layers, and model-specific processing.
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract
 
 **Rule:** A pipeline MUST declare its supported modalities, configuration,
-inputs, outputs, loading path, and runtime capabilities.
+inputs, outputs, loading path, and runtime capabilities (including its
+merged-LoRA capability via `SupportsMergedLoRA` or an explicit registry entry in
+`vllm_omni/lora/capability.py`).
 
 ### DIFF-MODEL-INV-002: Registration is the selection boundary
 
@@ -59,10 +67,49 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+Qwen-Image-Edit-Plus initializes its Qwen2.5-VL encoder on CPU before sharding
+and moving it to the execution device. Its non-persistent FP32 RoPE frequency
+buffers must match Diffusers' CPU initialization: computing them on the
+accelerator can change BF16 conditioning and image accuracy. The DiT retains
+the loader's device context and the selected compilation and attention modes.
+
 HunyuanImage3 uses `OmniDiffusionConfig.revision` for model configuration,
 generation configuration, tokenizer, and weight loading, including preprocessing.
 The shared-weight runtime pins remote loads to the commit resolved by AR;
 local checkpoint directories must remain immutable throughout the session.
+
+MiniMax-H3-Image resolves all requested release assets from the Hub, including
+the PDD configuration and fused heads, tokenizer, processor, and VAE. Finding
+`model_index.json` in a cold or partially populated cache does not establish
+that these other required assets are available.
+
+## HunyuanImage3 AR KV token identity
+
+The HunyuanImage3 AR-to-DiT bridge carries the original prompt and generated
+token IDs alongside display text. Scheduler preparation and worker execution
+use those generated IDs for CoT sections, then build the uncached image suffix
+with the existing template. Decoding and re-encoding generated text is not an
+identity operation, even when the token count stays the same.
+
+Before importing AR KV, the conditional prefix must match the original AR
+sequence token by token. Dense reuse is bounded by the actual key and value
+coverage of every decoder layer; native transfer uses confirmed computed-token
+coverage. The closing CoT token remains outside the reused prefix. Dropping
+cached thought tokens or receiving incomplete image/CFG coverage is rejected
+before injection. Full recomputation can still drop thoughts. Standalone text
+requests and AR outputs without a completed CoT retain their template path.
+
+## Shared RMSNorm residual precision on NPU
+
+The shared `RMSNorm.forward_npu` uses `torch_npu.npu_add_rms_norm` when `x`
+and `residual` have the same dtype. With different dtypes, it materializes
+`residual + x` using PyTorch's dtype promotion, then calls `npu_rms_norm`
+with gamma converted to the sum's dtype. The returned residual and normalized
+output preserve the promoted dtype.
+
+Selection is automatic. Matching BF16 inputs use fusion, which can normalize
+the sum before BF16 rounding; this policy does not enforce the native rounding
+boundary for that case. Calls without a residual still use `npu_rms_norm`.
 
 ## Weight reloading
 

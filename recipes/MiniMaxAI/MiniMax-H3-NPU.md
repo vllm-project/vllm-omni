@@ -151,7 +151,6 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export MINDIE_SD_FA_TYPE="ascend_laser_attention"
-export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
@@ -173,6 +172,16 @@ vllm serve "${MODEL}" \
 
 Notes:
 
+- The MiniMax-H3 encoder's object payloads no longer cross HCCL: they travel
+  over the gloo CPU group (issue #10645). Automatic NPU-side socket port
+  allocation (`HCCL_NPU_SOCKET_PORT_RANGE=auto`) was observed to make the
+  first request fail with `EI0006 Communication_Error_Get_Socket` on
+  `HcclBroadcast` on hosts whose NPUs sit in more than one interconnect
+  domain, such as a host with two four-NPU UB domains. The recipes keep the
+  variable unset because that split-domain case is **not verified here**: the
+  available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
+  the two-domain first request of issue #10645 was not reproduced. The
+  reporter of #10645 could validate `auto` on their two-domain host.
 - Do not add `--enforce-eager`. The first request includes regional
   compilation; warm the server once before measuring steady-state latency.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
@@ -556,7 +565,7 @@ The optimizations stacked by the recommended configurations above:
    kernel selected through `MINDIE_SD_FA_TYPE`, carried by the FLASH_ATTN
    backend with a mask-free packed varlen path and K/V prefix slicing driven
    by the packed `cu_seqlens` metadata.
-2. Ascend-friendly fused operators: RMSNorm, AddRMSNorm, GQA, SwiGLU, and
+2. Ascend-friendly fused operators: RMSNorm, dtype-selected AddRMSNorm, GQA, SwiGLU, and
    rotary position embedding from MindIE-SD.
 3. RainFusion block-sparse attention, optionally with EQBSA mixed INT8/FP8
    precision — see
@@ -566,6 +575,26 @@ The optimizations stacked by the recommended configurations above:
 5. Parallelism: USP, text-encoder TP, and native VAE `tile` patch
    parallelism, plus distributed layerwise offload.
 6. Post-training: few-step distillation via the FlashGen online LoRA.
+
+### Text-encoder RMSNorm precision
+
+The NPU RMSNorm path selects residual fusion automatically:
+
+| Input and residual dtypes | Behavior |
+| --- | --- |
+| Same | Fused AddRMSNorm |
+| Different | Separate add with dtype promotion, then RMSNorm |
+
+Mixed-dtype addition preserves the promoted residual. Matching BF16 inputs
+use fusion and can differ from explicit BF16 add-then-RMSNorm rounding.
+There is no fusion switch to configure.
+
+An earlier comparison of the two paths measured 39.54 ms fused versus 39.63 ms
+split on one Ascend 950PR (BF16, TP=1, 30 tokens; 20 interleaved pairs after
+three warmups per mode). The paired difference was +0.083 ms (+0.21%), with
+a 95% interval of -0.24 to +0.39 ms. This is historical path-level evidence,
+not validation of automatic dtype selection. Timing excludes tokenization,
+model loading, and video generation. See [measurement details](https://github.com/vllm-project/vllm-omni/pull/10141).
 
 ## Benchmarks (Atlas 800I A2 / A3)
 

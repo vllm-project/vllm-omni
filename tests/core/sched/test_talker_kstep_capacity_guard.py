@@ -12,6 +12,7 @@ single-frame path. vLLM only admits a waiting request while
 nothing and its uniform decode spans may keep the drafts.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -196,8 +197,13 @@ def test_dynamic_lookup_does_not_enable_narrow_static_graph_or_npu():
 
 
 def test_dynamic_width_is_booked_by_real_upstream_accounting():
-    class RequestState(SimpleNamespace):
-        __hash__ = object.__hash__
+    @dataclass(eq=False)
+    class RequestState:
+        num_computed_tokens: int
+        num_in_flight_tokens: int
+        num_tokens: int
+        num_output_placeholders: int
+        use_structured_output: bool
 
     sched = object.__new__(OmniARScheduler)
     fixture = _dynamic_sched()
@@ -223,3 +229,89 @@ def test_dynamic_width_is_booked_by_real_upstream_accounting():
     assert [r.num_computed_tokens for r in sched.requests.values()] == [104, 104]
     assert [r.num_in_flight_tokens for r in sched.requests.values()] == [4, 4]
     assert output.total_num_scheduled_tokens == 8
+
+
+def test_draftless_mixed_batch_keeps_prefill_span():
+    sched = _sched(running=[], waiting=[], max_num_running_reqs=4)
+    output = _booked_output([7, 0])
+    output.scheduled_spec_decode_tokens.clear()
+    OmniARScheduler._enforce_kstep_span_uniformity(sched, output)
+    assert output.num_scheduled_tokens == {0: 8, 1: 1}
+    assert output.total_num_scheduled_tokens == 9
+
+
+@pytest.mark.parametrize("with_decode_peer", [False, True])
+def test_resumed_single_token_condition_is_not_booked_as_kstep_decode(with_decode_peer):
+    """A Venus audio-bos flush has one new prompt row, not sixteen codec rows."""
+
+    @dataclass(eq=False)
+    class RequestState:
+        num_computed_tokens: int
+        num_in_flight_tokens: int
+        num_tokens: int
+        prompt_token_ids: list[int]
+        num_output_placeholders: int
+        use_structured_output: bool
+
+    sched = object.__new__(OmniARScheduler)
+    sched._talker_kstep_armed = lambda: True
+    sched.num_spec_tokens = 15
+    sched.defer_block_free = False
+    sched._inflight_prefills = set()
+    sched.requests = {
+        0: RequestState(
+            num_computed_tokens=146,
+            num_in_flight_tokens=0,
+            num_tokens=147,
+            prompt_token_ids=[0] * 147,
+            num_output_placeholders=0,
+            use_structured_output=False,
+        )
+    }
+    if with_decode_peer:
+        sched.requests[1] = RequestState(
+            num_computed_tokens=100,
+            num_in_flight_tokens=0,
+            num_tokens=101,
+            prompt_token_ids=[0] * 50,
+            num_output_placeholders=0,
+            use_structured_output=False,
+        )
+    output = _booked_output([15] * len(sched.requests))
+    output.has_structured_output_requests = False
+    sched._update_after_schedule(output)
+    assert output.num_scheduled_tokens == dict.fromkeys(sched.requests, 1)
+    assert output.scheduled_spec_decode_tokens == {}
+    assert sched.requests[0].num_computed_tokens == 147
+    assert all(r.num_in_flight_tokens == 1 for r in sched.requests.values())
+    # The schedule() backstop sees already-advanced counts and stays idempotent.
+    sched._enforce_kstep_span_uniformity(output)
+    assert output.total_num_scheduled_tokens == len(sched.requests)
+    # The next codec decode can still use the configured K-step width.
+    for request in sched.requests.values():
+        request.num_tokens = request.num_computed_tokens + 1
+        request.num_in_flight_tokens = 0
+    decode = _booked_output([15] * len(sched.requests))
+    decode.has_structured_output_requests = False
+    sched._update_after_schedule(decode)
+    assert decode.num_scheduled_tokens == dict.fromkeys(sched.requests, 16)
+    assert sched.requests[0].num_computed_tokens == 163
+
+
+def test_generation_scheduler_folds_drafts_before_booking(monkeypatch):
+    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, VLLMScheduler
+
+    sched = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    sched._talker_kstep_armed = lambda: True
+    sched.num_spec_tokens = 7
+    output = _booked_output([7, 0])
+    del output.scheduled_spec_decode_tokens[1]
+    output.num_scheduled_tokens[1] = 5
+    booked = []
+    monkeypatch.setattr(
+        VLLMScheduler, "_update_after_schedule", lambda self, step: booked.append(step.total_num_scheduled_tokens)
+    )
+    sched._update_after_schedule(output)
+    assert output.num_scheduled_tokens == {0: 1, 1: 5}
+    assert output.scheduled_spec_decode_tokens == {}
+    assert booked == [6]

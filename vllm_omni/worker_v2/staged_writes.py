@@ -191,6 +191,9 @@ def install() -> None:
         orig_init(self, size, dtype, device, max_concurrency, uva_instead_of_gpu)
         self._np_dtype = torch.empty((), dtype=dtype).numpy().dtype
         self._staged_len = 0
+        # Upstream stages contents into an array.array; omni's stage_write
+        # appends list/ndarray chunks, so restore the list shape here.
+        self._staged_write_contents = []
         if self.write_contents is None:
             self.write_contents = pool_cls(1, dtype=dtype, max_concurrency=self.max_concurrency)
 

@@ -53,7 +53,6 @@ ALLOWED_FILES = {
     "vllm_omni/model_executor/models/moss_tts/cuda_graph_streaming_decoder_wrapper.py",
     "vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py",
     "vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py",
-    "vllm_omni/worker/gpu_ar_model_runner.py",
 }
 
 _GENERIC_TIP = (

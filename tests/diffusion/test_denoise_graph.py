@@ -9,6 +9,7 @@ The capture/replay machinery itself is ``GraphedForward``'s and is covered by
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -55,6 +56,8 @@ def platform(monkeypatch) -> SimpleNamespace:
     fake.is_graph_capturing = lambda: fake.outer_capture
     fake.get_graphed_forward_cls = lambda: fake.graph_cls
     monkeypatch.setattr(graph_mod, "current_omni_platform", fake)
+    # Isolate runners left alive by reference cycles in other tests.
+    monkeypatch.setattr(graph_mod, "_RUNNERS", weakref.WeakSet())
     monkeypatch.setattr(cuda_graph_mod, "current_omni_platform", fake)
     monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
     return fake
@@ -65,10 +68,15 @@ def _od_config(**overrides):
         diffusion_use_graph=True,
         enforce_eager=False,
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        diffusion_attention_schedule=None,
+        diffusion_graph_release_after_denoise=False,
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_config=AttentionConfig(),
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)

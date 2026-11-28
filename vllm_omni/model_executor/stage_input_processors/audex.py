@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex thinker → code2wav stage input processors.
 
 The thinker is a plain token-autoregressive LM whose sampled stream contains
@@ -130,8 +130,9 @@ def expand_cfg_prompts(prompt: dict[str, Any] | str, sampling_params: Any) -> li
             "the caller must build the length-matched null prompt before submission"
         )
 
+    companion_prompt: dict[str, Any] | str
     if isinstance(prompt, dict):
-        companion_prompt: dict[str, Any] | str = {**prompt, "prompt": null_prompt}
+        companion_prompt = {**prompt, "prompt": null_prompt}
         companion_prompt.pop("prompt_token_ids", None)
     else:
         companion_prompt = null_prompt
@@ -245,6 +246,11 @@ def thinker2code2wav_async_chunk(
             req_id=[request_id],
         ),
     )
+
+
+# Codec frames are derived from the complete generated prefix, including
+# decode steps that do not carry a multimodal payload.
+setattr(thinker2code2wav_async_chunk, "_requires_full_token_history", True)
 
 
 def thinker2code2wav_full_payload(

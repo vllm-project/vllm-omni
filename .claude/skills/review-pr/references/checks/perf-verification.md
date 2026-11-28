@@ -51,6 +51,31 @@ For diffusion accuracy evidence, use the reference-alignment and calibration
 contract in [diffusion-accuracy-test](../../../diffusion-accuracy-test/SKILL.md)
 to assess the claimed comparison scope and threshold evidence.
 
+## Required output artifacts by modality
+
+Provide the actual output files or responses and the applicable raw benchmark
+records for each model, modality, and serving path covered by the claim. Bind
+them to the revisions, checkpoint, input, seed, and runtime configuration. For
+a comparison, provide both sides. Apply every applicable row for multimodal
+claims. For a shared change, name the affected model families, explain the
+representative cases, and list untested combinations.
+
+| Output | Required quality or correctness artifacts | Performance artifacts when claimed |
+| --- | --- | --- |
+| Text and multimodal understanding | Actual returned text or response payload with the input and task score or parity check. | TTFT, decode latency or token throughput at stated input and output lengths. |
+| Image generation or editing | Decodable generated or edited image files, conditioning inputs, and the applicable quality check. | End-to-end latency and peak memory at matching dimensions and steps. |
+| Video and audio-video generation | Playable generated video files with frame count, FPS, and duration. Audio-video requires the generated audio track and alignment check. | End-to-end latency and peak memory at matching frames, resolution, and steps. |
+| Text-to-speech | Generated audio and the exact synthesis text. For streaming, include received chunks and the final audio. | End-to-end latency and real-time factor. For streaming, include the first-packet and continuity measures below. |
+| Multimodal Omni | Actual returned text and generated audio. Include the actual files for each additional claimed output modality. | End-to-end time and the applicable first-token, first-audio, and stage timings. |
+| Music or sound generation | Generated audio with sample rate, duration, and the applicable quality check. | End-to-end latency and real-time factor. |
+| Multi-stage or interactive outputs | Final outputs and the relevant stage or session trace, including terminal events. | End-to-end time and the applicable stage, handoff, or per-tick timings. |
+
+Give the reviewer access to the actual artifacts through attachments or stable
+links. Open the media or response and confirm its run identity. Hashes, metric
+summaries, and screenshots can supplement the required files. A missing or
+inaccessible required artifact triggers the zero-score rule in
+[review-score.md](review-score.md#hard-scoring-requirements).
+
 ## E2e stage-attribution table
 
 For an end-to-end latency claim, request the stage-attribution table the

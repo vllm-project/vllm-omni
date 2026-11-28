@@ -16,6 +16,7 @@ from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -26,18 +27,23 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.engine.omni_engine_base import _derive_supported_tasks
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai import media_input
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.images import helpers as image_helpers
 from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.cosmos3.pipeline import COSMOS3_OMNI_DEPLOY_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -218,6 +224,7 @@ def test_client(mock_async_diffusion):
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
@@ -301,6 +308,7 @@ def async_omni_test_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -365,6 +373,7 @@ def async_omni_rgba_test_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -429,6 +438,7 @@ def async_omni_stage_configs_only_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     assert not hasattr(engine, "stage_list")
@@ -507,6 +517,7 @@ def mammoth_moda2_test_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -576,6 +587,7 @@ def streaming_image_edit_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -610,6 +622,7 @@ def test_health_endpoint_no_engine():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     # Don't set any engine
 
     client = TestClient(app)
@@ -630,6 +643,7 @@ def test_health_endpoint_dead_engine():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     dead_engine = AsyncMock()
     dead_engine.check_health = AsyncMock(side_effect=EngineDeadError())
@@ -661,6 +675,7 @@ def test_models_endpoint_no_engine():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     # Don't set any engine
 
     client = TestClient(app)
@@ -699,6 +714,77 @@ def test_generate_single_image(test_client):
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
     assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
+
+
+@pytest.mark.parametrize("deploy_overlay", [False, True])
+def test_cosmos3_images_api_keeps_image_and_video_tasks(test_client, deploy_overlay):
+    if deploy_overlay:
+        config = VllmOmniConfig.from_pipeline_config(COSMOS3_OMNI_DEPLOY_PIPELINE)
+    else:
+        config = StageConfigFactory.create_typed_default_diffusion(
+            "nvidia/Cosmos3-Super", {"model_class_name": "Cosmos3OmniDiffusersPipeline"}
+        )
+    assert config.stage_configs[0].final_output_type == "video"
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+    assert set(test_client.app.state.supported_tasks) == {"x2i", "x2v"}
+
+    response = test_client.post("/v1/images/generations", json={"prompt": "A cat", "size": "1024x1024"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["b64_json"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["robbyant/lingbot-video-dense-1.3b", "robbyant/lingbot-video-moe-30b-a3b"],
+)
+def test_lingbot_images_api_accepts_single_frame_with_video_defaults(test_client, mock_async_diffusion, model):
+    config = StageConfigFactory.create_typed_default_diffusion(model, {"model_class_name": "LingBotVideoPipeline"})
+    assert config.stage_configs[0].final_output_type == "video"
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+    test_client.app.state.openai_serving_models = _DiffusionServingModels([BaseModelPath(name=model, model_path=model)])
+    mock_async_diffusion.default_sampling_params_list[0].num_frames = 81
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "model": model,
+            "prompt": "a robotic arm picks up a red block",
+            "size": "320x192",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_frames": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 3.0,
+            "flow_shift": 3.0,
+            "seed": 42,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["b64_json"]
+    assert test_client.app.state.supported_tasks == ("x2i", "x2v")
+    assert mock_async_diffusion.captured_prompt["modalities"] == ["image"]
+    assert mock_async_diffusion.captured_sampling_params_list[0].num_frames == 1
+    assert mock_async_diffusion.default_sampling_params_list[0].num_frames == 81
+
+
+@pytest.mark.parametrize("model_class", ["LingBotWorldCausalDMDPipeline", "WanPipeline"])
+def test_video_only_pipeline_rejects_image_generation(test_client, mock_async_diffusion, model_class):
+    config = StageConfigFactory.create_typed_default_diffusion("test-model", {"model_class_name": model_class})
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+
+    response = test_client.post(
+        "/v1/images/generations", json={"prompt": "a robotic arm picks up a red block", "num_frames": 1}
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "The model does not support image generation"
+    assert test_client.app.state.supported_tasks == ("x2v",)
+    assert mock_async_diffusion.generate_calls == 0
 
 
 def test_generate_images_guardrail_error_returns_400(test_client, mock_async_diffusion):
@@ -953,6 +1039,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
     chat_handler.engine_client = engine
@@ -1455,6 +1542,7 @@ def test_model_not_loaded():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     # Don't set diffusion_engine to simulate uninitialized state
     app.state.diffusion_engine = None
 
@@ -1510,6 +1598,10 @@ def test_parameter_validation():
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", guidance_scale=21.0)
+
+    for flow_shift in [float("nan"), float("inf"), float("-inf"), 0.0, -2.0]:
+        with pytest.raises(ValueError):
+            ImageGenerationRequest(prompt="test", flow_shift=flow_shift)
 
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
@@ -1761,6 +1853,35 @@ def test_image_edit_images_processing(async_omni_test_client):
     assert processed_images[1].size == (24, 24)
 
 
+def test_image_edit_rejects_oversized_http_url_before_decode(async_omni_test_client, monkeypatch):
+    async_client = media_input.httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        return async_client(
+            *args,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-length": "5"},
+                    content=b"12345",
+                )
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(image_helpers, "MAX_IMAGE_INPUT_BYTES", 4)
+    monkeypatch.setattr(media_input.httpx, "AsyncClient", _client_factory)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        data={"prompt": "reject oversized input", "url": "https://93.184.216.34/large.png"},
+    )
+
+    assert response.status_code == 400
+    assert "exceeds" in response.json()["detail"]
+    assert async_omni_test_client.app.state.engine_client.captured_prompt is None
+
+
 def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((16, 16))
     img_bytes_2 = make_test_image_bytes((32, 32))
@@ -1796,6 +1917,48 @@ def test_image_edit_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("num_images", [4, 5, 10])
+def test_image_edit_accepts_qwen_image_21_references(async_omni_test_client, num_images):
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.od_config = get_diffusion_model_metadata("QwenImage21Pipeline")
+    sizes = [(16 + i, 16 + i) for i in range(num_images)]
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes(size)) for size in sizes],
+        data={"prompt": "Combine all reference images into one scene."},
+    )
+
+    assert response.status_code == 200
+    images = engine.captured_prompt["multi_modal_data"]["image"]
+    assert [image.size for image in images] == sizes
+
+
+def test_image_edit_rejects_eleven_qwen_image_21_references_before_loading(async_omni_test_client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import vllm_omni.entrypoints.openai.api_server as api_server_module
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.od_config = get_diffusion_model_metadata("QwenImage21Pipeline")
+    load = AsyncMock(side_effect=AssertionError("Over-limit images must not be loaded"))
+    monkeypatch.setattr(api_server_module, "_load_input_images", load)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16))) for _ in range(11)],
+        data={"prompt": "Combine all reference images into one scene."},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Received 11 input images. At most 10 images are supported by this model."
+    assert engine.captured_prompt is None
+    load.assert_not_called()
 
 
 def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):
@@ -2937,7 +3100,7 @@ def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: st
     )
     test_client.app.state.engine_client.default_sampling_params_list = [defaults]
     for override in (explicit, False):
-        payload = {"prompt": "a cat"}
+        payload: dict[str, str | int | float] = {"prompt": "a cat"}
         if override:
             payload.update(guidance_scale=0.0, seed=0, n=1)
         if route == "generations":

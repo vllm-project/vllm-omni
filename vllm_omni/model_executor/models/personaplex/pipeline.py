@@ -39,6 +39,7 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="personaplex",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -64,6 +65,9 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="PersonaPlexCode2Wav",
+            # Mimi keeps a streaming decoder row until the session finishes,
+            # including while its request is parked waiting for the next chunk.
+            retains_state_across_chunks=True,
             # In sync (non-async-chunk) mode the only pre-stage input proc is a
             # length-only placeholder; the bulk codec payload ships via the
             # worker connector from stage 0's full-payload producer.
@@ -72,6 +76,7 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             sampling_constraints={"detokenize": True},
             supports_native_mrv2_data_plane=True,
             supports_duplex_mrv2=True,
+            requires_full_payload_input=True,
         ),
     ),
 )

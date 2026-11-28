@@ -29,7 +29,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     clear_scheduled_denoise_step_on_exit,
+    get_forward_context,
+    is_forward_context_available,
 )
 from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
@@ -70,7 +73,9 @@ from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
+from vllm_omni.diffusion.utils.flow_matching import normalize_shift
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -152,7 +157,7 @@ def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc")
     raw = extra_args.get("sample_solver", default)
     sample_solver = str(raw).strip().lower()
     if sample_solver not in WAN_SAMPLE_SOLVER_CHOICES:
-        raise ValueError(f"Invalid sample_solver={raw!r}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}")
+        raise OmniClientError(f"Invalid sample_solver={raw!r}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}")
     return sample_solver
 
 
@@ -163,9 +168,9 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
 
     try:
-        return float(raw_flow_shift)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+        return normalize_shift(raw_flow_shift, name="flow_shift")
+    except ValueError as exc:
+        raise OmniClientError(str(exc)) from exc
 
 
 def resolve_wan_boundary_ratio(
@@ -727,10 +732,22 @@ class Wan22Pipeline(
         # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
         # length; None without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
+        sigma_scheduled = is_forward_context_available() and bool(get_forward_context().attention_sigma_schedule)
         with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t, total_steps=total_steps)
+                self.record_denoise_step(
+                    step_idx,
+                    t,
+                    total_steps=total_steps,
+                    # DMD bypasses set_timesteps and steps its fixed timesteps with the grid
+                    # sigma nearest to each one, so publish that sigma.
+                    sigma=(
+                        self.scheduler.sigma_for_timestep(t, device="cpu").item()
+                        if self.is_dmd and sigma_scheduled
+                        else None
+                    ),
+                )
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -1396,6 +1413,8 @@ class Wan22Pipeline(
             else:
                 self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
+            # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+            check_scheduler_sigmas(self.scheduler.sigmas)
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
@@ -1546,8 +1565,9 @@ class Wan22Pipeline(
                 # ranks get an empty placeholder. Emit typed media only from the
                 # owning rank and keep the placeholder on the legacy output field, so
                 # the media batch-dimension check in split_diffusion_output_by_request
-                # does not trip on every non-owner rank.
-                if decoded.dim() == 5:
+                # does not trip on every non-owner rank. Under pipeline parallelism a
+                # non-decoding stage receives None from the PP decode wrapper.
+                if decoded is not None and decoded.dim() == 5:
                     output = None
                     media = DiffusionMediaOutput(
                         video=VideoMediaOutput(

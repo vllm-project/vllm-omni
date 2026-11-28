@@ -30,7 +30,11 @@ from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
     resolve_continuation_request,
     window_frame_index,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    check_continuation_conditions,
+    max_output_seconds,
+    resolve_long_video_mode,
+)
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     MINIMAX_H3_OUTPUT_SHORT_EDGE,
     load_minimax_h3_images,
@@ -743,6 +747,8 @@ def prepare_encoder_inputs(
         guided=bool(timeline_guides),
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []
+    if resolve_long_video_mode(extra_args, task) == "continuation":
+        check_continuation_conditions(task, keyframe_indices)
     video_timestamps: list[list[float]] = []
     qwen_video_inputs: list[tuple[np.ndarray, dict[str, Any]]] = []
     condition_labels: list[tuple[str, int]] = []

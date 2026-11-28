@@ -230,7 +230,9 @@ In `DiffusionParallelConfig`:
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
-| `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
+| `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
+| `ulysses_a2a_backend` | str | `"auto"` | Strict Ulysses all-to-all transport: `auto`, `nccl` or `copy_engine` (see below). On NPU, `copy_engine` selects platform SHMEM. |
+| `ulysses_overlap_chunks` | int | `0` | Overlap the copy-engine exchange with attention in this many head chunks; `0` disables. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -238,6 +240,19 @@ In `DiffusionParallelConfig`:
 - Total sequence parallel size equals `ulysses_degree × ring_degree × allgather_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
+
+The copy engine is faster than NCCL, so the default `ulysses_a2a_backend="auto"` uses it wherever it is supported and
+NCCL otherwise. It follows vLLM's custom all-reduce rules: NVIDIA CUDA, the whole Ulysses group on one node, full
+NVLink connectivity for more than two GPUs (two GPUs may use PCIe P2P; check with `nvidia-smi topo -p2p r`), GPU P2P access and torch symmetric memory, plus
+strict pure Ulysses without CUDA graphs. The choice and any reason for NCCL are logged once per group. Set `--ulysses-a2a-backend` to override (an unsupported explicit
+`copy_engine` raises):
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-backend copy_engine
+```
+
+On NPU, the flag retains the existing
+[NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
 
 ## Best Practices
 
@@ -253,6 +268,19 @@ In `DiffusionParallelConfig`:
 - Small images (<1024px) - overhead exceeds benefit, use single GPU with cache instead
 
 ---
+
+## Compiling FA4 Ring attention
+
+On Blackwell, Ring prefers vLLM's bundled FlashAttention dispatcher. When it
+selects FA4, compiled Ring uses the bundled FA4 kernel. Ring can also use
+standalone CuTe FA4 when the bundled dispatcher is unavailable.
+
+With `torch.compile` enabled and PyTorch 2.14 or newer, set the following before
+starting workers to enable experimental native P2P compilation:
+
+```bash
+export TORCHDYNAMO_ENABLE_P2P_COMPILATION=1
+```
 
 ## Troubleshooting
 

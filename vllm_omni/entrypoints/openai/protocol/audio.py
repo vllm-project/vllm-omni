@@ -220,8 +220,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         ge=_INT64_MIN,
         le=_INT64_MAX,
-        description="Random seed for reproducible generation. When set, ensures "
-        "deterministic output for the same input text and seed value.",
+        description="Random seed for reproducible generation. An explicitly set seed isolates the "
+        "request from other batched work: it waits for the engine to drain and runs alone, which makes "
+        "its output byte-reproducible but lowers throughput while it runs. A seed copied from a stage's "
+        "default_sampling_params does not trigger this.",
     )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
@@ -239,8 +241,50 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
-        description=("Optional model-specific parameters passed directly to the model's extra_args."),
+        description=("Optional model-specific parameters and first-stage sampling overrides."),
     )
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="First-stage temperature override; takes precedence over extra_params.temperature.",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="First-stage repetition penalty override; takes precedence over extra_params.repetition_penalty.",
+    )
+
+    @model_validator(mode="after")
+    def _merge_sampling_overrides(self) -> "OpenAICreateSpeechRequest":
+        # Resolve precedence before validating so shadowed nested values do
+        # not reject an otherwise valid top-level override.
+        overrides = {
+            name: value for name in ("temperature", "repetition_penalty") if (value := getattr(self, name)) is not None
+        }
+        values = {**(self.extra_params or {}), **overrides}
+        # The serving layer assigns these overrides to a request-local
+        # sampling configuration. Reject non-numeric overrides at admission.
+        for name in ("temperature", "repetition_penalty"):
+            value = values.get(name)
+            if value is None:
+                continue
+            bound = "> 0" if name == "repetition_penalty" else ">= 0"
+            message = f"extra_params.{name} must be a finite number {bound}"
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(message)
+            number = float(value)
+            if not math.isfinite(number) or number < 0 or (name == "repetition_penalty" and number == 0):
+                raise ValueError(message)
+        # Canonicalize both public spellings before adapter validation so a
+        # model that rejects sampling overrides sees top-level fields too.
+        if overrides:
+            self.extra_params = values
+        return self
+
     word_timestamps: bool = Field(
         default=False,
         description=(
@@ -665,11 +709,16 @@ class StreamingSpeechSessionConfig(BaseModel):
 
     model: str | None = None
     text_input_mode: Literal["buffered", "commitment"] = "buffered"
+    model_input_mode: Literal["complete", "incremental"] = "complete"
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = Field(
+        default=None,
+        description="Target sample rate of the returned audio. If omitted, use the model's native sample rate.",
+    )
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(
@@ -694,11 +743,22 @@ class StreamingSpeechSessionConfig(BaseModel):
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector. Mutually exclusive with ref_audio.",
     )
+    # The fields below mean the same as on OpenAICreateSpeechRequest; the
+    # handler validates them by building that request at session.config time.
+    ref_audio_codes: list[list[StrictInt]] | None = None
+    ref_audio_2: str | None = None
+    ambient_sound: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0.0)
+    token_count: StrictInt | None = Field(default=None, gt=0, le=_INT64_MAX)
+    cache_salt: str | None = None
+    temperature: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    repetition_penalty: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
+    extra_params: dict[str, Any] | None = None
     stream_audio: bool = Field(
         default=False,
         description=(
-            "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. WebSocket streaming currently requires "
+            "If true, send PCM or WAV audio chunks progressively over WebSocket. "
+            "Requires response_format='pcm' or 'wav'. WebSocket streaming currently requires "
             "speed=1.0, including for models with native speed control."
         ),
     )
@@ -724,20 +784,29 @@ class StreamingSpeechSessionConfig(BaseModel):
     split_granularity: Literal["none", "sentence", "clause"] = Field(
         default="none",
         description=(
-            "How incoming input.text is segmented before TTS. 'none' (default) "
+            "Segmentation for complete buffered input. 'none' (default) "
             "buffers until input.done and runs one request, matching the "
             "long-form timbre-continuity path. 'sentence' emits a request at "
             "each sentence boundary (Latin .!? plus CJK/Indic/Arabic marks). "
-            "'clause' also splits on commas/semicolons for lower TTFA."
+            "'clause' also splits on commas/semicolons for lower TTFA. "
+            "Incremental model input currently requires 'none'; its text "
+            "delivery policy controls when input becomes available."
         ),
     )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.model_input_mode == "incremental":
+            if self.text_input_mode != "commitment":
+                raise ValueError("Incremental model input requires text_input_mode='commitment'")
+            if not self.stream_audio or self.response_format != "pcm":
+                raise ValueError("Incremental model input requires stream_audio=true and response_format='pcm'")
+            if self.split_granularity != "none" or self.word_timestamps:
+                raise ValueError("Incremental model input requires split_granularity='none' and word_timestamps=false")
         if self.stream_audio:
-            if self.response_format != "pcm":
+            if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm'. "
+                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:
@@ -747,4 +816,11 @@ class StreamingSpeechSessionConfig(BaseModel):
                     "WebSocket stream_audio=true currently requires speed=1.0; "
                     "native speed control is only available through HTTP streaming."
                 )
+        if (self.duration_seconds is not None or self.token_count is not None) and (
+            self.split_granularity != "none" or self.text_input_mode != "buffered"
+        ):
+            raise ValueError(
+                "duration_seconds and token_count set the length of a whole request, so they require "
+                "split_granularity='none' and text_input_mode='buffered'."
+            )
         return self

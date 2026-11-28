@@ -113,8 +113,11 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     ) -> None:
         if hasattr(layer, "pre_quant_scale"):
             raise ValueError(f"{module_name} uses unsupported SmoothQuant pre_quant_scale")
+        # Merged layers (e.g. gate/up) hold one tensorwise scale per logical
+        # shard until the native transform requantizes them to a single scale.
         weight_scale = getattr(layer, "weight_scale", None)
-        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != 1:
+        num_shards = len(getattr(layer, "logical_widths", None) or [None])
+        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != num_shards:
             raise ValueError(f"{module_name} requires serialized tensorwise FP8 weights")
         fp8_kernel = getattr(method, "kernel", None)
         from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
@@ -134,7 +137,9 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     ) -> None:
         weight = getattr(layer, "weight", None)
         scale = getattr(layer, "weight_scale", None)
-        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.float8_e4m3fn:
+        # vLLM normalizes E4M3FN checkpoints to E4M3FNUZ on gfx942, doubling the
+        # scale, so materialize() still dequantizes the same values.
+        if not isinstance(weight, torch.Tensor) or weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             dtype = getattr(weight, "dtype", None)
             raise TypeError(f"{module_name} requires a canonical FP8 weight, got {dtype}")
         if weight.ndim != 2:

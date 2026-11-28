@@ -29,7 +29,29 @@ recommended batching deploy isolates the Thinker on GPU 0 and
 co-locates Talker and Code2Wav on GPU 1; 1-GPU, 3-GPU, and 8x4090 layouts are
 also provided.
 
+## Seed-TTS defaults
+
+Seed-TTS optimization settings are included in the default
+[`minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
+deployment. It places all three stages and two Code2Wav replicas
+on logical GPU 0, enables grouped reference setup and Flow FP16, and disables
+Thinker prefix caching for ngram speculation. Measurements used private CUDA
+MPS and one large-memory L20X; this is not a qualified production preset.
+The CUDA profile also drops unused upstream CFM attention buffers before
+placing Code2Wav on the device; its batched backend owns the active caches.
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+  --stage-configs-path vllm_omni/deploy/minicpmo_4_5_turn.yaml
+```
+
+See the [performance contract](../../docs/design/minicpm_o45_mrv2_performance.md#seed-tts-experimental-optimization-bundle)
+for controls and performance-evidence limits. CPU background
+reference extraction remains disabled because it regressed the C16 screen.
+
 ## References
+
+- [Two-card Ascend features and serving](MiniCPM-o-4_5-Ascend.md).
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
@@ -69,22 +91,18 @@ Code2Wav consumes them through a shared-memory async connector.
 | 2-GPU | GPU 0 | GPU 1 | GPU 1 | 2x large-memory GPU |
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
+| 3x Intel XPU 32GB (overlay) | XPU 0 | XPU 1 | XPU 2 | 3x Intel Arc Pro B70 |
 
 ### Default model runner
 
-On CUDA the default deployment runs the Thinker and Code2Wav on Model Runner V2.
-The Talker stays on V1 because its multi-frame decode runs only on V1;
-`minicpmo_4_5_turn_mrv2.yaml` runs all three stages on V2 with single-frame
-Talker decode. Other platforms retain Model Runner V1. Every stage keeps `async_chunk: true`.
+The default CUDA deployment runs all three stages on Model Runner V2. The
+Talker uses FlashAttention and decodes up to sixteen codec frames per K-step.
+`minicpmo_4_5_turn.yaml` inherits these settings for ordinary HTTP serving.
 
-The ordinary turn profile inherits the CUDA V2 default and enables Thinker
-prefix caching on CUDA. MRv2 restores cached latent rows and their token/position
-metadata together for the Talker. NPU, ROCm, XPU and MUSA retain disabled caching.
-`minicpmo_4_5_turn_mrv2.yaml` additionally selects its own capacity and
-scheduling settings, including stage 0 `async_chunk: false`. To select V1 on CUDA, override
-`platforms.cuda.model_runner: v1` in a custom deployment overlay. CUDA turn
-profiles keep Thinker prefix caching enabled with either runner; duplex
-profiles keep it disabled.
+CUDA turn serving inherits Thinker ngram speculation and disabled prefix
+caching, and passes the completed Thinker payload to the Talker. The Talker
+streams codec chunks to Code2Wav. Model Runner V2 is the only supported runner
+with vLLM 0.34; a custom overlay that selects V1 is rejected.
 
 Stage-0 speculative decoding (including n-gram) cannot be combined with the
 stage-output prefix cache. Existing CUDA turn overlays that enable speculation
@@ -135,8 +153,8 @@ the service after a capture failure. To run without capture, set
 limit there with `code2wav_max_npu_graphs`. Graph mode also requires
 `ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
 
-The inner NPUGraph is independent of the outer runner setting, so do not use a
-global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.
+The inner NPUGraph is independent of the outer runner setting. Leave
+`enforce_eager` disabled on stages 0 and 1 to use `PIECEWISE` replay there.
 
 ## GPU
 
@@ -156,7 +174,7 @@ video. Use the two-GPU profile for production throughput.
 - OS: Linux
 - Python: 3.10+
 - vLLM / vLLM-Omni: >= 0.21.0 (or current `main`)
-- Optional Talker dep: `stepaudio2-minicpmo` (see Notes for why this is
+- Code2Wav dep: `step-audio2==1.0.0` (see Notes for why this is
   required and how to install it)
 
 #### Command
@@ -375,20 +393,72 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 - All other knobs match the single-GPU section; the only difference is
   the per-card memory pressure on the thinker shards.
 
+## Intel XPU
+
+`minicpmo_4_5.yaml` sets `platforms.xpu.model_runner: v2`, so on XPU all three
+stages build on Model Runner V2, as on CUDA. Thinker and Talker capture XPU
+graphs (`PIECEWISE` + `FULL`). Code2Wav keeps its HiFT/CFM device graphs
+disabled on XPU and runs them eagerly.
+
+### 1 x Intel Arc Pro B70 32GB: default profile does not fit
+
+The unmodified default profile starts on MRv2 on one 32 GB Arc Pro B70, but
+Stage 0 runs out of device memory in its encoder profile run. That profile is
+sized for one large-memory GPU (0.55 utilization, 64 images / 64 audios per
+prompt, 16k batched tokens). No single-card XPU configuration has been
+validated.
+
+### 3 x Intel Arc Pro B70 32GB (validated)
+
+This overlay keeps `minicpmo_4_5.yaml` as its base, so the XPU runner
+selection comes from the default profile. It puts each stage on its own card
+and lowers the Stage-0 limits:
+
+```yaml
+# minicpmo_4_5_b70_3card.yaml
+base_config: vllm_omni/deploy/minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.92
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    limit_mm_per_prompt: {image: 16, audio: 16, video: 1}
+  - stage_id: 1
+    devices: "1"
+    gpu_memory_utilization: 0.5
+  - stage_id: 2
+    devices: "2"
+    gpu_memory_utilization: 0.5
+```
+
+```bash
+ZE_AFFINITY_MASK=0,1,2 vllm-omni serve openbmb/MiniCPM-o-4_5 --omni \
+    --trust-remote-code \
+    --deploy-config minicpmo_4_5_b70_3card.yaml --port 8099
+```
+
+With vLLM 0.34.0+xpu and torch 2.15.0+xpu, the server became healthy in about
+140 s. A realtime duplex session on OmniInteract `1q1a` completed with text and
+streamed speech, 100% streaming continuity, and no server errors.
+
 ## Notes (applies to all layouts)
 
-- **Code2Wav dependency**: Stage 2 loads `Token2wav` from the
-  MiniCPM-o-flavored
-  vocoder (PyPI package `stepaudio2-minicpmo` — NOT the upstream
-  `stepfun-ai/Step-Audio2`, whose `Token2wav.__init__` signature
-  rejects `n_timesteps`). Install via the published extra:
+- **Code2Wav dependency**: Stage 2 runs the in-tree Step-Audio2 Token2Wav
+  core, whose checkpoint `flow.yaml` instantiates `cosyvoice2.*` classes. The
+  top-level `cosyvoice2` package comes from PyPI `step-audio2` (the version
+  pinned in `pyproject.toml`):
 
   ```bash
-  pip install stepaudio2-minicpmo
+  pip install step-audio2==1.0.0
   ```
 
-  A missing dep raises `ImportError` at first request with the same
-  install hint instead of silently emitting empty audio.
+  The previously documented `stepaudio2-minicpmo` package is not a
+  substitute: it ships `cosyvoice2` only as `stepaudio2.cosyvoice2`, so with
+  that package alone Stage 2 fails at load with
+  `ImportError: There is no such class as cosyvoice2.flow.flow.CausalMaskedDiffWithXvec`.
+  Do not co-install the two; both provide a top-level `stepaudio2` package.
 
 - **TTS conditioning**: the MiniCPM stage bridge can condition speech from
   the generated assistant span without changing shared serving code.

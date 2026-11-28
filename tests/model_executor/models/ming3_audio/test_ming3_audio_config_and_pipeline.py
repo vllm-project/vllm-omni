@@ -188,7 +188,19 @@ def tiny_model(
         "BailingMoeV3ForCausalLM",
         DummyLanguageModel,
     )
+    # The pin's _mark_tower_model imports get_pp_group from vllm.distributed
+    # inside the method (no use_v2_model_runner guard); real construction always
+    # has the group initialized. Stage 0: first and last rank.
+    monkeypatch.setattr(
+        "vllm.distributed.get_pp_group",
+        lambda: _FirstRankPPGroup(),
+    )
     return BailingMoeV3AudioForConditionalGeneration(vllm_config=VllmConfig(model_config=tiny_model_config))
+
+
+class _FirstRankPPGroup:
+    is_first_rank = True
+    is_last_rank = True
 
 
 def test_native_config_loads_without_remote_code(tiny_model_path: Path):

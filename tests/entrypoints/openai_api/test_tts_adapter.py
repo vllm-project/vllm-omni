@@ -10,11 +10,15 @@ import base64
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, call
 
 import numpy as np
 import pytest
 import torch
+from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
+from tokenizers.models import BPE
+from transformers import PreTrainedTokenizerFast
+from transformers.models.qwen2.tokenization_qwen2 import PRETOKENIZE_REGEX
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -37,7 +41,11 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as ming3_tts_module
 from vllm_omni.entrypoints.openai.tts_adapters.auk import AuKAdapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities, resolve_stage_model_path
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    IncrementalInputNotReadyError,
+    TTSCapabilities,
+    resolve_stage_model_path,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
@@ -53,20 +61,24 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSNanoAdapter,
     _code_grid_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
-    QWEN3_TTS_AUTO_BUDGET_KEY,
-    QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY,
     Qwen3TTSAdapter,
-    Qwen3TTSCodecLimitError,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.step_audio2 import StepAudio2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
 from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
+from vllm_omni.model_executor.models.moss_tts import processor_loading as moss_processor_loading
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+    build_assistant_text,
+)
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +87,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
+    "chatterbox",
+    "chatterbox_original",
+    "phonon",
     "qwen3_tts",
     "voxcpm2",
     "voxtral_tts",
@@ -95,6 +110,7 @@ EXPECTED_MODEL_TYPES = {
     "indextts2_5",
     "auk",
     "gepard",
+    "kimi_audio",
 }
 
 
@@ -649,9 +665,9 @@ def test_moss_salt_shares_reference_across_texts(mocker):
     assert salt(voice + 1, input="Hello.") != hello
 
 
-def _moss_adapter_with_stage_configs(stage_configs, mocker):
+def _moss_adapter_with_stage_configs(stage_configs, mocker, model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"):
     engine_client = SimpleNamespace(
-        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"),
+        model_config=SimpleNamespace(model=model),
         stage_configs=stage_configs,
     )
     server = mocker.Mock(api_server_shared_dir=None)  # one API process
@@ -751,17 +767,49 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer = mocker.Mock()
     audio_tokenizer.to.return_value = audio_tokenizer
     processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
-    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
-    from_pretrained = native_loader.return_value.from_pretrained
-    from_pretrained.return_value = processor
+    load_processor = mocker.patch(
+        "vllm_omni.entrypoints.openai.tts_adapters.moss_tts.load_moss_processor", return_value=processor
+    )
 
     assert adapter._get_moss_processor() is processor
     audio_tokenizer.to.assert_called_once_with(torch.device("cuda", 3))
     audio_tokenizer.eval.assert_called_once_with()
     # Lazy cache: no re-load / re-placement on the second call.
     assert adapter._get_moss_processor() is processor
-    from_pretrained.assert_called_once()
+    load_processor.assert_called_once()
     audio_tokenizer.to.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("model", "class_reference"),
+    [
+        ("OpenMOSS-Team/MOSS-TTS", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-v1.5", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTSD-v1.0", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-SoundEffect", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-VoiceGenerator", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", "processing_moss_tts.MossTTSLocalProcessor"),
+    ],
+)
+def test_moss_get_processor_loads_checkpoint_class_not_auto_processor(mocker, tmp_path, model, class_reference):
+    # AutoProcessor passes these checkpoints a ``revision`` kwarg that they reject (#9717).
+    adapter = _moss_adapter_with_stage_configs([], mocker, model=model)
+    config_file = tmp_path / "processor_config.json"
+    config_file.write_text(json.dumps({"auto_map": {"AutoProcessor": class_reference}}), encoding="utf-8")
+    config_lookup = mocker.patch.object(moss_processor_loading, "cached_file", return_value=str(config_file))
+    auto_processor = mocker.patch("transformers.AutoProcessor.from_pretrained")
+    class_lookup = mocker.patch.object(moss_processor_loading, "get_class_from_dynamic_module")
+    checkpoint_from_pretrained = class_lookup.return_value.from_pretrained
+    processor = object()
+    checkpoint_from_pretrained.return_value = processor
+
+    assert adapter._get_moss_processor() is processor
+    config_lookup.assert_called_once_with(model, "processor_config.json", _raise_exceptions_for_missing_entries=False)
+    class_lookup.assert_called_once_with(class_reference, model)
+    # Any other kwarg would reach ProcessorMixin.__init__ through the checkpoint's from_pretrained.
+    checkpoint_from_pretrained.assert_called_once_with(model, trust_remote_code=True)
+    auto_processor.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -832,6 +880,140 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.model_type == "CustomVoice"
 
 
+class TestQwen3TTSIncrementalInput:
+    """Adapter lifecycle and token delivery, using a small in-memory tokenizer."""
+
+    @pytest.fixture
+    def tokenizer(self):
+        byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+        vocab = {token: index for index, token in enumerate(sorted(byte_level.alphabet()))}
+        merges = []
+        for text in ("assistant", "\n\n", "Hello", "自动驾驶"):
+            encoded = byte_level.pre_tokenize_str(text)[0][0]
+            left = encoded[0]
+            for right in encoded[1:]:
+                if left + right not in vocab:
+                    merges.append((left, right))
+                    vocab[left + right] = len(vocab)
+                left += right
+        backend = Tokenizer(BPE(vocab=vocab, merges=merges))
+        backend.decoder = decoders.ByteLevel()
+        backend.normalizer = normalizers.NFC()
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [pre_tokenizers.Split(Regex(PRETOKENIZE_REGEX), behavior="isolated"), byte_level]
+        )
+        backend.add_special_tokens(
+            [AddedToken(content, normalized=False, special=True) for content in ("<|im_start|>", "<|im_end|>")]
+        )
+        return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+    @pytest.fixture
+    def adapter_context(self, tokenizer, mocker):
+        server = SimpleNamespace(
+            _tts_executor=None,
+            _tts_tokenizer=tokenizer,
+            _tts_stage=None,
+            uploaded_speakers={},
+            _voice_created_at=mocker.Mock(return_value=0),
+            _count_usage_text_tokens=lambda text: len(tokenizer.encode(text, add_special_tokens=False)),
+        )
+        engine = SimpleNamespace(append_text=mocker.AsyncMock())
+        adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine))
+        adapter.capabilities = TTSCapabilities(
+            supported_speakers=frozenset({"vivian"}),
+            default_speaker="vivian",
+        )
+
+        mocker.patch.object(adapter, "_estimate_prompt_len_async", new=mocker.AsyncMock(return_value=3))
+        request = OpenAICreateSpeechRequest(input="Hello ", voice="vivian", language="English")
+        return SimpleNamespace(adapter=adapter, engine=engine, tokenizer=tokenizer, request=request)
+
+    async def test_not_ready_build_preserves_text_across_initial_retries(self, adapter_context):
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        for candidate in ("自", "自动", "自动驾"):
+            adapter_context.request.input = candidate
+            with pytest.raises(IncrementalInputNotReadyError):
+                await model_input.build(candidate, final=False)
+        adapter_context.adapter._estimate_prompt_len_async.assert_not_awaited()
+        adapter_context.engine.append_text.assert_not_awaited()
+        adapter_context.request.input = "自动驾驶系统"
+        prepared = await model_input.build(adapter_context.request.input, final=True)
+        expected = adapter_context.tokenizer.encode(build_assistant_text("自动驾驶系统"), add_special_tokens=False)
+        assert prepared.tts_params["input_stream"] == {"token_ids": expected[3:-5], "final": True}
+
+    async def test_initial_build_preserves_prefill_length_and_generation_budget(self, adapter_context):
+        adapter = adapter_context.adapter
+        adapter_context.engine.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(codec_language_id={"english": 2050}, spk_is_dialect={})
+            )
+        )
+        adapter._estimate_prompt_len_async.side_effect = adapter._estimate_prompt_len
+        text = "自动驾驶系统正在运行"
+        adapter_context.request.input = text
+        model_input = await adapter.create_incremental_input(adapter_context.request)
+        prepared = await model_input.build(text, final=False)
+        complete_body = adapter_context.tokenizer.encode(build_assistant_text(text), add_special_tokens=False)[3:-5]
+        released = prepared.tts_params["input_stream"]["token_ids"]
+        assert 0 < len(released) < len(complete_body)
+        assert len(prepared.prompt["prompt_token_ids"]) == 3 + 6 + 1
+        params = adapter.apply_sampling_overrides(
+            [SamplingParams(max_tokens=1024)], adapter_context.request, prepared.prompt
+        )
+        assert params[0].max_tokens == 1024
+
+    async def test_append_buffers_without_an_engine_update_and_flushes_at_eof(self, adapter_context):
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        prepared = await model_input.build("Hello ", final=False)
+        await model_input.append("request", "自", final=False)
+        adapter_context.engine.append_text.assert_not_awaited()
+        await model_input.append("request", "", final=True)
+        complete_body = adapter_context.tokenizer.encode(build_assistant_text("Hello 自"), add_special_tokens=False)[
+            3:-5
+        ]
+        initial = prepared.tts_params["input_stream"]["token_ids"]
+        adapter_context.engine.append_text.assert_awaited_once_with(
+            "request", complete_body[len(initial) :], final=True
+        )
+
+    async def test_initial_template_ids_preserve_the_leading_newline(self, adapter_context):
+        text = "\nHello "
+        adapter_context.request.input = text
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        prepared = await model_input.build(text, final=False)
+        await model_input.append("request", "world.", final=True)
+        initial = prepared.tts_params[PRECOMPUTED_TEXT_IDS_KEY][0]
+        body = initial[3:-5] + adapter_context.engine.append_text.await_args.args[1]
+        expected = adapter_context.tokenizer.encode(build_assistant_text(text + "world."), add_special_tokens=False)
+        assert initial[:3] + body + initial[-5:] == expected
+
+    async def test_invalid_request_mode_is_not_reported_as_not_ready(self, adapter_context):
+        adapter_context.request.non_streaming_mode = True
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        with pytest.raises(ValueError, match="interleaved prompt construction"):
+            await model_input.build("Hello ", final=False)
+        adapter_context.adapter._estimate_prompt_len_async.assert_not_awaited()
+        adapter_context.engine.append_text.assert_not_awaited()
+
+    async def test_inputs_keep_pending_text_independent(self, adapter_context):
+        first_request = adapter_context.request.model_copy(update={"input": "自"})
+        second_request = adapter_context.request.model_copy(update={"input": "Hello"})
+        first = await adapter_context.adapter.create_incremental_input(first_request)
+        second = await adapter_context.adapter.create_incremental_input(second_request)
+        with pytest.raises(IncrementalInputNotReadyError):
+            await first.build("自", final=False)
+        prepared = await second.build("Hello", final=True)
+        assert prepared.tts_params[PRECOMPUTED_TEXT_IDS_KEY][0] == adapter_context.tokenizer.encode(
+            build_assistant_text("Hello"), add_special_tokens=False
+        )
+        first_request.input = "自动驾驶"
+        prepared = await first.build(first_request.input, final=True)
+        assert (
+            prepared.tts_params["input_stream"]["token_ids"]
+            == adapter_context.tokenizer.encode(build_assistant_text("自动驾驶"), add_special_tokens=False)[3:-5]
+        )
+
+
 def test_covo_audio_build_constructs_tokenized_prompt():
     class FakeTokenizer:
         def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
@@ -848,6 +1030,49 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.prompt == {"prompt_token_ids": [11, 12, 13]}
     assert prepared.tts_params == {}
     assert prepared.model_type == "covo_audio"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("limit", [None, 7, 8192])
+def test_covo_audio_request_budget_reaches_engine(limit, stream):
+    server = object.__new__(OmniOpenAIServingSpeech)
+    default = SamplingParams(max_tokens=256, temperature=0.8, extra_args={"sentinel": 17})
+    decoder_default = SamplingParams(max_tokens=1)
+    seen = []
+
+    def record_generate(**kwargs):
+        seen.append(kwargs)
+        return iter(())
+
+    server._diffusion_mode = False
+    server._tts_model_type = "covo_audio"
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=[default, decoder_default], generate=record_generate
+    )
+    server._adapter = CovoAudioAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._adapter._tokenizer = SimpleNamespace(apply_chat_template=lambda *_args, **_kwargs: [11, 12, 13])
+    server._refresh_uploaded_speakers = lambda: None
+    server._validate_speech_sample_rate = lambda _request: None
+    server._log_request = lambda *_args: None
+    server._speech_output_policies = {}
+    server.request_logger = None
+
+    asyncio.run(
+        server._prepare_speech_generation(
+            OpenAICreateSpeechRequest(input="Hello", max_new_tokens=limit, stream=stream, response_format="pcm"),
+            request_id="covo-budget",
+        )
+    )
+
+    assert len(seen) == 1
+    observed = seen[0]["sampling_params_list"]
+    assert observed[0].max_tokens == (limit if limit is not None else 256)
+    assert observed[0].temperature == 0.8 and observed[0].extra_args == {"sentinel": 17}
+    assert observed[1].max_tokens == 1
+    assert seen[0]["prompt"]["prompt_token_ids"] == [11, 12, 13]
+    assert default.max_tokens == 256 and default.extra_args == {"sentinel": 17}
+    assert decoder_default.max_tokens == 1
 
 
 @pytest.mark.parametrize("voice", [None, "DB30"])
@@ -934,16 +1159,83 @@ def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
     assert prepared.model_type == "ming3_audio_tts"
 
 
-def test_step_audio2_build_constructs_open_assistant_turn():
+@pytest.mark.parametrize(
+    "instructions,expected_system",
+    [(None, "以自然的语速读出下面的文字。"), ("Read warmly.", "Read warmly.")],
+)
+def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected_system):
     adapter = StepAudio2Adapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", instructions="Read warmly.")
+    request = OpenAICreateSpeechRequest(input="hello", instructions=instructions)
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
-    assert "<|im_start|>system\nRead warmly.<|im_end|>" in prepared.prompt["prompt"]
-    assert prepared.prompt["prompt"].endswith("<|im_start|>assistant\n<tts_start>")
+    assert prepared.prompt["prompt"] == (
+        f"<|BOT|>system\n{expected_system}<|EOT|><|BOT|>human\nhello<|EOT|><|BOT|>assistant\n<tts_start>"
+    )
     assert prepared.tts_params == {}
     assert prepared.model_type == "step_audio2"
+
+
+@pytest.mark.parametrize("limit", [None, 7, 8192])
+def test_step_audio2_request_budget_reaches_engine(limit):
+    server = object.__new__(OmniOpenAIServingSpeech)
+    default = SamplingParams(max_tokens=256)
+    decoder_default = SamplingParams(max_tokens=1)
+    seen = []
+
+    def record_generate(**kwargs):
+        seen.append(kwargs)
+        return iter(())
+
+    server._diffusion_mode = False
+    server._tts_model_type = "step_audio2"
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=[default, decoder_default], generate=record_generate
+    )
+    server._adapter = StepAudio2Adapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._refresh_uploaded_speakers = lambda: None
+    server._validate_speech_sample_rate = lambda _request: None
+    server._log_request = lambda *_args: None
+    server._speech_output_policies = {}
+    server.request_logger = None
+    request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=limit)
+
+    asyncio.run(server._prepare_speech_generation(request, request_id="step-budget"))
+
+    assert len(seen) == 1
+    observed = seen[0]["sampling_params_list"]
+    assert observed[0].max_tokens == (limit if limit is not None else 256)
+    assert observed[1].max_tokens == 1
+    assert default.max_tokens == 256
+    assert decoder_default.max_tokens == 1
+
+
+def _step_audio2_engine(variant, encode=None):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(step_audio2_variant=variant)),
+        get_tokenizer=AsyncMock(return_value=SimpleNamespace(encode=encode)),
+    )
+
+
+def test_step_audio2_base_encodes_upstream_segments():
+    encode = Mock(side_effect=[[11], [22, 33]])
+    adapter = StepAudio2Adapter(SimpleNamespace(engine_client=_step_audio2_engine("base", encode)))
+
+    prepared = asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello", instructions="Read."), [], False))
+
+    assert prepared.prompt == {"prompt_token_ids": [11, 22, 33]}
+    assert encode.call_args_list == [
+        call("Read.\n", add_special_tokens=False),
+        call("hello<tts_start>", add_special_tokens=False),
+    ]
+    assert prepared.model_type == "step_audio2"
+
+
+def test_step_audio2_rejects_unknown_variant():
+    adapter = StepAudio2Adapter(SimpleNamespace(engine_client=_step_audio2_engine("unknown")))
+    with pytest.raises(ValueError, match="unknown"):
+        asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False))
 
 
 def test_voxtral_prompt_builder_is_sync():
@@ -957,27 +1249,25 @@ def test_voxtral_prompt_builder_is_sync():
 
 
 @pytest.mark.parametrize(
-    ("task_type", "text_tokens", "request_cap", "expected_cap", "auto"),
+    ("task_type", "text_tokens", "request_cap", "expected_cap"),
     [
-        ("Base", 0, None, 4096, False),
-        ("Base", 10, None, 192, True),
-        ("Base", 23, None, 276, True),
-        ("Base", 23, 128, 128, False),
-        ("Base", 23, 512, 512, False),
-        ("Base", 400, None, 4096, True),
-        ("CustomVoice", 0, None, 4096, False),
-        ("CustomVoice", 6, None, 400, True),
-        ("CustomVoice", 23, None, 920, True),
-        ("CustomVoice", 200, None, 4096, True),
-        ("CustomVoice", 10, 256, 256, False),
-        ("CustomVoice", 10, 4096, 4096, False),
-        ("VoiceDesign", 23, None, 920, True),
-        ("VoiceDesign", 23, 1000, 1000, False),
+        ("Base", 0, None, 4096),
+        ("Base", 10, None, 192),
+        ("Base", 23, None, 276),
+        ("Base", 23, 128, 128),
+        ("Base", 23, 512, 512),
+        ("Base", 400, None, 4096),
+        ("CustomVoice", 0, None, 4096),
+        ("CustomVoice", 6, None, 400),
+        ("CustomVoice", 23, None, 920),
+        ("CustomVoice", 200, None, 4096),
+        ("CustomVoice", 10, 256, 256),
+        ("CustomVoice", 10, 4096, 4096),
+        ("VoiceDesign", 23, None, 920),
+        ("VoiceDesign", 23, 1000, 1000),
     ],
 )
-def test_qwen3_tts_applies_text_scaled_codec_safety_limit(
-    task_type, text_tokens, request_cap, expected_cap, auto, mocker
-):
+def test_qwen3_tts_applies_text_scaled_codec_safety_limit(task_type, text_tokens, request_cap, expected_cap, mocker):
     server = mocker.Mock()
     server._count_usage_text_tokens.return_value = text_tokens
     adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
@@ -992,8 +1282,6 @@ def test_qwen3_tts_applies_text_scaled_codec_safety_limit(
     overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
 
     assert overridden[0].max_tokens == expected_cap
-    assert prompt["additional_information"][QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [expected_cap]
-    assert (QWEN3_TTS_AUTO_BUDGET_KEY in prompt["additional_information"]) is auto
     assert stage_defaults[0].max_tokens == 4096
     if request_cap is not None:
         # The explicit caller budget bypasses text-token counting entirely.
@@ -1040,7 +1328,6 @@ def test_qwen3_tts_codec_budget_reads_talker_additional_config(legacy, additiona
     overridden = adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096, min_tokens=2)], request, prompt)
 
     assert overridden[0].max_tokens == expected_cap
-    assert (QWEN3_TTS_AUTO_BUDGET_KEY in prompt["additional_information"]) is (expected_cap != 4096)
 
     # An explicit request budget still wins over the configured coefficients.
     explicit = OpenAICreateSpeechRequest(input="test text", task_type="CustomVoice", max_new_tokens=64)
@@ -1076,59 +1363,6 @@ def test_qwen3_tts_codec_budget_follows_prompt_task_type(mocker):
     overridden = adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096)], request, prompt)
 
     assert overridden[0].max_tokens == 276
-
-
-def test_qwen3_tts_rejects_length_finish_under_auto_budget_for_all_tasks(mocker):
-    adapter = Qwen3TTSAdapter(SpeechServingContext(server=mocker.Mock()))
-    for task_type in ("CustomVoice", "VoiceDesign"):
-        auto = {
-            "task_type": [task_type],
-            QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY: [276],
-            QWEN3_TTS_AUTO_BUDGET_KEY: [True],
-        }
-        adapter.validate_generation(auto, stage0_finish_reason="stop", output_tokens=276)
-        with pytest.raises(Qwen3TTSCodecLimitError, match=f"{task_type} .*275/276"):
-            adapter.validate_generation(auto, stage0_finish_reason="length", output_tokens=275)
-
-        # An explicit caller budget (or the configured stage limit) keeps the
-        # pre-existing behavior for non-Base tasks: the audio is returned.
-        explicit = {"task_type": [task_type], QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY: [256]}
-        adapter.validate_generation(explicit, stage0_finish_reason="length", output_tokens=256)
-
-
-def test_qwen3_tts_reports_length_finish_when_derived_budget_hits_stage_limit(mocker):
-    """A long input clamps the derived budget to the stage limit; reaching it without EOS is still reported."""
-    server = mocker.Mock()
-    server._count_usage_text_tokens.return_value = 200
-    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
-    request = OpenAICreateSpeechRequest(input="test text", task_type="CustomVoice")
-    prompt: dict[str, Any] = {"additional_information": {"task_type": ["CustomVoice"]}}
-
-    overridden = adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096)], request, prompt)
-
-    assert overridden[0].max_tokens == 4096
-    tts_params = prompt["additional_information"]
-    adapter.validate_generation(tts_params, stage0_finish_reason="stop", output_tokens=3000)
-    with pytest.raises(Qwen3TTSCodecLimitError, match="CustomVoice .*4096/4096"):
-        adapter.validate_generation(tts_params, stage0_finish_reason="length", output_tokens=4096)
-
-
-def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):
-    adapter = Qwen3TTSAdapter(SpeechServingContext(server=mocker.Mock()))
-    params = {
-        "task_type": ["Base"],
-        QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY: [192],
-    }
-
-    # EOS at the exact budget is valid; the token count alone is not a
-    # sufficient failure signal.
-    adapter.validate_generation(params, stage0_finish_reason="stop", output_tokens=192)
-    adapter.validate_generation(params, stage0_finish_reason=None, output_tokens=192)
-
-    # Some frontends expose 191 decoded frames for max_new_tokens=192. The
-    # engine terminal reason still makes this an unambiguous limit failure.
-    with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
-        adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
 
 
 @pytest.mark.parametrize("architecture", ["Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"])
@@ -1368,6 +1602,11 @@ def test_indextts25_build_uses_configured_tokenizer_file(
     hf_config,
     expected_tokenizer_file,
 ):
+    from vllm_omni.model_executor.models.indextts2 import text_processing_v2_5, tokenizer_v2_5
+
+    hf_config.gpt = {"max_text_tokens": 600}
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", lambda text, **kwargs: text)
+    monkeypatch.setattr(tokenizer_v2_5, "encode_indextts25_text", lambda text, **kwargs: [42])
     captured = {}
 
     def fake_estimate(*args, **kwargs):
@@ -1400,14 +1639,179 @@ def test_indextts25_build_uses_configured_tokenizer_file(
     assert captured["tokenizer_file"] == expected_tokenizer_file
 
 
+@pytest.mark.parametrize("normalized, expected", [("ONE.TWO.THREE.", ["ONE.", "TWO.", "THREE."]), ("ONE.", ["ONE."])])
+def test_indextts25_segments_normalize_once_and_preserve_conditioning(monkeypatch, mocker, normalized, expected):
+    from vllm_omni.model_executor.models.indextts2 import text_processing_v2_5, tokenizer_v2_5
+    from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import IndexTTS25Config
+
+    calls = []
+    voice = [[0.1, 0.2], 22050]
+    shared_params = {
+        "text": ["original"],
+        "lang": ["en"],
+        "text_normalization": [True],
+        "voice": [voice],
+        "duration_factor": [0.5],
+        "emo_alpha": [0.8],
+    }
+
+    async def build_params(request):
+        calls.append("resolve_reference")
+        return shared_params
+
+    def normalize(text, *, lang, text_normalization):
+        assert text == "original"
+        assert lang == "en"
+        assert text_normalization is True
+        calls.append("normalize")
+        return normalized
+
+    def encode(text, *, model_dir, tokenizer_file):
+        assert model_dir == "/model"
+        assert tokenizer_file == "custom.tiktoken"
+        return [ord(char) + 2 for char in text]
+
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", normalize)
+    monkeypatch.setattr(text_processing_v2_5, "encode_indextts25_text", encode)
+    monkeypatch.setattr(tokenizer_v2_5, "encode_indextts25_text", encode)
+    server = mocker.Mock()
+    server.engine_client.model_config.model = "/model"
+    server.engine_client.model_config.hf_config = IndexTTS25Config(
+        tokenizer_file="custom.tiktoken", gpt={"max_text_tokens": 13}
+    )
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=server))
+    monkeypatch.setattr(adapter, "_build_params", build_params)
+    request = OpenAICreateSpeechRequest(input="original")
+
+    prepared = asyncio.run(adapter.build_segments(request))
+
+    assert calls == ["resolve_reference", "normalize"]
+    assert [item.tts_params["text"][0] for item in prepared] == expected
+    assert len({item.prompt["cache_salt"] for item in prepared}) == len(expected)
+    for item in prepared:
+        params = item.tts_params
+        assert params is not shared_params
+        assert params["voice"] is shared_params["voice"]
+        assert params["duration_factor"] == [0.5]
+        assert params["emo_alpha"] == [0.8]
+        assert params["_indextts25_text_preprocessed"] == [True]
+        assert item.prompt["additional_information"] is params
+        # Language-prefixed text + 2 wrappers + 3 conditioning + 1 start-mel.
+        assert len(item.prompt["prompt_token_ids"]) == len("<|en|> " + params["text"][0]) + 6
+    assert shared_params["text"] == ["original"]
+    assert "_indextts25_text_preprocessed" not in shared_params
+
+
+def test_indextts25_preprocessing_mode_changes_cache_salt():
+    request = OpenAICreateSpeechRequest(input="hello")
+    params = {"text": ["hello"]}
+    assert indextts2_conditioning_cache_salt(request, params) != indextts2_conditioning_cache_salt(
+        request, dict(params, _indextts25_text_preprocessed=[True])
+    )
+
+
+@pytest.mark.parametrize("mode", ["stream", "timestamps", "plain"])
+def test_indextts25_long_request_response_scope(mocker, mode):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    mocker.patch.object(
+        adapter,
+        "build_segments",
+        new=mocker.AsyncMock(
+            return_value=[
+                PreparedRequest(prompt={"part": 0}),
+                PreparedRequest(prompt={"part": 1}),
+            ]
+        ),
+    )
+    request = OpenAICreateSpeechRequest(input="text", stream=mode == "stream", word_timestamps=mode == "timestamps")
+    if mode == "plain":
+        prepared = asyncio.run(adapter.build(request, [], False))
+        assert prepared.additional_prompts == [{"part": 1}]
+    else:
+        with pytest.raises(ValueError, match="non-streaming"):
+            asyncio.run(adapter.build(request, [], False))
+
+
+@pytest.mark.parametrize("emotion_text", [None, "", "happy"])
+def test_indextts25_prepares_off_loop_and_preserves_full_emotion_text(mocker, emotion_text):
+    import threading
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
+    loop_thread = threading.get_ident()
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    params = {"use_emo_text": [True], "emo_text": [emotion_text]}
+    mocker.patch.object(adapter, "_build_params", new=mocker.AsyncMock(return_value=params))
+    prepared = [PreparedRequest(prompt={"prompt_token_ids": [1]})]
+
+    def prepare(request, params):
+        assert threading.get_ident() != loop_thread
+        assert params["emo_text"] == [request.input if emotion_text is None else emotion_text]
+        return prepared
+
+    mocker.patch.object(adapter, "_prepare_segments", side_effect=prepare)
+    request = OpenAICreateSpeechRequest(input="The entire input, before splitting.")
+    assert asyncio.run(adapter.build_segments(request)) is prepared
+
+
 def test_diffusion_adapter_extra_body_params_fallback():
     class _DiffAdapter(DiffusionTTSAdapter):
         name = "diff_probe"
 
-        async def build(self, request, sampling_params_list):  # pragma: no cover
+        async def build(self, request, sampling_params_list, has_inline_ref_audio):  # pragma: no cover
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_omnivoice_diffusion_adapter_request_preparation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: None,
+        _resolve_ref_audio=None,
+        uploaded_speakers={"alice": {}},
+        _voice_created_at=lambda voice: 123,
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(
+        input="Hello",
+        voice="alice",
+        language="English",
+        instructions="男, american accent",
+    )
+
+    adapter.normalize(request)
+    assert adapter.validate(request) is None
+    prepared = await adapter.build(request, [], False)
+
+    assert prepared.model_type == "omnivoice"
+    assert prepared.prompt == {
+        "input": "Hello",
+        "voice_name": "alice",
+        "voice_created_at": 123,
+        "lang": "English",
+        "instruct": "male, american accent",
+    }
+
+
+def test_omnivoice_diffusion_adapter_ref_audio_validation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: "unsupported reference audio",
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(input="Hello", ref_audio="unsupported")
+
+    adapter.normalize(request)
+
+    assert adapter.validate(request) == "unsupported reference audio"
 
 
 def _higgs_v2_adapter() -> HiggsAudioV2Adapter:
@@ -1621,3 +2025,93 @@ def test_ming3_tts_defaults_to_ip_voice_without_reference():
     assert info["prompt_audio_mode"] == "none"
     assert info["speaker_conditioning"] == "mute"
     assert "reference_audio" not in info
+
+
+@pytest.mark.parametrize("budget", [None, 1, 2000, 4096])
+def test_phonon_forwards_request_budget(mocker, budget):
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+
+    mocker.patch.object(PhononAdapter, "_load_assets", return_value=(SimpleNamespace(encode=lambda text: [1, 2]), 3))
+    defaults = [SamplingParams(max_tokens=1500)]
+    server = mocker.Mock()
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=defaults, generate=mocker.Mock(return_value=object())
+    )
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server._tts_model_type = "phonon"
+    server._validate_speech_sample_rate.return_value = None
+    server.request_logger = None
+    server._speech_output_policies = {}
+    adapter = PhononAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._get_tts_adapter.return_value = adapter
+    request = OpenAICreateSpeechRequest(input="Hello", voice="default", max_new_tokens=budget)
+    asyncio.run(OmniOpenAIServingSpeech._prepare_speech_generation(server, request, request_id="test"))
+    forwarded = server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+    assert forwarded[0].max_tokens == (1500 if budget is None else budget)
+    assert defaults[0].max_tokens == 1500
+
+
+@pytest.mark.parametrize("budget", [0, 4097])
+def test_phonon_rejects_invalid_request_budget(budget):
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+
+    adapter = PhononAdapter.__new__(PhononAdapter)
+    request = SimpleNamespace(
+        input="Hello", voice="default", ref_audio=None, speaker_embedding=None, max_new_tokens=budget
+    )
+    assert "max_new_tokens" in adapter.validate(request)
+
+
+def _yue2_request(**overrides: Any) -> OpenAICreateSpeechRequest:
+    fields: dict[str, Any] = {
+        "input": "[Verse]\nTwinkle, twinkle, little star",
+        "instructions": "gentle acoustic folk, 90 BPM",
+    }
+    fields.update(overrides)
+    return OpenAICreateSpeechRequest(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides, err_substr",
+    [
+        pytest.param({"duration_seconds": 30.0}, "max_new_tokens", id="duration_seconds"),
+        pytest.param({"token_count": 250}, "token_count", id="token_count"),
+        pytest.param({"speaker_embedding": [0.1] * 16}, "speaker_embedding", id="speaker_embedding"),
+        pytest.param({"x_vector_only_mode": True}, "x_vector_only_mode", id="x_vector_only_mode"),
+        pytest.param({"ambient_sound": "rain"}, "ambient_sound", id="ambient_sound"),
+        pytest.param({"initial_codec_chunk_frames": 10}, "initial_codec_chunk_frames", id="initial_codec_chunk_frames"),
+        pytest.param({"non_streaming_mode": False}, "non_streaming_mode", id="non_streaming_mode"),
+        pytest.param({"ref_audio_2": "data:audio/wav;base64,AA=="}, "ref_audio_2", id="ref_audio_2"),
+        pytest.param(
+            {"extra_params": {"cot": "off", "yue2_max_audio_frames": 500}},
+            "yue2_max_audio_frames",
+            id="extra_params_unknown_key",
+        ),
+        pytest.param(
+            {"extra_params": {"temperature": 0.3, "foo": 1}},
+            "fixed sampling",
+            id="extra_params_sampling_key_reported_first",
+        ),
+    ],
+)
+def test_yue2_validate_rejects_unused_fields(overrides: dict[str, object], err_substr: str) -> None:
+    err = Yue2Adapter(SimpleNamespace()).validate(_yue2_request(**overrides))
+    assert err is not None
+    assert err_substr in err
+
+
+def test_yue2_validate_accepts_supported_request() -> None:
+    adapter = Yue2Adapter(SimpleNamespace())
+    assert adapter.validate(_yue2_request()) is None
+    full = _yue2_request(max_new_tokens=400, seed=7, extra_params={"cot": "full", "abc": "X:1\nK:C\nCDEF|"})
+    assert adapter.validate(full) is None
+    assert adapter.validate(_yue2_request(extra_params={"cot": "off", "foo": None})) is None
+
+
+@pytest.mark.parametrize(
+    "extra", [{"abc_max_tokens": 512}, {"cfg_scale": 1.5}, {"abc_max_tokens": 512, "cfg_scale": 1.5}]
+)
+def test_yue2_accepts_abc_budget_and_guidance(extra: dict[str, int | float]) -> None:
+    request = _yue2_request(extra_params={"cot": "full", **extra})
+    assert Yue2Adapter(SimpleNamespace()).validate(request) is None

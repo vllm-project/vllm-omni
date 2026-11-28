@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -43,11 +44,15 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     QK_NORM_ROPE_TABLE_KEY,
@@ -64,6 +69,19 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    MIXFUSION_STREAMS_KEY,
+)
+from vllm_omni.diffusion.mixfusion.plan import (
+    ChunkedOutput,
+    MixFusionChunkOutputs,
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionImageRequest,
+    MixFusionRoot,
+    PerRequestOutput,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -92,11 +110,84 @@ def _packed_qk_norm_rope_table(
     kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
     gate.
     """
+    if vid_freqs.dim() == 3:
+        # Per-row RoPE tables (MixFusion's chunk-stacked layout): text rows
+        # are per request while image rows are per chunk, so one joint table
+        # cannot serve both streams.
+        return None
     freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
     if batch_size * freqs.shape[0] < _fused_min_tokens():
         return None
     return pack_qk_norm_rope_table(
         freqs.real, freqs.imag, batch_size, dtype=torch.float32, activation_dtype=activation_dtype
+    )
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor._version
+    except RuntimeError:
+        # Inference tensors do not expose version counters.
+        return None
+
+
+def _is_cuda_graph_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        # Fail closed when the CUDA runtime cannot report capture state.
+        return True
+
+
+@dataclass(eq=False)
+class _QwenImageModulationCacheKey:
+    timestep: torch.Tensor
+    timestep_version: int | None
+    guidance: torch.Tensor | None
+    guidance_version: int | None
+    additional_t_cond: torch.Tensor | None
+    additional_t_cond_version: int | None
+    hidden_dtype: torch.dtype
+    hidden_device: torch.device
+
+    def matches(self, other: _QwenImageModulationCacheKey) -> bool:
+        return (
+            self.timestep is other.timestep
+            and self.timestep_version == other.timestep_version
+            and self.guidance is other.guidance
+            and self.guidance_version == other.guidance_version
+            and self.additional_t_cond is other.additional_t_cond
+            and self.additional_t_cond_version == other.additional_t_cond_version
+            and self.hidden_dtype == other.hidden_dtype
+            and self.hidden_device == other.hidden_device
+        )
+
+
+def _make_qwen_image_modulation_cache_key(
+    timestep: torch.Tensor | None,
+    guidance: torch.Tensor | None,
+    additional_t_cond: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+) -> _QwenImageModulationCacheKey | None:
+    if torch.compiler.is_compiling() or torch.is_grad_enabled() or _is_cuda_graph_capturing():
+        return None
+    if timestep is None or not isinstance(timestep, torch.Tensor):
+        return None
+    if guidance is not None and not isinstance(guidance, torch.Tensor):
+        return None
+    if additional_t_cond is not None and not isinstance(additional_t_cond, torch.Tensor):
+        return None
+    return _QwenImageModulationCacheKey(
+        timestep=timestep,
+        timestep_version=_tensor_version(timestep),
+        guidance=guidance,
+        guidance_version=None if guidance is None else _tensor_version(guidance),
+        additional_t_cond=additional_t_cond,
+        additional_t_cond_version=None if additional_t_cond is None else _tensor_version(additional_t_cond),
+        hidden_dtype=hidden_states.dtype,
+        hidden_device=hidden_states.device,
     )
 
 
@@ -122,7 +213,12 @@ def _qwen_image_qk_norm_rope(
     ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
+        if rope_table.dim() == 3:
+            # Per-token freqs (mixfusion): every batch row carries its own
+            # positions, so no shared-table expand is needed.
+            rope_table = rope_table.reshape(tokens, rotary_dim)
+        else:
+            rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
             q.reshape(tokens, num_heads, head_dim),
             k.reshape(tokens, num_kv_heads, head_dim),
@@ -144,6 +240,22 @@ def _qwen_image_qk_norm_rope(
     k = norm_k(k)
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
+    if cos.dim() == 3:
+        # Per-token freqs (mixfusion): each batch row has its own positions,
+        # but the rope kernels strip a 3-D cos down to cos[0] assuming a shared
+        # table — flatten to per-token rows so every row keeps its own angle.
+        kv_heads = k.shape[2]
+        q = rope(
+            q.reshape(tokens, num_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(q.shape)
+        k = rope(
+            k.reshape(tokens, kv_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(k.shape)
+        return q, k
     return rope(q, cos, sin), rope(k, cos, sin)
 
 
@@ -690,12 +802,21 @@ def _reference_qk_norm_rope(
     norm_k: nn.Module,
     freqs: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply reference rounding with shared or per-row complex RoPE tables."""
     from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen
 
+    q_shape, k_shape = q.shape, k.shape
+    q, k = norm_q(q), norm_k(k)
+    if freqs.ndim == 3:
+        # The reference helper broadcasts a shared [S, D/2] table. Flatten
+        # rows into tokens so each MixFusion chunk keeps its own positions.
+        q = q.flatten(0, 1).unsqueeze(0)
+        k = k.flatten(0, 1).unsqueeze(0)
+        freqs = freqs.flatten(0, 1)
     # FP32 complex rotation belongs outside compiled/FA paths (#7494).
     return (
-        apply_rotary_emb_qwen(norm_q(q), freqs, use_real=False),
-        apply_rotary_emb_qwen(norm_k(k), freqs, use_real=False),
+        apply_rotary_emb_qwen(q, freqs, use_real=False).reshape(q_shape),
+        apply_rotary_emb_qwen(k, freqs, use_real=False).reshape(k_shape),
     )
 
 
@@ -815,6 +936,16 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states_mask: torch.Tensor | None = None,
         qk_norm_rope_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The packed MixFusion plan travels on the forward context (the
+        # MixFusionDriver arms the step, the root hook fills it in) so this
+        # signature stays free of MixFusion threading. No context / no armed
+        # step (serial forwards, unit tests) means the packed branch below
+        # stays dormant.
+        mixfusion_plan = None
+        if is_forward_context_available():
+            step = get_forward_context().mixfusion_step
+            if step is not None:
+                mixfusion_plan = step.plan
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -863,34 +994,52 @@ class QwenImageCrossAttention(nn.Module):
                 qk_norm_rope_table,
                 self.eps,
             )
-        elif self.reference_precision:
-            img_query, img_key = _reference_qk_norm_rope(img_query, img_key, self.norm_q, self.norm_k, vid_freqs)
-            txt_query, txt_key = _reference_qk_norm_rope(
-                txt_query, txt_key, self.norm_added_q, self.norm_added_k, txt_freqs
-            )
-            joint_query = torch.cat([txt_query, img_query], dim=1)
-            joint_key = torch.cat([txt_key, img_key], dim=1)
-            joint_value = torch.cat([txt_value, img_value], dim=1)
         else:
-            img_query, img_key = _qwen_image_qk_norm_rope(
-                img_query,
-                img_key,
-                self.norm_q,
-                self.norm_k,
-                vid_freqs,
-                self.rope,
-                self.eps,
-                use_fused=self.qk_norm,
-            )
-            txt_query, txt_key = _qwen_image_qk_norm_rope(
-                txt_query,
-                txt_key,
-                self.norm_added_q,
-                self.norm_added_k,
-                txt_freqs,
-                self.rope,
-                self.eps,
-            )
+            if self.reference_precision:
+                img_query, img_key = _reference_qk_norm_rope(img_query, img_key, self.norm_q, self.norm_k, vid_freqs)
+                txt_query, txt_key = _reference_qk_norm_rope(
+                    txt_query, txt_key, self.norm_added_q, self.norm_added_k, txt_freqs
+                )
+            else:
+                img_query, img_key = _qwen_image_qk_norm_rope(
+                    img_query,
+                    img_key,
+                    self.norm_q,
+                    self.norm_k,
+                    vid_freqs,
+                    self.rope,
+                    self.eps,
+                    use_fused=self.qk_norm,
+                )
+                txt_query, txt_key = _qwen_image_qk_norm_rope(
+                    txt_query,
+                    txt_key,
+                    self.norm_added_q,
+                    self.norm_added_k,
+                    txt_freqs,
+                    self.rope,
+                    self.eps,
+                )
+            if mixfusion_plan is not None:
+                # MixFusion chunked layout: image chunks stay stacked on the
+                # local batch dimension while text stays request-level, so
+                # the joint cat below cannot apply. The model declares its
+                # streams on the adapter; here the text stream rides the
+                # extra channel and image chunks stay positional, and the
+                # attention layer recovers each request to ``text + image``
+                # at its pre/post boundary (the all-to-all position).
+                attn_metadata = AttentionMetadata(
+                    extra={
+                        MIXFUSION_PLAN_KEY: mixfusion_plan,
+                        MIXFUSION_STREAMS_KEY: {"text": (txt_query, txt_key, txt_value)},
+                    },
+                )
+                packed_outputs = self.attn(img_query, img_key, img_value, attn_metadata)
+                img_attn_output = packed_outputs["image"].flatten(2, 3).to(img_query.dtype)
+                txt_attn_output = packed_outputs["text"].flatten(2, 3).to(txt_query.dtype)
+                img_attn_output = self.to_out(img_attn_output)
+                txt_attn_output = self.to_add_out(txt_attn_output)
+                return img_attn_output, txt_attn_output
             joint_query = torch.cat([txt_query, img_query], dim=1)
             joint_key = torch.cat([txt_key, img_key], dim=1)
             joint_value = torch.cat([txt_value, img_value], dim=1)
@@ -1041,6 +1190,47 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
         self.zero_cond_t = zero_cond_t
+        self._modulation_cache: (
+            tuple[
+                _QwenImageModulationCacheKey,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
+
+    def _get_modulation_params(
+        self,
+        temb: torch.Tensor,
+        cache_enabled: bool,
+        timestep: torch.Tensor | None,
+        guidance: torch.Tensor | None,
+        additional_t_cond: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_key = None
+        if cache_enabled and not self.training:
+            cache_key = _make_qwen_image_modulation_cache_key(
+                timestep,
+                guidance,
+                additional_t_cond,
+                hidden_states,
+            )
+
+        if cache_key is None:
+            self._modulation_cache = None
+        elif self._modulation_cache is not None and self._modulation_cache[0].matches(cache_key):
+            _, img_mod_params, txt_mod_params = self._modulation_cache
+            self._modulation_cache = None
+            return img_mod_params, txt_mod_params
+
+        img_mod_params = self.img_mod(temb)
+        txt_temb = torch.chunk(temb, 2, dim=0)[0] if self.zero_cond_t else temb
+        txt_mod_params = self.txt_mod(txt_temb)
+
+        if cache_key is not None:
+            self._modulation_cache = (cache_key, img_mod_params, txt_mod_params)
+        return img_mod_params, txt_mod_params
 
     def _modulate(self, mod_params):
         """Apply modulation to input tensor"""
@@ -1058,14 +1248,20 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
+        modulation_cache_enabled: bool = False,
+        modulation_timestep: torch.Tensor | None = None,
+        modulation_guidance: torch.Tensor | None = None,
+        modulation_additional_t_cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        img_mod_params, txt_mod_params = self._get_modulation_params(
+            temb,
+            modulation_cache_enabled,
+            modulation_timestep,
+            modulation_guidance,
+            modulation_additional_t_cond,
+            hidden_states,
+        )
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -1197,6 +1393,18 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
     _hsdp_shard_conditions = [is_transformer_block_module]
 
+    stacked_params_mapping: list[tuple[str, str, str]] = [
+        # (param_name, shard_name, shard_id)
+        # self-attn
+        (".to_qkv", ".to_q", "q"),
+        (".to_qkv", ".to_k", "k"),
+        (".to_qkv", ".to_v", "v"),
+        # cross-attn
+        (".add_kv_proj", ".add_q_proj", "q"),
+        (".add_kv_proj", ".add_k_proj", "k"),
+        (".add_kv_proj", ".add_v_proj", "v"),
+    ]
+
     # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
     # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.
@@ -1226,6 +1434,27 @@ class QwenImageTransformer2DModel(CachedTransformer):
         },
         # Gather output at proj_out
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
+    # MixFusion packed-layout plan (the MixFusion counterpart of _sp_plan, see
+    # mixfusion/plan.py). The MixFusionDriver arms a MixFusionStep on the
+    # forward context per packed denoise step; these boundary hooks then run
+    # the chunk-stacked layout without any MixFusion branching in forward().
+    _mixfusion_plan = {
+        "": MixFusionRoot(
+            request=MixFusionImageRequest(default_true_cfg_scale=4.0),
+            disabled_if=("zero_cond_t",),
+            required_inputs=("img_shapes", "txt_seq_lens"),
+            unsupported_inputs=("image_latents",),
+        ),
+        # The _sp_plan split_output boundary: run per request, then chunk-stack
+        # hidden_states / vid_freqs and stack the per-request txt_freqs.
+        "image_rope_prepare": MixFusionChunkOutputs(
+            per_request_args=("hidden_states", "img_shapes"),
+            outputs=(ChunkedOutput(seq_dim=1), ChunkedOutput(seq_dim=0), PerRequestOutput()),
+        ),
+        "transformer_blocks.*.img_mod": MixFusionExpandRows(),
+        "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
 
     def __init__(
@@ -1349,13 +1578,15 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_kwargs: dict[str, Any] | None = None,
         additional_t_cond=None,
         return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+    ) -> torch.Tensor | Transformer2DModelOutput | list[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
 
         Args:
             hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-                Input `hidden_states`.
+                Input `hidden_states`. Under an armed MixFusion step it is one
+                `[num_images, S_i, C]` tensor per request; `image_rope_prepare`
+                turns it into the chunk-stacked batch.
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
@@ -1374,17 +1605,20 @@ class QwenImageTransformer2DModel(CachedTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        # if attention_kwargs is not None:
-        #     attention_kwargs = attention_kwargs.copy()
-        #     lora_scale = attention_kwargs.pop("scale", 1.0)
-        # else:
-        #     lora_scale = 1.0
-
         # Set split_text_embed_in_sp = False for dual-stream attention
         # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
         # Text embeddings must be replicated across SP ranks for correctness.
         if self.parallel_config.sequence_parallel_size > 1:
             get_forward_context().split_text_embed_in_sp = False
+
+        # Keep the raw inputs for the eager-only modulation cache. Building the
+        # key inside each block lets regional torch.compile fail closed.
+        modulation_timestep = timestep
+        modulation_guidance = guidance
+        modulation_additional_t_cond = additional_t_cond
+        modulation_cache_enabled = bool(getattr(self, "do_true_cfg", False)) and (
+            get_classifier_free_guidance_world_size() == 1
+        )
 
         # Prepare hidden_states and RoPE via ImageRopePrepare module
         # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
@@ -1478,6 +1712,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
+                modulation_cache_enabled=modulation_cache_enabled,
+                modulation_timestep=modulation_timestep,
+                modulation_guidance=modulation_guidance,
+                modulation_additional_t_cond=modulation_additional_t_cond,
             )
 
         if self.zero_cond_t:
@@ -1492,17 +1730,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # self-attn
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
-            # cross-attn
-            (".add_kv_proj", ".add_q_proj", "q"),
-            (".add_kv_proj", ".add_k_proj", "k"),
-            (".add_kv_proj", ".add_v_proj", "v"),
-        ]
+        stacked_params_mapping = list(self.stacked_params_mapping)
         # Expose packed shard mappings for LoRA handling of fused projections.
         self.stacked_params_mapping = stacked_params_mapping
 

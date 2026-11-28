@@ -19,7 +19,10 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 
 import pytest
+from vllm.platforms import current_platform
 
+from tests.helpers.assertions import SuccessRateGate, collect_at_success_rate
+from tests.helpers.client import OmniResponse
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
@@ -30,6 +33,8 @@ STAGE_CONFIG = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
 SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
+# Both profiles use V2. The H200-tuned profile is CUDA-only; the default
+# retains the existing non-CUDA eager settings through platform overrides.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -39,7 +44,33 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v3_plain_text",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3_mrv2_h200.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id="higgs_audio_v3_mrv2_h200",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
+    ),
+]
+
+# The explicit CUDA profiles must boot the same MRV2 audio path as the
+# auto-discovered default; a valid request also checks codec payload delivery.
+CUDA_PROFILE_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path(f"higgs_multimodal_qwen3_{profile}.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id=f"higgs_audio_v3_{profile}",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="Profile requires CUDA FlashInfer"),
     )
+    for profile in ("high_throughput", "low_latency")
 ]
 
 DEFAULT_SPEECH_TIMEOUT_S = 180.0
@@ -47,6 +78,12 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # A WAV header adds 44 bytes; conservative floor catches truncated /
 # silence-only outputs without flagging short legitimate clips.
 _MIN_AUDIO_BYTES = 20_000
+_SINGLE_STREAM_HNR_DB = -2.0 if current_platform.is_rocm() else 0.0
+
+# Per-request seeds for the HNR gate in test_plain_text_pcm_streaming. The set
+# includes both low- and typical-HNR seeds; the gate is the pass count, not any
+# individual result.
+_HNR_GATE_SEEDS = (42, 1, 2, 3)
 
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
@@ -107,6 +144,11 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                # A concurrent sample can be misheard by whisper-small. As in
+                # the single-request case, confirm a failed match with the
+                # stronger ASR model before treating the generated speech as
+                # a semantic regression.
+                "transcript_escalation_model": "large-v3",
             },
             request_num=3,
         )
@@ -123,22 +165,103 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=0.0`` sit below the typical speech-noise floor so the
-        check still catches catastrophic codec failure (silence, white noise, sample
-        scramble all give HNR << 0) while allowing for the sliding-window codec's
-        slightly-noisier-than-sync output. The default 1.0 dB threshold has only
-        ~0.16 dB margin over measured single-request output (1.16 dB on L4), so
-        flake risk is too high there.
+        NOTE: per-rendition HNR is a sampled metric rather than a per-path
+        constant. With the stage-0 sampling defaults, renditions of this sentence
+        measured anywhere from -2.4 dB to +2.6 dB on both runners and averaged
+        about +1.5 dB, so a single unseeded request at a fixed floor fails
+        whenever it draws a noisy rendition. The gate therefore sends four
+        requests with pinned seeds and requires three of them to clear
+        the platform HNR floor (0.0 dB on CUDA, -2.0 dB on ROCm): one noisy
+        rendition no longer flakes CI, while a
+        codec or runner regression that sinks every rendition still fails all
+        four. The pinned seeds only bound CI variance; the pass count is the
+        gate. Requests are sent one at a time because the V1 sampler produces a
+        different rendition for the same seed when requests share a batch,
+        while MRV2 reproduces its renditions either way.
         """
+        seed_iter = iter(_HNR_GATE_SEEDS)
+
+        def sample() -> OmniResponse:
+            return online_client.send_audio_speech_request(
+                {
+                    "model": omni_server.model,
+                    "input": "The quick brown fox jumps over the lazy dog.",
+                    "stream": True,
+                    "stream_format": "audio",
+                    "response_format": "pcm",
+                    "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                    "min_hnr_db": _SINGLE_STREAM_HNR_DB,
+                    "seed": next(seed_iter),
+                }
+            )[0]
+
+        collect_at_success_rate(
+            sample, SuccessRateGate(min_successes=3, concurrency=1), request_num=len(_HNR_GATE_SEEDS)
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_pcm_streaming_client_abort(self, omni_server, online_client) -> None:
+        """A client aborting mid-stream must not wedge the server.
+
+        Exiting the streaming context mid-iteration closes the connection
+        (client-side cancel). Guards MRV2 owned-audio-output cleanup and
+        connector request recycling. A follow-up request proves the server survived.
+        """
+        long_text = (
+            "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20
+        )
+        with online_client.client.audio.speech.with_streaming_response.create(
+            model=omni_server.model,
+            input=long_text,
+            voice=None,
+            response_format="pcm",
+            extra_body={"stream_format": "audio"},
+            timeout=DEFAULT_SPEECH_TIMEOUT_S,
+        ) as resp:
+            chunks = resp.iter_bytes()
+            first = next(chunks)
+            assert first, "stream produced no audio before abort"
+        # Context exit closed the stream mid-generation; the server must
+        # recycle the request and keep serving.
         online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
-                "input": "The quick brown fox jumps over the lazy dog.",
-                "stream": True,
-                "stream_format": "audio",
-                "response_format": "pcm",
+                "input": "Server still healthy after abort.",
+                "stream": False,
+                "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_hnr_db": 0.0,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_long_input_text(self, omni_server, online_client) -> None:
+        """A long prompt near the stage-0 context budget must synthesize fully.
+
+        Guards the MRV2 decode-state capacity paths (_ensure_slot_capacity /
+        _ensure_decode_state_capacity) across many steps under one long sequence.
+        """
+        long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 90
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": long_input,
+                "stream": False,
+                "response_format": "wav",
+                "timeout": 300.0,
+                # Normalize the generation cap below the Stage-0 max_tokens
+                # cap every profile ships (2048). The byte floor stays
+                # generous under real weights: audio-eos timing is
+                # weight-dependent, so only require ~10 s of synthesized
+                # audio to prove the long input enters the long-sequence
+                # path rather than producing an empty/trivial response.
+                "max_new_tokens": 1900,
+                "transcript_expected_text": None,
+                "min_audio_bytes": 500_000,
             }
         )
 
@@ -167,6 +290,29 @@ class TestHiggsAudioV3OnlineHappyPath:
             },
             request_num=3,
         )
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", CUDA_PROFILE_PARAMS, indirect=True)
+@pytest.mark.parametrize("stream", [False, True], ids=["wav", "concurrent_pcm"])
+def test_mrv2_profile_audio(omni_server, online_client, stream) -> None:
+    """Explicit profiles boot MRV2 and deliver audio through both stages."""
+    online_client.send_audio_speech_request(
+        {
+            "model": omni_server.model,
+            "input": "She sells seashells by the seashore.",
+            "stream": stream,
+            "stream_format": "audio",
+            "response_format": "pcm" if stream else "wav",
+            "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+            "min_audio_bytes": _MIN_AUDIO_BYTES,
+            # Match the concurrent-streaming codec quality gate above.
+            "min_hnr_db": -2.0,
+        },
+        request_num=3 if stream else 1,
+    )
 
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
@@ -319,7 +465,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     [

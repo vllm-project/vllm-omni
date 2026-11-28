@@ -81,3 +81,13 @@ stages:
       use_dit_cuda_graphs: true
     disable_hybrid_kv_cache_manager: true
     skip_mm_profiling: true
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        # Keep ROCm stage 0 eager until the compiled/graph path has hardware
+        # speech-quality parity. AMD weekly produced corrupted online
+        # voice-clone output on that path while the same seeded MRv2 RAS
+        # workload passed in eager offline execution.
+        enforce_eager: true

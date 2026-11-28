@@ -39,6 +39,51 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _make_request(request_id: str = "r0", **extra) -> OmniDiffusionRequest:
+    """Build a request carrying the given noisy-session extra args."""
+    return OmniDiffusionRequest(
+        prompt="x",
+        request_id=request_id,
+        sampling_params=OmniDiffusionSamplingParams(extra_args=extra),
+    )
+
+
+class _OrderRecorder:
+    """Wrap two NoisyKVState methods so their call order is observable."""
+
+    def __init__(self, kv: NoisyKVState, *, order: list[str], plan, cache: NoisyKVCache) -> None:
+        self.kv = kv
+        self.order = order
+        self.plan = plan
+        self.cache = cache
+        self._orig_prior = kv.exchange_and_await_prior_handoffs
+        self._orig_prepare = kv.prepare
+
+    def install(self) -> None:
+        self.kv.exchange_and_await_prior_handoffs = self.prior  # type: ignore[method-assign]
+        self.kv.prepare = self.prepare  # type: ignore[method-assign]
+
+    def prior(self, slot):
+        self.order.append("prior")
+        return self._orig_prior(slot)
+
+    def prepare(self, tasks):
+        self.order.append("prepare")
+        for req, task in tasks:
+            for src in self.plan.sources(task, 0):
+                key = (req, *src.version)
+                if not self.cache.pool.has(key):
+                    self.cache.pool.alloc(key)
+        return self._orig_prepare(tasks)
+
+
+def _raise_chunk_base(self, scheduler_output, od_config):
+    """``execute_model_batch`` stand-in that fails after allocating a peer row."""
+    del scheduler_output, od_config
+    self.noisy_kv_cache.pool.alloc(("session-b", 0, 1, 0))
+    raise ValueError("chunk_base must be non-negative, got -1")
+
+
 def _cache(*, history: int = 2) -> NoisyKVCache:
     return NoisyKVCache(
         ARDiffusionNoisyKVSpec(
@@ -71,11 +116,15 @@ def _schedule(**kwargs) -> CellSchedule:
 
 
 class _CountingAdapter(CellAdapter):
-    def forward(self, tasks, kv_contexts, *, hidden):
-        return torch.zeros(1, 4, 8)
+    def compatibility_key(self, cell):
+        return cell
+
+    def forward(self, batch, members, *, member_inputs):
+        del members, member_inputs
+        return {"hidden_states": torch.zeros(batch.size, 4, 8)}
 
     def pack_activation(self, output):
-        return {"hidden_states": output}
+        return output if isinstance(output, dict) else {"hidden_states": output}
 
     def unpack_activation(self, payload):
         return payload["hidden_states"]
@@ -137,43 +186,30 @@ def test_prior_handoff_runs_before_first_prepare():
     cache = _cache(history=1)
     kv = NoisyKVState(cache)
     order: list[str] = []
-    orig_prior, orig_prepare = kv.exchange_and_await_prior_handoffs, kv.prepare
-
-    def _prior(slot):
-        order.append("prior")
-        return orig_prior(slot)
-
-    def _prepare(tasks):
-        order.append("prepare")
-        for req, task in tasks:
-            for src in plan.sources(task, 0):
-                key = (req, *src.version)
-                if not cache.pool.has(key):
-                    cache.pool.alloc(key)
-        return orig_prepare(tasks)
-
-    kv.exchange_and_await_prior_handoffs = _prior  # type: ignore[method-assign]
-    kv.prepare = _prepare  # type: ignore[method-assign]
+    _OrderRecorder(kv, order=order, plan=plan, cache=cache).install()
     ctx = ARDiffusionCellContext(
         spec=CellRunSpec(topology=CellTopology(step_replicas=2, layer_groups=1), rank=0),
         kv=kv,
     )
     ctx.enqueue("world", plan, chunk_tokens=4, retain=clean_history_cells(schedule, num_blocks=1))
-    run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
+    adapter = _CountingAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     assert order.index("prior") < order.index("prepare")
 
 
 def test_retain_window_structural_key_and_same_step_sink():
-    cache = _cache(history=1)
+    cache = _cache(history=4)
     state = NoisyKVState(cache)
     same = _schedule(num_denoise_steps=2, step_replicas=2, ordering=Ordering.SAME_STEP, chunk_base=3)
-    assert clean_history_cells(same, num_blocks=1) == {(0, 2, 0), (3, 2, 0)}
-    cache.pool.alloc(("world", 0, 2, 0))
-    cache.pool.alloc(("world", 3, 2, 0))
-    cache.pool.alloc(("world", 2, 2, 0))
+    keep = {(0, 2, 0), (3, 0, 0), (3, 1, 0)}
+    assert clean_history_cells(same, num_blocks=1) == keep
+    for cell in keep | {(2, 0, 0), (2, 1, 0), (3, 2, 0)}:
+        cache.pool.alloc(("world", *cell))
     state.end_request("world", retain=clean_history_cells(same, num_blocks=1))
-    assert cache.pool.has(("world", 0, 2, 0)) and cache.pool.has(("world", 3, 2, 0))
-    assert not cache.pool.has(("world", 2, 2, 0))
+    assert all(cache.pool.has(("world", *cell)) for cell in keep)
+    assert not cache.pool.has(("world", 2, 0, 0))
+    assert not cache.pool.has(("world", 2, 1, 0))
+    assert not cache.pool.has(("world", 3, 2, 0))
 
     first = _schedule()
     cache.bind_session_structure("world", first.structural_key())
@@ -193,7 +229,8 @@ def test_session_continuation_and_nonlocking_retain():
     cache.bind_session_structure("world", first.structural_key())
     retain = clean_history_cells(first, num_blocks=1)
     ctx.enqueue("world", build_cell_plan(first), chunk_tokens=4, retain=retain)
-    run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
+    adapter = _CountingAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     kv.end_request("world", retain=retain)
     assert cache.pool.has(("world", 1, 1, 0)) and not cache.pool.has(("world", 0, 1, 0))
 
@@ -203,7 +240,8 @@ def test_session_continuation_and_nonlocking_retain():
     retain2 = clean_history_cells(second, num_blocks=1)
     assert prior.isdisjoint(retain2)
     ctx.enqueue("world", build_cell_plan(second, prior_history=prior), chunk_tokens=4, retain=retain2)
-    run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
+    adapter = _CountingAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     kv.end_request("world", retain=retain2)
     assert cache.pool.has(("world", 2, 1, 0)) and not cache.pool.has(("world", 1, 1, 0))
 
@@ -225,13 +263,7 @@ def test_runner_lifecycle_and_batch_isolation(monkeypatch):
     from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
     from vllm_omni.diffusion.worker import diffusion_model_runner as dmr
 
-    def _req(request_id="r0", **extra):
-        return OmniDiffusionRequest(
-            prompt="x",
-            request_id=request_id,
-            sampling_params=OmniDiffusionSamplingParams(extra_args=extra),
-        )
-
+    _req = _make_request
     assert CausVidWanPipeline._noisy_request_lifecycle(_req(session_id="world", close_session=True)) == (
         "world",
         False,
@@ -269,11 +301,7 @@ def test_runner_lifecycle_and_batch_isolation(monkeypatch):
     cache.pool.alloc(("session-a", 0, 1, 0))
     cache.bind_session_structure("session-a", key)
 
-    def _boom(self, scheduler_output, od_config):
-        self.noisy_kv_cache.pool.alloc(("session-b", 0, 1, 0))
-        raise ValueError("chunk_base must be non-negative, got -1")
-
-    monkeypatch.setattr(dmr.DiffusionModelRunner, "execute_model_batch", _boom)
+    monkeypatch.setattr(dmr.DiffusionModelRunner, "execute_model_batch", _raise_chunk_base)
     with pytest.raises(ValueError, match="chunk_base"):
         runner.execute_model_batch(
             SimpleNamespace(

@@ -45,6 +45,7 @@ class OmniRequest(Request):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
         payload_sender_info: PayloadSenderInfo | None = None,
+        return_hidden_states: bool = False,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -66,6 +67,9 @@ class OmniRequest(Request):
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
         # Sender's connector address, or the payload itself for run requests.
         self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
+        # Typed per-request opt-in for last-layer hidden-state return
+        # (RL teacher rollouts); read by the MRv2 runner's add_requests.
+        self.return_hidden_states: bool = bool(return_hidden_states)
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -83,6 +87,7 @@ class OmniRequest(Request):
         cls,
         request: OmniEngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
+        block_hashes: list["BlockHash"] | None = None,
     ) -> "Request":
         """Create an OmniRequest from an OmniEngineCoreRequest.
 
@@ -90,6 +95,9 @@ class OmniRequest(Request):
             request: The OmniEngineCoreRequest to convert
             block_hasher: Optional function to compute block hashes for
                 prefix caching
+            block_hashes: Optional frontend-computed prompt block hashes
+                (v0.34); the hasher continues from the first block they
+                do not cover.
 
         Returns:
             OmniRequest instance created from the engine core request
@@ -111,9 +119,11 @@ class OmniRequest(Request):
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            block_hashes=block_hashes,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             payload_sender_info=request.payload_sender_info,
+            return_hidden_states=getattr(request, "return_hidden_states", False),
             resumable=request.resumable,
             session_id=request.session_id,
             kv_hints=request.kv_hints,

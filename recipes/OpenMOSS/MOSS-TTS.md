@@ -169,6 +169,37 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - Input field maps to the `ambient_sound` parameter in the upstream processor.
 - Rate: ~12.5 tokens per second; longer descriptions produce longer audio.
 
+### NPU
+
+#### 1x Ascend A3 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
+
+`moss_tts_local_npu_mrv2.yaml` is an opt-in profile with both stages on
+Model Runner V2. Stage0 (Talker) uses ACL graphs and builds Ascend attention
+metadata; Stage1 (codec) uses streaming NPUGraphs. Stage0 does not send the
+first audio frame itself on NPU; Stage1 delivers every chunk.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml \
+  --stage-init-timeout 1200 --init-timeout 1500
+```
+
+The startup log contains `NPU Model Runner V2 loaded
+MossTTSLocalTalkerForGeneration with Ascend attention metadata`. The speech
+request is the same as for GPU; Local 1.5 returns 48 kHz stereo audio.
+
+The two-stage MRV2 profile is validated on Atlas A3 (910C) with vLLM v0.33.0,
+CANN 9.2.1 and torch_npu 2.10.0.post7. Codec warmup captures all 21 configured
+graphs, and speech requests use NPUGraph replay. Validation requests set
+`seed: 42`; non-streaming WAV and streaming PCM return 48 kHz stereo audio
+and pass transcription checks.
+
+The default NPU profile continues to use V1 for Stage0. Historical vLLM
+v0.32.0 validation and benchmark results, including the V1 graph-mode
+comparison, are recorded in the
+[PR evidence](https://github.com/vllm-project/vllm-omni/pull/9953#issuecomment-6676396983).
+
 ## Local 1.5 unified deployment and slot attention
 
 `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` uses one single-GPU deploy
@@ -176,8 +207,9 @@ file, `moss_tts_local.yaml`. The CUDA settings use MRV2, 128 stream slots per
 stage, full-quota private MPS, prefix caching and Triton backbone attention.
 These settings replace the former C64, high-concurrency, low-latency and
 optimized presets. Pipeline selection no longer probes GPU memory or MPS.
-Non-CUDA platforms retain V1 through the same file's platform overrides;
-the separate 2/3-NPU files describe different device placements.
+Non-CUDA platforms retain V1 through the same file's platform overrides, and
+NPU has an opt-in MRV2 profile (see the NPU section above); the separate 2/3-NPU
+files describe different device placements.
 
 Both stages share one GPU, with a 32 GiB Talker KV budget. The CUDA settings
 are validated on H200 and require room for codec state and graphs, plus

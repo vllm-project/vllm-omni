@@ -15,6 +15,10 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+# Stable stop-reason prefix shared by the scheduler and duplex client errors.
+CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+
+
 # Where a receiver gets a request's stage payload: the sender's connector address, or the
 # serialized payload itself for a run request.
 PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes
@@ -78,6 +82,12 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     Attributes:
         additional_information: Optional serialized additional information
             dictionary containing tensors or lists to pass along with the request
+        return_hidden_states: Per-request opt-in for returning the policy
+            stage's last-layer hidden states (the tensor its logits head
+            consumes) through ``CompletionOutput.multimodal_output`` under
+            the ``"teacher_hidden_states"`` key. RL teacher rollouts
+            (on-policy distillation) use this signal; ordinary requests
+            leave it off so no device-to-host copy is paid.
     """
 
     # Optional additional information dictionary (serialized)
@@ -87,6 +97,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: PayloadSenderInfo | None = None
+    # Typed per-request opt-in; lifted from SamplingParams.extra_args by the
+    # ingress builder so the wire contract stays explicit.
+    return_hidden_states: bool = False
 
     @classmethod
     def from_request(
@@ -97,6 +110,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
         payload_sender_info: PayloadSenderInfo | None = None,
+        return_hidden_states: bool | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -108,6 +122,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
         if payload_sender_info is None:
             payload_sender_info = getattr(request, "payload_sender_info", None)
+        if return_hidden_states is None:
+            return_hidden_states = getattr(request, "return_hidden_states", False)
 
         return cls(
             request_id=request.request_id,
@@ -135,6 +151,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
             payload_sender_info=payload_sender_info,
+            return_hidden_states=return_hidden_states,
         )
 
 
@@ -163,6 +180,10 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
     # spans of measured duplex chunks, the producing step's chunk last.
     stage_work: list[list[int]] | None = None
+    # Talker/async-chunk segment identity for this poll. Duplex stamp copies it
+    # onto processed outputs so sentence-TTS park can tell leftover 2150 from
+    # the next utterance. Not the chunk-transfer adapter watermark.
+    segment_generation: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

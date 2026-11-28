@@ -64,6 +64,71 @@ class TestHiggsAudioV3Config:
         assert config.num_real_codes == 1024
         assert config.tie_modality_embeddings is True
 
+    def test_mrv2_flags_follow_runner_by_default(self):
+        """Tri-state resolution: None follows the runner; v1 turns all off."""
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config()
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert all(
+            getattr(v2, name) is True
+            for name in (
+                "audio_async_prompt_mode",
+                "audio_async_payload",
+                "audio_mrv2_static_inputs",
+                "audio_mrv2_slot_parameters",
+                "audio_mrv2_direct_payload",
+                "audio_mrv2_sample_graph_buckets",
+                "audio_mrv2_async_state_indices",
+                "audio_mrv2_fused_state",
+            )
+        )
+        v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
+        assert all(getattr(v1, name) is False for name in v2.__dataclass_fields__)
+
+    def test_mrv2_structural_flags_cannot_be_disabled_under_v2(self):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        for name in ("audio_async_payload", "audio_async_prompt_mode"):
+            config = HiggsAudioV3Config(**{name: False})
+            with pytest.raises(ValueError, match=name):
+                config.resolve_mrv2_defaults(use_v2_model_runner=True)
+
+    def test_mrv2_non_structural_flags_overridable(self):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(audio_mrv2_static_inputs=False)
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert v2.audio_mrv2_static_inputs is False
+        assert v2.audio_async_payload is True
+
+    def test_mrv2_explicit_flags_warn_when_ignored_under_v1(self, caplog):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(audio_mrv2_static_inputs=True, audio_mrv2_fused_state=True)
+        with caplog.at_level("WARNING", logger="vllm_omni.transformers_utils.configs.higgs_audio_v3"):
+            v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
+        assert v1.audio_mrv2_static_inputs is False
+        assert v1.audio_mrv2_fused_state is False
+        assert any(
+            "audio_mrv2_static_inputs" in message and "audio_mrv2_fused_state" in message for message in caplog.messages
+        )
+
+        # The same explicit values are honored, not warned about, under v2.
+        caplog.clear()
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert v2.audio_mrv2_static_inputs is True
+        assert v2.audio_mrv2_fused_state is True
+        assert not caplog.records
+
     def test_custom_audio_encoder_config(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
@@ -385,17 +450,15 @@ class TestSamplerMethods:
 
     @staticmethod
     def _sampling_metadata(temperature=1.0, top_k=50, top_p=0.95, generators=None):
-        return type(
-            "SamplingMetadata",
-            (),
-            {
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "all_greedy": temperature is None,
-                "generators": generators or {},
-            },
-        )()
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import HiggsAudioSamplingParams
+
+        return HiggsAudioSamplingParams(
+            temperature=None if temperature is None else torch.as_tensor(temperature),
+            top_k=None if top_k is None else torch.as_tensor(top_k),
+            top_p=None if top_p is None else torch.as_tensor(top_p),
+            all_greedy=temperature is None,
+            generators=generators or {},
+        )
 
     @staticmethod
     def _seeded_generator(seed):
@@ -696,7 +759,7 @@ class TestSamplerMethods:
         assert not getattr(
             mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False
         )
-        assert sampler_output.sampled_token_ids.tolist() == [[99999], [151671]]
+        assert sampler_output.tolist() == [[99999], [151671]]
 
     def test_direct_audio_sampler_uses_gpu_tokens_for_active_rows(self):
         """Direct audio sampling leaves scheduler-visible tokens to the GPU tensor."""
@@ -726,7 +789,60 @@ class TestSamplerMethods:
 
         sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
 
-        assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
+        assert sampler_output.tolist() == [[99999], [99999]]
+
+    def test_text_sampling_uses_current_sampler_callback(self, mocker):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration as C,
+        )
+
+        t = SimpleNamespace(
+            _resolve_token_ids=lambda: None,
+            _audio_continuation_id=5,
+            _last_logits_hidden=None,
+            _clear_last_audio_outputs=mocker.Mock(),
+        )
+        logits = torch.randn(2, 7)
+        tokens = torch.tensor([[2], [3]], dtype=torch.int32)
+        current_sampler = mocker.Mock(return_value=tokens)
+
+        result = C.sample(t, logits, self._sampling_metadata(), sample_text=current_sampler)
+
+        assert result is tokens
+        current_sampler.assert_called_once_with(logits)
+        t._clear_last_audio_outputs.assert_called_once_with()
+
+    def test_mixed_sampling_keeps_text_row_and_updates_only_audio_row(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration as C,
+        )
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id, t._eos_token_id = 5, 6
+        t._last_logits_hidden = torch.zeros(2, 16)
+        t._last_step_input_ids = torch.tensor([5, 2])
+        t._last_step_query_start_loc = None
+        t._fast_audio_direct_rows = 0
+        t._fast_audio_sampler_gpu_fallback_reason = C._fast_audio_sampler_gpu_fallback_reason.__get__(t)
+        t._apply_audio_mode_bias_batched = C._apply_audio_mode_bias_batched.__get__(t)
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._sample_audio_codes = lambda logits, *args, noise=None: torch.zeros(logits.shape[0], dtype=torch.long)
+        logits = torch.zeros(2, 7)
+        logits[:, 2] = 2
+        seen = []
+
+        def sample_text(biased_logits):
+            seen.append(biased_logits.clone())
+            return biased_logits.argmax(-1, keepdim=True).to(torch.int32)
+
+        tokens = C.sample(t, logits, self._sampling_metadata(), sample_text=sample_text)
+
+        assert tokens.tolist() == [[5], [2]]
+        assert len(seen) == 1 and torch.isneginf(seen[0][0, 2])
+        assert seen[0][1, 2] == 2
+        assert t._decode_has_codes.tolist() == [True, False]
+        assert t._last_audio_host_staging[:, 8].tolist() == [1, 0]
 
     def test_terminal_rampdown_frame_is_emitted_before_done(self):
         """The final ramp-down frame must be emitted, not replaced by a done marker."""
@@ -1481,9 +1597,9 @@ class TestStageInputProcessor:
         assert len(result) == 1
         assert result[0]["prompt_token_ids"] == []
 
-    def test_filter_real_code_frames(self):
+    def test_valid_code_prefix(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _filter_real_code_frames,
+            _valid_code_prefix,
         )
 
         # 8 codebooks, 4 frames
@@ -1499,12 +1615,11 @@ class TestStageInputProcessor:
                 [107, 207, 1024, 307],
             ]
         )
-        result = _filter_real_code_frames(codes)
-        # Frame 2 (column 2) has BOC in all codebooks -> filtered out
-        assert result.shape == (8, 3)
+        result = _valid_code_prefix(codes)
+        # Stop at the first invalid frame; do not compact the timeline.
+        assert result.shape == (8, 2)
         assert result[0, 0].item() == 100
         assert result[0, 1].item() == 200
-        assert result[0, 2].item() == 300
 
     def test_async_chunk_accepts_multimodal_output_keyword(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
@@ -1555,8 +1670,9 @@ class TestRegistry:
     def test_deploy_yaml_uses_native_flashinfer(self):
         from vllm_omni.config.stage_config import load_deploy_config
 
+        # The explicit V2 profiles keep the FLASHINFER shape; the default yaml
+        # flipped to MRV2 (FLASH_ATTN) and is anchored separately below.
         for name in (
-            "higgs_multimodal_qwen3.yaml",
             "higgs_multimodal_qwen3_high_throughput.yaml",
             "higgs_multimodal_qwen3_low_latency.yaml",
         ):
@@ -1566,6 +1682,32 @@ class TestRegistry:
             stage_0 = next(stage for stage in deploy_config.stages if stage.stage_id == 0)
             assert stage_0.attention_backend == "FLASHINFER"
             assert stage_0.engine_extras["attention_config"] == {"use_trtllm_attention": False}
+
+    def test_deploy_yaml_flipped_default_shape(self):
+        """The flipped default yaml anchors the validated MRV2 shape."""
+        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+
+        yaml_path = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
+        deploy = _apply_platform_overrides(load_deploy_config(yaml_path), platform="cuda")
+        assert deploy.model_runner == "v2"
+        assert deploy.async_chunk is True
+        stage0, stage1 = deploy.stages
+        assert stage0.attention_backend == "FLASH_ATTN"
+        assert stage0.enforce_eager is False
+        assert stage0.async_scheduling is True
+        assert stage0.engine_extras["enable_prefix_caching"] is False
+        # Connector geometry matches the codec graph windows (25 + 8 = 33);
+        # first chunk is one 8-frame graph window.
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_chunk_frames"] == 25
+        assert extra["codec_left_context_frames"] == 8
+        assert extra["codec_right_holdback_frames"] == 0
+        assert extra["initial_codec_chunk_frames"] == 8
+        # Stage-1 codec CUDA graph windows follow the connector geometry.
+        hf_overrides = stage1.engine_extras["hf_overrides"]
+        assert hf_overrides["codec_graph_single_max_frames"] == 33
+        assert hf_overrides["codec_graph_frame_sizes"] == [8, 33]
+        assert hf_overrides["codec_graph_batch_sizes"] == list(range(1, 17))
 
 
 # ---- AC-3: Prompt Builder ----

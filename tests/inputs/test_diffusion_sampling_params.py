@@ -107,61 +107,72 @@ def test_streaming_resource_limits_reject_invalid_values(field, value):
         OmniDiffusionSamplingParams(**{field: value})
 
 
-@pytest.mark.parametrize("schedule", [None, [], [{"start": 3, "end": None, "profile": "quantized"}]])
-def test_attention_schedule_typed_and_extra_args_inputs_match(schedule):
-    typed = OmniDiffusionSamplingParams(attention_schedule=copy.deepcopy(schedule))
-    extra = {"attention_schedule": copy.deepcopy(schedule), "pipeline_specific": "kept"}
+# Both schedule fields go through absorb_attention_schedule_extra_args; each has one non-empty example.
+_SCHEDULES = {
+    "attention_schedule": [{"start": 3, "end": 6, "profile": "sparse"}],
+    "attention_sigma_schedule": [{"low": 0.2, "high": 0.6, "profile": "sparse"}],
+}
+_FIELDS = pytest.mark.parametrize("field", sorted(_SCHEDULES))
+
+
+@_FIELDS
+@pytest.mark.parametrize("kind", ["inherit", "disabled", "set"])
+def test_attention_schedule_typed_and_extra_args_inputs_match(field, kind):
+    schedule = {"inherit": None, "disabled": [], "set": _SCHEDULES[field]}[kind]
+    typed = OmniDiffusionSamplingParams(**{field: copy.deepcopy(schedule)})
+    extra = {field: copy.deepcopy(schedule), "pipeline_specific": "kept"}
     saved = copy.deepcopy(extra)
     nested = OmniDiffusionSamplingParams(extra_args=extra)
     plain = OmniDiffusionSamplingParams.from_params(_sampling_params(extra_args=extra))
 
-    assert typed.attention_schedule == nested.attention_schedule == plain.attention_schedule
+    assert getattr(typed, field) == getattr(nested, field) == getattr(plain, field)
     assert nested.extra_args == plain.extra_args == {"pipeline_specific": "kept"}
     assert extra == saved
-    assert (typed.attention_schedule is None) == (schedule is None)
+    assert (getattr(typed, field) is None) == (schedule is None)
     if schedule == []:
-        assert typed.attention_schedule == ()
+        assert getattr(typed, field) == ()
 
 
-def test_attention_schedule_copies_input_and_survives_transport():
-    source = [{"start": 3, "end": 6, "profile": "sparse"}]
-    params = OmniDiffusionSamplingParams(attention_schedule=source)
-    source[0]["start"] = 0
+@_FIELDS
+def test_attention_schedule_copies_input_and_survives_transport(field):
+    source = copy.deepcopy(_SCHEDULES[field])
+    params = OmniDiffusionSamplingParams(**{field: source})
+    expected = OmniDiffusionSamplingParams(**{field: _SCHEDULES[field]})
+    source[0]["profile"] = "changed"
     source.clear()
 
-    assert params.attention_schedule[0].start == 3
+    assert getattr(params, field) == getattr(expected, field)
     for restored in (
         params.clone(),
         OmniDiffusionSamplingParams(**msgspec.msgpack.decode(msgspec.msgpack.encode(params))),
         OmniDiffusionSamplingParams(**json.loads(json.dumps(asdict(params)))),
     ):
-        assert restored.attention_schedule == params.attention_schedule
+        assert getattr(restored, field) == getattr(params, field)
         assert restored is not params
 
 
-def test_attention_schedule_accepts_equal_duplicate_sources():
-    source = [{"start": 3, "end": 6, "profile": "sparse"}]
-    params = OmniDiffusionSamplingParams(attention_schedule=source, extra_args={"attention_schedule": source})
-    assert params.attention_schedule[0].profile == "sparse"
-    assert "attention_schedule" not in params.extra_args
+@_FIELDS
+def test_attention_schedule_accepts_equal_duplicate_sources(field):
+    source = _SCHEDULES[field]
+    params = OmniDiffusionSamplingParams(**{field: source}, extra_args={field: source})
+    assert getattr(params, field)[0].profile == "sparse"
+    assert field not in params.extra_args
 
 
-def test_attention_schedule_rejects_conflicting_duplicate_sources():
-    extra = {"attention_schedule": [{"start": 3, "end": 6, "profile": "sparse"}]}
-    with pytest.raises(ValueError, match="conflicting.*attention_schedule"):
-        OmniDiffusionSamplingParams(attention_schedule=[], extra_args=extra)
+@_FIELDS
+def test_attention_schedule_rejects_conflicting_duplicate_sources(field):
+    with pytest.raises(ValueError, match=f"conflicting {field} values"):
+        OmniDiffusionSamplingParams(**{field: []}, extra_args={field: _SCHEDULES[field]})
 
 
-@pytest.mark.parametrize(
-    "typed", [None, [], [{"start": 3, "end": 6, "profile": "sparse"}]], ids=["inherit", "disabled", "ranges"]
-)
-def test_null_extra_args_schedule_keeps_the_typed_value(typed):
+@_FIELDS
+@pytest.mark.parametrize("kind", ["inherit", "disabled", "set"])
+def test_null_extra_args_schedule_keeps_the_typed_value(field, kind):
     # null means the same as an omitted key: it neither conflicts with nor clears the typed value.
-    params = OmniDiffusionSamplingParams(
-        attention_schedule=copy.deepcopy(typed), extra_args={"attention_schedule": None, "other": 1}
-    )
+    typed = {"inherit": None, "disabled": [], "set": _SCHEDULES[field]}[kind]
+    params = OmniDiffusionSamplingParams(**{field: copy.deepcopy(typed)}, extra_args={field: None, "other": 1})
 
-    assert params.attention_schedule == OmniDiffusionSamplingParams(attention_schedule=typed).attention_schedule
+    assert getattr(params, field) == getattr(OmniDiffusionSamplingParams(**{field: typed}), field)
     assert params.extra_args == {"other": 1}
 
 

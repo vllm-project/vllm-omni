@@ -1,5 +1,10 @@
 # LFM3-Omni-2B on Ascend and CUDA
 
+> **Unavailable with vLLM 0.34 / V2-only execution.** Both speech and text profiles require the retired Model Runner V1.
+> The commands, configurations, and measurements below are historical reference,
+> not installation or serving instructions for this version. Configuration loading
+> rejects the V1 profile; changing its runner flag does not add V2 support.
+
 ## Model and execution
 
 [LiquidAI/LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B)
@@ -18,9 +23,9 @@ The serving integration also runs with Transformers 5.19.0, within the
 repository's supported dependency range; upgrading the shared installation
 to the reference environment's version is not required.
 
-## Deployment
+## Historical deployment
 
-The integration is validated on one Ascend 910B1 with 64 GiB HBM and on one
+The earlier integration was validated on one Ascend 910B1 with 64 GiB HBM and on one
 NVIDIA RTX 4090 with 24 GB.
 
 From the repository root, in an installed vLLM-Omni Ascend environment:
@@ -29,11 +34,11 @@ From the repository root, in an installed vLLM-Omni Ascend environment:
 vllm serve LiquidAI/LFM3-Omni-2B --omni --trust-remote-code \
   --revision 21d75123f86c1f7ffb4bef1ea202710c4e7ebe67 \
   --deploy-config vllm_omni/deploy/lfm3_omni.yaml --async-chunk \
-  --hf-overrides '{"lfm3_depth_graph":true,"lfm3_vectorized_greedy":true}' \
+  --stage-overrides '{"0":{"hf_overrides":{"lfm3_depth_graph":true,"lfm3_vectorized_greedy":true}}}' \
   --port 8091
 ```
 
-On CUDA, use the same command without `--hf-overrides`.
+On CUDA, omit the `--stage-overrides` argument.
 `lfm3_depth_graph` captures NPU graphs only. On the RTX 4090,
 `lfm3_vectorized_greedy` measured within run-to-run noise; see the measured CUDA
 performance below.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import argparse
@@ -46,9 +49,10 @@ class _IdentityFtfy:
         return text
 
 
-def _ensure_wan_ftfy_fallback() -> None:
-    if not hasattr(wan_i2v_module, "ftfy"):
-        wan_i2v_module.ftfy = _IdentityFtfy()
+def _align_wan_prompt_cleaning() -> None:
+    # Always use identity ftfy, installed or not. Otherwise, offline ftfy cleaning
+    # differs from Omni's online whitespace-only cleaning and breaks accuracy alignment.
+    wan_i2v_module.ftfy = _IdentityFtfy()
 
 
 def _offline_cuda_device() -> torch.device:
@@ -124,7 +128,7 @@ def main() -> int:
     args = _parse_args()
     device = _offline_cuda_device()
     torch.cuda.set_device(device)
-    _ensure_wan_ftfy_fallback()
+    _align_wan_prompt_cleaning()
 
     pipe = WanImageToVideoPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
     pipe.register_to_config(boundary_ratio=BOUNDARY_RATIO)

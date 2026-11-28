@@ -70,7 +70,11 @@ logger = init_logger(__name__)
 def _deterministic_ltx_vocoder():
     previous = torch.backends.cudnn.deterministic
     try:
-        torch.backends.cudnn.deterministic = True
+        # PyTorch exposes ROCm devices through the ``cuda`` device type, but
+        # MIOpen has no deterministic algorithm for the LTX BWE resampler's
+        # grouped conv1d. Keep NVIDIA's reproducible policy without forcing
+        # the unsupported MIOpen path on ROCm.
+        torch.backends.cudnn.deterministic = not current_omni_platform.is_rocm()
         yield
     finally:
         torch.backends.cudnn.deterministic = previous
