@@ -1803,8 +1803,11 @@ async def test_managed_window_release_timeout_and_owner_retirement(mocker, monke
         owner.call_utility_async.side_effect = delayed_release
         monkeypatch.setattr(pool, "RELEASE_RPC_TIMEOUT_S", 0.02)
         assert (await _close(orchestrator, rpc_q)).ok
-        assert SESSION_ID in manager._closing
-        assert SESSION_ID in orchestrator.replica_placement.snapshot()["sessions"]
+        # A timed-out window release no longer pins the admission slot (#11301):
+        # the in-flight release below still owns the window state, and a retry
+        # joins it, so the session's capacity is released immediately.
+        assert SESSION_ID not in manager._closing
+        assert SESSION_ID not in orchestrator.replica_placement.snapshot()["sessions"]
         pending = orchestrator._window_releases[SESSION_ID]
         if owner_dies:
             await orchestrator._handle_dead_replica(0, index, EngineDeadError("owner died during close"))
