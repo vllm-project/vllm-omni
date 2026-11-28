@@ -187,6 +187,60 @@ def test_hccl_receive_oom_is_reported_before_collective(monkeypatch, rank: int):
         executor.gather_tensors(torch.zeros(4))
 
 
+def test_publish_tensor_broadcasts_from_rank0(monkeypatch):
+    executor = DistributedVaeExecutor()
+    executor.rank = 1
+    tensor = torch.zeros(3)
+
+    def broadcast(source, *, src, group):
+        assert src == 0 and group is executor.group
+        source.fill_(5.0)
+
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+    executor._publish_tensor(tensor)
+    torch.testing.assert_close(tensor, torch.full((3,), 5.0))
+
+
+@pytest.mark.parametrize("override", [None, torch.int32])
+def test_control_tensors_use_executor_dtype(monkeypatch, override):
+    """Every control tensor crossing a collective follows ``_control_dtype``.
+
+    The default case leaves the executor untouched and expects int64, so an
+    accidental change of the shared default fails it. The second case overrides
+    the hook with int32, which is what the 310P patch installs because 310P HCCL
+    accepts INT8/INT16/INT32/FP16/FP32 only and an int64 all_reduce there agrees
+    no padding shape. A site that hard-codes the other dtype fails one of them.
+    """
+    control_dtype = torch.int64 if override is None else override
+    executor = DistributedVaeExecutor()
+    executor.rank = 0
+    if override is not None:
+        executor._control_dtype = override
+    reduced, published = [], []
+
+    def all_reduce(tensor, *, op, group):
+        reduced.append((tensor.dtype, tuple(tensor.shape)))
+
+    def publish(tensor):
+        published.append((tensor.dtype, tuple(tensor.shape)))
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(executor, "_publish_tensor", publish)
+
+    executor._compute_global_padding_shape([(0, torch.zeros((2, 3)))], 3, "cpu")
+    grid_spec = GridSpec(split_dims=(1, 2), grid_shape=(1, 1))
+    _, meta_tensor = executor._pack_local_tiles(
+        [(0, torch.ones((2, 3, 4)))], [1, 2, 3, 4], grid_spec, device="cpu", dtype=torch.float32
+    )
+    result = executor._sync_final_result(torch.zeros((1, 3, 4, 5)), 4, "cpu", torch.float32)
+
+    # The error-agreement status is a scalar and stays int32 on every backend.
+    assert [entry for entry in reduced if entry[1] != ()] == [(control_dtype, (4,))]
+    assert meta_tensor.dtype == control_dtype
+    assert result.shape == (1, 3, 4, 5)
+    assert published == [(control_dtype, (4,)), (torch.float32, (1, 3, 4, 5))]
+
+
 def test_balance_tasks():
     executor = DistributedVaeExecutor()
     workloads = [2, 5, 13, 8, 2, 4]  # each is 17

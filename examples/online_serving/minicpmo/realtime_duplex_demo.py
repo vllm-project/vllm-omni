@@ -52,7 +52,7 @@ from vllm_omni.clients.duplex import (  # noqa: E402
 from vllm_omni.clients.minicpmo_4_5 import (  # noqa: E402
     create_duplex_session_config,
 )
-from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
+from vllm_omni.clients.video_stacking import (  # noqa: E402
     concat_frames_b64,
     unit_subframe_offsets,
 )

@@ -14,9 +14,9 @@ from tests.model_executor.models.joyai_vl_interaction.test_visual_memory_pipelin
 from vllm_omni.engine.duplex.commands import AppendAudio, CancelResponse, Commit, CreateItem, DeleteItem
 from vllm_omni.engine.duplex.plugin import duplex_text_history
 from vllm_omni.errors import OmniClientError
-from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import WorkingObservation
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import USER_QUERY_HEADER
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

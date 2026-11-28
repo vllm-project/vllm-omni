@@ -2659,7 +2659,7 @@ def test_server_vad_interrupt_validates_generation_and_playback(
     ref_audio.write_bytes(b"reference")
     monkeypatch.setattr(driver, "RealtimeDuplexClient", Client)
     monkeypatch.setattr(driver, "read_pcm16_wav", lambda path: b"\0\0")
-    monkeypatch.setattr(driver, "wait_for", wait_for)
+    monkeypatch.setattr(driver, "wait_for_condition", wait_for)
     result = asyncio.run(
         driver.run_server_vad_interrupt(
             SimpleNamespace(

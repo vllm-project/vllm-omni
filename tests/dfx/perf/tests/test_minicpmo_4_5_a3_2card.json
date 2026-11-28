@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_a3_2card",
-    "description": "Five-tier Seed-TTS EN sweep for A3 two-card MRv2 Thinker Ngram.",
+    "description": "Seed-TTS EN concurrency sweep for A3 two-card MRv2 Thinker Ngram.",
     "mark": [
       {
         "hardware_marks": {
@@ -35,17 +35,15 @@
         "endpoint": "/v1/chat/completions",
         "num_prompts": [
           32,
-          64,
-          128,
           256,
+          512,
           512
         ],
         "max_concurrency": [
           1,
-          4,
-          8,
           16,
-          32
+          32,
+          64
         ],
         "no_oversample": true,
         "disable_shuffle": true,

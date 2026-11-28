@@ -500,11 +500,11 @@ def test_joyai_system_prompt_extra_replaces_silence_persona():
 
 
 def test_delegate_action_precedes_session_instructions_in_system_prompt():
-    from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import SILENT_SYSTEM_PROMPT
     from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
         delegation_system_section,
         delegation_tool_definition,
     )
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import SILENT_SYSTEM_PROMPT
 
     runtime = {"instructions": "Answer delegated results aloud.", "realtime_tools": [delegation_tool_definition()]}
     assert JoyAIDuplexPlugin._system_prompt(runtime) == "\n\n".join(

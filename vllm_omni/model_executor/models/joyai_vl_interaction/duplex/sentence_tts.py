@@ -37,14 +37,14 @@ from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
 from vllm_omni.engine.duplex.plugin import PartialStageForward
 from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput, consume_growing_text
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
-from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.output_parser import (
     DELEGATION_TAG,
     RESPONSE_TOKEN,
     SILENCE_TOKEN,
     Action,
     parse_action,
 )
-from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompts import USER_QUERY_HEADER
 
 _DELEGATION_MARKERS = (DELEGATION_TAG, "<delegation>")
 _LEADING_MARKERS = (SILENCE_TOKEN, RESPONSE_TOKEN)

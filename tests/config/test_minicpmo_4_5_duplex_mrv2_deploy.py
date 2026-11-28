@@ -95,6 +95,7 @@ def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     assert options["minicpmo_talker_compact_decode"] is True
     assert options["minicpmo_talker_hybrid_context"] is True
     assert options["minicpmo_talker_replica_route"] == "half"
+    assert options["minicpmo_talker_refill_coalesce"] is True
     assert vocoder.yaml_runtime["num_replicas"] == 2
     assert vocoder.yaml_runtime["env"] == {
         "MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY": "1",
@@ -106,6 +107,18 @@ def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     assert (extra["token2wav_setup_cache_size"], extra["token2wav_setup_host_cache_size"]) == (64, 512)
     assert extra["cfm_graph_capture_frames"] == [16, 32, 48, 64, 80]
     assert extra["token2wav_runtime_prompt_cache_size"] == 512
+
+    # Talker also reads shared connector extras when initializing its scheduler.
+    coalescing = {
+        "generation_max_regular_batch": 16,
+        "generation_min_batch_size": 4,
+        "generation_max_wait_ms": 25,
+        "generation_first_chunk_express": True,
+        "generation_first_chunk_express_min_slack_s": 0.30,
+    }
+    assert extra.keys().isdisjoint(coalescing)
+    vocoder_options = vocoder.yaml_engine_args["additional_config"]
+    assert {key: vocoder_options[key] for key in coalescing} == coalescing
 
 
 def test_two_card_prefill_startup_uses_private_markers(monkeypatch) -> None:

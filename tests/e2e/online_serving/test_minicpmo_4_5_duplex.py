@@ -37,7 +37,7 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
 )
 from tests.helpers.mark import hardware_test
 from vllm_omni.clients.duplex import build_realtime_url, metric_mean
-from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
+from vllm_omni.clients.video_stacking import concat_frames_b64
 
 pytestmark = pytest.mark.omni
 
