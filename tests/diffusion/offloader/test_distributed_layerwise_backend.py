@@ -2999,6 +2999,91 @@ class TestDistributedComponentSelection:
             assert registry is None or registry.get_hook("distributed_layerwise_offload") is None
             torch.testing.assert_close(block.weight, expected)
 
+    @pytest.mark.parametrize(
+        ("pin_cpu_memory", "is_cuda", "configured"),
+        [(True, True, True), (False, True, False), (True, False, False)],
+    )
+    def test_enable_configures_pinned_allocator_before_pinning(
+        self, patched_offload_runtime, monkeypatch, pin_cpu_memory, is_cuda, configured
+    ):
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=pin_cpu_memory,
+                dlo_use_allgather=False,
+                components=frozenset({"dit"}),
+            ),
+            torch.device("cpu"),
+        )
+        monkeypatch.setattr(dist_backend_module.current_omni_platform, "is_cuda", lambda: is_cuda)
+        calls: list[str] = []
+        monkeypatch.setattr(dist_backend_module, "_configure_pinned_host_allocator", lambda: calls.append("configured"))
+
+        def stop_before_pinning(*_args, **_kwargs):
+            calls.append("planned")
+            raise RuntimeError("stop before pinning")
+
+        # Settings only affect later allocations, so they must precede the
+        # plan that leads to every shard being pinned.
+        monkeypatch.setattr(dist_backend_module, "resolve_offload_plan", stop_before_pinning)
+
+        with pytest.raises(RuntimeError, match="stop before pinning"):
+            backend.enable(nn.Module())
+        assert calls == (["configured", "planned"] if configured else ["planned"])
+
+    @pytest.mark.parametrize(
+        ("allocator_conf", "expected"),
+        [
+            ("", "pinned_max_round_threshold_mb:64,pinned_use_cuda_host_register:True,pinned_num_register_threads:8"),
+            (
+                "expandable_segments:True,pinned_use_cuda_host_register:False",
+                "expandable_segments:True,pinned_use_cuda_host_register:False,"
+                "pinned_max_round_threshold_mb:64,pinned_num_register_threads:8",
+            ),
+            (
+                "pinned_max_round_threshold_mb:128,pinned_num_register_threads:4,pinned_use_cuda_host_register:False",
+                None,
+            ),
+            (
+                "expandable_segments:True,pinned_use_hip_host_register:False",
+                "expandable_segments:True,pinned_use_hip_host_register:False,"
+                "pinned_max_round_threshold_mb:64,pinned_num_register_threads:8",
+            ),
+            (
+                "pinned_max_round_threshold_mb:128,pinned_num_register_threads:4,pinned_use_hip_host_register:False",
+                None,
+            ),
+            (
+                "max_split_size_mb:128",
+                "max_split_size_mb:128,pinned_max_round_threshold_mb:64,"
+                "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+            ),
+            (
+                "max_split_size_mb:128, ",
+                "max_split_size_mb:128,pinned_max_round_threshold_mb:64,"
+                "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+            ),
+            (
+                "max_split_size_mb:128,roundup_power2_divisions:[256:1,512:2,>:4],"
+                "garbage_collection_threshold:0.8,max_non_split_rounding_mb:64",
+                "max_split_size_mb:128,roundup_power2_divisions:[256:1,512:2,>:4],"
+                "garbage_collection_threshold:0.8,max_non_split_rounding_mb:64,"
+                "pinned_max_round_threshold_mb:64,pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+            ),
+        ],
+    )
+    def test_pinned_allocator_settings_keep_user_choices(self, monkeypatch, allocator_conf, expected):
+        for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+            monkeypatch.delenv(name, raising=False)
+        # Runtime settings may differ from the environment that initialized PyTorch.
+        monkeypatch.setattr(torch._C, "_accelerator_getAllocatorSettings", lambda: allocator_conf)
+        applied: list[str] = []
+        monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings", applied.append)
+
+        dist_backend_module._configure_pinned_host_allocator()
+
+        assert applied == ([expected] if expected else [])
+
     def test_multirank_enable_failure_cleanup_skips_restore_collective(
         self, monkeypatch, mocker, patched_offload_runtime
     ):

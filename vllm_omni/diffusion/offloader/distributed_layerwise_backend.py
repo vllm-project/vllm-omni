@@ -84,6 +84,28 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
+# PyTorch rounds pinned host blocks up to a power of two and frees them with
+# cudaFreeHost. DLO's long-lived ~300 MB shards then pin ~66% more host memory
+# than they hold, and releasing it at worker exit can outlast the executor's
+# shutdown grace period. Exact-size cudaHostRegister blocks avoid both.
+_PINNED_HOST_ALLOCATOR_SETTINGS = {
+    "pinned_max_round_threshold_mb": "64",
+    "pinned_use_cuda_host_register": "True",
+    "pinned_num_register_threads": "8",
+}
+
+
+def _configure_pinned_host_allocator() -> None:
+    """Apply DLO's pinned-allocator settings the user has not chosen explicitly."""
+    user_conf = torch._C._accelerator_getAllocatorSettings().rstrip().rstrip(",")
+    configured = user_conf.replace("pinned_use_hip_host_register", "pinned_use_cuda_host_register")
+    settings = [f"{key}:{value}" for key, value in _PINNED_HOST_ALLOCATOR_SETTINGS.items() if key not in configured]
+    if settings:
+        # The setter resets omitted device options, so replay the full current configuration.
+        # Only affects later allocations; blocks pinned earlier keep their own free path.
+        torch._C._accelerator_setAllocatorSettings(",".join(filter(None, [user_conf, *settings])))
+
+
 # Collective backends do not support E8M0 scales or packed FP4 as element
 # types. Both are byte-addressable and bit-preserving under a uint8 view, so
 # collect the underlying bytes and view the output back to the original dtype.
@@ -1762,6 +1784,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
             return
+
+        if self.config.pin_cpu_memory and current_omni_platform.is_cuda():
+            _configure_pinned_host_allocator()
 
         # Initialize DP group (if not already done by early init)
         if self.dp_group is None and self._has_multirank_allgather():
