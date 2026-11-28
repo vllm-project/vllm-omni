@@ -692,3 +692,47 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+### Reference-video tile input (experimental)
+
+Set `VLLM_OMNI_H3_VAE_STREAM_TILE=1` to upload only each rank's spatial tiles
+for the native FP32 CNN reference-video encoder. This opt-in path preserves
+per-clip tile assignment, gather/blend order, temporal padding and one posterior
+sample. The flag follows the legacy preparation flag syntax. It defaults to
+`0`, ignores case and surrounding whitespace, and is disabled by an empty
+value, `0`, `false`, or `off`. Other values, including `1`, `true`, and `on`,
+enable it on CPU and Ascend NPUs. CUDA, ROCm, XPU, and other devices use
+ordinary preparation, as do unsupported checkpoint configurations.
+The streamed path uses the callable `DiagonalGaussianDistribution` from the
+checkpoint's `encode_base` module. If that name is unavailable, encoding uses
+ordinary preparation.
+`VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes precedence. Workers log the reason
+when they skip the streamed path or fall back after a local encoding failure.
+
+On one Ascend 950PR card (256x448, 33 frames, real weights) the streamed path
+produced bit-identical encoder rows and lowered peak allocated device memory
+by about 40 MiB, with latency within 1% of the ordinary path.
+
+On eight Ascend 950PR cards (public Ref2VA fixture, 1344x768, 124 frames,
+seed 0), encoder rows stayed bit-identical across all ranks and the video VAE
+encode's allocator peak fell by 1.6 GiB allocated and 2.2 GiB reserved
+(31.8%/32.4%) against baseline `085d7dba3` for candidate `5e4f260d`. These are
+PyTorch/NPU allocator high-water marks for the encode stage, not device HBM
+peaks. VAE latency stayed inside the 3% gate with a 95% confidence interval
+that included zero.
+
+The eight-rank run used one public Ref2VA request at a time, the FP32 video
+encoder with FP16 latent output, and the checkpoint's native spatial tile
+geometry with VAE patch parallel size 8. Both arms used USP 8, ring 1,
+text-encoder TP 8, eager execution, and layer offload. The baseline used
+ordinary preparation and the candidate set `VLLM_OMNI_H3_VAE_STREAM_TILE=1`.
+The ABBA run collected ten formal VAE encode samples and six formal HTTP
+requests at 50 inference steps per arm after block warm-ups. VAE device-event
+time and allocator peaks were taken as the maximum across the eight ranks per
+request. The median paired device-event change was -1.29% (95% percentile
+bootstrap CI -1.46% to +0.56%, 10,000 resamples).
+
+The [validation archive](https://github.com/cflin27/iskill-archive/blob/cc5f986ec608dbecd85743acbac95567d9cd43d4/materials/prs/vllm-omni-11003-h3-stream-tile/validation-and-benefit.md)
+links the pinned serving recipe and public fixture and gives the request
+parameters and measurement boundaries. The experimental timing harness was
+unpublished. These measurements apply to the commit pair above.

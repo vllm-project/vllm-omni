@@ -44,6 +44,8 @@ MINIMAX_H3_AUDIO_CHANNELS = 2
 
 # Escape hatch back to the checkpoint's whole-video numpy preparation path.
 _VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
+# Opt-in for rank-local reference-video tile uploads.
+_VAE_STREAM_TILE_ENV = "VLLM_OMNI_H3_VAE_STREAM_TILE"
 
 
 logger = init_logger(__name__)
@@ -77,8 +79,8 @@ def _minimax_h3_keyframe_encode_context(
         yield
 
 
-def _legacy_encode_prep_enabled() -> bool:
-    value = os.environ.get(_VAE_ENCODE_LEGACY_PREP_ENV, "0")
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "0")
     return value.strip().lower() not in ("", "0", "false", "off")
 
 
@@ -1062,7 +1064,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def predict_video_latent_shape(self, frames: np.ndarray) -> tuple[int, int, int]:
         """Predict the checkpoint latent shape for its reference-video input."""
         effective_frames = int(frames.shape[0])
-        if not _legacy_encode_prep_enabled():
+        if not _env_flag_enabled(_VAE_ENCODE_LEGACY_PREP_ENV):
             prep_metadata = self._stream_video_prep_metadata(frames)
             if prep_metadata is not None:
                 effective_frames += prep_metadata[1]
@@ -1123,6 +1125,152 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             out[:, start:end].copy_(chunk)
         return out
 
+    def _stream_encode_video_tiles(
+        self,
+        frames: np.ndarray,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Upload only the current rank's tiles, preserving native clip order.
+
+        The supported CNN path has no class-token aggregation or isolated
+        frames. All other checkpoint contracts retain ordinary preparation.
+        Each clip keeps the native tile gather order. The checkpoint's
+        ``encode_base`` must expose a callable ``DiagonalGaussianDistribution``
+        in its module globals. If it is unavailable, use ordinary preparation.
+        """
+        model = self.model
+        if device.type not in ("cpu", "npu"):
+            logger.info_once("MiniMax H3 video tile streaming skipped on %s.", device.type)
+            return None
+        metadata = self._stream_video_prep_metadata(frames)
+        if metadata is None:
+            logger.info_once("MiniMax H3 video tile streaming skipped: unsupported frame or preprocessing layout.")
+            return None
+        encoder = getattr(model, "encoder", None)
+        if (
+            model.training
+            or not getattr(model, "encoder_tiling", False)
+            or getattr(model, "encoder_parallel", False)
+            or getattr(model, "stack_tiling", False)
+            or not any(cls.__name__ == "EncoderFCN3D" for cls in type(encoder).__mro__)
+            or hasattr(encoder, "loss_info")
+            or any(
+                getattr(model, name, False)
+                for name in ("isolated_first_frame", "isolated_last_frame", "isolated_key_frame")
+            )
+        ):
+            logger.info_once("MiniMax H3 video tile streaming skipped: unsupported checkpoint encoder layout.")
+            return None
+        encode_base = getattr(model, "encode_base", None)
+        encode_base = getattr(encode_base, "__func__", encode_base)
+        sample = getattr(encode_base, "__globals__", {}).get("DiagonalGaussianDistribution")
+        if not callable(sample):
+            logger.info_once("MiniMax H3 video tile streaming skipped: checkpoint posterior sampler unavailable.")
+            return None
+        clip_length, prep_pad, mean, std = metadata
+        processor = model.processor
+        crop_mode = getattr(processor, "crop_mode", "top_left")
+        if crop_mode not in ("top_left", "center"):
+            logger.info_once("MiniMax H3 video tile streaming skipped: unsupported checkpoint crop mode.")
+            return None
+        used = int(processor.get_suitable_video_length(len(frames) + prep_pad))
+        height, width = frames.shape[1:3]
+        aligned_h, aligned_w = processor._align_to_total_patch_size(height, width)
+        if used <= 0 or not (0 < aligned_h <= height and 0 < aligned_w <= width):
+            logger.info_once("MiniMax H3 video tile streaming skipped: invalid aligned video length or dimensions.")
+            return None
+        top, left = ((height - aligned_h) // 2, (width - aligned_w) // 2) if crop_mode == "center" else (0, 0)
+        y_idx, y_len, y_overlap = model.split_tiles(aligned_h, False)
+        x_idx, x_len, x_overlap = model.split_tiles(aligned_w, False)
+        if len(set(y_len)) != 1 or len(set(x_len)) != 1:
+            logger.info_once("MiniMax H3 video tile streaming skipped: expected nonempty uniform spatial tiles.")
+            return None
+        tile_count = len(y_idx) * len(x_idx)
+        parallel = bool(getattr(model, "parallel_tiling", False))
+        state = self._native_parallel_state() if parallel else {}
+        rank, world = int(state.get("sp_rank", 0)), int(state.get("sp_size", 1))
+        if tile_count < world:
+            logger.info_once("MiniMax H3 video tile streaming skipped: fewer spatial tiles than participating ranks.")
+            return None
+        group = state["sp_process_group"] if world > 1 else None
+        failed = torch.zeros(1, dtype=torch.int32, device=device) if world > 1 else None
+        local_error: str | None = None
+
+        @contextmanager
+        def local_work() -> Iterator[None]:
+            nonlocal local_error
+            try:
+                yield
+            except Exception as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+
+        def should_fall_back() -> bool:
+            # Make the same fallback decision on every rank before entering
+            # another collective. Communication errors propagate to the caller.
+            if failed is not None:
+                if local_error is not None:
+                    failed.fill_(1)
+                dist.all_reduce(failed, group=group)
+                if not failed.item():
+                    return False
+            elif local_error is None:
+                return False
+            reason = local_error if local_error is not None else "local work failed on another VAE rank"
+            logger.warning_once("MiniMax H3 video tile streaming failed; using ordinary preparation: %s", reason)
+            return True
+
+        with local_work():
+            mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+            std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        total = used + (-used) % clip_length
+        last_real = min(used, len(frames)) - 1
+        clips: list[torch.Tensor] = []
+        ratio = int(model.vae_ratio)
+        for start in range(0, total, clip_length):
+            tasks = []
+            if local_error is None:
+                with local_work():
+                    indices = np.minimum(np.arange(start, start + clip_length), last_real)
+                    for index in range(rank, tile_count, world):
+                        row, col = divmod(index, len(x_idx))
+                        y, x = top + y_idx[row], left + x_idx[col]
+                        host = np.ascontiguousarray(frames[indices, y : y + y_len[row], x : x + x_len[col]])
+                        tile = torch.from_numpy(host).to(device=device)
+                        tile = tile.permute(3, 0, 1, 2).float().div_(255.0).sub_(mean_t).div_(std_t)
+                        tasks.append(model.encode(tile.unsqueeze(0).contiguous()))
+            if should_fall_back():
+                return None
+            if world > 1:
+                encoded = model._all_gather_tiled_results(tasks, tile_count)
+            else:
+                encoded = tasks
+            with local_work():
+                rows = []
+                for row in range(len(y_idx)):
+                    columns = []
+                    for col in range(len(x_idx)):
+                        index = row * len(x_idx) + col
+                        value = encoded[index]
+                        if row > 0:
+                            value = model.blend(encoded[index - len(x_idx)], value, y_overlap[row - 1] // ratio, dim=-2)
+                        if col > 0:
+                            value = model.blend(encoded[index - 1], value, x_overlap[col - 1] // ratio, dim=-1)
+                        if row < len(y_idx) - 1:
+                            value = value[..., : -(y_overlap[row] // ratio), :]
+                        if col < len(x_idx) - 1:
+                            value = value[..., :, : -(x_overlap[col] // ratio)]
+                        columns.append(value)
+                    rows.append(torch.cat(columns, dim=-1))
+                clips.append(torch.cat(rows, dim=-2))
+        latent = None
+        if local_error is None:
+            with local_work():
+                moments = torch.cat(clips, dim=2)
+                if model.token_drop > 0:
+                    moments = moments[:, :, : -int(model.token_drop)]
+                latent = sample(moments).sample().squeeze(0).contiguous().half()
+        return None if should_fall_back() else latent
+
     @torch.inference_mode()
     def encode_video(
         self,
@@ -1152,18 +1300,29 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                latent = None
                 prepared = None
-                if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
-                    prepared = self._stream_prepare_video_tensor(frames, parameter.device)
-                if prepared is not None:
-                    # Tensor inputs already carry the checkpoint's expected
-                    # (3, T, H, W) normalized-FP32 contract, so encode_videos
-                    # skips its own convert/transform/pad whole-video copies.
-                    frames = [prepared]
-                latent = self.model.encode_videos(
-                    frames,
-                    use_fp16_latent=True,
-                )[0]
+                legacy_prep = _env_flag_enabled(_VAE_ENCODE_LEGACY_PREP_ENV)
+                stream_tile = _env_flag_enabled(_VAE_STREAM_TILE_ENV)
+                if isinstance(frames, np.ndarray) and not legacy_prep:
+                    if stream_tile:
+                        # Restore the seeded state if a streamed posterior was
+                        # sampled on some ranks before the group chose fallback.
+                        with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+                            latent = self._stream_encode_video_tiles(frames, parameter.device)
+                    if latent is None:
+                        prepared = self._stream_prepare_video_tensor(frames, parameter.device)
+                elif stream_tile:
+                    reason = "legacy preparation is enabled" if legacy_prep else "expected a NumPy frame array"
+                    logger.info_once("MiniMax H3 video tile streaming skipped: %s.", reason)
+                if latent is None:
+                    if prepared is not None:
+                        # Preserve the normalized-FP32 checkpoint input contract.
+                        frames = [prepared]
+                    latent = self.model.encode_videos(
+                        frames,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
