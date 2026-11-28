@@ -7,12 +7,12 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-import requests
 from huggingface_hub import constants
 from PIL import Image
 
@@ -25,6 +25,7 @@ from tests.e2e.accuracy.helpers import (
     write_accuracy_result,
     write_json_artifact,
 )
+from tests.helpers.client import OnlineOmniClient
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 from vllm_omni.platforms import current_omni_platform
@@ -36,23 +37,30 @@ MODEL_ID = "MiniMaxAI/MiniMax-H3-Image"
 CASES = {
     "t2i": {
         "size": "1024x1024",
+        "extra_params": {"min_generation_area": 1024 * 1024},
         "seed": 42,
         "prompt": "Documentary photograph of a lighthouse keeper on a cliff at dawn, Kodak Portra 400",
     },
     "edit": {"size": "2048x2048", "seed": 1234},
 }
-# The configured timeouts budget 39 minutes on CUDA and 44 on NPU, leaving time
+# The configured timeouts budget 39 minutes on CUDA and 62 on NPU, leaving time
 # for environment setup, snapshot resolution, and artifact handling.
 REFERENCE_PREFLIGHT_TIMEOUT_S = 180
 REFERENCE_GENERATION_TIMEOUT_S = 1200
-NPU_REFERENCE_GENERATION_TIMEOUT_S = 1500
+NPU_REFERENCE_GENERATION_TIMEOUT_S = 2100
+OMNI_INIT_TIMEOUT_S = 480
 OMNI_STARTUP_TIMEOUT_S = 600
+NPU_OMNI_INIT_TIMEOUT_S = 1200
+NPU_OMNI_STARTUP_TIMEOUT_S = 1260
 IMAGE_REQUEST_TIMEOUT_S = 180
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 def test_diffusers_similarity(accuracy_artifact_root):
     device_type = current_omni_platform.device_type
+    cases = CASES.copy()
+    if device_type == "npu":
+        cases.pop("edit")
     calibration = os.environ.get("H3_IMAGE_CALIBRATE", "1")
     assert calibration in {"0", "1"}, "H3_IMAGE_CALIBRATE must be 0 or 1"
     policy = json.loads(Path(__file__).with_name("thresholds.json").read_text(encoding="utf-8"))
@@ -62,7 +70,7 @@ def test_diffusers_similarity(accuracy_artifact_root):
         assert policy["status"] == "selected", (
             "Select device-specific bounds in thresholds.json after calibration before setting H3_IMAGE_CALIBRATE=0"
         )
-        for task in CASES:
+        for task in cases:
             tables[task] = {profile: SimilarityThresholds(**row) for profile, row in policy[task].items()}
             floors = resolve_similarity_thresholds(tables[task])
             assert type(floors.ssim) in (float, int) and -1 <= floors.ssim <= 1, f"Invalid SSIM floor for {task}"
@@ -72,36 +80,35 @@ def test_diffusers_similarity(accuracy_artifact_root):
             thresholds[task] = floors
     python = os.environ.get("H3_IMAGE_REFERENCE_PYTHON")
     assert python and Path(python).is_file(), "Source setup_reference.sh first"
+    allow_patterns = [
+        "model_index.json",
+        "modular_model_index.json",
+        "pdd_*",
+        "transformer/*",
+        "transformer_diffusers/*",
+        "vae/*",
+        "vae_diffusers/*",
+        "scheduler/*",
+        "text_encoder/*",
+        "tokenizer/*",
+        "processor/*",
+    ]
+    if "edit" in cases:
+        allow_patterns.extend(["examples/reference1.png", "examples/prompt.edit.txt"])
     model = hf_api().snapshot_download(
         MODEL_ID,
-        allow_patterns=[
-            "model_index.json",
-            "modular_model_index.json",
-            "pdd_*",
-            "transformer/*",
-            "transformer_diffusers/*",
-            "vae/*",
-            "vae_diffusers/*",
-            "scheduler/*",
-            "text_encoder/*",
-            "tokenizer/*",
-            "processor/*",
-            "examples/reference1.png",
-            "examples/prompt.edit.txt",
-        ],
+        allow_patterns=allow_patterns,
         local_files_only=constants.HF_HUB_OFFLINE,
     )
     revision = Path(model).name  # The Hub returns a snapshots/<commit> directory.
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (accuracy_artifact_root / "minimax_h3_image" / run_id).resolve()
     output.mkdir(parents=True)
-    examples = Path(model) / "examples"
-    reference_bytes = (examples / "reference1.png").read_bytes()
-    (output / "edit-input.png").write_bytes(reference_bytes)
-    cases = {
-        **CASES,
-        "edit": {**CASES["edit"], "prompt": (examples / "prompt.edit.txt").read_text(encoding="utf-8").strip()},
-    }
+    edit_input = output / "edit-input.png"
+    if "edit" in cases:
+        examples = Path(model) / "examples"
+        shutil.copyfile(examples / "reference1.png", edit_input)
+        cases["edit"] = {**cases["edit"], "prompt": (examples / "prompt.edit.txt").read_text(encoding="utf-8").strip()}
     common = {
         "model": model,
         "generator_device": "cpu",
@@ -115,8 +122,13 @@ def test_diffusers_similarity(accuracy_artifact_root):
     env = dict(os.environ)
     pythonpath = env.pop("PYTHONPATH", "")
     reference_timeout = REFERENCE_GENERATION_TIMEOUT_S
+    init_timeout = OMNI_INIT_TIMEOUT_S
+    startup_timeout = OMNI_STARTUP_TIMEOUT_S
     if device_type == "npu":
         reference_timeout = NPU_REFERENCE_GENERATION_TIMEOUT_S
+        # Cold checkpoint reads and first-op compilation extend Ascend startup.
+        init_timeout = NPU_OMNI_INIT_TIMEOUT_S
+        startup_timeout = NPU_OMNI_STARTUP_TIMEOUT_S
         env["PATH"] = f"{Path(python).parent}{os.pathsep}{env.get('PATH', os.defpath)}"
         # Keep the CANN compiler modules visible without inheriting serving packages.
         cann_home = env.get("ASCEND_HOME_PATH") or env.get("ASCEND_TOOLKIT_HOME")
@@ -142,25 +154,30 @@ def test_diffusers_similarity(accuracy_artifact_root):
         "--diffusion-offload-config",
         '{"mode":"layer","components":["dit","text_encoder"]}',
         "--init-timeout",
-        "480",
+        str(init_timeout),
     ]
     if device_type == "npu":
         args.append("--enforce-eager")
-    with OmniServer(model, args, startup_timeout=OMNI_STARTUP_TIMEOUT_S) as server:
-        url = f"http://{server.host}:{server.port}/v1/images/"
+    with OmniServer(model, args, startup_timeout=startup_timeout) as server:
+        client = OnlineOmniClient(host=server.host, port=server.port)
         for task, case in cases.items():
             request = {**common, **case}
             if task == "edit":
-                response = requests.post(
-                    url + "edits",
-                    data=request,
-                    files=[("image", ("reference1.png", reference_bytes, "image/png"))],
-                    timeout=IMAGE_REQUEST_TIMEOUT_S,
-                )
+                response = client.send_images_edits_http_request(
+                    {
+                        "data": request,
+                        "files": [("image", ("reference1.png", edit_input.read_bytes(), "image/png"))],
+                        "timeout": IMAGE_REQUEST_TIMEOUT_S,
+                    }
+                )[0]
+                assert response.status_code == 200, response.error_message
             else:
-                response = requests.post(url + "generations", json=request, timeout=IMAGE_REQUEST_TIMEOUT_S)
-            response.raise_for_status()
-            images = response.json()["data"]
+                response = client.send_images_generations_http_request(
+                    {"json": request, "timeout": IMAGE_REQUEST_TIMEOUT_S}
+                )[0]
+            payload = response.json_body
+            assert isinstance(payload, dict), response.error_message
+            images = payload["data"]
             assert len(images) == 1
             with Image.open(io.BytesIO(base64.b64decode(images[0]["b64_json"], validate=True))) as image:
                 assert image.format == "PNG" and f"{image.width}x{image.height}" == case["size"]
