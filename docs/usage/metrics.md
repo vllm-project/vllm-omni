@@ -191,6 +191,7 @@ defaults report what the pipeline resolved where the pipeline reports it
 | `fps`, `seed` | Output rate; resolved seed, including a server-assigned random seed. |
 | `num_inference_steps` | Requested denoising steps (`null` when the model default applied). |
 | `completed_steps` | Denoising steps the pipeline completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
+| `cached_steps` | Of the completed steps, those a step cache (Cache-DiT) served from its cache instead of running the transformer; the transformer ran `completed_steps - cached_steps` times. `null` without such a step cache. |
 | `flow_shift` | Shift the pipeline reported, else the request's or server's value; `null` when unknown. |
 | `guidance_scale` | Value set by the request; `null` when the request left it to the model default or the pipeline runs without CFG (`cfg: false`). |
 | `num_outputs_per_prompt` | Outputs generated for the request. |

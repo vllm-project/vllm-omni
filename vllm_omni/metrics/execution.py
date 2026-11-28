@@ -192,6 +192,7 @@ def diffusion_facts(
         "seed": sp.seed,
         "num_inference_steps": sp.num_inference_steps,
         "completed_steps": output.num_completed_steps,
+        "cached_steps": getattr(output, "num_cached_steps", None),
         "guidance_scale": (
             sp.guidance_scale if sp.guidance_scale_provided and reported.get("cfg") is not False else None
         ),

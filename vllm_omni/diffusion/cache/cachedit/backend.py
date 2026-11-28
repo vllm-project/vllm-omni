@@ -120,6 +120,29 @@ def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) ->
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
+def cached_step_count(pipeline: SupportsComponentDiscovery) -> int | None:
+    """Steps the last forward served from the Cache-DiT cache, summed over cached transformers.
+
+    ``None`` when no transformer is cached or the installed Cache-DiT does not
+    report per-step stats. The cache context resets per request, so this
+    counts the request that just ran.
+    """
+    targets = getattr(pipeline, "_cache_dit_targets", None)
+    if targets is None:
+        targets = tuple(attrgetter(name)(pipeline) for name in _dit_module_names(pipeline))
+    total = None
+    for target in targets:
+        if not BlockAdapter.is_cached(target):
+            continue
+        try:
+            stats = cache_dit.summary(target, details=False, logging=False)
+        except Exception:
+            logger.debug("Cache-DiT summary unavailable for the execution summary", exc_info=True)
+            return None
+        total = (total or 0) + max((len(getattr(s, "cached_steps", None) or ()) for s in stats), default=0)
+    return total
+
+
 def set_separate_cfg(transformer: nn.Module, do_true_cfg: bool) -> None:
     """Tell Cache-DiT whether the next request runs CFG.
 

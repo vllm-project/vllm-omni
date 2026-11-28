@@ -40,7 +40,7 @@ from vllm_omni.diffusion.attention.schedule import (
     resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
 )
-from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
+from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary, cached_step_count
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
@@ -1074,8 +1074,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if denoise_progress is not None:
                     # One forward runs one denoising schedule for every request in the batch.
                     completed = denoise_progress.result()
+                    cached = self._cached_step_count(od_config)
                     for output in outputs:
                         output.num_completed_steps = completed
+                        output.num_cached_steps = cached
                         output.execution_runtime = getattr(self, "_execution_runtime", None)
                 with record_function("prepare_output_for_transport"):
                     outputs = [
@@ -1107,6 +1109,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
     def _execution_summary_enabled(self) -> bool:
         return getattr(self.od_config, "enable_execution_summary", False) is True
+
+    def _cached_step_count(self, od_config: OmniDiffusionConfig) -> int | None:
+        """Steps Cache-DiT served from its cache in the forward that just ran (execution summary)."""
+        if od_config.cache_backend != "cache_dit":
+            return None
+        runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
+        if not (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline)):
+            return None
+        return cached_step_count(self.pipeline)
 
     def _attach_stepwise_metadata(
         self,

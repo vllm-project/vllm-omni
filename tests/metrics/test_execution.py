@@ -298,3 +298,25 @@ def test_diffusion_facts_read_frames_from_encoded_video_without_counts(monkeypat
     facts = execution.diffusion_facts(_request(), DiffusionOutput(), formatted)
 
     assert (facts["num_frames"], facts["frames_source"]) == (209, "container")
+
+
+def test_cached_step_count_sums_cached_transformers(monkeypatch):
+    from vllm_omni.diffusion.cache.cachedit import backend
+
+    cached, plain = torch.nn.Linear(1, 1), torch.nn.Linear(1, 1)
+    pipeline = SimpleNamespace(_cache_dit_targets=(cached, plain))
+    monkeypatch.setattr(backend.BlockAdapter, "is_cached", staticmethod(lambda module: module is cached))
+    monkeypatch.setattr(
+        backend.cache_dit, "summary", lambda module, **kwargs: [SimpleNamespace(cached_steps=[3, 5, 6, 9])]
+    )
+
+    assert backend.cached_step_count(pipeline) == 4
+    assert backend.cached_step_count(SimpleNamespace(_cache_dit_targets=(plain,))) is None
+
+
+def test_diffusion_facts_report_cached_steps():
+    output = DiffusionOutput(num_completed_steps=49, num_cached_steps=20)
+
+    facts = execution.diffusion_facts(_request(), output)
+
+    assert (facts["completed_steps"], facts["cached_steps"]) == (49, 20)

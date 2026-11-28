@@ -2198,6 +2198,9 @@ class DiffusionOutput:
     # iterations). None when the pipeline did not report progress (no shared
     # progress bar) or counting was disabled.
     num_completed_steps: int | None = None
+    # Of those, steps a step cache (Cache-DiT) served from its cache instead of
+    # computing the transformer; None without a step cache reporting them.
+    num_cached_steps: int | None = None
     # Values the pipeline resolved itself (e.g. ``width``, ``height``,
     # ``flow_shift`` when the request left them to the model defaults), and the
     # worker's runtime facts (resolved attention backends, device), reported by
