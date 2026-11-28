@@ -58,7 +58,8 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
+from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears, vae_scale_factor_from_vae
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -302,7 +303,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             prefix="transformer",
         )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(getattr(self, "vae", None))
         self.default_sample_size = 128
 
         self.SYSTEM_PROMPT_4_T2I = SYSTEM_PROMPT_4_T2I_UNIFIED
@@ -632,14 +633,13 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
     def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
         """Sample initial noise latents (upstream ``prepare_latents``)."""
-        height = int(height) // self.vae_scale_factor
-        width = int(width) // self.vae_scale_factor
-        shape = (batch_size, num_channels_latents, height, width)
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device)
-        return latents
+        shape = (
+            batch_size,
+            num_channels_latents,
+            int(height) // self.vae_scale_factor,
+            int(width) // self.vae_scale_factor,
+        )
+        return _prepare_latents(shape, dtype=dtype, device=device, generator=generator, latents=latents)
 
     def _resolve_output_size(self, height, width):
         """t2i branch of upstream ``_resolve_output_and_original_size``.

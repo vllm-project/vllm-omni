@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
-import json
 import logging
 import os
 import warnings
@@ -24,7 +23,6 @@ from diffusers.image_processor import (
 from diffusers.models.autoencoders import AutoencoderKL
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
-from diffusers.utils.torch_utils import randn_tensor
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -38,6 +36,8 @@ from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import _load_json, load_vae_scale_factor
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -247,10 +247,13 @@ def get_omnigen2_pre_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+    vae_config = _load_json(model_path, "vae/config.json")
+    vae_scale_factor = load_vae_scale_factor(
+        model_path,
+        vae_config=vae_config,
+        config_key="temporal_downsample",
+        exponent_offset=0,
+    )
 
     image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
     latent_channels = vae_config.get("z_dim", 16)
@@ -308,10 +311,7 @@ def get_omnigen2_post_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
 
@@ -725,32 +725,13 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         generator: torch.Generator | None,
         latents: torch.FloatTensor | None = None,
     ) -> torch.FloatTensor:
-        """
-        Prepare the initial latents for the diffusion process.
-
-        Args:
-            batch_size: The number of images to generate.
-            num_channels_latents: The number of channels in the latent space.
-            height: The height of the generated image.
-            width: The width of the generated image.
-            dtype: The data type of the latents.
-            device: The device to place the latents on.
-            generator: The random number generator to use.
-            latents: Optional pre-computed latents to use instead of random initialization.
-
-        Returns:
-            torch.FloatTensor: The prepared latents tensor.
-        """
-        height = int(height) // self.vae_scale_factor
-        width = int(width) // self.vae_scale_factor
-
-        shape = (batch_size, num_channels_latents, height, width)
-
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device)
-        return latents
+        shape = (
+            batch_size,
+            num_channels_latents,
+            int(height) // self.vae_scale_factor,
+            int(width) // self.vae_scale_factor,
+        )
+        return _prepare_latents(shape, dtype=dtype, device=device, generator=generator, latents=latents)
 
     def encode_vae(self, img: torch.FloatTensor) -> torch.FloatTensor:
         """

@@ -12,7 +12,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import (
@@ -43,6 +42,8 @@ from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import 
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -225,7 +226,7 @@ class HunyuanVideo15I2VPipeline(
         self.vae_scale_factor_spatial = (
             self.vae.spatial_compression_ratio if hasattr(self.vae, "spatial_compression_ratio") else 16
         )
-        self.num_channels_latents = self.vae.config.latent_channels if hasattr(self.vae, "config") else 32
+        self.num_channels_latents = latent_channels_from_vae(self.vae, default=32)
 
         # fmt: off
         # NOTE: whitespace must match the diffusers reference exactly because
@@ -454,21 +455,14 @@ class HunyuanVideo15I2VPipeline(
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if latents is not None:
-            return latents.to(device=device, dtype=dtype)
-
-        num_channels = self.num_channels_latents
         shape = (
             batch_size,
-            num_channels,
+            self.num_channels_latents,
             (num_frames - 1) // self.vae_scale_factor_temporal + 1,
             int(height) // self.vae_scale_factor_spatial,
             int(width) // self.vae_scale_factor_spatial,
         )
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return latents
+        return _prepare_latents(shape, dtype=dtype, device=device, generator=generator, latents=latents)
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
         return self.transformer(**kwargs)[0]
