@@ -564,6 +564,78 @@ steps:
           (exit "$$status")
 
 
+    - label: "ROCm · Tiny Diffusion Offline Base Expansion"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      # Already ROCm-marked base cases omitted from the existing 22-node job.
+      # Keep this separate and serial; LTX2 remains outside qualified coverage.
+      env:
+        DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+      # Two bounded collections and a 60-minute run leave room for cleanup.
+      timeout_in_minutes: 90
+      artifact_paths:
+        - "artifacts/rocm-tiny-diffusion-offline-ready/**/*"
+      commands:
+        - |
+          set -euo pipefail
+          artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-tiny-diffusion-offline-ready"
+          mkdir -p "$$artifact_dir"
+          nodes=(
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[WanPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImageEditPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[FluxPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[FluxKontextPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Krea2Pipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusionXLPipeline]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > "$$artifact_dir/expected-nodes.txt"
+          timeout --signal=TERM --kill-after=1m 10m \
+            pytest -q "$${nodes[@]}" \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level core_model --shard-id 0 --num-shards 1 --collect-only \
+            | tee "$$artifact_dir/collection-exact.txt"
+          sed -n 's/^\(tests\/.*::.*\)/\1/p' "$$artifact_dir/collection-exact.txt" \
+            | sort > "$$artifact_dir/collected-nodes.txt"
+          diff -u "$$artifact_dir/expected-nodes.txt" "$$artifact_dir/collected-nodes.txt"
+          # Memory snapshots support capacity review; these are not peak measurements.
+          cat /proc/meminfo > "$$artifact_dir/host-memory-before.txt"
+          rocm-smi --showmeminfo vram > "$$artifact_dir/gpu-memory-before.txt" 2>&1 || true
+          trap 'cat /proc/meminfo > "$$artifact_dir/host-memory-after.txt"; rocm-smi --showmeminfo vram > "$$artifact_dir/gpu-memory-after.txt" 2>&1 || true' EXIT
+          TIMEFORMAT='real_seconds %3R user_seconds %3U system_seconds %3S'
+          { time env ROCM_DIFFUSION_RUN_LEVEL=core_model \
+              bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              1 9 60m rocm-tiny-diffusion-offline-ready "$${nodes[@]}" \
+              -m "core_model and diffusion and rocm and MI325 and cards_1" 2>&3;
+          } 3>&2 2> "$$artifact_dir/runtime.txt"
+          # Compare parent ids: pytest 9 includes successful subtests in suite totals.
+          python -c 'import sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          from pathlib import Path
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          expected = Counter()
+          for node in Path(sys.argv[2]).read_text().splitlines():
+              module, name = node.split("::", 1)
+              expected[(module.removesuffix(".py").replace("/", "."), name)] += 1
+          actual = Counter((case.get("classname"), case.get("name")) for case in root.iter("testcase"))
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          bad_results = any(int(suite.get(key, "0")) != 0
+                            for suite in suites for key in ("skipped", "failures", "errors"))
+          bad_results = bad_results or any(list(root.iter(tag)) for tag in ("skipped", "failure", "error"))
+          if actual != expected or bad_results:
+              print("Expected every pinned tiny-diffusion READY node to execute without skips or failures; "
+                    f"missing={expected - actual}, unexpected={actual - expected}, bad_results={bad_results}",
+                    file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$artifact_dir/pytest.xml" "$$artifact_dir/expected-nodes.txt"
+
+
     - label: "ROCm · Tiny Diffusion Base GPU Test"
       agent_pool: mi300_1
       depends_on: amd-build
