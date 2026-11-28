@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import hashlib
 import math
 import time
 from collections import OrderedDict
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Protocol, get_args
 
+import msgspec
 import torch
 import torch.nn as nn
 from vllm.config.lora import LoRAConfig, MaxLoRARanks
@@ -40,6 +42,15 @@ from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
 
 logger = init_logger(__name__)
+RUNTIME_LORA_FINGERPRINT_SIZE = hashlib.sha256().digest_size
+
+
+class _RuntimeAdapterSnapshot(msgspec.Struct, frozen=True):
+    adapter_id: int
+    rank: int
+    fingerprint: bytes
+    factors: bytes
+    format: str = "runtime-lora-v1"
 
 
 def repack_lora_weights(
@@ -1010,7 +1021,7 @@ class LoRAManager:
                 ):
                     raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
 
-    def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
+    def _replace_layers_with_lora(self, peft_helper: PEFTHelper, *, snapshot: LoRAModel | None = None) -> None:
         """Wrap the layers ``peft_helper`` targets, growing the buffers to its rank first.
 
         All or nothing: when a wrapper cannot be built (its buffers are
@@ -1022,9 +1033,28 @@ class LoRAManager:
         self._validate_adapter_targets(peft_helper)
         previous_rank = self._max_lora_rank
         installed: list[tuple[str, nn.Module, str]] = []
+        # Reject unbound snapshots before touching live wrappers or buffers.
+        if snapshot is not None:
+            max_rank = max(previous_rank, self._get_smallest_valid_max_rank(peft_helper.r))
+            staged = list(self._build_lora_layers(peft_helper, self._buffer_lora_config(max_rank)))
+            self._validate_snapshot_targets(
+                snapshot,
+                self._lora_modules | {name: layer for _, _, name, layer in staged},
+            )
         try:
             self._ensure_max_lora_rank(peft_helper.r)
-            self._install_lora_layers(peft_helper, installed)
+            layers = (
+                staged if snapshot is not None else self._build_lora_layers(peft_helper, self._buffer_lora_config())
+            )
+            for component, module_name, full_module_name, layer in layers:
+                set_buffer_device = getattr(layer, "_set_diffusion_lora_buffer_device", None)
+                if callable(set_buffer_device):
+                    set_buffer_device(self._resident_lora_device)
+                if self.lora_application == "runtime":
+                    replace_submodule(component, module_name, layer)
+                self._lora_modules[full_module_name] = layer
+                installed.append((full_module_name, component, module_name))
+                logger.debug("Replaced layer: %s -> %s", full_module_name, type(layer).__name__)
         except Exception:
             for full_module_name, component, module_name in reversed(installed):
                 lora_layer = self._lora_modules.pop(full_module_name)
@@ -1036,15 +1066,14 @@ class LoRAManager:
                 invalidate_denoise_graphs("LoRA layer installation failed")
             raise
 
-    def _install_lora_layers(self, peft_helper: PEFTHelper, installed: list[tuple[str, nn.Module, str]]) -> None:
-        """Wrap every target layer not wrapped yet, recording each new wrapper in ``installed``."""
+    def _build_lora_layers(
+        self, peft_helper: PEFTHelper, lora_config: LoRAConfig
+    ) -> Iterator[tuple[nn.Module, str, str, BaseLayerWithLoRA]]:
+        """Build wrappers for target modules that do not already have one."""
         _matches_target, is_filtered = build_target_module_matcher(
             getattr(peft_helper, "target_modules", None),
             allow_none=self.lora_application != "merged",
         )
-
-        # dummy lora config
-        lora_config = self._buffer_lora_config()
 
         for component_name, component in self._iter_lora_components():
             # Collect replacements first to avoid mutating the module tree
@@ -1129,16 +1158,7 @@ class LoRAManager:
                 )
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
-                    # Layers without the re-homing hook keep the legacy
-                    # placement (buffers follow the base weight device).
-                    set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
-                    if callable(set_buffer_device):
-                        set_buffer_device(self._resident_lora_device)
-                    if self.lora_application == "runtime":
-                        replace_submodule(component, module_name, lora_layer)
-                    self._lora_modules[full_module_name] = lora_layer
-                    installed.append((full_module_name, component, module_name))
-                    logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
+                    yield component, module_name, full_module_name, lora_layer
 
     def _ensure_moe_lora_context(self) -> None:
         """Wrap MoE runners and publish mapping before the first forward.
@@ -1210,10 +1230,10 @@ class LoRAManager:
             config.max_lora_rank = max_lora_rank
         return config
 
-    def _buffer_lora_config(self) -> LoRAConfig:
-        """The config per-layer LoRA buffers are allocated from: one slot at the current maximum rank."""
+    def _buffer_lora_config(self, max_rank: int | None = None) -> LoRAConfig:
+        """The config per-layer LoRA buffers are allocated from."""
         return self._lora_config(
-            self._max_lora_rank,
+            self._max_lora_rank if max_rank is None else max_rank,
             max_loras=1,
             max_cpu_loras=self.max_cached_adapters,
             lora_dtype=self.dtype,
@@ -1901,7 +1921,21 @@ class LoRAManager:
         logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
 
         lora_model, peft_helper = self._load_adapter(lora_request)
-        self._validate_adapter_targets(peft_helper)
+        self._register_runtime_adapter(lora_model, peft_helper)
+        return True
+
+    def _register_runtime_adapter(
+        self,
+        lora_model: LoRAModel,
+        peft_helper: PEFTHelper,
+        *,
+        validate_snapshot_targets: bool = False,
+    ) -> None:
+        adapter_id = lora_model.id
+        if validate_snapshot_targets:
+            self._replace_layers_with_lora(peft_helper, snapshot=lora_model)
+        else:
+            self._validate_adapter_targets(peft_helper)
 
         # Evict only after validation so a rejected adapter cannot displace a
         # working cached adapter.
@@ -1911,7 +1945,8 @@ class LoRAManager:
         self._registered_adapters[adapter_id] = lora_model
 
         try:
-            self._replace_layers_with_lora(peft_helper)
+            if not validate_snapshot_targets:
+                self._replace_layers_with_lora(peft_helper)
         except Exception:
             # An adapter the buffers cannot hold must not stay cached: a retry
             # would skip loading and fail while binding instead.
@@ -1920,9 +1955,39 @@ class LoRAManager:
             raise
 
         logger.debug(
-            "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
+            "Adapter %d added, cache size: %d/%d",
+            adapter_id,
+            len(self._registered_adapters),
+            self.max_cached_adapters,
         )
-        return True
+
+    def _validate_snapshot_targets(self, lora_model: LoRAModel, layers: dict[str, BaseLayerWithLoRA]) -> None:
+        from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+
+        unbound = set(lora_model.loras)
+        for name, layer in layers.items():
+            if isinstance(layer, FusedMoEWithLoRA):
+                targets = _moe_lora_target_names(name, layer.base_layer)
+            elif (weights := self._get_lora_weights(lora_model, name)) is not None:
+                unbound.discard(weights.module_name)
+                continue
+            else:
+                prefix, _, suffix = name.rpartition(".")
+                slices = getattr(layer, "n_slices", 1)
+                targets = (
+                    [
+                        f"{prefix}.{sub}" if prefix else sub
+                        for sub in self._get_packed_sublayer_suffixes(suffix, slices) or ()
+                    ]
+                    if slices > 1
+                    else ()
+                )
+            for target in targets:
+                weights = self._get_lora_weights(lora_model, target)
+                if weights is not None:
+                    unbound.discard(weights.module_name)
+        if not lora_model.loras or unbound:
+            raise ValueError(f"Runtime adapter snapshot has unbound modules: {sorted(unbound)}")
 
     def remove_adapter(self, adapter_id: int) -> bool:
         """
@@ -1988,6 +2053,102 @@ class LoRAManager:
         self._adapter_access_order[adapter_id] = time.time()
         self._adapter_access_order.move_to_end(adapter_id)
         logger.info("Pinned adapter id=%d (won't be evicted)", adapter_id)
+        return True
+
+    def installed_runtime_adapter(self, adapter_id: int | None) -> LoRAModel | None:
+        """Resolve the current adapter without loading or activating one."""
+        if self.lora_application != "runtime" or self._fixed_adapter or adapter_id in self._merged_adapters:
+            raise ValueError("Step snapshots support ordinary runtime LoRA only")
+        if adapter_id is None:
+            return None
+        model = self._registered_adapters.get(adapter_id)
+        if model is None:
+            raise ValueError(f"Step snapshot requires installed LoRA adapter {adapter_id}")
+        return model
+
+    def runtime_adapter_fingerprint(self, adapter_id: int | None) -> bytes:
+        """Fingerprint the installed runtime factors, independently of their reusable adapter ID."""
+        model = self.installed_runtime_adapter(adapter_id)
+        if model is None:
+            return bytes(RUNTIME_LORA_FINGERPRINT_SIZE)
+        return self._fingerprint_runtime_adapter(model)
+
+    @staticmethod
+    def _fingerprint_runtime_adapter(model: LoRAModel) -> bytes:
+        if not model.loras or model.modules_to_save:
+            raise ValueError("Step snapshots require an A/B-only runtime LoRA adapter")
+
+        digest = hashlib.sha256(b"vllm-omni-runtime-lora-v1")
+        for name, weights in sorted(model.loras.items()):
+            digest.update(msgspec.msgpack.encode((name, weights.rank, weights.scaling, weights.is_packed)))
+            for factors in (weights.lora_a, weights.lora_b):
+                tensors = factors if weights.is_packed else (factors,)
+                digest.update(msgspec.msgpack.encode(len(tensors)))
+                for tensor in tensors:
+                    if tensor is None:
+                        digest.update(msgspec.msgpack.encode(None))
+                        continue
+                    digest.update(msgspec.msgpack.encode((str(tensor.dtype), tuple(tensor.shape))))
+                    digest.update(tensor.detach().cpu().contiguous().view(torch.uint8).numpy())
+        return digest.digest()
+
+    def export_runtime_adapter(self, adapter_id: int, *, max_bytes: int) -> bytes:
+        """Serialize the installed A/B factors with their existing dtype and scaling."""
+        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniMsgpackEncoder
+
+        model = self.installed_runtime_adapter(adapter_id)
+        if model is None or not model.loras or model.modules_to_save:
+            raise ValueError("Adapter persistence requires an installed A/B-only runtime LoRA")
+        factors = {}
+        remaining = max_bytes
+        for name, weights in model.loras.items():
+            a, b = weights.lora_a, weights.lora_b
+            if weights.is_packed or a is None or b is None:
+                raise ValueError("Adapter persistence requires unpacked A/B factors")
+            remaining -= a.nbytes + b.nbytes
+            if remaining < 0:
+                raise ValueError("Runtime adapter snapshot exceeds its byte budget")
+            factors[name] = (weights.rank, weights.lora_alpha, weights.scaling, a, b)
+        envelope = _RuntimeAdapterSnapshot(
+            adapter_id, model.rank, self._fingerprint_runtime_adapter(model), OmniMsgpackEncoder().encode(factors)
+        )
+        payload = msgspec.msgpack.encode(envelope)
+        if len(payload) > max_bytes:
+            raise ValueError("Runtime adapter snapshot exceeds its byte budget")
+        return payload
+
+    def restore_runtime_adapter(self, payload: bytes, *, max_bytes: int) -> bool:
+        """Register previously served factors without applying PEFT scaling again."""
+        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniMsgpackDecoder
+
+        self.installed_runtime_adapter(None)
+        if not 0 < len(payload) <= max_bytes:
+            raise ValueError("Runtime adapter snapshot exceeds its byte budget")
+        snapshot = msgspec.msgpack.decode(payload, type=_RuntimeAdapterSnapshot)
+        if snapshot.format != "runtime-lora-v1" or snapshot.adapter_id <= 0 or snapshot.rank <= 0:
+            raise ValueError("Invalid runtime adapter snapshot metadata")
+        # Reject unsupported ranks before registration can evict a loaded adapter.
+        self._get_smallest_valid_max_rank(snapshot.rank)
+        if snapshot.adapter_id in self._registered_adapters:
+            if self.runtime_adapter_fingerprint(snapshot.adapter_id) == snapshot.fingerprint:
+                return True
+            raise ValueError(f"A different runtime adapter is already installed under ID {snapshot.adapter_id}")
+
+        loras = {}
+        for name, (rank, alpha, scale, a, b) in OmniMsgpackDecoder().decode(snapshot.factors).items():
+            if a.dtype != self.dtype or b.dtype != self.dtype or a.ndim != 2 or b.ndim != 2:
+                raise ValueError(f"Runtime adapter factors for {name!r} do not match the engine dtype or layout")
+            if rank <= 0 or a.shape[0] != rank or b.shape[1] != rank or not math.isfinite(scale):
+                raise ValueError(f"Invalid runtime adapter rank or scaling for {name!r}")
+            loras[name] = LoRALayerWeights(name, rank, alpha, a, b, scaling=scale)
+        model = LoRAModel(snapshot.adapter_id, snapshot.rank, loras)
+        if self._fingerprint_runtime_adapter(model) != snapshot.fingerprint:
+            raise ValueError("Runtime adapter snapshot fingerprint does not match its factors")
+        self._register_runtime_adapter(
+            model,
+            PEFTHelper(r=model.rank, lora_alpha=model.rank, target_modules=list(loras)),
+            validate_snapshot_targets=True,
+        )
         return True
 
 
