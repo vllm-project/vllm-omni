@@ -88,25 +88,71 @@ class DistributedRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = get_tensor_model_parallel_world_size()
+        return _distributed_rms_norm(x, self.weight, self.eps)
 
-        input_dtype = x.dtype
-        x_float = x.float()
-        local_sum_sq = (x_float**2).sum(dim=-1, keepdim=True)
-        local_count = x.shape[-1]
 
-        if tp_size > 1:
-            global_sum_sq = local_sum_sq.clone()
-            tensor_model_parallel_all_reduce(global_sum_sq)
-            global_count = local_count * tp_size
-        else:
-            global_sum_sq = local_sum_sq
-            global_count = local_count
+def _distributed_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    tp_size = get_tensor_model_parallel_world_size()
 
-        rms = torch.sqrt(global_sum_sq / global_count + self.eps)
+    input_dtype = x.dtype
+    x_float = x.float()
+    local_sum_sq = (x_float**2).sum(dim=-1, keepdim=True)
+    local_count = x.shape[-1]
 
-        output = (x_float / rms) * self.weight.float()
-        return output.to(input_dtype)
+    if tp_size > 1:
+        global_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
+        global_count = local_count * tp_size
+    else:
+        global_sum_sq = local_sum_sq
+        global_count = local_count
+
+    rms = torch.sqrt(global_sum_sq / global_count + eps)
+
+    output = (x_float / rms) * weight.float()
+    return output.to(input_dtype)
+
+
+def distributed_rms_norm_pair(
+    x1: torch.Tensor,
+    weight1: torch.Tensor,
+    x2: torch.Tensor,
+    weight2: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalise two same-shaped activations with a single all-reduce.
+
+    Q and K are normalised with independent weights but identical geometry, so
+    their per-row squared sums can be concatenated along the last dimension and
+    reduced in one collective. Each collective carries a tiny payload, so its
+    cost is almost entirely latency; halving their number per self-attention
+    layer removes that latency from the critical path.
+    """
+    if x1.shape != x2.shape:
+        raise ValueError(f"distributed_rms_norm_pair expects equal shapes, got {x1.shape} and {x2.shape}")
+    tp_size = get_tensor_model_parallel_world_size()
+
+    input_dtype = x1.dtype
+    x1_float = x1.float()
+    x2_float = x2.float()
+    sums = torch.cat(
+        (
+            (x1_float**2).sum(dim=-1, keepdim=True),
+            (x2_float**2).sum(dim=-1, keepdim=True),
+        ),
+        dim=-1,
+    )
+    local_count = x1.shape[-1]
+
+    if tp_size > 1:
+        sums = tensor_model_parallel_all_reduce(sums)
+        global_count = local_count * tp_size
+    else:
+        global_count = local_count
+
+    rms1, rms2 = torch.sqrt(sums / global_count + eps).unbind(dim=-1)
+    out1 = (x1_float / rms1.unsqueeze(-1)) * weight1.float()
+    out2 = (x2_float / rms2.unsqueeze(-1)) * weight2.float()
+    return out1.to(input_dtype), out2.to(x2.dtype)
 
 
 class ColumnParallelGELU(nn.Module):
@@ -365,8 +411,14 @@ class HeliosSelfAttention(nn.Module):
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # Both norms share one collective; see distributed_rms_norm_pair.
+        query, key = distributed_rms_norm_pair(
+            query,
+            self.norm_q.weight,
+            key,
+            self.norm_k.weight,
+            self.norm_q.eps,
+        )
 
         query = query.unflatten(2, (self.num_heads, self.head_dim))
         key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
