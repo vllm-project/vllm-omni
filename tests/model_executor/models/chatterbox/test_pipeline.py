@@ -101,11 +101,10 @@ def test_the_deploy_files_context_and_budgets_fit_the_models_needs(deploy: dict)
         "codec_max_chunk_frames",
         "codec_stream_scale_factor",
         "codec_left_context_frames",
-        "generation_min_batch_size",
-        "generation_max_wait_ms",
     }
-    assert extra["generation_min_batch_size"] == 16
-    assert extra["generation_max_wait_ms"] == 6
+    assert decoder["additional_config"]["generation_min_batch_size"] == 16
+    assert decoder["additional_config"]["generation_max_wait_ms"] == 6
+    assert "generation_max_wait_ms" not in talker["additional_config"]
     # The output cap is the model's, which the API bounds requests by.
     assert talker["default_sampling_params"]["max_tokens"] == config.max_new_tokens
     # Stage 0's context leaves room for text once the speaker slot, the
