@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_ready",
-    "description": "The sweep is c1/c8/c16 with 10/80/160 seed-tts prompts. The previous H100 baseline was two points (c1/c4, 10/40 prompts) and cannot be indexed against this sweep. No c1/c8/c16 baseline is recorded for this prompt schedule; the empty baseline is intentional until those points are measured. test_minicpmo_4_5.json thresholds are a different prompt count and are not reused here.",
+    "description": "The sweep is c1/c8/c16 with 10/80/160 seed-tts prompts. H100 and A3 mean_audio_rtf / mean_audio_ttfp_ms lists are sweep-aligned to c1/c8/c16. test_minicpmo_4_5.json thresholds are a different prompt count and are not reused here.",
     "mark": [
       {
         "hardware_marks": {
@@ -54,7 +54,32 @@
           }
         },
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "H100": {
+            "mean_audio_rtf": [
+              0.07,
+              0.17,
+              0.26
+            ],
+            "mean_audio_ttfp_ms": [
+              140.305,
+              390.675,
+              512.29
+            ]
+          },
+          "A3": {
+            "mean_audio_rtf": [
+              0.15,
+              0.56,
+              1.0
+            ],
+            "mean_audio_ttfp_ms": [
+              294.14,
+              1118.055,
+              1612.675
+            ]
+          }
+        }
       }
     ]
   }
