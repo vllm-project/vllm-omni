@@ -370,6 +370,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "guidance_scale": None,
         "guidance_scale_provided": False,
         "generator": None,
+        "return_trajectory_latents": False,
         "seed": 123,
         "num_outputs_per_prompt": 1,
         "frame_rate": None,
@@ -1373,6 +1374,167 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
 
     torch.testing.assert_close(first, second)
     assert not torch.equal(first, different_seed)
+
+
+def _run_trajectory_video(pipeline, **sampling_overrides):
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    pipeline.scheduler = FlowUniPCMultistepScheduler(
+        shift=1.0,
+        use_dynamic_shifting=False,
+        prediction_type="flow_prediction",
+    )
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    params = dict(
+        seed=123,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+        num_inference_steps=4,
+        num_frames=5,
+        height=16,
+        width=16,
+        extra_args={"flow_shift": 3.0},
+    )
+    params.update(sampling_overrides)
+    request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, make_sampling_params(**params))
+    return pipeline.forward(request)
+
+
+def test_trajectory_latents_are_returned_per_step(make_cosmos3_pipeline) -> None:
+    from diffusers.utils.torch_utils import randn_tensor
+
+    pipeline = make_cosmos3_pipeline()
+    output = _run_trajectory_video(pipeline, return_trajectory_latents=True)
+
+    # The trajectory travels as a structured payload, not in the legacy fields.
+    assert output.trajectory_latents is None and output.trajectory_timesteps is None
+    trajectory = output.output["payload"]["trajectory"]
+    # Initial latent plus one latent per step, each [1, C, T_lat, H_lat, W_lat].
+    assert tuple(trajectory["latents"].shape) == (5, 1, 2, 2, 2, 2)
+    assert tuple(trajectory["timesteps"].shape) == (4,)
+    torch.testing.assert_close(trajectory["timesteps"], pipeline.scheduler.timesteps.float().cpu())
+    # Entry 0 is the initial noise for this seed; the entries differ step to step.
+    noise = randn_tensor((1, 2, 2, 2, 2), generator=torch.Generator().manual_seed(123), dtype=torch.float32)
+    torch.testing.assert_close(trajectory["latents"][0], noise)
+    assert not torch.equal(trajectory["latents"][-1], trajectory["latents"][0])
+
+
+def test_trajectory_latents_do_not_change_the_result(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    plain = _run_trajectory_video(pipeline)
+    traced = _run_trajectory_video(pipeline, return_trajectory_latents=True)
+
+    assert plain.media is not None and plain.output is None
+    torch.testing.assert_close(traced.output["payload"]["video"], plain.media.video.tensor)
+
+
+def test_trajectory_payload_reaches_the_request_output(make_cosmos3_pipeline) -> None:
+    """Postprocessor and output formatter carry the payload to ``OmniRequestOutput``."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+    from vllm_omni.diffusion.output_formatter import _trajectory_payload, normalize_diffusion_postprocess_output
+
+    pipeline = make_cosmos3_pipeline()
+    output = _run_trajectory_video(pipeline, return_trajectory_latents=True)
+    postprocess = get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    processed = postprocess(output.output, sampling_params=make_sampling_params(extra_args={"guardrails": False}))
+
+    assert set(processed["payload"]) == {"video", "trajectory"}
+    normalized = normalize_diffusion_postprocess_output(processed)
+    assert normalized.primary_key == "video"
+    trajectory = _trajectory_payload(normalized, output)
+    assert tuple(trajectory["latents"].shape) == (5, 1, 2, 2, 2, 2)
+    assert tuple(trajectory["timesteps"].shape) == (4,)
+
+
+def test_trajectory_payload_stacks_streams_and_denoising_loops() -> None:
+    """Every stream is ``[steps + 1, N, ...]``; loops run one after the other are joined along ``N``."""
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as module
+
+    assert module._begin_trajectory_run(None) is None
+    assert module._trajectory_payload(None) is None
+    assert module._with_trajectory({"video": 1}, None) == {"video": 1}
+
+    trajectory: dict[str, list] = {"runs": []}
+    for offset in (0.0, 10.0):  # two loops, e.g. two transfer chunks
+        run = module._begin_trajectory_run(trajectory)
+        module._record_trajectory_step(
+            run, None, torch.full((1, 2, 1, 1, 1), offset), sound_latents=torch.zeros(1, 3, 4)
+        )
+        for step, timestep in enumerate((900.0, 500.0), start=1):
+            module._record_trajectory_step(
+                run,
+                torch.tensor(timestep),
+                torch.full((1, 2, 1, 1, 1), offset + step),
+                sound_latents=torch.full((1, 3, 4), float(step)),
+            )
+
+    payload = module._trajectory_payload(trajectory)
+    assert set(payload) == {"latents", "audio_latents", "timesteps"}
+    assert tuple(payload["latents"].shape) == (3, 2, 2, 1, 1, 1)
+    assert tuple(payload["audio_latents"].shape) == (3, 2, 3, 4)
+    assert payload["timesteps"].tolist() == [900.0, 500.0]
+    # Step index first, then the loop: loop 1 holds 10, 11, 12.
+    assert payload["latents"][:, 1, 0, 0, 0, 0].tolist() == [10.0, 11.0, 12.0]
+
+    flat = module._with_trajectory({"video": "v", "audio": "a"}, trajectory)
+    assert set(flat["payload"]) == {"video", "audio", "trajectory"}
+    envelope = module._with_trajectory({"payload": {"actions": "x"}, "metadata": {"k": 1}}, trajectory)
+    assert set(envelope["payload"]) == {"actions", "trajectory"} and envelope["metadata"] == {"k": 1}
+
+
+def test_trajectory_survives_postprocessing_for_audio_and_action_outputs() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+
+    postprocess = get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    params = make_sampling_params(extra_args={"guardrails": False})
+    trajectory = {"latents": torch.zeros(2, 1, 2, 1, 1, 1), "timesteps": torch.zeros(1)}
+    video = torch.zeros(1, 3, 5, 16, 16)
+
+    with_audio = postprocess(
+        {"payload": {"video": video, "audio": torch.zeros(1, 2, 8), "audio_sample_rate": 10, "trajectory": trajectory}},
+        sampling_params=params,
+    )
+    assert with_audio["trajectory"] is trajectory and with_audio["audio_sample_rate"] == 10
+
+    action_only = postprocess(
+        {"payload": {"actions": torch.zeros(1, 2, 2), "trajectory": trajectory}, "metadata": {"actions": {}}},
+        sampling_params=params,
+    )
+    assert action_only["payload"]["trajectory"] is trajectory and "actions" in action_only["payload"]
+
+
+def test_trajectory_latents_cover_every_image_of_a_request(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler = FlowUniPCMultistepScheduler(
+        shift=1.0, use_dynamic_shifting=False, prediction_type="flow_prediction"
+    )
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    request = make_request_batch(
+        {"prompt": "A test image.", "modalities": ["image"]},
+        make_sampling_params(
+            seed=123,
+            guidance_scale=1.0,
+            guidance_scale_provided=True,
+            num_inference_steps=4,
+            height=16,
+            width=16,
+            num_outputs_per_prompt=2,
+            return_trajectory_latents=True,
+            extra_args={"flow_shift": 3.0},
+        ),
+    )
+    trajectory = pipeline.forward(request).output["payload"]["trajectory"]
+
+    # [steps + 1, images, C, 1, H_lat, W_lat]; the two images start from different noise.
+    assert tuple(trajectory["latents"].shape) == (5, 2, 2, 1, 2, 2)
+    assert tuple(trajectory["timesteps"].shape) == (4,)
+    assert not torch.equal(trajectory["latents"][0, 0], trajectory["latents"][0, 1])
 
 
 def test_distilled_set_timesteps_uses_fixed_sigma_schedule(make_cosmos3_pipeline) -> None:
@@ -3492,6 +3654,21 @@ def test_forward_transfer_runs_multichunk_overlap_path(
 
     assert captured["conditional_frames"] == [2, 1]
     assert len(captured["decode_calls"]) == 2
+
+    # With return_trajectory_latents, each chunk's denoising loop is recorded.
+    assert "trajectory" not in output.output["payload"]
+    request.sampling_params.return_trajectory_latents = True
+    captured["decode_calls"].clear()
+    traced = pipeline.forward(request)
+    request.sampling_params.return_trajectory_latents = False
+    trajectory = traced.output["payload"]["trajectory"]
+    latent_shape = tuple(captured["decode_calls"][0].shape[1:])
+    # [steps + 1, chunks, C, T_lat, H_lat, W_lat] for one step and two chunks.
+    assert tuple(trajectory["latents"].shape) == (2, 2, *latent_shape)
+    assert tuple(trajectory["timesteps"].shape) == (1,)
+    for chunk_id in range(2):
+        torch.testing.assert_close(trajectory["latents"][-1, chunk_id], captured["decode_calls"][chunk_id][0])
+    torch.testing.assert_close(traced.output["payload"]["video"], output.output["payload"]["video"])
     assert output.output["payload"]["video"].shape == (1, 3, 8, 16, 16)
     torch.testing.assert_close(
         output.output["payload"]["video"][0, 0, :, 0, 0],
