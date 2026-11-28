@@ -15,6 +15,7 @@ from contextlib import AbstractContextManager, nullcontext
 import torch
 from vllm import envs
 from vllm.config import CUDAGraphMode, set_current_vllm_config
+from vllm.config.profiler import validate_profile_prefix
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import CompilationTimes
@@ -370,6 +371,7 @@ class OmniGPUWorkerBase(GPUWorker):
                 "For omni models, add profiler_config to the relevant deploy config stage."
             )
         if is_start:
+            validate_profile_prefix(profile_prefix)
             from vllm_omni.profiler import OmniTorchProfilerWrapper
 
             if isinstance(self.profiler, OmniTorchProfilerWrapper):
