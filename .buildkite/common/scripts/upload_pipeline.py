@@ -22,8 +22,16 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     shared path. For mixed diffs, narrow coverage only when a non-fallback file
     matches a job-key prefix; unrelated files must not reduce fallback coverage.
     List used shared helpers in job dependencies so mixed diffs retain their consumers.
+
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
-    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
+    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml). NPU presets
+    also declare ``image_build_depends_on`` — the bootstrap ``image-build-*`` step
+    that builds their per-commit CI image. That declaration is merged into the
+    step's ``depends_on`` only when rendering the NPU ready/nightly test
+    pipelines, preserving existing entries and their ``allow_failure`` settings,
+    so a variant's tests start once its own image build finishes instead of
+    waiting for all four builds. In other render contexts the key is popped and
+    ignored.
   - ``automatic_shard: true`` is uploader-only. Before planning, the uploader
     tries to build a per-step profile from recent passed ``timings/jobs``
     artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). Ready excludes ``main`` and uses
@@ -105,6 +113,14 @@ from tests.helpers.mark import (  # noqa: E402
 
 LOG = "upload_pipeline"
 CUDA_RUNTIME_CHECK = "python3 .buildkite/cuda/scripts/check_vllm_runtime.py"
+
+# Uploader-only key declared in ci_mirror_hardwares.yml NPU presets: the
+# bootstrap image-build step that produces the preset's per-commit CI image
+# (.buildkite/npu/bootstrap-upload-steps.yml). _expand_mirror_hardwares pops
+# it so it never reaches Buildkite; when rendering the NPU test pipelines
+# below, it is merged into the step's depends_on.
+_IMAGE_BUILD_DEP_KEY = "image_build_depends_on"
+NPU_TEST_PIPELINE_NAMES = frozenset({"test-npu-ready.yml", "test-npu-nightly.yml"})
 
 # --- Logging ---
 
@@ -552,13 +568,21 @@ def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | No
     return name
 
 
-def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
+def _expand_mirror_hardwares(
+    step: dict[str, Any],
+    *,
+    inject_image_build_dep: bool = False,
+) -> dict[str, Any] | None:
     """Replace ``mirror_hardwares`` (or infer it from ``-m``) with preset agents/plugins.
 
     Explicit preset string: used as-is; pytest marks are ignored.
     Omitted key: match H100/L4 (or ``MIRROR_HW``) in ``-m``, then compose
     ``{chip}_{n}`` from ``cards_n``. No match skips the step. Steps with no
     SKU/cards and no ``mirror_hardwares`` are left unchanged (CPU jobs).
+
+    A preset's ``image_build_depends_on`` declaration is always popped. With
+    ``inject_image_build_dep`` (NPU ready/nightly renders) it is merged into the
+    step's ``depends_on``, preserving existing entries and ``allow_failure``.
 
     Returns None when the current ``MIRROR_HW`` selector does not apply.
     """
@@ -594,6 +618,9 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
         )
 
     expanded = copy.deepcopy(preset)
+    # Uploader-only declaration of the bootstrap image-build step; popped so
+    # it never reaches Buildkite YAML.
+    image_build_dep = expanded.pop(_IMAGE_BUILD_DEP_KEY, None)
     merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
     # A scheduled build's HF_TOKEN may override a pod env entry with the same
     # name. The preset injects the Kubernetes secret under a collision-proof
@@ -610,6 +637,19 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
     # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
+    # Merge the declared image-build gate only when rendering the NPU test
+    # pipelines (their steps run in the same build as the bootstrap image
+    # builds). Existing entries and their allow_failure settings are preserved;
+    # build the merged list instead of mutating a possibly shared input list.
+    if inject_image_build_dep and image_build_dep is not None:
+        depends_on = merged.get("depends_on")
+        if depends_on is None:
+            merged["depends_on"] = image_build_dep
+        elif isinstance(depends_on, list):
+            if image_build_dep not in depends_on:
+                merged["depends_on"] = [*depends_on, image_build_dep]
+        else:
+            merged["depends_on"] = [depends_on, image_build_dep]
     return merged
 
 
@@ -692,6 +732,7 @@ def _process_test_steps(
     changed_files: list[str] | None,
     *,
     expand_mirror_hardwares: bool = True,
+    inject_image_build_dep: bool = False,
 ) -> list[Any]:
     """Drop steps by ``source_file_dependencies`` when *changed_files* is set; always strip that field."""
     processed: list[Any] = []
@@ -714,6 +755,7 @@ def _process_test_steps(
                 nested,
                 changed_files,
                 expand_mirror_hardwares=expand_mirror_hardwares,
+                inject_image_build_dep=inject_image_build_dep,
             )
             if not kept_nested:
                 _log(f"omit empty group {_get_step_label(step)!r}")
@@ -729,7 +771,7 @@ def _process_test_steps(
         if not expand_mirror_hardwares:
             processed.append(leaf)
             continue
-        expanded = _expand_mirror_hardwares(leaf)
+        expanded = _expand_mirror_hardwares(leaf, inject_image_build_dep=inject_image_build_dep)
         if expanded is None:
             continue
         processed.append(_plan_automatic_shard(expanded))
@@ -772,7 +814,12 @@ def _render_test_pipeline(
     pipeline_path: Path | None = None,
     e2e_only: bool = False,
 ) -> dict[str, Any]:
-    """Filter steps by PR diff and strip uploader-only ``source_file_dependencies`` metadata."""
+    """Filter steps by PR diff and strip uploader-only ``source_file_dependencies`` metadata.
+
+    For the NPU ready/nightly pipelines, merge each NPU preset's declared
+    ``image_build_depends_on`` into the step's ``depends_on`` so tests gate on
+    their own variant's bootstrap image build.
+    """
     # Validate MIRROR_HW once up front. Per-step skip must not run for typos
     # (e.g. b20o), or a pipeline can shrink to leftover CPU-only steps and
     # still upload successfully.
@@ -789,7 +836,8 @@ def _render_test_pipeline(
         changed_files,
         pipeline_path=pipeline_path,
     )
-    steps = _process_test_steps(steps, changed_files)
+    inject_image_build_dep = pipeline_path is not None and pipeline_path.name in NPU_TEST_PIPELINE_NAMES
+    steps = _process_test_steps(steps, changed_files, inject_image_build_dep=inject_image_build_dep)
     return {**doc, "steps": steps}
 
 

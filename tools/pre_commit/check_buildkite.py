@@ -60,9 +60,11 @@ def _prepare_pipeline(path: Path) -> dict[str, Any]:
 
     # Rendering plans automatic shards. Skip the history download and the
     # timings/file-shards files; this hook only checks the rendered YAML.
+    # pipeline_path must match the upload render so pipeline-gated behavior
+    # (e.g. the NPU image_build_depends_on merge) is validated as uploaded.
     os.environ["VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD"] = "1"
     os.environ["VLLM_OMNI_SKIP_SHARD_FILE_WRITE"] = "1"
-    return _render_test_pipeline(doc, changed_files=None)
+    return _render_test_pipeline(doc, changed_files=None, pipeline_path=path)
 
 
 def _validate(path: Path, doc: dict[str, Any]) -> int:

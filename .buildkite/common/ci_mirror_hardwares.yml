@@ -1,3 +1,4 @@
+
 # Uploader-only hardware presets for CUDA / NPU test YAML.
 # Referenced as ``mirror_hardwares: l4_1`` on a step; ``upload_pipeline.py`` expands to
 # ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins`` + ``retry``,
@@ -621,11 +622,20 @@ mirror_hardwares:
                   path: /mnt/shared
                   type: DirectoryOrCreate
 
+  # NPU presets run test pods from the per-commit CI image built by the
+  # bootstrap image-build steps (.buildkite/npu/bootstrap-upload-steps.yml).
+  # Keep tag suffixes in sync with those steps: no suffix = image-build-a2,
+  # -a3/-a5/-310p = image-build-a3/a5/310p. ``image_build_depends_on`` is an
+  # uploader-only declaration of that build step: upload_pipeline.py pops it
+  # during expansion and merges it into the step's depends_on only when
+  # rendering the NPU ready/nightly test pipelines, preserving existing
+  # entries and their allow_failure settings.
   a2b3_npu_1:
     agents:
       queue: "ascend-a2b3"
       resource_class: "npu-1"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    image_build_depends_on: image-build-a2
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -634,6 +644,7 @@ mirror_hardwares:
       queue: "ascend-a2b3"
       resource_class: "npu-4"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    image_build_depends_on: image-build-a2
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -643,6 +654,7 @@ mirror_hardwares:
       queue: "ascend-a2b3"
       resource_class: "npu-8"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    image_build_depends_on: image-build-a2
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -651,6 +663,7 @@ mirror_hardwares:
       queue: "ascend-a3"
       resource_class: "npu-2"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    image_build_depends_on: image-build-a3
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -659,6 +672,7 @@ mirror_hardwares:
       queue: "ascend-a3"
       resource_class: "npu-4"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    image_build_depends_on: image-build-a3
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -667,6 +681,7 @@ mirror_hardwares:
       queue: "ascend-a3"
       resource_class: "npu-8"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    image_build_depends_on: image-build-a3
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -675,6 +690,7 @@ mirror_hardwares:
       queue: "ascend-a3"
       resource_class: "npu-16"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
+    image_build_depends_on: image-build-a3
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -683,6 +699,7 @@ mirror_hardwares:
       queue: "ascend-a5"
       resource_class: "npu-2"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a5"
+    image_build_depends_on: image-build-a5
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -691,6 +708,7 @@ mirror_hardwares:
       queue: "ascend-a5"
       resource_class: "npu-4"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a5"
+    image_build_depends_on: image-build-a5
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -699,6 +717,7 @@ mirror_hardwares:
       queue: "ascend-a5"
       resource_class: "npu-8"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a5"
+    image_build_depends_on: image-build-a5
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -707,6 +726,7 @@ mirror_hardwares:
       queue: "ascend-a5"
       resource_class: "npu-16"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a5"
+    image_build_depends_on: image-build-a5
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -715,6 +735,7 @@ mirror_hardwares:
       queue: "ascend-310p"
       resource_class: "npu-1"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-310p"
+    image_build_depends_on: image-build-310p
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -723,6 +744,7 @@ mirror_hardwares:
       queue: "ascend-310p"
       resource_class: "npu-2"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-310p"
+    image_build_depends_on: image-build-310p
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
 
@@ -731,5 +753,6 @@ mirror_hardwares:
       queue: "ascend-310p"
       resource_class: "npu-4"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-310p"
+    image_build_depends_on: image-build-310p
     retry: *hardware_retry
     plugins: *npu_k8s_plugins
