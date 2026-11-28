@@ -3,7 +3,7 @@
 """The LingBot stepwise deploy config must keep serving on the AR-Diffusion path.
 
 `WS /v1/realtime/video` only reaches the stepwise code when the stage selects the
-AR-Diffusion engine and asks for streamed step execution, so those fields are
+AR-Diffusion runner and asks for streamed step execution, so those fields are
 pinned here rather than left to drift.
 """
 
@@ -25,12 +25,12 @@ def _stage():
     return deploy.stages[0]
 
 
-def test_stage_selects_the_ar_diffusion_engine_and_pipeline() -> None:
+def test_stage_selects_the_ar_diffusion_runner_and_pipeline() -> None:
     stage = _stage()
     assert stage.model_class_name == "LingBotWorldCausalDMDPipeline"
-    # engine_backend/model_config reach the engine through the passthrough, the
+    # diffusion_model_runner_cls/model_config reach the engine through the passthrough, the
     # same way the DreamZero AR-Diffusion deploy config does.
-    assert stage.engine_extras["engine_backend"].endswith("ar_diffusion.engine.ARDiffusionEngine")
+    assert stage.engine_extras["diffusion_model_runner_cls"].endswith("ar_diffusion.runner.ARDiffusionModelRunner")
 
 
 def test_stage_requests_streamed_step_execution_on_one_sequence() -> None:

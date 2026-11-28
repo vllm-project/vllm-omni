@@ -17,7 +17,7 @@ stages:
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: CausVidWanPipeline
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    diffusion_model_runner_cls: vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner
     parallel_config:
       pipeline_parallel_size: 4
     default_sampling_params:

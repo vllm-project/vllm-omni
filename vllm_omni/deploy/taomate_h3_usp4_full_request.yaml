@@ -9,7 +9,7 @@ stages:
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: TaoMateH3Pipeline
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    diffusion_model_runner_cls: vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner
     step_execution: false
     streaming_output: false
     parallel_config:

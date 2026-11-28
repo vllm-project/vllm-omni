@@ -11,7 +11,7 @@ stages:
       enable_device_postprocess: true
     vae_use_tiling: true
     model_class_name: PhysisH3Pipeline
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    diffusion_model_runner_cls: vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner
     default_sampling_params:
       num_frames: null
     parallel_config:

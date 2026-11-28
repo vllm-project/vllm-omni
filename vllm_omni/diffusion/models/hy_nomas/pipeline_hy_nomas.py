@@ -177,11 +177,13 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     HyNomasARConfig.from_args(custom)
     if config.step_execution and not config.streaming_output:
         raise ValueError("Hy-Nomas step execution requires streaming_output=true.")
-    if config.step_execution and config.engine_backend not in (
-        "ar_diffusion",
-        "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
-    ):
-        raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
+    if config.step_execution:
+        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+        from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+        runner_cls = DiffusionEngine.resolve_model_runner_class(config)
+        if not issubclass(runner_cls, ARDiffusionModelRunner):
+            raise ValueError("Hy-Nomas step execution requires ARDiffusionModelRunner.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
