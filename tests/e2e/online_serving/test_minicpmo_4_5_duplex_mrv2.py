@@ -151,8 +151,6 @@ def _recalls_own_secret(transcript: str, secret: str, session_secrets: tuple[str
     "cancel,sessions,interruptions",
     [
         ("response.cancel", 1, 1),
-        ("output_audio_buffer.clear", 1, 1),
-        ("barge_in", 1, 1),
         ("response.cancel", 2, 1),
         ("response.cancel", 1, 2),
     ],

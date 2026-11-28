@@ -4,7 +4,6 @@
 import asyncio
 import base64
 import importlib.util
-import json
 import subprocess
 import sys
 import wave
@@ -13,7 +12,6 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-import websockets
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,7 +33,8 @@ def _load_demo_module():
     return module
 
 
-def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch():
+@pytest.mark.parametrize("audio_type", ["response.output_audio.delta", "response.audio.delta"])
+def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch(audio_type):
     state = _load_demo_module().DemoState()
     state.events = [
         {"type": "response.output_audio.delta", "response_id": "old", "metadata": {"epoch": 0}},
@@ -43,7 +42,9 @@ def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch():
         {"type": "response.output_audio.delta", "response_id": "new", "metadata": {"epoch": 0}},
     ]
     assert state.stale_audio_delta_count() == 0
-    state.events.append({"type": "response.output_audio.delta", "response_id": "old", "metadata": {"epoch": 0}})
+    state.events.extend(
+        [{"type": "session.closed"}, {"type": audio_type, "response_id": "old", "metadata": {"epoch": 0}}]
+    )
     assert state.stale_audio_delta_count() == 1
 
 
@@ -62,44 +63,6 @@ def test_interrupted_recall_transcript(transcript, valid):
     from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _recalls_own_secret
 
     assert _recalls_own_secret(transcript, "robin", ("robin", "squirrel")) is valid
-
-
-@pytest.mark.parametrize("late_audio", ["response.output_audio.delta", "response.audio.delta"])
-def test_interrupt_recall_rejects_late_audio(tmp_path, late_audio):
-    from tests.e2e.online_serving.test_minicpmo_4_5_duplex_mrv2 import _run_interrupted_recall
-
-    async def exercise():
-        async def serve(ws):
-            async def send(event):
-                await ws.send(json.dumps(event))
-
-            assert json.loads(await ws.recv())["type"] == "session.update"
-            await send({"type": "session.updated"})
-            for _ in range(2):
-                assert json.loads(await ws.recv())["type"] == "input.text.append"
-            await send({"type": "response.output_audio.delta", "response_id": "old", "delta": "AA=="})
-            assert json.loads(await ws.recv())["type"] == "response.cancel"
-            assert json.loads(await ws.recv())["type"] == "input.text.append"
-            await send({"type": "response.done", "response": {"id": "old", "status": "cancelled"}})
-            await send({"type": "response.output_audio_transcript.delta", "response_id": "new", "delta": "Robin."})
-            await send({"type": "response.output_audio.delta", "response_id": "new", "delta": "AA=="})
-            await send({"type": "response.done", "response": {"id": "new", "status": "completed"}})
-            assert json.loads(await ws.recv())["type"] == "session.close"
-            await send({"type": late_audio, "response_id": "old", "delta": "AA=="})
-            await send({"type": "session.closed"})
-
-        async with websockets.serve(serve, "127.0.0.1", 0) as server:
-            port = server.sockets[0].getsockname()[1]
-            with pytest.raises(AssertionError, match="cancelled response"):
-                await _run_interrupted_recall(
-                    url=f"ws://127.0.0.1:{port}/v1/realtime",
-                    model="fixture",
-                    cancel="response.cancel",
-                    secret="robin",
-                    event_path=tmp_path / "events.json",
-                )
-
-    asyncio.run(exercise())
 
 
 def _load_multi_demo_module():

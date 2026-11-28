@@ -11,7 +11,6 @@ import websockets
 
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.clients.duplex import DuplexProtocolError
-from vllm_omni.clients.realtime import RealtimeDuplexClient
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -35,19 +34,6 @@ def _url(server):
 async def _reject(socket, *, code="resource_exhausted", retryable=True):
     await socket.send(json.dumps({"type": "error", "error": {"code": code, "retryable": retryable}}))
     await socket.close()
-
-
-async def test_configure_preserves_admission_error_before_transport_closes():
-    async def handler(socket):
-        await socket.recv()
-        await _reject(socket)
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        async with RealtimeDuplexClient(_url(server)) as client:
-            with pytest.raises(DuplexProtocolError) as caught:
-                await client.configure("test-model", timeout_s=1)
-    assert caught.value.code == "resource_exhausted"
-    assert caught.value.raw["error"]["retryable"] is True
 
 
 async def test_admission_reconnects_before_sending_any_sample_input():

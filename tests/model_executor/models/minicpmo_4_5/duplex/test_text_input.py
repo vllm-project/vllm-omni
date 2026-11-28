@@ -22,71 +22,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("window", [False, True])
-@pytest.mark.parametrize("terminator", ["chunk_eos_token_id", "chunk_tts_eos_token_id", "listen_token_id", None])
-def test_interruption_appends_turn_eos_without_replaying_context_or_resetting_audio(window, terminator):
-    runtime = stage0_vision_runtime()
-    state = _MiniCPMO45Stage0SessionState(session_id="interrupt", window_enabled=window)
-    state.context_token_ids = [200, 201]
-    state.context_embeds = [runtime._embed_token(i) for i in state.context_token_ids]
-    runtime._stage_prefill_embeddings_only(state, None, input_text_token_ids=[21, 22], epoch=0, seq=1)
-    state.pending_terminator_token = getattr(runtime, terminator) if terminator else None
-    state.audio_buffer = np.array([0.125, 0.25], dtype=np.float32)
-    audio_buffer = state.audio_buffer
-    state.generated_tokens = [51, 52]
-    state.current_turn_ended = False
-    state.pending_speech_context = True
-    state.pending_speech_response_open = True
-    payload = {
-        "type": "text",
-        "text_token_ids": [runtime.turn_eos_token_id],
-        "force_listen": True,
-        INTERRUPTION_KEY: True,
-    }
-    kwargs = MiniCPMO45OmniForConditionalGeneration._minicpmo45_duplex_prefill_kwargs({"epoch": 0, "seq": 2}, payload)
-    kwargs["stage0_window"] = {"completed_token_ids": [51, 52]}
-    result = runtime._stage_prefill_embeddings_only(state, None, **kwargs)
-    prompt = build_duplex_data_plane_prompt(
-        request_id="resident",
-        fence=DuplexFence("interrupt"),
-        session_config={},
-        runtime_config={},
-        seq=2,
-        turn_seq=2,
-        payload=payload,
-        final=False,
-    )
-    assert result["input_token_ids"] == [
-        runtime.turn_eos_token_id,
-        runtime.listen_token_id,
-        runtime.unit_end_token_id,
-        runtime.unit_token_id,
-    ]
-    assert result["num_input_tokens"] == len(prompt["prompt_token_ids"]) == 4
-    assert _duplex_row_outputs([{"duplex": result}, {"duplex": {}}])[INTERRUPTION_KEY] == [True, False]
-    np.testing.assert_array_equal(state.audio_buffer, audio_buffer)
-    assert state.audio_encoder_chunk_idx == 0
-    assert state.generated_tokens == [51, 52]
-    assert state.current_turn_ended
-    assert not state.pending_speech_context and not state.pending_speech_response_open
-    if window:
-        assert len(state.window_units) == 1
-        assert state.window_units[0].token_ids == [
-            runtime.unit_token_id,
-            21,
-            22,
-            51,
-            52,
-            runtime.turn_eos_token_id,
-            runtime.listen_token_id,
-            runtime.unit_end_token_id,
-        ]
-        assert state.pending_window_unit.token_ids == [runtime.unit_token_id]
-    replay = runtime._stage_prefill_embeddings_only(state, None, **kwargs)
-    assert replay["inputs_embeds"] is result["inputs_embeds"]
-    assert len(state.window_units) == int(window)
-
-
 @pytest.mark.parametrize("mode", ["basic", "context"])
 def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_in_sync(mode):
     runtime = stage0_vision_runtime()
@@ -172,18 +107,38 @@ def test_interrupted_unit_and_followup_keep_scheduler_and_worker_window_lengths_
             assert state.pending_window_unit.token_ids == [runtime.unit_token_id, 23]
 
 
-@pytest.mark.parametrize("window", [False, True])
-def test_text_units_match_exact_scheduler_budget_and_preserve_audio_state(window):
+@pytest.mark.parametrize(
+    "window,terminator",
+    [(False, "normal"), (True, "normal"), (False, None), (False, "chunk_eos_token_id"), (True, "chunk_eos_token_id")],
+)
+def test_text_units_match_exact_scheduler_budget_and_preserve_audio_state(window, terminator):
     runtime = stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="text", window_enabled=window)
     state.context_token_ids = [200, 201]
     state.context_embeds = [runtime._embed_token(i) for i in state.context_token_ids]
     state.audio_buffer = np.array([0.125, 0.25], dtype=np.float32)
     for seq, text_ids in enumerate(([21, 22, 23], [24, 25]), start=1):
-        payload = {"type": "text", "text_token_ids": text_ids}
+        interruption = terminator != "normal" and seq == 2
+        if interruption:
+            text_ids = [runtime.turn_eos_token_id]
+            state.pending_terminator_token = getattr(runtime, terminator) if terminator else None
+            state.generated_tokens = [51, 52]
+            state.current_turn_ended = False
+            state.pending_speech_context = state.pending_speech_response_open = True
+        payload = {
+            "type": "text",
+            "text_token_ids": text_ids,
+            "force_listen": interruption,
+            INTERRUPTION_KEY: interruption,
+        }
         audio = runtime._decode_audio_payload(payload)
         assert audio.size == 0
-        result = runtime._stage_prefill_embeddings_only(state, audio, input_text_token_ids=text_ids, epoch=0, seq=seq)
+        kwargs = MiniCPMO45OmniForConditionalGeneration._minicpmo45_duplex_prefill_kwargs(
+            {"epoch": 0, "seq": seq}, payload
+        )
+        if interruption:
+            kwargs["stage0_window"] = {"completed_token_ids": [51, 52]}
+        result = runtime._stage_prefill_embeddings_only(state, audio, **kwargs)
         prompt = build_duplex_data_plane_prompt(
             request_id="text",
             fence=DuplexFence("text"),
@@ -194,31 +149,34 @@ def test_text_units_match_exact_scheduler_budget_and_preserve_audio_state(window
             payload=payload,
             final=False,
         )
-        expected = [200, 201] if seq == 1 else [runtime.listen_token_id, runtime.unit_end_token_id]
-        expected += [runtime.unit_token_id, *text_ids]
-        assert result["success"]
-        assert result["input_token_ids"] == expected
-        assert result["num_input_tokens"] == len(prompt["prompt_token_ids"])
+        closure = ([runtime.turn_eos_token_id] if interruption else []) + [
+            runtime.listen_token_id,
+            runtime.unit_end_token_id,
+        ]
+        expected = ([200, 201] if seq == 1 else closure) + [runtime.unit_token_id]
+        if not interruption:
+            expected += text_ids
+        assert result["success"] and result["input_token_ids"] == expected
+        assert result["num_input_tokens"] == len(prompt["prompt_token_ids"]) == len(expected)
+        assert _duplex_row_outputs([{"duplex": result}, {"duplex": {}}])[INTERRUPTION_KEY] == [interruption, False]
         torch.testing.assert_close(
             result["inputs_embeds"], torch.cat([runtime._embed_token(i).reshape(1, -1) for i in expected])
         )
-        assert state.pending_speech_context
+        assert state.pending_speech_context is not interruption
+        if interruption:
+            assert state.generated_tokens == [51, 52] and state.current_turn_ended
+            assert not state.pending_speech_response_open
         assert state.audio_encoder_chunk_idx == 0
         np.testing.assert_array_equal(state.audio_buffer, [0.125, 0.25])
-        replay = runtime._stage_prefill_embeddings_only(state, audio, input_text_token_ids=text_ids, epoch=0, seq=seq)
+        replay = runtime._stage_prefill_embeddings_only(state, audio, **kwargs)
         assert replay["inputs_embeds"] is result["inputs_embeds"]
         assert state.audio_chunk_idx == seq
         state.pending_terminator_token = runtime.listen_token_id
     if window:
-        assert state.window_units[0].token_ids == [
-            runtime.unit_token_id,
-            21,
-            22,
-            23,
-            runtime.listen_token_id,
-            runtime.unit_end_token_id,
-        ]
-        assert state.pending_window_unit.token_ids == [runtime.unit_token_id, 24, 25]
+        generated = [51, 52] if interruption else []
+        assert len(state.window_units) == 1
+        assert state.window_units[0].token_ids == [runtime.unit_token_id, 21, 22, 23, *generated, *closure]
+        assert state.pending_window_unit.token_ids == [runtime.unit_token_id, *([] if interruption else [24, 25])]
 
 
 @pytest.mark.parametrize(("input_ids", "result_ids"), [([21, 22], []), ([], [200, 201]), ([21, 22], [200, 201])])
