@@ -3316,3 +3316,42 @@ class TestDistributedComponentSelection:
 
         with pytest.raises(ValueError, match="not declared replicated"):
             resolve_offload_plan(StubEncoderPipeline(), config)
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_mmap_staging_pack_uses_staging_threads_and_restores(monkeypatch, threads):
+    monkeypatch.setattr(dist_backend_module, "_STAGING_THREADS", threads)
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    seen: list[int] = []
+
+    def transform(tensor):
+        seen.append(torch.get_num_threads())
+        return tensor.t().contiguous().t()
+
+    contiguous = torch.randn(1000)
+    strided = torch.randn(8, 6).t()
+    cpu_sources = {
+        torch.float32: [
+            {"tensor": contiguous, "transform": None, "name": "w0"},
+            {"tensor": strided, "transform": transform, "name": "w1"},
+        ]
+    }
+    metadata = {
+        torch.float32: [
+            {"numel": 1000, "offset": 0, "shape": contiguous.shape, "stride": contiguous.stride()},
+            {"numel": 48, "offset": 1000, "shape": strided.shape, "stride": strided.stride()},
+        ]
+    }
+    slot = {torch.float32: torch.full((1053,), float("nan"))}
+    try:
+        staged = DistributedLayerwiseOffloadHook._pack_mmap_sources(cpu_sources, metadata, slot)[torch.float32]
+        after = torch.get_num_threads()
+    finally:
+        torch.set_num_threads(previous)
+
+    assert seen == [threads]
+    assert after == 1
+    assert torch.equal(staged[:1000], contiguous)
+    packed_strided = torch.as_strided(staged[1000:1048], size=strided.shape, stride=strided.stride())
+    assert torch.equal(packed_strided, strided)
