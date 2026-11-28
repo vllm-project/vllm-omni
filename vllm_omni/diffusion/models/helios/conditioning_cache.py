@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Helios adapter for request-owned, non-paged conditioning K/V.
 
-No entry is shared across requests. Versionless inference tensors are compared
-against owned snapshots; object identity or an allocator address is insufficient.
-This conservative comparison can synchronize CUDA. Callers must not mutate
-conditioning or model weights concurrently with an executing forward.
+No entry is shared across requests. Versionless sources are verified against
+snapshots by default. Helios request owners may opt out for accelerator
+sources they keep immutable for the lifetime of the request.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ def request_conditioning_cache(forward):
 
     @wraps(forward)
     def wrapped(*args, **kwargs):
-        with HeliosConditioningCache() as cache, cache.activate():
+        with HeliosConditioningCache(immutable_accelerator_sources=True) as cache, cache.activate():
             return forward(*args, **kwargs)
 
     return wrapped
@@ -50,6 +49,15 @@ def tensor_version(tensor: torch.Tensor) -> int | None:
         return tensor._version
     except RuntimeError:
         return None
+
+
+def comparison_snapshot(
+    source: torch.Tensor, version: int | None, *, immutable_accelerator_source: bool = False
+) -> torch.Tensor | None:
+    """Snapshot versionless sources unless their owner guarantees immutability."""
+    if version is not None or (immutable_accelerator_source and source.device.type != "cpu"):
+        return None
+    return source.detach().clone()
 
 
 @dataclass
@@ -66,8 +74,9 @@ class _Entry:
 class HeliosConditioningCache:
     """Model-specific preparation; validity/publication/release use the common scope."""
 
-    def __init__(self, request_id: str = "helios") -> None:
+    def __init__(self, request_id: str = "helios", *, immutable_accelerator_sources: bool = False) -> None:
         self.request_id = request_id
+        self._immutable_accelerator_sources = immutable_accelerator_sources
         self._entries: dict[str, _Entry] = {}
         self._lock = RLock()
         self._closed = False
@@ -108,8 +117,8 @@ class HeliosConditioningCache:
                 )
                 if same and version is not None:
                     same = entry.version == version
-                elif same:
-                    same = entry.snapshot is not None and torch.equal(source, entry.snapshot)
+                elif same and entry.snapshot is not None:
+                    same = torch.equal(source, entry.snapshot)
                 if same and layers is not None:
                     if entry.projected.is_cuda:
                         entry.projected.record_stream(torch.cuda.current_stream(entry.projected.device))
@@ -118,7 +127,9 @@ class HeliosConditioningCache:
                 entry.scope.close()
                 del self._entries[branch]
             self._revision += 1
-            snapshot = source.detach().clone() if version is None else None
+            snapshot = comparison_snapshot(
+                source, version, immutable_accelerator_source=self._immutable_accelerator_sources
+            )
             projected, key_values = build(source)
             if not key_values:
                 raise ValueError("Helios conditioning requires at least one layer")
