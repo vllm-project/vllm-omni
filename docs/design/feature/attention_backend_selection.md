@@ -53,6 +53,11 @@ The active `OmniPlatform` owns compatibility policy through
 - account for head size and other platform-visible constraints; and
 - return a qualified class path implementing `AttentionBackend`.
 
+Wan's NPU `SOL_ATTN` includes a full-attention execution path. When its
+optional sparse kernels are unavailable, it warns once per worker and uses
+`FLASH_ATTN` before applying any sparse token layout. Sol configuration
+validation still applies. See [fallback conditions](../../user_guide/diffusion/attention_backends/sol_attn.md#automatic-fallback-to-full-attention).
+
 Hub preflight and execution share the same version resolver. FlashAttention 2
 tries versions 1, 2, then 3 so Torch stable-ABI builds remain available when
 older per-Torch builds do not match. An explicit selection still fails when
@@ -74,6 +79,7 @@ unstructured keyword dictionaries:
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
 - `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
+- `sol_attn` configures the diagonal threshold and dense steps/layers for Wan video self-attention on Ascend; and
 - `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
 
 A backend reads only the fields it owns and rejects incompatible values. New

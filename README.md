@@ -74,6 +74,7 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Nightly CUDA Docker images](https://hub.docker.com/r/vllm/vllm-omni/tags?name=nightly) built from the latest `main`
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 - [Deployment Recipes](https://recipes.vllm.ai) for vLLM-Omni model serving
+- [Wan2.2 TI2V-5B Sol-Attn on Ascend: integration and 50-step benchmark](benchmarks/diffusion/wan2_2_sol_attn/README.md)
 
 ## Contributing
 

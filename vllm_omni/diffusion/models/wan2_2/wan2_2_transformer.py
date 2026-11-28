@@ -32,6 +32,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.sol_attn import SOL_MORTON_ORDER, get_morton_indices, wan_sol_layout
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
@@ -50,6 +51,19 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
 logger = init_logger(__name__)
+
+
+def _morton_block_inputs(
+    hidden_states: torch.Tensor,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    timestep_proj: torch.Tensor,
+    order: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    # I2V carries one timestep per video token. T2V broadcasts a per-sample timestep.
+    if timestep_proj.ndim == 4:
+        timestep_proj = timestep_proj.index_select(1, order)
+    cos, sin = rotary_emb
+    return hidden_states.index_select(1, order), (cos.index_select(1, order), sin.index_select(1, order)), timestep_proj
 
 
 class DistributedRMSNorm(nn.Module):
@@ -760,6 +774,7 @@ class WanTransformerBlock(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         vsa_dit_seq_shape: tuple[int, int, int] | None = None,
         preserve_vsa_all_blocks: bool = False,
+        attention_extra: dict[str, bool] | None = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -780,7 +795,7 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        self_attn_extra = {}
+        self_attn_extra: dict[str, object] = dict(attention_extra or {})
         if vsa_dit_seq_shape is not None:
             self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
         if preserve_vsa_all_blocks:
@@ -1215,7 +1230,17 @@ class WanTransformer3DModel(nn.Module):
         # Preserve the post-patch (T, H, W) grid so VSA can partition
         # the flattened DiT sequence into spatiotemporal blocks.
         vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
-        for block in self.blocks[self.start_layer : self.end_layer]:
+        blocks = self.blocks[self.start_layer : self.end_layer]
+        attention_extra = {}
+        if blocks and hidden_states.device.type == "npu":
+            attention_extra = wan_sol_layout(blocks[-1].attn1.attn)
+        inverse_order = None
+        if attention_extra.get(SOL_MORTON_ORDER):
+            order, inverse_order = get_morton_indices(vsa_dit_seq_shape, hidden_states.device)
+            hidden_states, rotary_emb, timestep_proj = _morton_block_inputs(
+                hidden_states, rotary_emb, timestep_proj, order
+            )
+        for block in blocks:
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -1224,7 +1249,11 @@ class WanTransformer3DModel(nn.Module):
                 hidden_states_mask,
                 vsa_dit_seq_shape,
                 self.preserve_vsa_all_blocks,
+                attention_extra,
             )
+
+        if inverse_order is not None:
+            hidden_states = hidden_states.index_select(1, inverse_order)
 
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.

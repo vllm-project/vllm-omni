@@ -1311,7 +1311,21 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 inner_precise=inner_precise,
             )
 
-        from mindiesd import attention_forward
+        try:
+            from mindiesd import attention_forward
+        except ModuleNotFoundError as exc:
+            # Plain unmasked Wan attention can use the native BSND Flash kernel
+            # when the optional MindIE-SD package is entirely absent.
+            if (
+                exc.name != "mindiesd"
+                or self.qkv_layout != "BSND"
+                or attention_mask is not None
+                or (attn_metadata and attn_metadata.extra.get("npu_attn_varlen"))
+            ):
+                raise
+            return self._npu_fusion_attention(
+                query, key, value, atten_mask=None, sparse_mode=0, softmax_scale=self.softmax_scale
+            )
 
         # Opt-in mask-free paths (mirror the CUDA cu_seqlens behavior): the
         # model marks extra["npu_attn_varlen"] and carries packed metadata, so
