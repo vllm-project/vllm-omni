@@ -138,9 +138,67 @@ def create_dpm_scheduler() -> DPMSolverMultistepScheduler:
     )
 
 
+class VibeVoiceDPMSolverLoop:
+    """Template DPM-Solver++ state reused across audio tokens.
+
+    Building a fresh scheduler per token (``create_dpm_scheduler`` +
+    ``set_timesteps``) costs ~0.9 ms of host work per token, and every solver
+    step uploads its timestep for the head input (host repeat + cast + H2D).
+    The template is built once per (steps, device); per token only the mutable
+    state resets, and the timesteps for the head input are pre-uploaded so the
+    per-step host round-trip disappears.
+
+    The coefficient arrays (``sigmas`` and friends) stay host-resident exactly
+    as in a fresh scheduler: 0-dim host tensors reach CUDA kernels as scalar
+    launch parameters, so residency costs nothing per use, and moving them to
+    the device would change type promotion (f32 tensor-tensor instead of a
+    scalar cast) and with it the bf16 numerics. The loop is therefore
+    bit-exact with the previous per-token construction by construction.
+    """
+
+    __slots__ = ("_template", "_model_outputs_reset", "_lower_order_nums_reset", "timesteps", "_timesteps")
+
+    def __init__(self, num_inference_steps: int, device: torch.device) -> None:
+        scheduler = create_dpm_scheduler()
+        scheduler.set_timesteps(num_inference_steps=num_inference_steps)
+        self._template = scheduler
+        # set_timesteps pre-sizes the multistep history to solver_order slots
+        # and zeroes the order ramp; step() indexes into both, so a reset must
+        # restore the same values.
+        self._model_outputs_reset = list(scheduler.model_outputs)
+        self._lower_order_nums_reset = scheduler.lower_order_nums
+        # Host-resident iteration order; step() only uses the timestep for the
+        # index lookup, which the preset step index bypasses.
+        self.timesteps = scheduler.timesteps
+        self._timesteps = [timestep.to(device) for timestep in scheduler.timesteps]
+
+    def begin(self) -> None:
+        """Reset the mutable solver state for a new token's loop."""
+        scheduler = self._template
+        scheduler._step_index = None
+        scheduler._begin_index = None
+        scheduler.model_outputs = list(self._model_outputs_reset)
+        scheduler.lower_order_nums = self._lower_order_nums_reset
+
+    def timestep(self, step_index: int) -> torch.Tensor:
+        """Device-resident timestep for the head input at ``step_index``."""
+        return self._timesteps[step_index]
+
+    def step(self, model_output: torch.Tensor, step_index: int, sample: torch.Tensor) -> torch.Tensor:
+        """One solver step; identical math to a fresh scheduler's ``step()``.
+
+        Presetting ``_step_index`` skips ``_init_step_index`` (host nonzero +
+        ``.item()`` lookup that would otherwise run every step).
+        """
+        scheduler = self._template
+        scheduler._step_index = step_index
+        return scheduler.step(model_output, self.timesteps[step_index], sample).prev_sample
+
+
 __all__ = [
     "VIBEVOICE_DEFAULT_GUIDANCE_SCALE",
     "VIBEVOICE_DEFAULT_NUM_DIFFUSION_STEPS",
     "VibeVoiceDiffusionHead",
+    "VibeVoiceDPMSolverLoop",
     "create_dpm_scheduler",
 ]
