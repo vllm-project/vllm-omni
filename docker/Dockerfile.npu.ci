@@ -61,11 +61,13 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       --default-timeout=60
 
 # MiniCPM-o 4.5 Stage-2 vocoder assets: s3tokenizer plus flashcosyvoice, which
-# is shipped by step-audio2. --no-deps keeps pip from replacing the Ascend torch
-# build; the deps these two actually need are installed above.
+# is shipped by step-audio2, and silero-vad for CPU VAD when the ONNX cache is
+# empty. --no-deps keeps pip from replacing the Ascend torch build; the deps
+# these packages actually need are installed above.
 RUN python3 -m pip install -v --no-deps \
       "s3tokenizer>=0.3.0" \
       "step-audio2>=1.0.0" \
+      "silero-vad==6.2.3" \
       --default-timeout=60
 
 ENV VLLM_TARGET_DEVICE=npu
