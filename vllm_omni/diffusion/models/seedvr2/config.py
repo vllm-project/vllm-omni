@@ -4,7 +4,7 @@
 
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 COLOR_CORRECTION_METHODS = ("lab", "wavelet", "adain", "none")
@@ -19,6 +19,13 @@ def _positive_int(name: str, default: int | None) -> int | None:
     if not value.strip().isdigit() or not int(value):
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
     return int(value)
+
+
+def get_dit_compute_dtype(additional_config: Mapping[str, object] | None) -> str:
+    value = (additional_config or {}).get("seedvr2_dit_compute_dtype", "float16")
+    if not isinstance(value, str) or value not in ("float16", "bfloat16"):
+        raise ValueError(f"seedvr2_dit_compute_dtype must be float16 or bfloat16, got {value!r}")
+    return value
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

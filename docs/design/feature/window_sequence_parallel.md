@@ -177,6 +177,11 @@ The native serving pipeline passes its parallel configuration to the DiT runtime
 and returns restored video through the standard media path. The causal VAE can
 run replicated, tiled, or height-sharded across the window-SP group.
 
+When [BF16 DiT compute](../../models/seedvr2.md#dit-compute-precision) is
+enabled, window SP gathers BF16 rows on every rank. Each rank receives the
+same canonical velocity and checks the FP16 conversion before the Euler update
+and distributed VAE decode.
+
 ## Limitations
 
 * Plan A re-shards the full activation at every layout boundary. Plan B halo
