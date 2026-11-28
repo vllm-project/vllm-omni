@@ -37,7 +37,7 @@ from vllm_omni.diffusion.weight_management.errors import (
     WeightStackError,
     WriteError,
 )
-from vllm_omni.diffusion.weight_management.interfaces import LoadState
+from vllm_omni.diffusion.weight_management.interfaces import LoadState, WeightStack
 
 __all__ = [
     "AllocationError",
@@ -57,6 +57,7 @@ __all__ = [
     "PreflightError",
     "RuntimeFault",
     "StackUnavailableError",
+    "WeightStack",
     "WeightStackError",
     "WriteError",
 ]

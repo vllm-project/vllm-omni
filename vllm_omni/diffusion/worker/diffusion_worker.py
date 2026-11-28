@@ -85,6 +85,12 @@ from vllm_omni.diffusion.sched.interface import (
     validate_new_request_data_identity,
 )
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolve_diffusion_moe_lora_token_capacity
+from vllm_omni.diffusion.weight_management.startup import (
+    WeightStack,
+    clear_process_weight_stack,
+    parse_weight_stack,
+    set_process_weight_stack,
+)
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -491,8 +497,14 @@ class DiffusionWorker:
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
-        self.init_device()
+        # Claim before device setup mutates process-wide rank and device state.
+        raw_stack = getattr(od_config, "diffusion_weight_stack", None)
+        stack = parse_weight_stack(raw_stack) if isinstance(raw_stack, (str, type(None))) else WeightStack.LEGACY
+        set_process_weight_stack(stack, owner=self)
+        device_initialized = False
         try:
+            self.init_device()
+            device_initialized = True
             # Create model runner — one decision chain, in precedence order:
             #   1. explicit od_config.diffusion_model_runner_cls (user override),
             #   2. the runner declared by the engine class that engine_backend
@@ -536,11 +548,16 @@ class DiffusionWorker:
                 # model-touching init steps do.
                 with set_current_vllm_config(self.vllm_config):
                     self.init_lora_manager()
-        except Exception:
-            # init_device() owns process-global distributed state. If anything
-            # after it fails, unwind that state before another inline worker is
-            # allowed to initialize in this process.
-            self.shutdown()
+        except BaseException:
+            # Only tear down process-global distributed state if this worker
+            # completed init_device(); otherwise release only our stack claim.
+            if device_initialized:
+                try:
+                    self.shutdown()
+                except Exception:
+                    logger.exception("Worker %s: cleanup after initialization failure failed", self.rank)
+            else:
+                clear_process_weight_stack(owner=self)
             raise
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
@@ -1682,6 +1699,7 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and release process-global resources."""
+        clear_process_weight_stack(owner=self)
         if getattr(self, "_shutdown_complete", False):
             return
         self._shutdown_complete = True

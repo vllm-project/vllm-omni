@@ -723,6 +723,7 @@ class StageDeployConfig:
     diffusion_kv_cache_skip_layers: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.
+    diffusion_weight_stack: str | None = None
     hsdp_weight_load_strategy: str | None = None
     enable_multithread_weight_load: bool | None = None
     enable_broadcast_weight_load: bool | None = None
