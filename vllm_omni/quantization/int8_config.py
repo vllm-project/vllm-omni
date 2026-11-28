@@ -18,6 +18,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_int8_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    Int8ScaledMMLinearLayerConfig,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -38,12 +41,17 @@ from vllm.model_executor.model_loader.weight_utils import initialize_single_dumm
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
+    PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
     copy_missing_attrs as _copy_missing_attrs,
+)
+from vllm_omni.quantization.int8_sm100 import (
+    Int8Sm100ScaledMMLinearKernel,
+    sm100_int8_fallback_needed,
 )
 
 if current_omni_platform.is_npu():
@@ -54,8 +62,10 @@ else:
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
-# Dynamic quantization is supported first.
-ACTIVATION_SCHEMES = ["dynamic"]
+# "dynamic": per-token activation scales computed at run time.
+# "static": one per-tensor FP32 ``input_scale`` per layer, read from the
+# serialized checkpoint (symmetric INT8).
+ACTIVATION_SCHEMES = ["dynamic", "static"]
 
 # Ascend's npu_quant_matmul (QuantBatchMatmulV3) refuses a weight whose last
 # dimension exceeds this, and it fails at the first forward rather than at load
@@ -174,15 +184,34 @@ class DiffusionInt8Config(QuantizationConfig):
         is_checkpoint_int8_serialized: bool = False,
         activation_scheme: str = "dynamic",
         ignored_layers: list[str] | None = None,
+        smoothquant: bool | dict[str, Any] | None = None,
+        runtime: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
 
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
+        # Model runtime metadata, for example the Cosmos3 MAPS
+        # ``diffusion_step_policy``. The model reads it from the checkpoint
+        # config. The linear method does not use it.
+        if runtime is not None and not isinstance(runtime, dict):
+            raise ValueError(f"runtime must be a dict, got {runtime!r}")
+        self.runtime = runtime or {}
 
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        # SmoothQuant: the checkpoint holds ``pre_quant_scale`` (FP32 [K]) per
+        # layer, and the runtime computes ``x * pre_quant_scale`` before the
+        # INT8 quantization. A dict value (e.g. {"alpha": 0.5}) is metadata.
+        if smoothquant is not None and not isinstance(smoothquant, (bool, dict)):
+            raise ValueError(f"smoothquant must be a bool or a dict, got {smoothquant!r}")
+        self.smoothquant = bool(smoothquant) if smoothquant is not None else False
+        if not is_checkpoint_int8_serialized:
+            if activation_scheme == "static":
+                raise ValueError("activation_scheme 'static' needs a serialized INT8 checkpoint with input_scale")
+            if self.smoothquant:
+                raise ValueError("smoothquant needs a serialized INT8 checkpoint with pre_quant_scale")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -211,6 +240,8 @@ class DiffusionInt8Config(QuantizationConfig):
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys_or(config, ["activation_scheme"], "dynamic")
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        smoothquant = cls.get_from_keys_or(config, ["smoothquant"], None)
+        runtime = cls.get_from_keys_or(config, ["runtime"], None)
 
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
@@ -218,6 +249,8 @@ class DiffusionInt8Config(QuantizationConfig):
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
+            smoothquant=smoothquant,
+            runtime=runtime,
         )
 
     def get_quant_method(
@@ -249,6 +282,15 @@ class DiffusionInt8Config(QuantizationConfig):
                     raise NotImplementedError("The current platform is not supported int8 offline quant.")
                 return offline_method
         return None
+
+
+def _load_pre_quant_scale(param: torch.nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs) -> None:
+    if loaded_weight.numel() != param.numel():
+        raise ValueError(
+            f"pre_quant_scale has {loaded_weight.numel()} values, expected {param.numel()} "
+            "(tensor-parallel sharding of pre_quant_scale is not supported)"
+        )
+    param.data.copy_(loaded_weight.reshape(param.shape))
 
 
 class BaseInt8LinearMethod(LinearMethodBase):
@@ -297,6 +339,24 @@ class BaseInt8LinearMethod(LinearMethodBase):
                 weight_loader=weight_loader,
             )
             layer.register_parameter("weight_scale", scale)
+
+            if self.quant_config.activation_scheme == "static":
+                # One scale per logical shard (fused q/k/v, gate/up). The
+                # kernel reduces them to one per-tensor scale after loading.
+                input_scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("input_scale", input_scale)
+
+            if self.quant_config.smoothquant:
+                pre_quant_scale = torch.nn.Parameter(
+                    torch.empty(input_size_per_partition, dtype=torch.float32),
+                    requires_grad=False,
+                )
+                # Fused shards share one input, so every shard writes the same values.
+                pre_quant_scale.weight_loader = _load_pre_quant_scale
+                layer.register_parameter("pre_quant_scale", pre_quant_scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         raise NotImplementedError("No BaseInt8LinearMethod process_weights_after_loading implementation.")
@@ -474,12 +534,23 @@ class Int8LinearMethod(BaseInt8LinearMethod):
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
 
-        self.int8_linear = init_int8_linear_kernel(
-            is_channelwise=False,
-            is_static_input_scheme=False,
-            input_symmetric=True,
-            module_name=self.__class__.__name__,
-        )
+        if current_omni_platform.is_cuda() and sm100_int8_fallback_needed():
+            # vLLM CUTLASS INT8 refuses SM100; use torch._int_mm instead.
+            self.int8_linear = Int8Sm100ScaledMMLinearKernel(
+                Int8ScaledMMLinearLayerConfig(
+                    is_channelwise=False,
+                    is_static_input_scheme=quant_config.activation_scheme == "static",
+                    input_symmetric=True,
+                ),
+                layer_param_names=["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"],
+            )
+        else:
+            self.int8_linear = init_int8_linear_kernel(
+                is_channelwise=False,
+                is_static_input_scheme=quant_config.activation_scheme == "static",
+                input_symmetric=True,
+                module_name=self.__class__.__name__,
+            )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         self.int8_linear.process_weights_after_loading(layer)
@@ -490,6 +561,19 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        pre_quant_scale = getattr(layer, "pre_quant_scale", None)
+        x2d = x.reshape(-1, x.shape[-1])
+        if (
+            pre_quant_scale is not None
+            and isinstance(self.int8_linear, Int8Sm100ScaledMMLinearKernel)
+            and self.int8_linear.fuses_pre_quant_scale(layer, x2d)
+        ):
+            # SM100 dynamic path: the multiply runs inside the quantization kernel.
+            output = self.int8_linear.apply_weights(layer, x2d.contiguous(), bias, pre_quant_scale=pre_quant_scale)
+            return output.reshape(*x.shape[:-1], output.shape[-1])
+        if pre_quant_scale is not None:
+            # Naive SmoothQuant: not fused into the previous norm.
+            x = x * pre_quant_scale.to(x.dtype)
         # ROCm INT8 kernels accept matrices; diffusion also passes batched states.
         output = self.int8_linear.apply_weights(layer, x.reshape(-1, x.shape[-1]).contiguous(), bias)
         return output.reshape(*x.shape[:-1], output.shape[-1])
@@ -506,6 +590,8 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
 
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
+        if quant_config.activation_scheme == "static" or quant_config.smoothquant:
+            raise NotImplementedError("Static activations and smoothquant are not supported on NPU.")
 
     def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
         if _fell_back_to_unquantized_npu(layer, *args, **kwargs):

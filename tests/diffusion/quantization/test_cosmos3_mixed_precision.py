@@ -58,6 +58,11 @@ def _fake_quant_config(name: str, *, serialized: bool = True):
             quant_method="NVFP4",
             is_checkpoint_nvfp4_serialized=serialized,
         )
+    if name == "int8":
+        return SimpleNamespace(
+            get_name=lambda: name,
+            is_checkpoint_int8_serialized=serialized,
+        )
     return SimpleNamespace(get_name=lambda: name)
 
 
@@ -843,7 +848,7 @@ def test_install_hybrid_uses_real_modelopt_strategies(monkeypatch) -> None:
         assert wrapper.strategy in runtime_impl._STRATEGIES
         assert wrapper.runtime is runtime
         assert wrapper.path == "generation"
-    log_info.assert_called_once_with("Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d", 1, 1)
+    log_info.assert_called_once_with("Cosmos3 mixed precision wrapped linears: fp8=%d, int8=%d, nvfp4=%d", 1, 0, 1)
 
 
 def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:
@@ -1030,3 +1035,175 @@ def test_maps_linear_backend_reaches_native_config(backend: str) -> None:
     config = OmniDiffusionConfig(linear_backend=projected["linear_backend"])
     native = create_diffusion_vllm_config(torch.device("cpu"), config)
     assert native.kernel_config.linear_backend == backend
+
+
+# ---------------------------------------------------------------------------
+# INT8 W8A8 / W8A16
+# ---------------------------------------------------------------------------
+
+
+def _int8_method(serialized: bool = True, *, mocker=None):
+    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+        CutlassInt8ScaledMMLinearKernel,
+    )
+
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config, Int8LinearMethod
+
+    method = object.__new__(Int8LinearMethod)
+    method.quant_config = DiffusionInt8Config(is_checkpoint_int8_serialized=serialized)
+    method.int8_linear = object.__new__(CutlassInt8ScaledMMLinearKernel)
+    return method
+
+
+def _int8_layer(output_size: int = 3, input_size: int = 4, *, smooth: bool = False) -> _Layer:
+    """A layer as it looks after CUTLASS processing: weight [K, N], scale [N, 1]."""
+    layer = _Layer(output_size, input_size)
+    q = torch.arange(-6, 6, dtype=torch.int8)[: output_size * input_size].reshape(output_size, input_size)
+    layer.weight = q.t().contiguous()
+    layer.weight_scale = torch.tensor([[0.5], [0.25], [2.0]])[:output_size]
+    if smooth:
+        layer.pre_quant_scale = torch.tensor([1.0, 2.0, 0.5, 4.0])[:input_size]
+    return layer
+
+
+def test_int8_strategy_accepts_only_serialized_int8_method() -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    strategy = Int8W8A8W8A16Strategy()
+    assert strategy.accepts(_int8_method(True))
+    assert not strategy.accepts(_int8_method(False))
+    assert not strategy.accepts(object())
+    assert not strategy.accepts(None)
+    assert not Fp8W8A8W8A16Strategy().accepts(_int8_method(True))
+
+
+@pytest.mark.parametrize("smooth", [False, True])
+def test_int8_materialize_dense_weight(smooth: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    layer = _int8_layer(smooth=smooth)
+    dense = Int8W8A8W8A16Strategy().materialize(layer)
+    assert dense.dtype == torch.bfloat16
+    assert tuple(dense.shape) == (3, 4)
+    q = layer.weight.t().float()  # [N, K]
+    expected = q * layer.weight_scale
+    if smooth:
+        expected = expected * layer.pre_quant_scale[None, :]
+    assert torch.equal(dense, expected.to(torch.bfloat16))
+
+
+def test_int8_materialize_square_layer_uses_k_n_layout() -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    layer = _Layer(3, 3)
+    q = torch.arange(9, dtype=torch.int8).reshape(3, 3)  # [N, K]
+    layer.weight = q.t().contiguous()  # live [K, N]
+    layer.weight_scale = torch.ones(3, 1)
+    dense = Int8W8A8W8A16Strategy().materialize(layer)
+    assert torch.equal(dense.float(), q.float())
+
+
+def test_int8_apply_high_uses_unsmoothed_input() -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    layer = _int8_layer(smooth=True)
+    x = torch.randn(2, 5, 4, dtype=torch.bfloat16)
+    out = Int8W8A8W8A16Strategy().apply_high(layer, x, None)
+    # Equivalent to (x * pre) @ (q * ws)^T in float32.
+    q = layer.weight.t().float() * layer.weight_scale
+    ref = (x.float() * layer.pre_quant_scale) @ q.t()
+    assert out.shape == (2, 5, 3)
+    assert torch.allclose(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_int8_validation_after_processing() -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    strategy = Int8W8A8W8A16Strategy()
+    strategy.validate_after_processing(_int8_layer(smooth=True), "x")
+    layer = _int8_layer()
+    layer.weight = layer.weight.t().contiguous()  # [N, K]: wrong layout
+    with pytest.raises(ValueError, match=r"\(K, N\)"):
+        strategy.validate_after_processing(layer, "x")
+    layer = _int8_layer()
+    layer.weight_scale = torch.zeros(3, 1)
+    with pytest.raises(ValueError, match="non-positive"):
+        strategy.validate_after_processing(layer, "x")
+    layer = _int8_layer(smooth=True)
+    layer.pre_quant_scale = torch.ones(5)
+    with pytest.raises(ValueError, match="pre_quant_scale"):
+        strategy.validate_after_processing(layer, "x")
+
+
+def test_int8_validation_rejects_non_cutlass_kernel() -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    method = _int8_method()
+    method.int8_linear = object()
+    with pytest.raises(ValueError, match=r"\[K, N\]"):
+        Int8W8A8W8A16Strategy().validate_before_processing(method, _int8_layer(), "x")
+
+
+def test_runtime_wraps_and_counts_int8(caplog) -> None:
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    assert Int8W8A8W8A16Strategy in {type(s) for s in runtime_impl._STRATEGIES}
+    assert runtime_impl._strategy_for(_int8_method()).format_name == "int8"
+    assert LinearBase is not None
+
+
+def test_checkpoint_gate_accepts_serialized_int8() -> None:
+    od_config = _checkpoint_od_config(_fake_quant_config("int8"), policy=_policy())
+    assert read_checkpoint_policy(od_config) == Cosmos3MixedPrecisionConfig()
+    od_config = _checkpoint_od_config(
+        _fake_quant_config("int8"),
+        additional_config={"cosmos3_mixed_precision": {}},
+    )
+    assert resolve_mixed_precision_config(od_config) == (Cosmos3MixedPrecisionConfig(), "additional_config")
+
+
+def test_checkpoint_gate_accepts_real_serialized_int8_config() -> None:
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    quant_config = DiffusionInt8Config(is_checkpoint_int8_serialized=True, activation_scheme="static", smoothquant=True)
+    od_config = _checkpoint_od_config(quant_config, additional_config={"cosmos3_mixed_precision": {}})
+    assert resolve_mixed_precision_config(od_config) == (Cosmos3MixedPrecisionConfig(), "additional_config")
+
+
+@pytest.mark.parametrize("has_checkpoint_policy", [False, True])
+def test_checkpoint_gate_rejects_online_int8(has_checkpoint_policy: bool) -> None:
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    for quant_config in (_fake_quant_config("int8", serialized=False), DiffusionInt8Config()):
+        od_config = _checkpoint_od_config(
+            quant_config,
+            policy=_policy() if has_checkpoint_policy else None,
+            additional_config={"cosmos3_mixed_precision": {}},
+        )
+        with pytest.raises(ValueError, match="serialized INT8"):
+            resolve_mixed_precision_config(od_config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs CUDA")
+@pytest.mark.parametrize("smooth", [False, True])
+@pytest.mark.parametrize("k,n", [(4096, 1024), (4096, 4096), (12288, 4096), (300, 70)])
+@pytest.mark.parametrize("stored_view", [True, False])
+def test_int8_materialize_cuda_triton_bit_identical(smooth: bool, k: int, n: int, stored_view: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import Int8W8A8W8A16Strategy
+
+    torch.manual_seed(0)
+    layer = _Layer(n, k)
+    q = torch.randint(-128, 128, (n, k), dtype=torch.int8, device="cuda")
+    layer.weight = q.t() if stored_view else q.t().contiguous()  # [K, N]
+    layer.weight_scale = torch.rand(n, 1, device="cuda") + 0.01
+    if smooth:
+        layer.pre_quant_scale = torch.rand(k, device="cuda") + 0.5
+    dense = Int8W8A8W8A16Strategy().materialize(layer)
+    ref = layer.weight.to(torch.float32) * layer.weight_scale.reshape(1, -1)
+    if smooth:
+        ref = ref * layer.pre_quant_scale.reshape(-1, 1)
+    ref = ref.t().to(torch.bfloat16)
+    assert dense.is_contiguous() and tuple(dense.shape) == (n, k)
+    assert torch.equal(dense, ref)

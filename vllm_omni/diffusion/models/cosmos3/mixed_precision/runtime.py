@@ -19,6 +19,7 @@ from .moe import RecordedMoE, ensure_supported_moe_method, install_moe_dispatch
 from .strategy import (
     Cosmos3PrecisionStrategy,
     Fp8W8A8W8A16Strategy,
+    Int8W8A8W8A16Strategy,
     Nvfp4W4A4W4A16Strategy,
 )
 
@@ -27,6 +28,7 @@ logger = init_logger(__name__)
 PrecisionPath = Literal["reasoner", "generation"]
 _STRATEGIES: tuple[Cosmos3PrecisionStrategy, ...] = (
     Fp8W8A8W8A16Strategy(),
+    Int8W8A8W8A16Strategy(),
     Nvfp4W4A4W4A16Strategy(),
 )
 
@@ -136,8 +138,9 @@ class Cosmos3MixedPrecisionRuntime:
             )
 
         logger.info(
-            "Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d",
+            "Cosmos3 mixed precision wrapped linears: fp8=%d, int8=%d, nvfp4=%d",
             wrapped_counts["fp8"],
+            wrapped_counts["int8"],
             wrapped_counts["nvfp4"],
         )
 

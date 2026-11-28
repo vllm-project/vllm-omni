@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 from vllm_omni.diffusion.quantization.hsdp_fp8 import fp8_kernel_weight_view
+from vllm_omni.quantization.int8_config import Int8LinearMethod
 
 _NVFP4_BLOCK_SIZE = 16
 
@@ -164,6 +165,83 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
         weight = fp8_kernel_weight_view(layer.weight, row_major=row_major)[:input_size, :output_size]
         scale = layer.weight_scale.reshape(1).to(device=weight.device, dtype=torch.float32)
         return (weight.to(torch.float32) * scale).t().to(torch.bfloat16)
+
+
+class Int8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
+    """Use the serialized INT8 W8A8 method or reference dense W8A16.
+
+    Optional SmoothQuant ``pre_quant_scale`` multiplies the input in the native
+    path only. The dense weight folds it in per input channel, so
+    ``apply_high`` uses the original activation.
+    """
+
+    format_name = "int8"
+
+    def accepts(self, method: object | None) -> bool:
+        return isinstance(method, Int8LinearMethod) and method.quant_config.is_checkpoint_int8_serialized
+
+    def validate_before_processing(
+        self,
+        method: object,
+        layer: torch.nn.Module,
+        module_name: str,
+    ) -> None:
+        from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+            CutlassInt8ScaledMMLinearKernel,
+        )
+
+        # Cutlass and its Triton subclass store the weight as [K, N].
+        kernel = getattr(getattr(method, "int8_linear", None), "__class__", None)
+        if kernel is None or not issubclass(kernel, CutlassInt8ScaledMMLinearKernel):
+            name = kernel.__name__ if kernel is not None else "none"
+            raise ValueError(f"{module_name} selected INT8 kernel {name}; MAPS needs a kernel with [K, N] INT8 weights")
+        weight_scale = getattr(layer, "weight_scale", None)
+        if not isinstance(weight_scale, torch.Tensor):
+            raise ValueError(f"{module_name} requires serialized INT8 weights")
+
+    def validate_after_processing(
+        self,
+        layer: torch.nn.Module,
+        module_name: str,
+    ) -> None:
+        weight = getattr(layer, "weight", None)
+        scale = getattr(layer, "weight_scale", None)
+        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.int8:
+            dtype = getattr(weight, "dtype", None)
+            raise TypeError(f"{module_name} requires an INT8 weight, got {dtype}")
+        if weight.ndim != 2:
+            raise ValueError(f"{module_name} requires a rank-2 INT8 weight, got {tuple(weight.shape)}")
+        input_size = int(layer.input_size_per_partition)
+        output_size = int(layer.output_size_per_partition)
+        if tuple(weight.shape) != (input_size, output_size):
+            raise ValueError(
+                f"{module_name} live INT8 weight shape {tuple(weight.shape)} "
+                f"is not (K, N)=({input_size}, {output_size})"
+            )
+        if not isinstance(scale, torch.Tensor) or scale.numel() != output_size:
+            raise ValueError(f"{module_name} requires one INT8 weight scale per output channel")
+        _validate_positive_finite_scale(scale, module_name)
+        pre_quant_scale = getattr(layer, "pre_quant_scale", None)
+        if pre_quant_scale is not None:
+            if pre_quant_scale.numel() != input_size:
+                raise ValueError(f"{module_name} pre_quant_scale must have {input_size} values")
+            _validate_positive_finite_scale(pre_quant_scale, module_name)
+
+    def materialize(self, layer: torch.nn.Module) -> torch.Tensor:
+        input_size = int(layer.input_size_per_partition)
+        output_size = int(layer.output_size_per_partition)
+        pre_quant_scale = getattr(layer, "pre_quant_scale", None)
+        if layer.weight.is_cuda:
+            # One fused pass, bit-identical to the torch reference below.
+            from vllm_omni.quantization.int8_sm100_triton import dequant_weight_bf16
+
+            return dequant_weight_bf16(layer.weight[:input_size, :output_size], layer.weight_scale, pre_quant_scale)
+        weight = layer.weight[:input_size, :output_size].to(torch.float32)  # [K, N]
+        scale = layer.weight_scale.reshape(1, -1).to(device=weight.device, dtype=torch.float32)
+        weight = weight * scale
+        if pre_quant_scale is not None:
+            weight = weight * pre_quant_scale.reshape(-1, 1).to(device=weight.device, dtype=torch.float32)
+        return weight.t().to(torch.bfloat16)
 
 
 class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
