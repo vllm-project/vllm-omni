@@ -445,7 +445,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      codec_streaming: true
       codec_chunk_frames: 25              # standard chunk size (~2s of audio)
       codec_left_context_frames: 25
       # initial chunk is computed dynamically by default
@@ -599,7 +598,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      codec_streaming: true
       codec_chunk_frames: 25
       codec_left_context_frames: 25
 ```
