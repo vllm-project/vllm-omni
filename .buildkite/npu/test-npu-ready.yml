@@ -112,6 +112,7 @@ steps:
             tests/diffusion/models/minimax_h3/test_minimax_h3_qwen3vl_swiglu.py
             tests/diffusion/models/minimax_h3/test_minimax_h3_modulation.py
             tests/diffusion/models/qwen_image_21/test_rope_device_qualification.py
+            tests/diffusion/models/lingbot_video/test_lingbot_video_transformer_npu.py
             -m 'core_model and npu and A3'
             --run-level 'core_model'
 

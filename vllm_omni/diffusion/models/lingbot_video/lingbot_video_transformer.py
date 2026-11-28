@@ -113,7 +113,12 @@ class LingBotVideoRotaryEmbedding(nn.Module):
         elif self.freqs_cis[0].device != device:
             self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
 
-        return torch.cat([self.freqs_cis[i][position_ids[:, i]] for i in range(len(self.axes_dims))], dim=-1)
+        # NPU aclnnIndex (advanced indexing) rejects complex64 self tensors;
+        # use index_select, as the other RoPE implementations do.
+        return torch.cat(
+            [self.freqs_cis[i].index_select(0, position_ids[:, i]) for i in range(len(self.axes_dims))],
+            dim=-1,
+        )
 
 
 def make_joint_position_ids(text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device) -> torch.Tensor:
@@ -122,11 +127,12 @@ def make_joint_position_ids(text_len: int, grid_t: int, grid_h: int, grid_w: int
     Text t-axis positions are 1..text_len, and video t-axis positions start at
     text_len + 1. This matches the token order produced by ``_cat_interleave``.
     """
-    tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
-    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
-    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
+    # NPU aclnnMaxDim rejects int32, so position ids must be int64.
+    tt = torch.arange(grid_t, device=device, dtype=torch.int64) + (text_len + 1)
+    hh = torch.arange(grid_h, device=device, dtype=torch.int64)
+    ww = torch.arange(grid_w, device=device, dtype=torch.int64)
     grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
-    text_t = torch.arange(text_len, device=device, dtype=torch.int32) + 1
+    text_t = torch.arange(text_len, device=device, dtype=torch.int64) + 1
     text_pos = torch.stack([text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1)
     return torch.cat([grid, text_pos], dim=0)  # (Nx + L, 3)
 
