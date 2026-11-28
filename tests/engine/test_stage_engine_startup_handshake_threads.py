@@ -207,3 +207,55 @@ def test_single_api_retains_socket_around_context_body(fake_startup: SimpleNames
     expected.append(("socket-close", owner))
     assert fake_startup.events == expected
     assert len(fake_startup.launches) == (0 if body_fails else 1)
+
+
+@pytest.mark.parametrize(
+    ("num_api_servers", "wait_error", "exited", "tolerated"),
+    [
+        pytest.param(1, RuntimeError, True, True, id="local-exit"),
+        pytest.param(1, RuntimeError, False, False, id="live-handshake-error"),
+        pytest.param(1, TimeoutError, True, False, id="deadline-killed-process"),
+        pytest.param(2, RuntimeError, True, False, id="multi-api-exit"),
+    ],
+)
+def test_launch_classifies_readiness_failure(
+    fake_startup: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    num_api_servers: int,
+    wait_error: type[Exception],
+    exited: bool,
+    tolerated: bool,
+) -> None:
+    error = wait_error("readiness wait failed")
+    sentinel = object()
+    sentinel_checks = []
+
+    def fail_wait(*_args, **_kwargs):
+        raise error
+
+    def wait_on_sentinel(objects, timeout):
+        assert objects == [sentinel]
+        assert timeout == 0
+        sentinel_checks.append(sentinel)
+        return [sentinel] if exited else []
+
+    monkeypatch.setattr(stage_engine_startup, "wait_for_engine_startup_with_deadline", fail_wait)
+    monkeypatch.setattr(stage_engine_startup.connection, "wait", wait_on_sentinel)
+    expected = stage_engine_startup.LocalReplicaStartupError if tolerated else wait_error
+    with pytest.raises(expected) as exc_info:
+        with stage_engine_startup.launch_stage_replica(
+            vllm_config=fake_startup.config,
+            executor_class=object,
+            log_stats=False,
+            stage_id=1,
+            replica_id=1,
+            num_api_servers=num_api_servers,
+        ) as resources:
+            resources.manager.processes = [SimpleNamespace(sentinel=sentinel)]
+
+    if tolerated:
+        assert "LLM stage-1 replica-1 exited before READY" in str(exc_info.value)
+        assert exc_info.value.__cause__ is error
+    else:
+        assert exc_info.value is error
+    assert len(sentinel_checks) == int(num_api_servers == 1 and wait_error is RuntimeError)

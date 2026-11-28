@@ -67,7 +67,15 @@ def wait_for_engine_startup_with_deadline(
     timer.daemon = True
     timer.start()
     try:
-        wait_for_engine_startup(handshake_socket, core_engines, parallel_config, coordinated_dp, cache_config, launch)
+        try:
+            wait_for_engine_startup(
+                handshake_socket, core_engines, parallel_config, coordinated_dp, cache_config, launch
+            )
+        finally:
+            timer.cancel()
+            # A callback that passed the cancellation check can still kill
+            # the processes. Join it before classifying the handshake result.
+            timer.join()
     except Exception as exc:
         if timed_out.is_set():
             raise TimeoutError(
@@ -75,12 +83,6 @@ def wait_for_engine_startup_with_deadline(
                 "its processes were terminated"
             ) from exc
         raise
-    finally:
-        timer.cancel()
-        # cancel() does not stop a callback that already passed the timer's
-        # cancellation check. Wait for it, so that ``timed_out`` and the
-        # processes' state are final before the stage is handed back.
-        timer.join()
     if timed_out.is_set():
         # READY arrived in the same instant the deadline fired and the processes were
         # already terminated: do not hand back a stage whose engine is gone.
