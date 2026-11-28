@@ -305,7 +305,8 @@ def test_scheduler_worker_end_to_end_state_agreement():
             "duplex": {
                 "data_plane": True,
                 "runtime_config": {
-                    "duplex_window_prefix_tokens": 16,
+                    "duplex_first_append_context_tokens": 16,
+                    "duplex_window_prefix_tokens": 14,
                     "duplex_window_config": {
                         "sliding_window_mode": "basic",
                         "basic_window_high_tokens": 64,  # Total watermark trigger at 64 tokens (< 64+1=65)
@@ -331,6 +332,7 @@ def test_scheduler_worker_end_to_end_state_agreement():
     assert session.num_computed_tokens == 48
     assert session.num_prompt_tokens == 48
     assert duplex_mgr.blocks == [0, 2, 3]
+    assert update.model_intermediate_buffer["duplex"]["stage0_reanchor"]["prefix_tokens"] == 16
 
     # Subsequent append from upstream _update_request_as_session adds the 1 pending token:
     session.prompt_token_ids.extend(update.prompt_token_ids)
@@ -642,7 +644,7 @@ def test_rejection_before_state_mutation():
             "duplex": {
                 "data_plane": True,
                 "runtime_config": {
-                    "duplex_window_prefix_tokens": 16,
+                    "duplex_first_append_context_tokens": 16,
                     "duplex_window_config": {
                         "sliding_window_mode": "basic",
                         "basic_window_high_tokens": 20,
@@ -789,7 +791,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
                 "seq": 2,
                 "runtime_config": {
                     "duplex_first_append_context_tokens": prefix_tokens,
-                    "duplex_window_prefix_tokens": prefix_tokens,
+                    "duplex_window_prefix_tokens": prefix_tokens - 2,
                     "duplex_window_config": {
                         "sliding_window_mode": "basic",
                         "basic_window_high_tokens": high_watermark,
@@ -848,7 +850,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
                 "seq": 3,
                 "runtime_config": {
                     "duplex_first_append_context_tokens": prefix_tokens,
-                    "duplex_window_prefix_tokens": prefix_tokens,
+                    "duplex_window_prefix_tokens": prefix_tokens - 2,
                     "duplex_window_config": {
                         "sliding_window_mode": "basic",
                         "basic_window_high_tokens": high_watermark,
@@ -899,7 +901,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
                 "seq": 4,
                 "runtime_config": {
                     "duplex_first_append_context_tokens": prefix_tokens,
-                    "duplex_window_prefix_tokens": prefix_tokens,
+                    "duplex_window_prefix_tokens": prefix_tokens - 2,
                     "duplex_window_config": {
                         "sliding_window_mode": "basic",
                         "basic_window_high_tokens": 100,  # Force watermark to fire
@@ -975,7 +977,8 @@ def test_worker_history_partial_unit_slice_and_exact_range():
     assert remaining_embeds[0][0, 0].item() == 16.0
 
 
-def test_watermark_interval_high_to_high_plus_prefix():
+@pytest.mark.parametrize(("prefix_tokens", "expected_sink_blocks"), [(96, 6), (100, 7)])
+def test_watermark_interval_high_to_high_plus_prefix(prefix_tokens: int, expected_sink_blocks: int):
     """Reviewer @amy-why-3459 Issue 3: Dispatch around the [high, high + prefix] interval.
 
     With prefix=96, high=8000, computed=7970, pending=64 -> projected=8034.
@@ -985,7 +988,6 @@ def test_watermark_interval_high_to_high_plus_prefix():
         MiniCPMO45DuplexWindowPolicy,
     )
 
-    prefix_tokens = 96
     high_watermark = 8000
     low_watermark = 6000
 
@@ -1000,7 +1002,8 @@ def test_watermark_interval_high_to_high_plus_prefix():
             "duplex": {
                 "data_plane": True,
                 "runtime_config": {
-                    "duplex_window_prefix_tokens": prefix_tokens,
+                    "duplex_first_append_context_tokens": prefix_tokens,
+                    "duplex_window_prefix_tokens": 64,
                     "duplex_window_config": {
                         "sliding_window_mode": "basic",
                         "basic_window_high_tokens": high_watermark,
@@ -1021,6 +1024,8 @@ def test_watermark_interval_high_to_high_plus_prefix():
     )
     assert plan is not None, "Zero-copy policy must trigger when total length passes basic_window_high_tokens!"
     assert plan.delta > 0
+    assert plan.sink_blocks == expected_sink_blocks
+    assert plan.sink_end >= prefix_tokens
     # Post-trim length must be bounded by low_watermark
     assert 8034 - plan.delta <= low_watermark
 

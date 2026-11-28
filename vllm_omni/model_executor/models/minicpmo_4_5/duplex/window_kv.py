@@ -613,7 +613,7 @@ class MiniCPMO45DuplexWindowPolicy:
             return None
 
         base_len = int(getattr(session, "num_computed_tokens", 0) or 0)
-        prefix_tokens = int(runtime_config.get("duplex_window_prefix_tokens", 96) or 96)
+        prefix_tokens = int(runtime_config.get("duplex_first_append_context_tokens", 96) or 96)
         high_watermark = int(window.get("basic_window_high_tokens", 8000) or 8000)
         low_watermark = int(window.get("basic_window_low_tokens", 6000) or 6000)
 
