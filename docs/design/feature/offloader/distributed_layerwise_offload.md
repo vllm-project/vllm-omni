@@ -154,6 +154,34 @@ When DP is greater than one, the engine can process one request per DP rank in
 the same denoising wave. Because AllGather is a collective, all participating
 requests must take the same execution path at every denoising step.
 
+### NPU INT8 weight layout
+
+Set `weight_nz_mode` in the INT8 component configuration, for example
+`--diffusion-quantization-config '{"transformer":{"method":"int8","weight_nz_mode":"cast"}}'`.
+The default is `off`. Choose `cast` or
+`reactor` to convert finalized NPU INT8 linear weights to `FRACTAL_NZ`
+(format 29). Both modes convert resident weights once after loading.
+
+For DLO, `cast` converts each streamed weight on the NPU after upload.
+`reactor` packs the padded NZ bytes on the CPU and binds an NZ view over the
+transfer buffer on the NPU. Disabling DLO restores the ordinary CPU weights.
+
+DLO `reactor` requires TorchNPU APIs that can create storage from a device
+pointer and bind an NZ tensor view. On Ascend 950 (A5) with
+`ALLOW_INTERNAL_FORMAT` disabled, the worker checks a padded borrowed NZ view
+and its INT8 matmul against ND once per device. Other devices require
+`torch.npu.config.allow_internal_format=True`. Startup rejects `reactor`
+when its checks fail. Use `off` to keep ND.
+
+Both DLO modes have been validated on Ascend 910B4-1 (A2) with CANN 9.2.1
+and on Ascend 950DT (A5) with CANN 9.3.0, using TorchNPU `2.10.0.post7`
+on both systems. The four-card A5 MiniMax-H3 smoke used DLO AllGather
+with `--dlo-chunk-size-mb 1`.
+
+A diffusion stage with sleep mode enabled rejects `cast` and `reactor` in its
+own NPU INT8 configuration before loading weights. Ordinary model-level and layer-wise CPU offload also reject
+either mode when the model contains eligible INT8 weights.
+
 ### Rank-local path without DLO AllGather
 
 With `weight_transfer="rank-local"`, DLO forces the affected component's internal

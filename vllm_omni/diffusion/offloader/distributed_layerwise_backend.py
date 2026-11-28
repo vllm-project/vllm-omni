@@ -37,6 +37,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.host_weight_runtime import HostWeightLease
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization import npu_int8_weight_nz
 
 from .base import OffloadBackend, OffloadConfig, run_cleanup_steps
 from .chunked_transport import PartManifest, build_part_manifest, pack_local_shard
@@ -76,6 +77,29 @@ from .tensor_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _weight_nz_policy(module: nn.Module) -> dict[str, str]:
+    modes = npu_int8_weight_nz.int8_weight_modes(module)
+    if "reactor" in modes.values():
+        npu_int8_weight_nz.check_reactor_support()
+    return modes
+
+
+def _host_weight_view(buffer: torch.Tensor, meta: dict[str, Any]) -> torch.Tensor:
+    storage = buffer[meta["offset"] : meta["offset"] + meta["numel"]]
+    if meta.get("weight_nz") == "reactor":
+        return npu_int8_weight_nz.unpack_nz_weight(storage, meta["shape"])
+    return torch.as_strided(storage, size=meta["shape"], stride=meta["stride"])
+
+
+def _device_weight_view(buffer: torch.Tensor, meta: dict[str, Any]) -> torch.Tensor:
+    mode = meta.get("weight_nz")
+    if mode == "reactor":
+        return npu_int8_weight_nz.nz_view(buffer, meta["offset"], meta["shape"])
+    value = _host_weight_view(buffer, meta)
+    return npu_int8_weight_nz.cast_weight_to_nz(value) if mode == "cast" else value
+
 
 # A backend normally owns both objects below. This process-lifetime safety
 # owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
@@ -180,6 +204,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
+        self._nz_modes = _weight_nz_policy(next_block)
+        self._has_nz_cast = "cast" in self._nz_modes.values()
+        # Pointer-backed NZ views must not outlive the device slot they borrow.
+        self._nz_keepalive: dict[torch.dtype, torch.Tensor] | None = None
 
         self._materialization_probe = materialization_probe_tensor
 
@@ -282,6 +310,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.next_block_parameters,
                 self.next_block_buffers,
                 self.tensor_transforms,
+                self._nz_modes,
             )
         elif self.dp_size > 1:
             self.cpu_shards, self.metadata, self.manifest = self._pack_chunk_shards(
@@ -297,6 +326,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.rank,
                 self.pin_memory,
                 self.tensor_transforms,
+                self._nz_modes,
             )
 
         # Allocate device buffers only if not using shared buffers from backend
@@ -310,10 +340,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 if m["name"] in self.next_block_parameters
                 else self.next_block_buffers[m["name"]],
                 dtype,
-                m["offset"],
-                m["numel"],
-                m["shape"],
-                m["stride"],
+                m,
             )
             for dtype, metas in self.metadata.items()
             for m in metas
@@ -344,6 +371,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
         tensor_transforms: dict[int, Any] | None = None,
+        nz_modes: dict[str, str] | None = None,
     ) -> tuple[dict[torch.dtype, list[dict[str, Any]]], dict[torch.dtype, list[dict[str, Any]]]]:
         """Retain file-backed tensors and describe their runtime layout.
 
@@ -351,6 +379,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         adapters are applied only while packing a bounded staging slot, so no
         full-model anonymous CPU copy is retained by a worker.
         """
+        nz_modes = nz_modes or {}
         cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
         metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
         offsets: dict[torch.dtype, int] = {}
@@ -382,6 +411,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 if runtime_source.numel() == 0
                 else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(runtime_source.shape, stride))
             )
+            mode = nz_modes.get(name)
+            if mode == "reactor":
+                storage_numel = npu_int8_weight_nz.nz_storage_numel(runtime_source.shape)
 
             cpu_sources.setdefault(dtype, []).append(
                 {
@@ -390,15 +422,16 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     "transform": transform,
                 }
             )
-            metadata.setdefault(dtype, []).append(
-                {
-                    "name": name,
-                    "offset": offset,
-                    "numel": storage_numel,
-                    "shape": runtime_source.shape,
-                    "stride": stride,
-                }
-            )
+            entry: dict[str, Any] = {
+                "name": name,
+                "offset": offset,
+                "numel": storage_numel,
+                "shape": runtime_source.shape,
+                "stride": stride,
+            }
+            if mode is not None:
+                entry["weight_nz"] = mode
+            metadata.setdefault(dtype, []).append(entry)
             offsets[dtype] = offset + storage_numel
 
         return cpu_sources, metadata
@@ -410,6 +443,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]], PartManifest]:
         """Pack next-block weights in chunk-major layout for sliced AllGather."""
         specs: list[tuple[str, torch.Tensor, bool]] = []
+        logical_layouts: dict[str, tuple[torch.Size, tuple[int, ...]]] = {}
         for name, target in chain(params.items(), bufs.items()):
             local = target.to_local() if hasattr(target, "to_local") else target
             transform = self.tensor_transforms.get(id(target))
@@ -423,9 +457,20 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         f"got dtype={local.dtype}, shape={tuple(local.shape)}"
                     )
             specs.append((name, local, name in bufs))
+            logical_layouts[name] = (local.shape, local.stride())
+        planning_specs = [
+            (
+                name,
+                torch.empty(npu_int8_weight_nz.nz_storage_numel(value.shape), dtype=value.dtype, device="meta")
+                if self._nz_modes.get(name) == "reactor"
+                else value,
+                is_buffer,
+            )
+            for name, value, is_buffer in specs
+        ]
         alignment_bytes = 256 if self.device.type != "cpu" else 1
         manifest = build_part_manifest(
-            specs,
+            planning_specs,
             block_id=id(self.next_block),
             part_id="block",
             weight_shard_size=self.dp_size,
@@ -438,7 +483,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             tensor = torch.empty(numel, dtype=dtype, device="cpu")
             return tensor.pin_memory() if self.pin_memory else tensor
 
-        cpu_shards = pack_local_shard(specs, manifest, allocator=_alloc)
+        def _source(name: str, value: torch.Tensor) -> torch.Tensor:
+            if self._nz_modes.get(name) == "reactor":
+                return npu_int8_weight_nz.pack_nz_weight(value.cpu())
+            return flatten_physical_storage(value)
+
+        cpu_shards = pack_local_shard(specs, manifest, allocator=_alloc, source_transform=_source)
         metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
         for dtype_manifest in manifest.dtypes:
             metadata[dtype_manifest.dtype] = [
@@ -446,8 +496,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     "name": tensor.name,
                     "offset": tensor.offset,
                     "numel": tensor.numel,
-                    "shape": torch.Size(tensor.shape),
-                    "stride": tensor.stride,
+                    "shape": logical_layouts[tensor.name][0],
+                    "stride": logical_layouts[tensor.name][1],
+                    **({"weight_nz": self._nz_modes[tensor.name]} if tensor.name in self._nz_modes else {}),
                 }
                 for tensor in dtype_manifest.tensors
             ]
@@ -461,12 +512,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank: int,
         pin_memory: bool,
         tensor_transforms: dict[int, Any] | None = None,
+        nz_modes: dict[str, str] | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Flatten params+buffers by dtype, split into DP shards, store local shard.
 
         Each rank stores only ``1/dp_size`` of the total weights. The full
         tensor is reconstructed at runtime via AllGather.
         """
+        nz_modes = nz_modes or {}
         dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
         cpu_shards: dict[torch.dtype, torch.Tensor] = {}
 
@@ -474,7 +527,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             # Apply loader-declared layout conversions block by block while
             # preserving the physical tensor layout used by the kernels.
             specs = describe_tensor_storage(named_weights, tensor_transforms)
-            total_numel = sum(spec.storage_numel for spec in specs)
+            storage_sizes = [
+                npu_int8_weight_nz.nz_storage_numel(spec.value.shape)
+                if nz_modes.get(spec.name) == "reactor"
+                else spec.storage_numel
+                for spec in specs
+            ]
+            total_numel = sum(storage_sizes)
 
             # Equal-sized shards (ceil division) for all_gather_into_tensor
             shard_size = (total_numel + dp_size - 1) // dp_size  # ceil
@@ -486,23 +545,32 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             shard = zeros_for_storage(shard_size, dtype, pin_memory=pin_memory)
 
             current_offset = 0
-            for spec in specs:
+            for spec, storage_numel in zip(specs, storage_sizes, strict=True):
                 # Offsets remain relative to the FULL flattened buffer
                 # (needed for correct AllGather reconstruction).
-                dtype_metadata.setdefault(dtype, []).append(tensor_storage_metadata(spec, current_offset))
+                entry = tensor_storage_metadata(spec, current_offset)
+                entry["numel"] = storage_numel
+                mode = nz_modes.get(spec.name)
+                if mode is not None:
+                    entry["weight_nz"] = mode
+                dtype_metadata.setdefault(dtype, []).append(entry)
 
                 # Copy ONLY the portion within [shard_start, shard_end)
                 overlap_start = max(current_offset, shard_start)
-                overlap_end = min(current_offset + spec.storage_numel, shard_end)
+                overlap_end = min(current_offset + storage_numel, shard_end)
                 if overlap_start < overlap_end:
-                    flat_storage = flatten_physical_storage(spec.value, spec.storage_numel)
+                    flat_storage = (
+                        npu_int8_weight_nz.pack_nz_weight(spec.value.cpu())
+                        if mode == "reactor"
+                        else flatten_physical_storage(spec.value, spec.storage_numel)
+                    )
                     src_start = overlap_start - current_offset
                     src_end = overlap_end - current_offset
                     dst_start = overlap_start - shard_start
                     dst_end = overlap_end - shard_start
                     shard[dst_start:dst_end].copy_(flat_storage[src_start:src_end])
 
-                current_offset += spec.storage_numel
+                current_offset += storage_numel
 
             cpu_shards[dtype] = shard
 
@@ -570,7 +638,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 start = meta["offset"]
                 physical_storage = destination[start : start + meta["numel"]]
-                if source.is_contiguous():
+                if meta.get("weight_nz") == "reactor":
+                    physical_storage.copy_(npu_int8_weight_nz.pack_nz_weight(source))
+                elif source.is_contiguous():
                     physical_storage.copy_(source.flatten())
                 else:
                     torch.as_strided(
@@ -615,6 +685,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 start = meta["offset"]
                 physical_storage = destination[start : start + meta["numel"]]
+                if meta.get("weight_nz") == "reactor":
+                    # The source mapping stays immutable; this temporary is not pinned.
+                    physical_storage.copy_(npu_int8_weight_nz.pack_nz_weight(source))
+                    continue
                 async_copy = non_blocking and source.is_pinned()
                 if source.is_contiguous():
                     physical_storage.copy_(source.flatten(), non_blocking=async_copy)
@@ -726,16 +800,26 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if self._shared_slot_owner is not None:
             self._shared_slot_owner[slot] = id(self)
 
-        # Re-point using cached metadata (avoids per-layer dict lookups).
-        for target, dtype, offset, numel, shape, stride in self._cached_repoint:
-            set_tensor_storage(
-                target,
-                torch.as_strided(
-                    gpu_weights[dtype][offset : offset + numel],
-                    size=shape,
-                    stride=stride,
-                ),
-            )
+        self._repoint_block(gpu_weights, slot)
+
+    def _repoint_block(self, gpu_weights: dict[torch.dtype, torch.Tensor], slot: int) -> None:
+        def build_views() -> list[torch.Tensor]:
+            return [_device_weight_view(gpu_weights[dtype], meta) for _, dtype, meta in self._cached_repoint]
+
+        if self._has_nz_cast:
+            writer = self.comm_stream if self.dp_size > 1 and self.dp_group is not None else self.copy_stream
+            with current_omni_platform.stream(writer):
+                values = build_views()
+                ready = current_omni_platform.Event()
+                ready.record(writer)
+            self.ready_events[slot] = ready
+            self._prefetch_done = ready
+        else:
+            # Reactor only builds descriptors; the transport event already covers all writes.
+            values = build_views()
+        self._nz_keepalive = gpu_weights
+        for (target, _, _), value in zip(self._cached_repoint, values, strict=True):
+            set_tensor_storage(target, value)
 
     def _wait_for_weights(self, slot: int) -> None:
         """Wait until the slot holding this block is ready for compute.
@@ -788,11 +872,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             for dtype, metas in self.metadata.items():
                 flat = self.cpu_shards[dtype]
                 for meta in metas:
-                    value = torch.as_strided(
-                        flat[meta["offset"] : meta["offset"] + meta["numel"]],
-                        size=meta["shape"],
-                        stride=meta["stride"],
-                    )
+                    value = _host_weight_view(flat, meta)
                     target = (
                         self.next_block_parameters[meta["name"]]
                         if meta["name"] in self.next_block_parameters
@@ -805,9 +885,23 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             raise RuntimeError("Cannot restore distributed offload weights without the DLO process group")
         self.prefetch_layer(0, non_blocking=False)
         current_omni_platform.synchronize()
-        for target in chain(self.next_block_parameters.values(), self.next_block_buffers.values()):
-            local = target.to_local() if hasattr(target, "to_local") else target
-            restore_tensor_storage(target, local, device="cpu")
+        if "reactor" not in self._nz_modes.values():
+            for target in chain(self.next_block_parameters.values(), self.next_block_buffers.values()):
+                local = target.to_local() if hasattr(target, "to_local") else target
+                restore_tensor_storage(target, local, device="cpu")
+            return
+        gpu_weights = self.gpu_buffers[0]
+        assert gpu_weights is not None
+        for dtype, metas in self.metadata.items():
+            # Copy the transport bytes, then undo NZ on CPU before releasing the hook.
+            flat = gpu_weights[dtype].cpu()
+            for meta in metas:
+                target = (
+                    self.next_block_parameters[meta["name"]]
+                    if meta["name"] in self.next_block_parameters
+                    else self.next_block_buffers[meta["name"]]
+                )
+                restore_tensor_storage(target, _host_weight_view(flat, meta), device="cpu")
 
     # ------------------------------------------------------------------ #
     #  ModelHook interface                                                #
@@ -954,11 +1048,13 @@ class PinnedResidentLayerGroup:
             params = dict(block.named_parameters())
             bufs = dict(block.named_buffers())
             targets: dict[str, torch.Tensor] = {**params, **bufs}
+            nz_modes = _weight_nz_policy(block)
             if rank_local_mmap:
                 cpu_sources, metadata = DistributedLayerwiseOffloadHook._collect_mmap_sources(
                     params,
                     bufs,
                     tensor_transforms,
+                    nz_modes,
                 )
                 cpu_shards: dict[torch.dtype, torch.Tensor] = {}
             else:
@@ -969,6 +1065,7 @@ class PinnedResidentLayerGroup:
                     rank=0,
                     pin_memory=pin_memory,
                     tensor_transforms=tensor_transforms,
+                    nz_modes=nz_modes,
                 )
                 cpu_sources = {}
             self._states.append(
@@ -1058,24 +1155,21 @@ class PinnedResidentLayerGroup:
                     slot_ready = current_omni_platform.Event()
                     slot_ready.record(self.copy_stream)
                     self._cpu_staging_events[slot] = slot_ready
-            ready.record(self.copy_stream)
 
-        for state, block_buffers in zip(self._states, gpu_buffers):
-            targets = state["targets"]
-            for dtype, metas in state["metadata"].items():
-                gpu_buffer = block_buffers[dtype]
-                for meta in metas:
-                    set_tensor_storage(
-                        targets[meta["name"]],
-                        torch.as_strided(
-                            gpu_buffer[meta["offset"] : meta["offset"] + meta["numel"]],
-                            size=meta["shape"],
-                            stride=meta["stride"],
-                        ),
-                    )
+        bindings: list[tuple[torch.Tensor, torch.Tensor]] = []
+        with current_omni_platform.stream(self.copy_stream):
+            for state, block_buffers in zip(self._states, gpu_buffers):
+                targets = state["targets"]
+                for dtype, metas in state["metadata"].items():
+                    for meta in metas:
+                        bindings.append((targets[meta["name"]], _device_weight_view(block_buffers[dtype], meta)))
+            # Cast mode writes NZ allocations; reactor only rebuilds descriptors.
+            ready.record(self.copy_stream)
 
         current_omni_platform.current_stream().wait_event(ready)
         self._gpu_buffers = gpu_buffers
+        for target, value in bindings:
+            set_tensor_storage(target, value)
         self.loaded = True
 
     def offload(self) -> None:
@@ -1113,11 +1207,7 @@ class PinnedResidentLayerGroup:
 
                 flat = state["cpu_shards"][dtype]
                 for meta in metas:
-                    source = torch.as_strided(
-                        flat[meta["offset"] : meta["offset"] + meta["numel"]],
-                        size=meta["shape"],
-                        stride=meta["stride"],
-                    )
+                    source = _host_weight_view(flat, meta)
                     restore_tensor_storage(targets[meta["name"]], source, device="cpu")
 
 
@@ -1166,6 +1256,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._host_registration: HostRegistration | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
         self._poisoned_reason: str | None = None
+
+    def weight_nz_owned_parameter_ids(self) -> set[int]:
+        """Parameters whose device layout is owned by DLO or component staging."""
+        owned = {
+            id(parameter)
+            for hooks in self._all_hook_groups
+            for hook in hooks
+            for parameter in hook.next_block_parameters.values()
+        }
+        for module in chain(self._resident_blocks, self._staged_components):
+            owned.update(id(parameter) for parameter in module.parameters())
+        return owned
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""

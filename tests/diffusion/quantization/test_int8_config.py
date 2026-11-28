@@ -3,6 +3,7 @@
 """Unit tests for Int8 quantization config."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -502,6 +503,97 @@ class TestInt8OnlineLinearMethod:
         layer.weight = Parameter(torch.randn(128, 64))
         method.process_weights_after_loading(layer)
         mock_deps["quant"].assert_called_once_with(layer.weight, scale=None)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "device_name", "mode"),
+    [("NPUInt8LinearMethod", "Ascend910B4-1", "cast"), ("NPUInt8OnlineLinearMethod", "Ascend950PR_958b", "reactor")],
+)
+def test_npu_int8_resident_weight_nz(mocker, monkeypatch, method_name, device_name, mode):
+    from vllm_omni.diffusion import offloader
+    from vllm_omni.quantization import int8_config
+
+    layer = Module()
+    layer.quant_method = getattr(int8_config, method_name)(build_quant_config("int8"))
+    logical_weight = torch.arange(64 * 32).reshape(64, 32).to(torch.int8)
+    layer.weight = Parameter(logical_weight.clone(), requires_grad=False)
+    layer.weight_scale = scale = Parameter(torch.ones(32), requires_grad=False)
+    other = torch.nn.Linear(32, 32)
+    model = torch.nn.Sequential(layer, other)
+    npu = mocker.Mock()
+    mocker.patch.dict("sys.modules", {"torch_npu": npu})
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    mocker.patch.object(offloader, "get_offload_backend", return_value=None)
+    config = mocker.Mock(enable_sleep_mode=False)
+    nz_buffer = torch.empty_like(logical_weight)
+    npu.get_npu_format.side_effect = lambda w: 29 if w.data_ptr() == nz_buffer.data_ptr() else 2
+    npu.empty_with_format.return_value = nz_buffer
+    npu.npu_format_cast.side_effect = lambda w, fmt: nz_buffer.copy_(w)
+    npu.npu.get_device_name.return_value = device_name
+    device = mocker.Mock(type="npu")
+    monkeypatch.setattr(torch.Tensor, "device", property(lambda _: device))
+    offloader.enable_offload_backend(config, model)
+    assert npu.get_npu_format(layer.weight) == 2
+    layer.quant_method = getattr(int8_config, method_name)(build_quant_config("int8", weight_nz_mode=mode))
+    offloader.enable_offload_backend(config, model)
+    if device_name.startswith("Ascend950"):
+        npu.npu_format_cast.assert_called_once()
+        assert npu.npu_format_cast.call_args.args[1] == 29
+    else:
+        npu.empty_with_format.assert_called_once_with(
+            logical_weight.shape, dtype=torch.int8, device=device, acl_format=29
+        )
+    assert npu.get_npu_format(layer.weight) == 29
+    assert npu.get_npu_format(other.weight) == 2
+    assert torch.equal(layer.weight, logical_weight)
+    assert layer.weight_scale is scale
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_npu_int8_nz_ordinary_offload(mocker, quantized):
+    from vllm_omni.diffusion import offloader
+    from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+    model = torch.nn.Linear(4, 4)
+    if quantized:
+        model.quant_method = NPUInt8LinearMethod(build_quant_config("int8", weight_nz_mode="cast"))
+    backend = mocker.Mock(spec=offloader.LayerWiseOffloadBackend)
+    mocker.patch.object(offloader, "get_offload_backend", return_value=backend)
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+
+    if quantized:
+        with pytest.raises(ValueError, match="distributed layerwise offload"):
+            offloader.enable_offload_backend(mocker.Mock(), model)
+        backend.enable.assert_not_called()
+    else:
+        assert offloader.enable_offload_backend(mocker.Mock(), model) == (model, backend)
+        backend.enable.assert_called_once_with(model)
+
+
+@pytest.mark.parametrize(
+    ("spec", "reject"),
+    [
+        (None, False),
+        ({"transformer": {"method": "int8"}}, False),
+        ({"method": "int8", "weight_nz_mode": "cast"}, True),
+        ({"transformer": {"method": "int8", "weight_nz_mode": "reactor"}}, True),
+    ],
+)
+def test_load_model_checks_stage_int8_layout_with_sleep(mocker, spec, reject):
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = SimpleNamespace(enable_sleep_mode=True, quantization_config=build_quant_config(spec))
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    reached_load = mocker.patch.object(runner, "_require_attention_schedule_pipeline", side_effect=StopIteration)
+    if reject:
+        with pytest.raises(ValueError, match="enable_sleep_mode.*weight_nz_mode"):
+            runner.load_model()
+        reached_load.assert_not_called()
+    else:
+        with pytest.raises(StopIteration):
+            runner.load_model()
+        reached_load.assert_called_once()
 
 
 @npu_available

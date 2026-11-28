@@ -174,6 +174,10 @@ def enable_offload_backend(
     host plans and optional fresh-model recovery callbacks stay inside the
     startup state consumed here.
     """
+    from vllm_omni.quantization.npu_int8_weight_nz import (
+        int8_weight_modes,
+        prepare_resident_weights,
+    )
 
     def enable_once(model: torch.nn.Module, state: OffloadStartupState | None) -> OffloadBackend | None:
         backend: OffloadBackend | None = None
@@ -183,11 +187,22 @@ def enable_offload_backend(
                 device=device,
                 host_weight_plan=state.host_weight_plan if state is not None else None,
             )
+            supports_nz = backend is None or isinstance(backend, DistributedLayerwiseOffloadBackend)
+            nz_modes = int8_weight_modes(model)
+            if not supports_nz and nz_modes:
+                raise ValueError("NPU INT8 weight NZ supports resident weights and distributed layerwise offload")
             if backend is not None:
                 logger.info("Enabling offloader backend: %s", backend.__class__.__name__)
                 backend.enable(model)
             elif state is not None:
                 state.close_loader_ownership()
+            if nz_modes:
+                owned = (
+                    backend.weight_nz_owned_parameter_ids()
+                    if isinstance(backend, DistributedLayerwiseOffloadBackend)
+                    else frozenset()
+                )
+                prepare_resident_weights(model, nz_modes.keys(), excluded_parameter_ids=owned)
             return backend
         except Exception:
             if backend is not None:
