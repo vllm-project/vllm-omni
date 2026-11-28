@@ -484,6 +484,7 @@ def test_modelopt_nvfp4_moe_lora_requires_a_startup_adapter_on_native_devices(
 ) -> None:
     from vllm.model_executor.layers.quantization.utils import nvfp4_utils
 
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
     monkeypatch.setattr(nvfp4_utils, "cutlass_fp4_supported", lambda: native_fp4)
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
