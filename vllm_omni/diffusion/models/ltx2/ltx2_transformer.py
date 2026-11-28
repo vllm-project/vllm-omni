@@ -374,6 +374,8 @@ class _LTX2ParallelAttention(Attention):
             )
         super().__init__(*args, **kwargs)
         self.ltx_sp_mode = ltx_sp_mode
+        if ltx_sp_mode != "video_self":
+            self.use_ring = False
         self._video_to_audio_strategy = None
 
     def _get_active_parallel_strategy(self):
@@ -382,6 +384,12 @@ class _LTX2ParallelAttention(Attention):
             return self._no_parallel_strategy
         if self.ltx_sp_mode == "video_self":
             return base_strategy
+        if base_strategy.name == "ring":
+            from vllm_omni.diffusion.attention.parallel.cross import ReplicatedQShardedKVParallelAttention
+
+            if self._video_to_audio_strategy is None:
+                self._video_to_audio_strategy = ReplicatedQShardedKVParallelAttention(get_sp_group())
+            return self._video_to_audio_strategy
         if base_strategy.name != "ulysses":
             raise NotImplementedError(
                 f"LTX video-to-audio sequence parallelism requires pure Ulysses; got strategy={base_strategy.name!r}."
@@ -756,6 +764,14 @@ class LTX2Attention(torch.nn.Module):
             causal=False,
             prefix=prefix,
             disable_kv_quant=disable_kv_quant,
+            role=(
+                "ltx2.video_self"
+                if sequence_parallel_mode == "video_self"
+                else "ltx2.cross"
+                if cross_attention_dim is not None
+                else "ltx2.audio_self"
+            ),
+            role_category="cross" if cross_attention_dim is not None else "self",
             ltx_sp_mode=sequence_parallel_mode,
         )
 
@@ -1899,6 +1915,14 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         self.gradient_checkpointing = False
         self._sp_plan = self._build_sp_plan(rope_type)
+        if any(
+            spec.sparsp is not None and spec.sparsp.placement != "none"
+            for block in self.transformer_blocks
+            if (spec := getattr(block.attn1.attn, "attn_spec", None)) is not None
+        ):
+            from vllm_omni.diffusion.models.ltx2.sparsp_layout import LTX2SparSPLayout
+
+            self._sparsp_layout = LTX2SparSPLayout(self)
 
     def _gradient_checkpointing_func(self, module: nn.Module, *inputs: Any):
         def custom_forward(*checkpoint_inputs: Any):

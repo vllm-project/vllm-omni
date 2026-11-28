@@ -8,7 +8,7 @@ vLLM-Omni to directly serve Diffusers models with near-zero per-model code.
 The adapter delegates full pipeline execution to diffusers' ``__call__()``.
 It does NOT support:
 - CFG parallel (diffusers handles CFG via guidance_scale internally)
-- Sequence parallel (requires model-specific attention surgery)
+- Sequence parallel outside the explicit LTX-Video and HunyuanVideo SparSP adapters
 - TeaCache / Cache-DiT (requires hooking into transformer blocks)
 - Step-wise execution (continuous batching)
 """
@@ -16,6 +16,7 @@ It does NOT support:
 import inspect
 import logging
 import re
+from contextlib import nullcontext
 from typing import Any, cast
 
 import torch
@@ -109,6 +110,14 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.device = device
         self._capabilities: dict[str, Any] = {}
         self._pipeline_utils: BasePipelineUtils = BasePipelineUtils()
+        roles = [
+            role
+            for role, spec in od_config.diffusion_attention_config.per_role.items()
+            if role in ("ltx.video_self", "hunyuan_video.video_joint") and spec.backend.upper() == "SPARSP_ATTN"
+        ]
+        if len(roles) > 1:
+            raise ValueError("Select the SparSP role for the Diffusers pipeline being loaded")
+        self._sparsp_role = next(iter(roles), None)
         self._raise_unsupported_features()
 
         self.setup_diffusion_pipeline_profiler(
@@ -186,6 +195,14 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Attention backend
         self._set_attention_backend()
+        if self._sparsp_role == "ltx.video_self":
+            from vllm_omni.diffusion.models.diffusers_adapter.ltx_sparsp import LTXSparSPAdapter
+
+            LTXSparSPAdapter(self._pipeline.transformer, self.od_config)
+        elif self._sparsp_role == "hunyuan_video.video_joint":
+            from vllm_omni.diffusion.models.diffusers_adapter.hunyuan_sparsp import HunyuanSparSPAdapter
+
+            self._hunyuan_sparsp = HunyuanSparSPAdapter(self._pipeline.transformer, self.od_config)
 
     def _load_pipeline_from_pretrained(
         self,
@@ -241,7 +258,12 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         kwargs = self._build_call_kwargs(req)
         logger.debug(f"Calling diffusers pipeline with kwargs: {kwargs}")
 
-        with torch.inference_mode():
+        scope = (
+            self._hunyuan_sparsp.caption_validation_scope(kwargs)
+            if self._sparsp_role == "hunyuan_video.video_joint"
+            else nullcontext()
+        )
+        with torch.inference_mode(), scope:
             output = self._pipeline(**kwargs)  # pyright: ignore[reportCallIssue]
 
         return self._wrap_output(output)
@@ -270,7 +292,16 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "CFG parallel is not supported with the diffusers backend. "
                 "Diffusers handles CFG internally via guidance_scale."
             )
-        if pc.sequence_parallel_size is not None and pc.sequence_parallel_size > 1:
+        if self._sparsp_role:
+            if (
+                pc.ring_degree < 2
+                or pc.ulysses_degree != 1
+                or pc.allgather_degree != 1
+                or not self.od_config.enforce_eager
+                or self.od_config.diffusion_attention_schedule is not None
+            ):
+                raise ValueError("SparSP requires eager pure Ring inference without attention scheduling")
+        elif pc.sequence_parallel_size is not None and pc.sequence_parallel_size > 1:
             raise NotImplementedError(
                 "Sequence parallel is not supported with the diffusers backend. "
                 "It requires model-specific attention surgery."
@@ -281,7 +312,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "with the diffusers backend. TeaCache/Cache-DiT require hooking "
                 "into individual transformer blocks."
             )
-        if self.od_config.enforce_eager:
+        if self.od_config.enforce_eager and not self._sparsp_role:
             raise NotImplementedError(
                 "Eager execution is not supported with the diffusers backend. "
                 "Use a native pipeline for continuous batching mode."

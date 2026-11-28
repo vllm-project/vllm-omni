@@ -70,6 +70,7 @@ from vllm_omni.diffusion.mixfusion.packed_attention import (
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionAttentionImpl
     from vllm_omni.diffusion.data import AttentionScheduleConfig, AttentionSpec, OmniDiffusionConfig
 
 logger = init_logger(__name__)
@@ -1165,6 +1166,7 @@ class Attention(nn.Module):
             reason = self._cross_backend_limitation(attn_metadata)
             if reason is not None:
                 blocked = self._cross_fallback_blocker(attn_metadata)
+                assert self.sdpa_fallback is not None and self.attn_backend is not None
                 result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
                 return replace(
                     result,
@@ -1362,6 +1364,11 @@ class Attention(nn.Module):
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
+        if self.attn_backend is not None and getattr(self.attn_backend, "owns_sequence_parallel", False):
+            if use_paged_attention or not strategy.enabled or strategy.name != "ring":
+                raise ValueError("Backend-owned sequence parallelism requires an active pure Ring region")
+            return self.attention.forward(query, key, value, self._with_kv_cache_dtype(attn_metadata))
+
         isolation = attn_metadata.extra.get(REFERENCE_ISOLATION) if attn_metadata is not None else None
         isolated_dense = None
         if isolation is not None:
@@ -1459,7 +1466,7 @@ class Attention(nn.Module):
                     out = self._run_local_attention(query, key, value, attn_metadata)
                 else:
                     state, compact = isolation
-                    assert isolated_dense is not None
+                    assert isolated_dense is not None and self.attn_backend is not None
                     logger.info_once(
                         "MiniMax-H3 isolation attention active: reference=dense_rr, dynamic=%s",
                         self.attn_backend.get_name(),
@@ -1599,6 +1606,7 @@ class Attention(nn.Module):
         explicit = self.backend_explicit if backend is None else spec is not None
         if explicit:
             selected = self.attn_backend if backend is None else backend
+            assert selected is not None
             return (
                 f"Explicit backend {selected.get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata, backend=backend, spec=spec)}"
@@ -1626,11 +1634,13 @@ class Attention(nn.Module):
     def _reference_isolation_dense_impl(self) -> AttentionImpl:
         if self.qkv_layout != "BSND":
             raise ValueError("H3 reference isolation requires BSND Q/K/V")
+        if self.attn_backend is None:
+            raise ValueError("H3 reference isolation requires a registered attention backend")
         backend = self.attn_backend.get_name()
         if backend in {"FLASH_ATTN", "SDPA"}:
             return self.attention
         if backend == "RAINFUSION_ATTN":
-            return self.attention.dense_fallback
+            return cast("RainFusionAttentionImpl", self.attention).dense_fallback
         raise ValueError(f"H3 reference isolation does not support backend {backend!r}")
 
     def _run_local_attention(self, query, key, value, attn_metadata):
@@ -1649,6 +1659,7 @@ class Attention(nn.Module):
                 blocked = self._cross_fallback_blocker(attn_metadata, backend=cross_backend, spec=cross_spec)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
+                assert self.sdpa_fallback is not None
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the

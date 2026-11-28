@@ -8,7 +8,7 @@ import os
 import random
 import warnings
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +40,7 @@ from vllm_omni.diffusion.attention.schedule import (
     validate_attention_schedule,
     validate_attention_sigma_schedule,
 )
+from vllm_omni.diffusion.attention.sparsp.config import SparSPSpec
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -2523,6 +2524,7 @@ class AttentionSpec:
     fastvideo_vsa_provider: str = "auto"
     fastvideo_vsa_precision: str = "bf16"
     sparge: SpargeAttnSpec | None = None
+    sparsp: SparSPSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -2532,6 +2534,9 @@ class AttentionSpec:
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
+        self.sparsp = self._coerce(self.sparsp, SparSPSpec, "sparsp")
+        if self.sparsp is not None and self.backend.upper() != "SPARSP_ATTN":
+            raise ValueError("sparsp options require backend=SPARSP_ATTN")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
@@ -2611,6 +2616,8 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.sparsp is not None:
+            kw["sparsp"] = asdict(self.sparsp)
         if self.sparge is not None:
             sp = self.sparge
             kw["sparge_topk"] = sp.topk
@@ -2706,6 +2713,7 @@ class AttentionConfig:
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
             "sparge",
+            "sparsp",
             "block_sparse",
         }
         node_dict = dict(node)

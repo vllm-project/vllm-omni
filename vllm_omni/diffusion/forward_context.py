@@ -26,6 +26,7 @@ from vllm_omni.diffusion.attention.schedule import (
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.sparsp.placement import SparSPVideoLayout
     from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
 
 
@@ -73,6 +74,7 @@ class ForwardContext:
     # a malformed paged request whose Worker adapter was not activated.
     in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
+    sparsp_video_layout: SparSPVideoLayout | None = None
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
     # The step's scheduler sigma in [0, 1], published only while sigma windows are bound.
@@ -592,6 +594,8 @@ def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
 
 
 class DenoiseProgressMixin:
+    scheduler: Any  # Supplied by the concrete diffusion pipeline.
+
     def record_denoise_step(
         self,
         step_idx: int | None,

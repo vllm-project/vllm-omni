@@ -18,7 +18,7 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, parse_attention_config
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size as get_guidance_parallel_world_size,
@@ -265,7 +265,21 @@ class LTXRuntime(
             )
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         allgather_degree = getattr(parallel_config, "allgather_degree", 1)
-        if ring_degree != 1 or allgather_degree != 1:
+        attention = parse_attention_config(getattr(od_config, "diffusion_attention_config", None))
+        video_spec = attention.per_role.get("ltx2.video_self")
+        use_sparsp = video_spec is not None and video_spec.backend.upper() == "SPARSP_ATTN"
+        if use_sparsp:
+            if (
+                self.pipeline_kind == "text_to_audio"
+                or ring_degree < 2
+                or allgather_degree != 1
+                or parallel_config.ulysses_degree != 1
+                or parallel_config.tensor_parallel_size != 1
+                or not od_config.enforce_eager
+                or od_config.diffusion_attention_schedule is not None
+            ):
+                raise ValueError("LTX SparSP requires eager pure Ring video inference without attention scheduling")
+        elif ring_degree != 1 or allgather_degree != 1:
             raise ValueError(
                 f"{self.__class__.__name__} supports pure Ulysses sequence parallelism only. "
                 "Set ring_degree=1 and allgather_degree=1; "

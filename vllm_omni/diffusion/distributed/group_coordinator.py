@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -5,7 +8,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -14,6 +17,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.sparsp.config import SparSPSpec
+    from vllm_omni.diffusion.attention.sparsp.executor import SparseRingExecutor
 
 logger = init_logger(__name__)
 
@@ -696,12 +703,13 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.recv_shape: dict[str, dict[int, torch.Size]] = {}
         self.send_shape: dict[str, dict[int, torch.Size]] = {}
-        self.recv_buffer: dict[str, dict[int, torch.Size]] = {}
+        self.recv_buffer: dict[str, dict[int, torch.Tensor]] = {}
+        self.extra_tensors_recv_buffer: dict[str, list[torch.Tensor]] = {}
 
         self.skip_tensor_recv_buffer_set: bool = False
-        self.recv_skip_tasks_queue: list[int | tuple[str, int]] = []
-        self.receiving_skip_tasks: list[tuple[torch.distributed.Work, str, int]] = []
-        self.skip_tensor_recv_buffer: list[torch.Tensor] | torch.Tensor | None = None
+        self.recv_skip_tasks_queue: list[int] = []
+        self.receiving_skip_tasks: list[tuple[torch.distributed.Work, int]] = []
+        self.skip_tensor_recv_buffer: list[torch.Tensor] = []
         self.skip_device_group = None
         for ranks in group_ranks:
             skip_device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
@@ -734,7 +742,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
-        self.skip_tensor_recv_buffer = {}
+        self.skip_tensor_recv_buffer = []
+        self.extra_tensors_recv_buffer.clear()
+        self.recv_buffer_set = False
+        self.skip_tensor_recv_buffer_set = False
 
     def set_config(self, dtype: torch.dtype):
         self.dtype = dtype
@@ -752,8 +763,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         )
         self.dtype = dtype
         self.num_pipefusion_patches = num_pipefusion_patches
-        self.recv_buffer = [torch.zeros(*shape, dtype=self.dtype, device=self.device) for shape in patches_shape_list]
-        self.recv_buffer.append(torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device))
+        self.recv_buffer["latent"] = {
+            idx: torch.zeros(*shape, dtype=dtype, device=self.device) for idx, shape in enumerate(patches_shape_list)
+        }
+        self.recv_buffer["latent"][-1] = torch.zeros(*feature_map_shape, dtype=dtype, device=self.device)
         self.recv_buffer_set = True
 
     def set_extra_tensors_recv_buffer(
@@ -969,22 +982,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
         assert len(self.receiving_skip_tasks) > 0, "No tasks to receive, call add_pipeline_recv_skip_task first"
         receiving_skip_task = self.receiving_skip_tasks.pop(0)
         receiving_skip_task[0].wait()
-        assert receiving_skip_task[2] == idx, "Received tensor does not match the requested"
+        assert receiving_skip_task[1] == idx, "Received tensor does not match the requested"
         return self.skip_tensor_recv_buffer[idx]
 
     def recv_skip_next(self):
         if len(self.recv_skip_tasks_queue) == 0:
             raise ValueError("No more tasks to receive")
-        elif len(self.recv_skip_tasks_queue) > 0:
-            task = self.recv_skip_tasks_queue.pop(0)
-            idx = task
-            self.receiving_skip_tasks.append(
-                (
-                    self._pipeline_irecv_skip(self.skip_tensor_recv_buffer[idx]),
-                    None,
-                    idx,
-                )
-            )
+        idx = self.recv_skip_tasks_queue.pop(0)
+        self.receiving_skip_tasks.append((self._pipeline_irecv_skip(self.skip_tensor_recv_buffer[idx]), idx))
 
     def _pipeline_irecv_skip(self, tensor: torch.tensor):
         return torch.distributed.irecv(tensor, src=self.skip_rank, group=self.skip_device_group)
@@ -1036,6 +1041,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
+        self.sparsp_executors: dict[tuple[int, int, SparSPSpec], SparseRingExecutor] = {}
         self.allgather_group = allgather_group
 
         self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
@@ -1046,6 +1052,9 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
 
     def destroy(self):
+        for executor in self.sparsp_executors.values():
+            executor.close()
+        self.sparsp_executors.clear()
         groups = [self.ulysses_group, self.ring_group, self.allgather_group]
         seen = {id(self.device_group), id(self.cpu_group)}
         for group in groups:
