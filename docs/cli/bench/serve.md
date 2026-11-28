@@ -1,6 +1,6 @@
 # vLLM-Omni Benchmark CLI Guide
 
-The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
+The `vllm bench serve --omni` command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
 
@@ -12,6 +12,19 @@ output has arrived. This includes retryable multimodal cache misses reported
 inside an HTTP 200 SSE stream. Other server errors and partial responses remain
 failed requests. Request latency and time to first output include failed
 attempts and retry delays.
+
+Currently these endpoints are available for `vllm bench serve --omni`:
+
+| Endpoint | Example models |
+| --- | --- |
+| `/v1/chat/completions` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
+| `/v1/audio/speech` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` |
+| `/v1/images/edits` | `tencent/HunyuanImage-3.0-Instruct` |
+| `/v1/images/generations` | `Qwen/Qwen-Image` |
+| `/v1/videos` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| `/v1/realtime` | `Qwen/Qwen3-Omni-30B-A3B-Instruct`<br>`openbmb/MiniCPM-o-4_5` |
+
+For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The three WebSocket backends use `/v1/realtime`.
 
 ## Basic Parameter Description
 
@@ -84,7 +97,14 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   `--goodput ttft:500 audio_ttfp:1000`.
 
 - `--print-stage`
-Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
+  Print per-stage benchmark metrics when the server returns `stage_metrics`. Disabled by default.
+  This flag only controls printing. The client still requests `return_stage_metrics` when
+  `--print-stage` is set, and also for image backends (`openai-image-edits-omni`,
+  `/v1/images/edits`, `/v1/images/generations`) and for `openai-chat-omni` when
+  `extra_body.modalities` includes `"image"` or when `--percentile-metrics` includes `tpot`/`itl`.
+  Latency rows follow `--percentile-metrics` by modality: `ttft`/`tpot`/`itl` for text stages,
+  `ttfc`/`tpoc`/`icl` for internal stream stages, and `tpop` for both text TPOP and
+  internal-stream TPOP.
 
 - `--save-result`
 Specify to save benchmark results to a json file
@@ -1346,24 +1366,18 @@ Stage audio frames generated:            6242730
 Mean Serving AUDIO_TTFP (ms):            1366.16
 Median Serving AUDIO_TTFP (ms):          1367.20
 P99 Serving AUDIO_TTFP (ms):             1368.26
------------------Real Time Factor-----------------
-Mean AUDIO_RTF:                          0.24
-Median AUDIO_RTF:                        0.26
-P99 AUDIO_RTF:                           0.27
 ```
 
-Explanation:
+Additional explanation of stage wise metrics:
 
 - stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
 
-- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to
-  the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage
-  for easier mapping.
+- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage for easier mapping.
 
-- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the
-  number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
+- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
 
-- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the
-  name ITL in text stage for easier mapping.
+- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the name ITL in text stage for easier mapping.
+
+End-to-end `AUDIO_RTF` is printed in the overall Audio Result, not in `--print-stage`. Which stage block is printed (Text / Audio / Image / Video / Internal Stream) follows `stage_modality_flags(final_output_type, output_unit_type)` in `vllm_omni/metrics/definitions.py`. Internal-stream rows (TTFC/TPOP/ICL) depend on a streaming `output_unit_type` (often `stream`) and non-empty timing samples; see [modality troubleshooting](../../design/feature/multi_stage_benchmark.md#a-stage-appears-but-modality-specific-metrics-are-missing).
 
 </details>
