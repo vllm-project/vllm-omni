@@ -2847,6 +2847,12 @@ class MiniMaxH3Pipeline(
             if session is not None:
                 session.abort()
             raise
+        # Match decode(): return the encode stage's freed pages to the
+        # allocator. The per-request peak measurement resets its counter but
+        # keeps the reserved pool, so pages left mapped here become the
+        # starting point of the next request's peak and its denoise buffers
+        # stack on top of them.
+        self._release_stage_cache()
         if not videos:
             return b""
         if len(videos) != 1:
