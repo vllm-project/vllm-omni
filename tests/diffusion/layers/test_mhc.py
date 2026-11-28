@@ -9,6 +9,7 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers import mhc
 from vllm_omni.diffusion.models.magi2 import layers as model_layers
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
@@ -187,8 +188,16 @@ def spy(monkeypatch, name):
 
 
 def post_residual_kernel_name(device_name):
-    """MUSA dispatches to the #7261 tile kernel; CUDA runs the bit-exact one."""
-    return "_mhc_post_residual_tile_kernel" if device_name == "musa" else "_mhc_post_residual_kernel"
+    """Only native CUDA uses the bit-exact kernel; other backends keep tile."""
+    if device_name == "cuda" and mhc._POST_RESIDUAL_BITEXACT:
+        return "_mhc_post_residual_kernel"
+    return "_mhc_post_residual_tile_kernel"
+
+
+@pytest.mark.cpu
+def test_bitexact_post_residual_targets_only_native_cuda():
+    """ROCm also uses the CUDA device type, so it must not select the PTX path."""
+    assert mhc._POST_RESIDUAL_BITEXACT == current_omni_platform.is_cuda()
 
 
 @pytest.mark.parametrize("device_name", DEVICES)
@@ -206,6 +215,8 @@ def test_coefficients_gpu(monkeypatch, device_name, dtype, tokens, iterations):
     actual = mhc.MHCPostResidual()(*args, scale=0.125, iterations=iterations, out_dtype=dtype)
     getattr(torch, device_name).synchronize()
     assert len(launches) == bool(tokens)
+    # Spy records before the launch; also reject a cached launch failure.
+    assert not mhc._FAILED_MHC_KERNELS
     tolerance = {torch.float32: 1e-5, torch.float16: 2e-3, torch.bfloat16: 1.6e-2}[dtype]
     for a, b in zip(actual, reference(args, iterations=iterations, out_dtype=dtype)):
         torch.testing.assert_close(a, b, rtol=tolerance, atol=1e-6)

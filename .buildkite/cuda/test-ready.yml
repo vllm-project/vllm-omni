@@ -134,7 +134,7 @@ steps:
       - label: "Diffusion · Other Test"
         timeout_in_minutes: 15
         commands:
-          - pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion tests/diffusion/layers/test_adalayernorm_*.py tests/diffusion/layers/test_indexed_modulation_*.py tests/diffusion/layers/test_fused_qk_norm_rope_token_path.py -m 'core_model and cuda' --run-level "core_model"
+          - pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion tests/diffusion/layers/test_adalayernorm_*.py tests/diffusion/layers/test_indexed_modulation_*.py tests/diffusion/layers/test_fused_qk_norm_rope_token_path.py tests/diffusion/layers/test_mhc.py tests/diffusion/layers/test_mhc_bitexact.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"

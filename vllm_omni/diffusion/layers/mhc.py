@@ -4,8 +4,8 @@
 
 """Native and eager Triton mHC post-processing, without projection or tensor caches.
 
-The statically-unrolled bit-exact post-residual kernel targets CUDA; MUSA keeps
-the #7261 tile kernel (``_mhc_post_residual_tile_kernel``).
+The statically-unrolled bit-exact post-residual kernel targets native CUDA;
+other backends keep the #7261 tile kernel (``_mhc_post_residual_tile_kernel``).
 """
 
 import threading
@@ -81,7 +81,7 @@ def _asm_add_rn_f32(a, b):
 # #7261 tile kernel: on S5000 (Triton 3.2) the unrolled form both diverges
 # from the eager formula by one ULP and compiles roughly 15x slower
 # (7-9 ms vs ~0.5 ms per call); see the #7545 review thread.
-_POST_RESIDUAL_BITEXACT = not current_omni_platform.is_musa()
+_POST_RESIDUAL_BITEXACT = current_omni_platform.is_cuda()
 
 
 @triton.jit

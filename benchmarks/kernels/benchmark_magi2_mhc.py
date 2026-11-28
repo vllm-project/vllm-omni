@@ -60,10 +60,9 @@ def benchmark_shape(torch: Any, mhc: Any, args: argparse.Namespace, tokens: int)
     coefficients = prepare_reference()
     mix_reference = partial(mix_op.forward_native, streams, branch, *coefficients)
     mix_fused = partial(mix_op, streams, branch, *coefficients)
-    # MUSA dispatches to the #7261 tile kernel; the bit-exact unrolled kernel
-    # is CUDA-only (see MHCPostResidual.forward_cuda).
-    is_musa = hasattr(torch.version, "musa") and torch.version.musa is not None
-    post_kernel = "_mhc_post_residual_tile_kernel" if is_musa else "_mhc_post_residual_kernel"
+    # Only native CUDA uses the bit-exact kernel (see MHCPostResidual.forward_cuda);
+    # ROCm and MUSA keep the #7261 tile kernel; probe the actual dispatched kernel.
+    post_kernel = "_mhc_post_residual_kernel" if mhc._POST_RESIDUAL_BITEXACT else "_mhc_post_residual_tile_kernel"
     mix_kernel = "_mhc_mix_kernel"
     cases = {
         "post_residual": (prepare_reference, prepare_fused, (post_kernel,)),
