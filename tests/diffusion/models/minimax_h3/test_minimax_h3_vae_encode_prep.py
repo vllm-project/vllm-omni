@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -156,6 +157,7 @@ def test_stream_prep_aligned_input_needs_no_pad():
         np.zeros((5, 6, 8, 4), dtype=np.uint8),  # four channels
         np.zeros((5, 6, 8), dtype=np.uint8),  # missing channel axis
         np.zeros((0, 6, 8, 3), dtype=np.uint8),  # empty
+        torch.zeros(5, 6, 8, 3),
     ],
 )
 def test_stream_prep_rejects_unsupported_inputs(frames):
@@ -241,3 +243,52 @@ def test_encode_video_falls_back_when_preparation_unsupported(monkeypatch):
     frames = _video(10)
     vae.encode_video(frames)
     assert vae.model.received is frames
+
+
+def _aligned_model(pad):
+    class _AlignedProcessor(_FakeProcessor):
+        def align_video_length(self, *args, **kwargs):
+            return pad
+
+    return _FakeCheckpointModel(processor=_AlignedProcessor())
+
+
+@pytest.mark.parametrize("model", [None, _aligned_model(5)])
+def test_stream_prep_tensor_frames_match_host_path_bitwise(model):
+    vae = _vae(model)
+    frames = _video(10)
+    source = torch.from_numpy(frames.copy())
+    expected = vae._stream_prepare_video_tensor(frames, torch.device("cpu"))
+    assert torch.equal(vae._stream_prepare_video_tensor(source, torch.device("cpu")), expected)
+    assert torch.equal(source, torch.from_numpy(frames))
+
+
+def test_device_uint8_video_detection():
+    video = torch.empty(4, 6, 8, 3, dtype=torch.uint8, device="meta")
+    assert vae_module._is_device_uint8_video(video)
+    for frames in (video.float(), video[..., :1], torch.zeros(4, 6, 8, 3, dtype=torch.uint8), _video(4)):
+        assert not vae_module._is_device_uint8_video(frames)
+
+
+@pytest.mark.parametrize(
+    ("legacy", "model", "expected"),
+    [("0", None, True), ("1", None, False), ("0", _FakeCheckpointModel(clip_length=None), False)],
+)
+def test_prepares_video_on_device(monkeypatch, legacy, model, expected):
+    monkeypatch.setenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", legacy)
+    assert _vae(model).prepares_video_on_device() is expected
+
+
+@pytest.mark.parametrize("mode", ["stream", "legacy", "no_contract"])
+def test_encode_video_resident_tensor_frames(monkeypatch, mode):
+    monkeypatch.setattr(vae_module, "_is_device_uint8_video", lambda frames: isinstance(frames, torch.Tensor))
+    monkeypatch.setenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", "1" if mode == "legacy" else "0")
+    frames = _video(10)
+    vae = _vae_for_encode_video()
+    if mode == "no_contract":
+        vae.model.clip_length = None
+    vae.encode_video(torch.from_numpy(frames.copy()))
+    if mode == "stream":
+        assert torch.equal(vae.model.received[0], _vae()._stream_prepare_video_tensor(frames, torch.device("cpu")))
+    else:
+        assert isinstance(vae.model.received, np.ndarray) and np.array_equal(vae.model.received, frames)
