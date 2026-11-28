@@ -79,6 +79,7 @@ def test_sampler_replay_returns_owned_live_rows_and_refreshes_controls(mocker):
     output = torch.arange(4, dtype=torch.int32)[:, None]
     model = SimpleNamespace(
         config=SimpleNamespace(audio_mrv2_sample_graph_buckets=True),
+        mrv2_options=SimpleNamespace(audio_mrv2_sample_graph_buckets=True),
         num_codebooks=2,
         _ensure_decode_state_capacity=lambda *args: None,
         _finish_audio_staging=mocker.Mock(),
@@ -102,11 +103,13 @@ def test_sampler_replay_returns_owned_live_rows_and_refreshes_controls(mocker):
 
     first = _replay_captured(model, hidden, controls, True)
     controls = HiggsAudioSamplingParams(torch.tensor([0.4, 0.5, 0.6]), controls.top_k, controls.top_p, False, {})
-    second = _replay_captured(model, hidden, controls, True)
+    noise = torch.full((6, 3), 2.0)
+    second = _replay_captured(model, hidden, controls, True, noise)
 
     assert first.tolist() == [[1], [2], [3]]
     assert second.tolist() == [[2], [3], [4]]
     assert first.data_ptr() != output.data_ptr() and second.data_ptr() != output.data_ptr()
     torch.testing.assert_close(static_controls.temperature[:3], controls.temperature)
+    torch.testing.assert_close(model._dense_sample_graphs[key][3][:6], noise)
     assert model._finish_audio_staging.call_count == 2
     assert model._finish_audio_staging.call_args.args[0].shape == (3, 4)

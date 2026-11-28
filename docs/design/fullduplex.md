@@ -95,8 +95,73 @@ Cancellation of a retained model stream identifies the response owning its
 queued audio, even after generation completes. The Realtime projection clears
 that playback without emitting a second terminal for the completed response.
 
+Deployment output capabilities are resolved after `configure_pipeline` using
+`deployment_capabilities`. A topology consisting of one final text stage
+advertises text output only and no playback ACK, audio truncation, or stage
+handoff. Other topologies retain their model plugin's output contract.
+`DuplexCapabilities.emits_audio` is the shared deployment predicate for output
+projection, history, synthesis parameters and calibration. Both typed and
+native truncation commands use one control-layer check of
+`supports_audio_truncate`, including audio-capable models that disable it.
+The engine capability property and session admission share this resolution.
+Startup warmup uses the engine's output defaults and, for text output, seeds
+an opening user turn and waits for a completed response containing text.
+
+`DuplexSessionConfig.modalities=None` preserves omission until admission.
+Both wire aliases are validated before defaults; unavailable output is rejected
+before reserving a session replica or creating a stage request. Live updates
+and response overrides validate a candidate before adopting configuration or
+reserving response options. Modality names are normalized to lowercase before
+validation. Explicit empty lists, normalized duplicates and conflicting aliases
+fail.
+
+A text-only deployment projects model results through existing text events.
+Its data plane still owns native unit and turn boundaries. Text responses
+reserve their history position before continued input, commit emitted text
+on completion or cancellation regardless of playback policy, and release
+playback bookkeeping without ACKs. Whitespace-only output creates no assistant
+history item or snapshot; meaningful emitted text is preserved verbatim.
+On text-only deployments, a response that starts while its user input is
+still being received binds to that input's next commit. History places
+that owning input before the reserved assistant slot, and later input
+after it. A terminal native LISTEN follows normal response completion,
+including when the continuation budget is exhausted.
+The unconditional bypass is deployment-scoped. On audio-capable deployments,
+a reply with zero generated/sent audio and no audio-completion dependency
+commits text without an ACK through the zero-audio fallback. Replies whose
+text depends on complete audio still follow alignment and playback checks.
+Selecting text output alone does not implement per-request TTS skipping.
+Cancellation rejects old-epoch results
+through the existing fence. Audio calibration is not started for deployments
+without audio output.
+
+MiniCPM-o 4.5 registers `minicpmo_4_5_thinker_only`, a Stage 0-only pipeline
+selected by a deploy config's `pipeline` key. Its data plane sends Stage 0
+output as text and ends a unit at LISTEN, `chunk_eos` or `chunk_tts_eos`; a
+unit ends the turn only when its final token before the terminator is
+`<|turn_eos|>`. Later text or a speak decision keeps the response open.
+The session requires a fast tokenizer and decodes cumulative tokens
+in unit order, so a snapshot spanning turns keeps each turn's text separate.
+Stage 0 metrics are cumulative snapshots under
+`metadata.vllm_omni.stage_metrics`. `response.speak` carries the running
+totals and text deltas omit them; the event that ends the response carries the
+final values: `response.done`, or `audio.cancelled` when it is cancelled.
+A snapshot that spans two turns is charged to the first reply, since the
+engine reports one set of metrics per snapshot.
+The first text delta carries server TTFT under
+`metadata.vllm_omni.response_request_metrics`, including responses already
+opened by `response.create` or `input_audio_buffer.commit`.
+
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
+On all deployments, continuation-limit endings discard uncommitted text and
+release response state if the reply produced no audio. Failed responses and
+`conversation: "none"` endings also release zero-audio state without committing
+text to history. On audio-capable
+deployments, a later ACK for that released response fails with
+`playback_item_not_found` without restoring its state. Text-only deployments
+reject ACKs with `unsupported_operation`. The built-in playback helper skips
+finished replies with no audio.
 `finalize_response_playback` is the shared check used by ACK processing,
 normal response completion, draining response completion, and cancellation.
 It retains state while that response is active, any of its requests are still
@@ -655,8 +720,8 @@ vllm_omni/
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
 │   ├── realtime/                    the OpenAI Realtime API itself
-│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (21 ship as Tier 1;
-│   │   │                            9 have a Tier 2 twin in protocol/duplex)
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (20 ship as Tier 1;
+│   │   │                            10 have a Tier 2 twin in protocol/duplex)
 │   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
 │   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
 │   │   ├── formats.py               audio format spellings, what is supported, per-session validation
@@ -670,8 +735,8 @@ vllm_omni/
 │       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
 │       │                            items, session, capabilities) so the engine never
 │       │                            imports protocol/realtime directly
-│       ├── events.py                the whole 44-event vocabulary: 21 Tier-1 re-exports,
-│       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
+│       ├── events.py                the whole 44-event vocabulary: 20 Tier-1 re-exports,
+│       │                            10 Tier-2 subclasses (session.created + resume_token, ...),
 │       │                            14 Tier-3 events (listen/speak, playback, resume, ...);
 │       │                            DuplexEvent = RealtimeEvent
 │       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
@@ -1684,6 +1749,30 @@ can expose function tokens. Model-local postprocess feedback alone does not
 expose a client tool call. Forced feedback remains queued until an eligible
 frame's postprocess consumes it once.
 
+Inside a call, Nemotron decodes back to back. The thinker publishes
+`nvc_function_fast_path` on frames decoded while its function head is inside a
+tool call, using the current frame's function decision before MRv2 sampling
+commits the call state. The session's plugin reports `fast_path_active` only
+for continuation scheduling. When synthetic silence continuation is permitted,
+the session then
+answers each such frame with its own silence unit at once instead of waiting for
+the client's next 80 ms unit. One token per append still holds; only the frame
+that feeds it changes. Client appends that arrive meanwhile are dropped and
+are never buffered, appended or replayed. Disabling
+`silence_continuation`, using the input clock, or failing to schedule the next
+synthetic unit preserves client-paced decoding instead. Session updates invalidate
+queued fast appends, including an off/on update before that append runs.
+Stage-2 suppression follows each originating Stage-0 acoustic frame, not the
+current scheduling flag: delayed call audio remains silent after `EOTC`, while
+earlier speech still plays during a call. Suppressed frames still count toward
+audio coverage and response completion. Coalesced codec chunks filter only the
+call's frames. Fast steps do not
+count against the response continuation limit: the plugin caps them
+(`_FAST_PATH_MAX_STEPS`, like NVIDIA's `MAX_TOOL_TOKENS`) and the frame that
+decodes `EOTC` clears the flag, after which client-paced continuation resumes.
+A finished or failed call request ends the fast path even when its last frame
+still carried the flag, so the session returns to appending client frames.
+
 Turn plugins may bind their stage identities in `configure_pipeline` and select
 an append's entry with `input_stage_id(payload)` (default 0). The request context
 and orchestrator retain that entry stage. Session prompt preparation receives
@@ -1693,11 +1782,38 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
-JoyAI keeps an empty assistant message for a retained visual observation's
-response when cancellation leaves no committed speech. This preserves the turn
-boundary in both direct and ASR-handoff prompts without restoring unheard text
-or treating cancellation as a model silence decision. The boundary follows the
-existing recent-history budget and disappears when its history item is deleted.
+JoyAI renders a retained visual observation's unheard response as an assistant
+message containing only `</response>`. The Session history item remains empty;
+the model prompt keeps JoyAI's action marker to close the previous observation.
+This preserves the turn boundary in both direct and ASR-handoff prompts without
+restoring unheard text or treating cancellation as a model silence decision.
+The boundary follows the existing recent-history budget and disappears when
+its history item is deleted.
+
+Both text and speech queries precede their observation's frames inside the same
+user message, matching the visual reference frontend. The ASR handoff and
+reconstructed history preserve this query-before-frame format.
+Spoken observations retain the public Session item ID and its non-reusable
+source ID. JoyAI resolves the current text only while both identities match.
+Deleting and recreating a public item ID must not attach the new item's text to
+old frames, even when the text is identical. Observation ordering anchors also
+retain user source IDs so recreated items cannot inherit old positions.
+The retained transcript precedes the original frames in the same user message,
+matching the ASR handoff. A later
+camera observation must not move the transcript into a separate user turn.
+Deleted transcripts stay absent; cancelled output does not discard an accepted
+user transcript.
+
+The default JoyAI silence persona keeps ongoing user instructions active across
+replies: a completed answer does not finish an instruction about future
+observations. Each new observation must be evaluated against applicable ongoing
+instructions before choosing silence. This does not force a spoken response for
+every camera commit; silence remains valid when no instruction or scene change
+calls for speech. The absence of a new query is not by itself a reason to stay
+silent: an ongoing instruction may require a reply to the newest observation.
+Answered one-time questions and unmet conditions in ongoing instructions do not
+require another reply. An explicit `joyai_system_prompt` still replaces the persona.
+
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting

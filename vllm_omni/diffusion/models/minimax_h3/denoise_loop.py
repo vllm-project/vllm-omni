@@ -102,6 +102,23 @@ class MiniMaxH3DenoiseBranch:
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
         self.audio_update_mask_dev = self.audio_update_mask.to(device)
+        self.update_idx_dev = self.update_mask.nonzero().view(-1).to(device)
+        self.cond_idx_dev = (~self.update_mask).nonzero().view(-1).to(device)
+        self.audio_update_idx_dev = self.audio_update_mask.nonzero().view(-1).to(device)
+        self.audio_cond_idx_dev = (~self.audio_update_mask).nonzero().view(-1).to(device)
+        video_target_pos = self.img_pos[self.update_mask]
+        video_cond_pos = self.img_pos[~self.update_mask]
+        audio_target_pos = self.audio_pos[self.audio_update_mask]
+        audio_cond_pos = self.audio_pos[~self.audio_update_mask]
+        self.video_target_pos_dev = video_target_pos.to(device)
+        self.video_cond_pos_dev = video_cond_pos.to(device)
+        self.audio_target_pos_dev = audio_target_pos.to(device)
+        self.audio_cond_pos_dev = audio_cond_pos.to(device)
+        groups = torch.zeros(seq_len, dtype=torch.long)
+        for group, positions in enumerate((video_target_pos, video_cond_pos, audio_target_pos, audio_cond_pos), 1):
+            groups[positions] = group
+        self.timestep_groups_present = tuple(sorted(set(groups.tolist())))
+        self.timestep_group_dev = groups.to(device)
         self.x_base = torch.zeros(1, seq_len, MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
@@ -202,17 +219,25 @@ class MiniMaxH3DenoiseBranch:
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
-        self.fill_timesteps(
-            timesteps,
-            t_video=t_video,
-            t_audio=t_audio,
-            imgvid_cond_timestep=imgvid_cond_timestep,
-            audio_ref_cond_timestep=audio_ref_cond_timestep,
-            video_target_timesteps=video_target_timesteps,
-            audio_target_timesteps=audio_target_timesteps,
-        )
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+        if video_target_timesteps is None and audio_target_timesteps is None:
+            unique_timesteps, inverse_indices = self._unique_step_timesteps(
+                t_video=t_video,
+                t_audio=t_audio,
+                imgvid_cond_timestep=imgvid_cond_timestep,
+                audio_ref_cond_timestep=audio_ref_cond_timestep,
+            )
+        else:
+            timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+            self.fill_timesteps(
+                timesteps,
+                t_video=t_video,
+                t_audio=t_audio,
+                imgvid_cond_timestep=imgvid_cond_timestep,
+                audio_ref_cond_timestep=audio_ref_cond_timestep,
+                video_target_timesteps=video_target_timesteps,
+                audio_target_timesteps=audio_target_timesteps,
+            )
+            unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
             "x": x,
@@ -220,6 +245,29 @@ class MiniMaxH3DenoiseBranch:
             "unique_timesteps": unique_timesteps,
             "inverse_indices": inverse_indices,
         }
+
+    def _unique_step_timesteps(
+        self,
+        *,
+        t_video: float,
+        t_audio: float,
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sorted unique timesteps and inverse indices of fill_timesteps' rows, without a host sync."""
+        audio_timestep = t_audio if self.locked_audio_rows is None else 1.0
+        sources = (t_video, t_video, imgvid_cond_timestep, audio_timestep, audio_ref_cond_timestep)
+        values = torch.tensor([float(value) for value in sources], dtype=torch.float32).tolist()
+        unique = sorted({values[group] for group in self.timestep_groups_present})
+        lookup = [unique.index(value) if value in unique else 0 for value in values]
+        unique_dev = self._upload(torch.tensor(unique, dtype=torch.float32))
+        lookup_dev = self._upload(torch.tensor(lookup, dtype=torch.long))
+        return unique_dev, lookup_dev[self.timestep_group_dev]
+
+    def _upload(self, host: torch.Tensor) -> torch.Tensor:
+        if torch.device(self.device).type == "cuda":
+            host = host.pin_memory()
+        return host.to(self.device, non_blocking=True)
 
     def fill_timesteps(
         self,
@@ -243,23 +291,22 @@ class MiniMaxH3DenoiseBranch:
         timestep_groups = (
             (
                 "video_target_timesteps",
-                self.img_pos_dev,
-                self.update_mask_dev,
+                self.video_target_pos_dev,
+                self.video_cond_pos_dev,
                 video_target_timesteps,
                 t_video,
                 imgvid_cond_timestep,
             ),
             (
                 "audio_target_timesteps",
-                self.audio_pos_dev,
-                self.audio_update_mask_dev,
+                self.audio_target_pos_dev,
+                self.audio_cond_pos_dev,
                 audio_target_timesteps,
                 t_audio if self.locked_audio_rows is None else 1.0,
                 audio_ref_cond_timestep,
             ),
         )
-        for name, positions, update_mask, target_timesteps, current_timestep, condition_timestep in timestep_groups:
-            target_positions = positions[update_mask]
+        for name, target_positions, cond_pos, target_timesteps, current_timestep, condition_timestep in timestep_groups:
             if target_timesteps is None:
                 timesteps[target_positions] = current_timestep
             else:
@@ -269,7 +316,7 @@ class MiniMaxH3DenoiseBranch:
                         f"{name} rows {target_timesteps.shape[0]} != target rows {target_positions.shape[0]}"
                     )
                 timesteps[target_positions] = target_timesteps
-            timesteps[positions[~update_mask]] = condition_timestep
+            timesteps[cond_pos] = condition_timestep
 
 
 def minimax_h3_prepare_denoise_rows(

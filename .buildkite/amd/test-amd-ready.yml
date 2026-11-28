@@ -588,26 +588,50 @@ steps:
           nodes=(
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[AnimaPipeline]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2KleinPipeline]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline[cache_dit+layerwise_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[FluxKontextPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[FluxPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Krea2Pipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LTX2Pipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LTX2TextToAudioPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImageEditPipeline[tea_cache]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImageEditPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline[tea_cache]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPlusPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImagePipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaImageToVideoPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+layerwise_offload]]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit]]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cpu_offload]]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[layerwise_offload]]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+cpu_offload]]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+layerwise_offload]]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaImageToVideoPipeline]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImagePipeline]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline[tea_cache]]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImageEditPipeline[tea_cache]]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline[cache_dit+layerwise_offload]]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPipeline]"
-            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPlusPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cache_dit+layerwise_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusionXLPipeline[cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusionXLPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[WanPipeline]"
             "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[AnimaPipeline]"
             "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[Flux2KleinPipeline]"
-            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImagePipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[Flux2Pipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[FluxKontextPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[FluxPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[Krea2Pipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[LTX2Pipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[LTX2TextToAudioPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[LongCatImageEditPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[LongCatImagePipeline]"
             "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImageEditPipeline]"
             "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImageEditPlusPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImagePipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[SanaImageToVideoPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[SanaVideoPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[StableDiffusion3Pipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[StableDiffusionXLPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[WanPipeline]"
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/tiny-diffusion-base-ready-expected.txt
           pytest -q \
@@ -627,7 +651,9 @@ steps:
             --run-level "core_model" \
             --junitxml="$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml"
           # Pytest includes subtests in the suite total; compare the parent node ids.
-          python -c 'import sys, xml.etree.ElementTree as ET
+          # Online video determinism/multi-output subtests skip by design on
+          # every platform (task_runners.py); allow exactly those 8 skips.
+          python -c 'import re, sys, xml.etree.ElementTree as ET
           from collections import Counter
           from pathlib import Path
           root = ET.parse(sys.argv[1]).getroot()
@@ -639,13 +665,18 @@ steps:
               expected[(module.removesuffix(".py").replace("/", "."), name)] += 1
           actual = Counter((case.get("classname"), case.get("name")) for case in root.iter("testcase"))
           suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-          bad_results = any(int(suite.get(key, "0")) != 0
-                            for suite in suites for key in ("skipped", "failures", "errors"))
-          bad_results = bad_results or any(list(root.iter(tag)) for tag in ("skipped", "failure", "error"))
+          known_skip = re.compile(r"Online (determinism|multi-output) isn.t supported for DiffusionTasks[.](TEXT|IMAGE)_TO_VIDEO[.]")
+          skips = [(case, skip) for case in root.iter("testcase") for skip in case.findall("skipped")]
+          bad_results = any(int(suite.get(key, "0")) != 0 for suite in suites for key in ("failures", "errors"))
+          bad_results = bad_results or sum(int(suite.get("skipped", "0")) for suite in suites) != 8 or len(skips) != 8
+          bad_results = bad_results or any(list(root.iter(tag)) for tag in ("failure", "error"))
+          bad_results = bad_results or not all(
+              case.get("classname") == "tests.model_tests.diffusion.test_common_online"
+              and known_skip.fullmatch(skip.get("message", "")) for case, skip in skips)
           if actual != expected or bad_results:
-              print("Expected every pinned tiny-diffusion READY node to execute without skips or failures; "
-                    f"missing={expected - actual}, unexpected={actual - expected}, bad_results={bad_results}",
-                    file=sys.stderr)
+              print("Expected every pinned tiny-diffusion READY node to execute without failures and with only the "
+                    f"8 known online-video skips; missing={expected - actual}, unexpected={actual - expected}, "
+                    f"bad_results={bad_results}", file=sys.stderr)
               raise SystemExit(5)
           ' "$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml" /tmp/tiny-diffusion-base-ready-expected.txt
           TINY_DIFFUSION_BASE_READY
@@ -793,6 +824,49 @@ steps:
         fi
       fi
       (exit "$$status")
+
+# MI300 owners for CUDA READY "Distributed Test · 1GPU" / "· 2GPU" (Mooncake
+# TCP/RDMA connector and native NIXL). The CUDA IPC weight-sharing tests in
+# those jobs stay CUDA-only: the feature itself requires NVIDIA CUDA, and its
+# modules skip at import on ROCm, so select omni_connectors/ only.
+# Blocking after five consecutive green READY runs each.
+- label: "ROCm · Distributed Test · 1-GPU"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  timeout_in_minutes: 30
+  env:
+    ROCM_DIFFUSION_RUN_LEVEL: core_model
+    # Mooncake's HIP transport cannot open an IPC handle exported by the same
+    # process (hipIpcOpenMemHandle: invalid device context), and these tests
+    # run producer and consumer in one process. Use the TCP path CUDA CI uses.
+    MC_DISABLE_HIP: "1"
+  artifact_paths:
+    - "artifacts/rocm-distributed-1gpu/**/*"
+  commands:
+    - >-
+      bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+      1 27 20m rocm-distributed-1gpu
+      tests/distributed/omni_connectors/
+      -m 'core_model and rocm and MI325 and not cards_2'
+
+- label: "ROCm · Distributed Test · 2-GPU"
+  agent_pool: mi300_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  timeout_in_minutes: 30
+  env:
+    ROCM_DIFFUSION_RUN_LEVEL: core_model
+  artifact_paths:
+    - "artifacts/rocm-distributed-2gpu/**/*"
+  commands:
+    - >-
+      bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+      2 8 20m rocm-distributed-2gpu
+      tests/distributed/omni_connectors/
+      -m 'core_model and rocm and MI325 and cards_2'
 
 - label: "ROCm · One-Card Worker GPU Test"
   agent_pool: mi300_1

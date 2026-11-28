@@ -33,6 +33,9 @@ Timeline contract (verified against NeMo ``_init_inference``/``_step_zero``/
 * The function channel is load-bearing for numerical correctness (fusion
   weight 2.0), emits tool calls, and accepts client tool results while keeping
   the text channel padded during forced response injection.
+* Inside a tool call the thinker can be driven back to back: a fast-path append
+  carries a silence frame where client audio would go, and one token per append
+  still holds, so the call completes without waiting on the 80 ms client frame.
 """
 
 from __future__ import annotations
@@ -280,6 +283,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     omni_client_multimodal_output_keys = (
         "nvc_function_token",
         "nvc_function_response_consumed_generation",
+        "nvc_function_fast_path",
     )
 
     @classmethod
@@ -539,6 +543,23 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # frame 0, so it publishes nothing and leaves a forced token queued.
         if self._use_function_head and model_outputs.numel() and isinstance(info_dicts, list) and info_dicts:
             function_tokens = self._client_function_tokens(model_outputs, info_dicts, kwargs.get("request_token_spans"))
+            # MRv2 publishes before sample commits function_call_active. Apply
+            # this frame's boundary without mutating the sampling-owned state.
+            fast_path = []
+            for info, token in zip(info_dicts, function_tokens):
+                session = self._sessions.get(info.get("request_id"), {}) if isinstance(info, dict) else {}
+                active = bool(session.get("function_call_active", False))
+                if token is None:
+                    active = False
+                elif not isinstance(session.get("forced_function_token"), int):
+                    decision = int(token.item())
+                    if decision == session.get("nvc_function_sotc_id"):
+                        active = True
+                    elif decision == session.get("nvc_function_eotc_id"):
+                        active = False
+                fast_path.append(torch.tensor([int(active)], dtype=torch.int64))
+            if any(bool(flag.item()) for flag in fast_path):
+                multimodal_outputs["nvc_function_fast_path"] = fast_path
             if len(info_dicts) == 1:
                 if function_tokens[0] is not None:
                     multimodal_outputs["nvc_function_token"] = function_tokens[0]

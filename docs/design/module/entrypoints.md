@@ -102,6 +102,10 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+An explicit model revision applies to startup prefetch and pipeline discovery.
+In Hugging Face offline mode, these steps use the cached snapshot for that
+revision.
+
 `AsyncOmni.generate(priority=...)` forwards the value when creating a
 stage-0 AR request, including the first ADD for streaming input and the
 terminal ADD for an empty stream. The stage's scheduling policy determines

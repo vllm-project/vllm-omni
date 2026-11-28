@@ -92,6 +92,7 @@ class _FakeAudioEncoder:
 class _FakeVisionModel:
     def __init__(self, vision_batch_size: int) -> None:
         self.config = _VisionConfig(vision_batch_size=vision_batch_size)
+        self.resampler_max_frames = 0
         self.vpm = _FakeVisionEncoder()
         self.resampler = _FakeResampler()
         self.vision_packed_encode = False
