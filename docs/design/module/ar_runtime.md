@@ -157,8 +157,9 @@ larger of the two. Requests that do not
 fit stay waiting. Expected growth is the largest growth of a request that
 finished normally, capped by `max_tokens`, or `max_tokens` until one finishes;
 a request that grows beyond it can still be preempted. Running requests,
-resumable sessions and the first admission into an empty stage are not held
-back, and `allow` stages keep vLLM's admission.
+resumable sessions (for their whole life, also after their input ends) and the
+first admission into an empty stage are not held back, and `allow` stages keep
+vLLM's admission.
 
 ## Candidate invariants
 

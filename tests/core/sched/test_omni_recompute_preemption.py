@@ -415,6 +415,45 @@ def test_reserve_passes_resumable_sessions_through_untracked(monkeypatch):
     assert "s" not in reserve.admitted
 
 
+def _end_input(scheduler, rid):
+    """Deliver the end-of-input marker for a resumable session through the connector-output consumer.
+
+    The input coordinator is a stub that receives chunks: only the consumer's handling of the marker
+    (which clears ``resumable``) is exercised, not chunk delivery.
+    """
+    from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+
+    coordinator, native = scheduler.input_coordinator, scheduler._native_resumable
+    scheduler.input_coordinator = Mock(receives_chunks=True)
+    scheduler._native_resumable = True
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        request_metadata={rid: SchedulingMetadataUpdate(input_terminal=True)}
+    )
+    try:
+        scheduler._consume_pending_connector_output("ar")
+    finally:
+        scheduler.input_coordinator, scheduler._native_resumable = coordinator, native
+    assert not scheduler.requests[rid].resumable
+
+
+@pytest.mark.parametrize("reserve", [True, False])
+def test_reserve_keeps_a_running_session_exempt_after_its_input_ends(monkeypatch, reserve):
+    # Six usable blocks; two resumable sessions, 16-token prompts, up to 32 more tokens each. Once a
+    # session's input ends it is no longer resumable, but it is still running: its next decode needs no
+    # new block, and holding that allocation for an admission reserve would preempt it into an error.
+    scheduler = _reserve_scheduler(monkeypatch, reserve=reserve, num_blocks=7, max_model_len=64)
+    a, b = _request("a", 16, 32), _request("b", 16, 32, first_token=1000)
+    for request in (a, b):
+        request.resumable = True
+        scheduler.add_request(request)
+    _step(scheduler, scheduler.schedule())  # prefill both
+    _end_input(scheduler, "a")
+    _step(scheduler, scheduler.schedule())
+    _end_input(scheduler, "b")
+    _run(scheduler, [])
+    assert [a.status, b.status] == [RequestStatus.FINISHED_LENGTH_CAPPED] * 2
+
+
 @pytest.mark.parametrize("num_blocks, admitted", [(25, True), (24, False)])
 def test_reserve_counts_an_in_flight_prefill_once_with_an_async_kv_load(monkeypatch, num_blocks, admitted):
     # A is in chunked prefill (160-token prompt, 16 tokens per step); B then loads 32 of its 48 tokens

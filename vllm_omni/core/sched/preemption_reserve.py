@@ -18,8 +18,9 @@ Expected growth (tokens added after admission) is an estimate: the largest
 growth seen on a request that finished normally, capped by the request's
 ``max_tokens``; ``max_tokens`` until a request finishes. A request that grows
 more than that can still be preempted and fails as before. Not covered:
-resumable streaming sessions (passed through untracked), and KV layouts other
-than a single full-attention group (not installed).
+resumable streaming sessions (passed through untracked for their whole life,
+also after their input ends), and KV layouts other than a single full-attention
+group (not installed).
 """
 
 from __future__ import annotations
@@ -63,6 +64,10 @@ class PreemptionReserve:
         self.scheduler_reserved = scheduler_reserved
         # request_id -> (request, num_tokens when it was admitted)
         self.admitted: dict[str, tuple[Request, int]] = {}
+        # Requests first allocated as resumable sessions. They stay untracked and
+        # exempt after ``resumable`` is cleared at end of input, since they may
+        # still be running: holding their next allocation would preempt them.
+        self.sessions: set[str] = set()
         self.max_growth: int | None = None
         # Sum of ``_need`` over ``admitted``, or None until the next full scan. Kept
         # exact: anything that can change one request's need clears it (a new step,
@@ -111,6 +116,7 @@ class PreemptionReserve:
         return total - min(overlap, caller_reserved)
 
     def on_free(self, request: Request) -> None:
+        self.sessions.discard(request.request_id)
         entry = self.admitted.pop(request.request_id, None)
         if entry is not None:
             self._total_need = None
@@ -122,10 +128,11 @@ class PreemptionReserve:
         """Blocks to reserve on top of ``caller_reserved`` before ``request`` gets blocks.
 
         Zero for requests that are not held back: admitted ones, resumable sessions
-        and the first admission into an empty stage. ``covered_tokens`` are the
-        tokens this allocation will cover.
+        (also once their input has ended) and the first admission into an empty
+        stage. ``covered_tokens`` are the tokens this allocation will cover.
         """
-        if request.request_id in self.admitted or request.resumable or not self.admitted:
+        rid = request.request_id
+        if rid in self.admitted or rid in self.sessions or request.resumable or not self.admitted:
             return 0
         own = max(0, self.final_blocks(request, request.num_tokens) - self.blocks(covered_tokens))
         return self.reserved_blocks(caller_reserved) + own
@@ -137,7 +144,11 @@ class PreemptionReserve:
             if rid in self.admitted:
                 # An admitted request now holds more blocks, so its need changed.
                 self._total_need = None
-            elif not request.resumable:
+            elif rid in self.sessions:
+                pass
+            elif request.resumable:
+                self.sessions.add(rid)
+            else:
                 self.admitted[rid] = (request, request.num_tokens)
                 if self._total_need is not None:
                     self._total_need += self._need(rid, request, request.num_tokens)
