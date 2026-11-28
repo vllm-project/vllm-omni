@@ -24,7 +24,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_total_steps,
 )
 from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_STATE
-from vllm_omni.diffusion.sampler import SamplingState, sampler_object
+from vllm_omni.diffusion.sampler import SamplingState, deferred_checks, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit
@@ -550,7 +550,8 @@ def minimax_h3_denoise_loop(
             check_request_cancellation()
             return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
 
-        with torch.inference_mode():
+        # A failed check abandons the request, so read the per-step checks back once at the end.
+        with torch.inference_mode(), deferred_checks(lambda: state.step_index):
             sampler_object(sampler).sample(
                 MiniMaxH3ModelBatch({state: adapter}),
                 [state],

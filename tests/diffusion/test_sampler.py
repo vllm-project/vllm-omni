@@ -18,7 +18,10 @@ from vllm_omni.diffusion.sampler import (
     Sampler,
     SamplingState,
     _commit,
+    deferred_checks,
     dpmpp_2m_coefficients,
+    euler_eta0_step,
+    require_device_condition,
     res_multistep_coefficients,
     sample_dpmpp_2m,
     sample_heun,
@@ -370,6 +373,60 @@ def test_heun_correction_evaluates_proposal_at_next_sigma_and_batches_only_non_t
     torch.testing.assert_close(late.latents[0], torch.full((3,), 0.25))
     assert early.step_index == late.step_index == 1
     assert early.history is None and late.history is None
+
+
+def test_deferred_checks_read_back_once_at_exit():
+    with deferred_checks():
+        require_device_condition(torch.tensor(True), "fine")
+    reached = []
+    with pytest.raises(ValueError, match="second"):
+        with deferred_checks():
+            require_device_condition(torch.tensor(True), "first")
+            require_device_condition(torch.tensor(False), "second")
+            reached.append("after failing check")
+    assert reached == ["after failing check"]
+    with pytest.raises(ValueError, match="immediate"):
+        require_device_condition(torch.tensor(False), "immediate")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("sigmas", [(1.0, 0.9), (0.977, 0.12345), (0.31, 0.0), (1e-3, 7e-4)])
+def test_euler_step_matches_device_scalar_formula(dtype, sigmas):
+    torch.manual_seed(0)
+    state, denoised = torch.randn(4096, dtype=dtype), torch.randn(4096, dtype=dtype)
+    curr, nxt = sigmas
+    compute = torch.float32
+    ratio = state.new_tensor(nxt, dtype=compute) / state.new_tensor(curr, dtype=compute)
+    expected = (ratio * state.to(compute) + (1.0 - ratio) * denoised.to(compute)).to(dtype)
+    assert torch.equal(euler_eta0_step(state, denoised, sigma_curr=curr, sigma_next=nxt), expected)
+
+
+def test_deferred_run_reads_back_once_and_reports_the_failing_step(monkeypatch):
+    state = _state()
+    calls = {"item": 0, "tolist": 0}
+    item, tolist = torch.Tensor.item, torch.Tensor.tolist
+
+    def counting(name, original):
+        def wrapper(self, *args, **kwargs):
+            calls[name] += 1
+            return original(self, *args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(torch.Tensor, "item", counting("item", item))
+    monkeypatch.setattr(torch.Tensor, "tolist", counting("tolist", tolist))
+
+    def model(es):
+        # A NaN from the second evaluation on; the loop keeps going and fails once, at the end.
+        return [
+            tuple(torch.full_like(x, float("nan") if e.state.step_index >= 1 else 0.1) for x in e.latents) for e in es
+        ]
+
+    with pytest.raises(ValueError, match=r"\(step 1\)"):
+        with deferred_checks(lambda: state.step_index):
+            sampler_object("euler").sample(model, [state])
+    assert state.finished
+    assert calls == {"item": 0, "tolist": 1}
 
 
 @pytest.mark.parametrize("sigmas", [_REF_VIDEO_SIGMAS, _REF_AUDIO_SIGMAS, (1.0, 0.6, 0.3, 0.1)])

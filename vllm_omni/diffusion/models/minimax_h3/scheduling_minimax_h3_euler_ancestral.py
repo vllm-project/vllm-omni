@@ -7,14 +7,13 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.sampler import euler_eta0_step
+from vllm_omni.diffusion.sampler import euler_eta0_step, require_device_condition
 
 minimax_h3_euler_eta0_step = euler_eta0_step
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
-    if not bool(torch.isfinite(tensor).all().item()):
-        raise ValueError(f"{name} must be finite")
+    require_device_condition(torch.isfinite(tensor).all(), f"{name} must be finite")
 
 
 def _validate_unit_timestep(timestep: torch.Tensor, name: str) -> None:
@@ -24,8 +23,7 @@ def _validate_unit_timestep(timestep: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be a floating point tensor")
     _require_finite_tensor(timestep, name)
     out_of_range = (timestep < 0) | (timestep > 1)
-    if bool(out_of_range.any().item()):
-        raise ValueError(f"{name} must be in [0, 1]")
+    require_device_condition(~out_of_range.any(), f"{name} must be in [0, 1]")
 
 
 def _validate_sigma(value: float, name: str) -> float:
