@@ -13,6 +13,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
@@ -33,6 +35,10 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.model_loader.prewarm import (
+    WeightsPrewarmHandoff,
+    parent_weights_prewarm,
+)
 from vllm_omni.diffusion.sched.request_scheduler import (
     build_rank_local_dp_extra_args_signature,
     build_request_batch_sampling_params_key,
@@ -351,15 +357,54 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         sharing_registry = vars(od_config).pop("_sharing_worker_registry", None)
         logger.info("Starting server...")
 
-        num_gpus = cast(int, od_config.num_gpus)
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
         # Fix the per-worker thread count: core_count -> core_count / N.
+        num_gpus = cast(int, od_config.num_gpus)
         set_multiprocessing_worker_envs(local_world_size=num_gpus)
         mp.set_start_method("spawn", force=True)
+
+        model_ref = getattr(od_config, "model", None)
+        load_format = getattr(od_config, "diffusion_load_format", "default")
+        prewarm_enabled = bool(getattr(od_config, "enable_weights_prewarm", False))
+        prewarm_context = (
+            parent_weights_prewarm(
+                str(model_ref),
+                revision=getattr(od_config, "revision", None),
+                cache_dir=getattr(od_config, "download_dir", None),
+            )
+            if model_ref and load_format != "dummy" and prewarm_enabled
+            else nullcontext(None)
+        )
+        try:
+            with prewarm_context as prewarm_handoff:
+                return self._spawn_worker_processes(
+                    broadcast_handle,
+                    wake_events,
+                    num_gpus,
+                    sharing_registry,
+                    prewarm_handoff,
+                )
+        finally:
+            # vllm's helper writes OMP_NUM_THREADS once and leaves it; a later
+            # executor in this process would then treat it as an explicit user
+            # value and skip its own per-worker sizing. Drop only what the helper
+            # wrote, so a user-provided value is never touched.
+            if os.environ.pop(OMP_NUM_THREADS_SET_BY_VLLM, None) is not None:
+                os.environ.pop("OMP_NUM_THREADS", None)
+
+    def _spawn_worker_processes(
+        self,
+        broadcast_handle: Handle,
+        wake_events: list[Event],
+        num_gpus: int,
+        sharing_registry: object,
+        prewarm_handoff: WeightsPrewarmHandoff | None,
+    ) -> tuple[list[mp.Process], list[Handle]]:
+        od_config = self.od_config
         mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
-        processes = []
+        processes: list[mp.Process] = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
@@ -383,7 +428,11 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
-                kwargs={"sharing_registry": sharing_registry, "parent_pid": os.getpid()},
+                kwargs={
+                    "sharing_registry": sharing_registry,
+                    "parent_pid": os.getpid(),
+                    "weights_prewarm_handoff": prewarm_handoff,
+                },
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )

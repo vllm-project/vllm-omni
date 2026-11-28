@@ -1521,7 +1521,11 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
         diffusion_attention_schedule=None,
     )
 
-    monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
+    monkeypatch.setattr(
+        model_runner_module,
+        "LoadConfig",
+        lambda **kwargs: SimpleNamespace(download_dir=kwargs.get("download_dir")),
+    )
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
 
@@ -1540,6 +1544,54 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_load_model_gives_the_loader_the_parent_prewarm_cache(monkeypatch):
+    """Demand loading must open the snapshot parent prewarm already warmed.
+
+    Parent prewarm reads ``od_config.download_dir``. An empty ``LoadConfig()``
+    leaves ``load_config.download_dir`` at the Hub default, so a custom cache
+    is warmed and then never read.
+    """
+    seen: dict[str, object] = {}
+
+    class _LoadConfig:
+        def __init__(self, **kwargs):
+            self.download_dir = kwargs.get("download_dir")
+            seen["load_config_kwargs"] = kwargs
+
+    class _Loader:
+        def __init__(self, load_config, od_config=None):
+            del od_config
+            seen["loader_download_dir"] = load_config.download_dir
+
+        def load_model(self, **kwargs):
+            del kwargs
+            raise RuntimeError("stop after cache dir is wired")
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.od_config = SimpleNamespace(
+        download_dir="/custom-hub-cache",
+        weight_sharing=None,
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        diffusion_attention_schedule=None,
+    )
+    monkeypatch.setattr(model_runner_module, "LoadConfig", _LoadConfig)
+    monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _Loader)
+
+    with pytest.raises(RuntimeError, match="stop after cache dir is wired"):
+        DiffusionModelRunner.load_model(runner)
+
+    assert seen["load_config_kwargs"] == {"download_dir": "/custom-hub-cache"}
+    assert seen["loader_download_dir"] == "/custom-hub-cache"
 
 
 @pytest.mark.core_model
