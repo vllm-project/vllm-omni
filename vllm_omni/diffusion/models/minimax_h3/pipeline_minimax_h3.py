@@ -741,6 +741,30 @@ class _SingleRankEncoderGroup:
         self.device_group = None
 
 
+MODEL_LOADED_COMPONENTS = ("transformer", "text_encoder", "vae_encoder", "vae_decoder")
+
+
+def _resolve_model_loaded(model_loaded: dict[str, bool]) -> tuple[bool, bool, bool, bool]:
+    """Read the four component switches, rejecting anything the stage cannot honor.
+
+    Unknown keys and non-bool values used to fall through ``dict.get`` defaults,
+    so a misspelled key silently left its component loaded and defeated the
+    memory bound the caller asked for.
+    """
+    unknown = sorted(set(model_loaded) - set(MODEL_LOADED_COMPONENTS))
+    if unknown:
+        raise ValueError(f"Unknown model_loaded key(s) {unknown}; MiniMax H3 accepts {list(MODEL_LOADED_COMPONENTS)}")
+    for key, value in model_loaded.items():
+        if not isinstance(value, bool):
+            raise TypeError(f"model_loaded.{key} must be a bool, got {type(value).__name__}")
+    return (
+        model_loaded.get("transformer", True),
+        model_loaded.get("text_encoder", True),
+        model_loaded.get("vae_encoder", True),
+        model_loaded.get("vae_decoder", True),
+    )
+
+
 class MiniMaxH3Pipeline(
     nn.Module,
     DenoiseProgressMixin,
@@ -1150,10 +1174,9 @@ class MiniMaxH3Pipeline(
                 "latent_refine default."
             )
         self.device = get_local_device()
-        self.load_transformer = od_config.model_loaded.get("transformer", True)
-        self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
-        self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
-        self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        self.load_transformer, self.load_text_encoder, self.load_vae_encoder, self.load_vae_decoder = (
+            _resolve_model_loaded(od_config.model_loaded)
+        )
         # Legal ``model_loaded`` sub-keys are independent except one VAE invariant:
         # ``vae_encoder`` requires ``vae_decoder`` (decoding needs the encoder).
         # Text-only tasks may set ``transformer=false`` / ``vae_encoder=false`` /
@@ -1228,6 +1251,19 @@ class MiniMaxH3Pipeline(
                 or getattr(od_config, "kv_offload_config", None)
             )
             if unsupported:
+                disabled = [
+                    key
+                    for key, enabled in (
+                        ("transformer", self.load_transformer),
+                        ("vae_encoder", self.load_vae_encoder),
+                    )
+                    if not enabled
+                ]
+                if disabled:
+                    raise ValueError(
+                        f"H3 control needs model_loaded.{disabled[0]}=true; it runs the DiT and encodes "
+                        "VAE latents locally"
+                    )
                 raise ValueError(
                     "H3 control requires request mode, local VAE encoding, dense weights, "
                     "and no cache/offload/SP/HSDP or reference-KV offload; TP is supported"

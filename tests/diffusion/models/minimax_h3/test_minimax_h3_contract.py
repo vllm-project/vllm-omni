@@ -4662,3 +4662,25 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
         pipeline.decode_to_mp4.assert_not_called()
     finally:
         registry.close()
+
+
+def test_resolve_model_loaded_defaults_every_component_to_loaded():
+    """An empty selection loads everything: the default lifecycle is unchanged."""
+    assert pipeline_minimax_h3._resolve_model_loaded({}) == (True, True, True, True)
+
+
+def test_resolve_model_loaded_returns_components_in_constructor_order():
+    assert pipeline_minimax_h3._resolve_model_loaded(
+        {"transformer": False, "text_encoder": True, "vae_encoder": False, "vae_decoder": False}
+    ) == (False, True, False, False)
+
+
+def test_resolve_model_loaded_rejects_unknown_components():
+    """A typo must fail closed instead of silently loading the named component."""
+    with pytest.raises(ValueError, match="Unknown model_loaded key"):
+        pipeline_minimax_h3._resolve_model_loaded({"vae_encoderr": False})
+
+
+def test_resolve_model_loaded_rejects_non_boolean_values():
+    with pytest.raises(TypeError, match="model_loaded.vae_decoder must be a bool"):
+        pipeline_minimax_h3._resolve_model_loaded({"vae_decoder": 0})
