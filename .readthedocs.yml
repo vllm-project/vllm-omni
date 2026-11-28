@@ -1,4 +1,7 @@
 # Read the Docs configuration file
+# Note that this is used for building the actual release docs,
+# but it's not used to build the checks for PRs, since we do it
+# in github actions for now.
 # See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
 
 version: 2

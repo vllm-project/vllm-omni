@@ -1,0 +1,66 @@
+name: Build Docs
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+
+concurrency:
+  # Separate things with the ready label into their own concurrency group.
+  # We need to carefully handle the case where `ready` is not the label added,
+  # because adding a different label to a PR with `ready` shouldn't retrigger.
+  group: >-
+    ${{ github.workflow }}-${{ github.event.pull_request.number }}-needs_docs-${{
+      contains(github.event.pull_request.labels.*.name, 'ready') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ready')
+    }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-docs:
+    # Similarly, we don't trigger if it's a labeled event that has ready, but it
+    # was a different label that was added, because then it would build but just
+    # put it in the -false concurrency group.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'ready') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ready')
+
+    runs-on: ubuntu-22.04
+    env:
+      READTHEDOCS: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu torch
+          uv pip install -e ".[docs]"
+
+      - name: Build documentation
+        # --no-sync to avoid resyncing across the project, since we already built the docs env
+        run: uv run --no-sync mkdocs build --strict
+
+      - name: Upload built docs
+        # Since this is just in PRs and not main and tags, we don't worry about pushing
+        # the preview to ReadTheDocs, but still upload them as an artifact so that they
+        # can be downloaded and served locally if needed.
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-site-pr-${{ github.event.pull_request.number }}
+          path: site
+          retention-days: 7
