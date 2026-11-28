@@ -429,9 +429,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
-        # The three decoder fast paths below are XPU-only: they were written
-        # against the XPU kernels/compile stack and validated there. CUDA keeps
-        # its own fused-operator path (install_h3_vae_optimizations above); on
+        # The three decoder fast paths below were written against the XPU
+        # kernels/compile stack and validated there; the FP16 weight cast alone
+        # is also available on NPU, as an opt-in. CUDA keeps its own
+        # fused-operator path (install_h3_vae_optimizations above); on
         # every other device the checkpoint's reference decoder runs unchanged
         # and none of the switches prints or installs anything. Like
         # install_h3_vae_optimizations, they target the checkpoint's own
@@ -461,7 +462,15 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 len(_blocks),
                 device,
             )
-        if _xpu and os.environ.get("H3_VAE_FP16_WEIGHTS", "1") == "1" and decoder is not None:
+        # Ascend decodes under the same FP16 autocast and never installs the CUDA path either, so the same cast
+        # applies there. It is opt-in on NPU (H3_VAE_FP16_WEIGHTS=1); the XPU default stays on.
+        _npu = device.type == "npu" and decoder_path is None
+        _fp16_weights = os.environ.get("H3_VAE_FP16_WEIGHTS", "1" if _xpu else "0") == "1"
+        # Persisting the weights in FP16 only matches reference decode while the decode itself runs
+        # in FP16, because it is that autocast which would otherwise re-cast them on every tile.
+        # ``decode_dtype`` is a runtime value, not a device constant -- the NVFP4 decoder sets it to
+        # BF16 above -- so check it here instead of leaving the invariant to ``decoder_path``.
+        if (_xpu or _npu) and _fp16_weights and decoder is not None and self.decode_dtype is torch.float16:
             # CUDA path (ops/vae/__init__.py) persists decoder-block Linear weights in fp16 so autocast does not re-cast
             # every weight on every tile; on XPU that path is never installed. Same cast, env-gated.
             from vllm_omni.diffusion.models.minimax_h3.ops.vae import _decoder_block_linears as _h3_dbl
@@ -469,9 +478,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             _linears = _h3_dbl(decoder) or []
             for _lin in _linears:
                 _lin.to(dtype=torch.float16)
-            logger.info(
-                "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
-            )
+            if _linears:
+                logger.info(
+                    "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
+                )
+            else:
+                # _decoder_block_linears returns None unless the decoder matches the CUDA fused
+                # path's structural contract, so an enabled switch can legitimately cast nothing
+                # (a Lite or future decoder). Name that reason rather than report a count of zero,
+                # which reads as if the switch were installed and found no work.
+                logger.warning(
+                    "[H3_VAE_FP16_WEIGHTS] enabled but this decoder does not match the fused-path structure, "
+                    "so no weights were cast device=%s",
+                    device,
+                )
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None

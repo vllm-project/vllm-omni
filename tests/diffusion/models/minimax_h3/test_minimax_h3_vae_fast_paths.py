@@ -3,10 +3,12 @@
 
 """CPU tests for the MiniMax-H3 VAE decoder fast-path gating.
 
-The three env switches (``H3_VAE_XEFMHA``, ``H3_VAE_COMPILE``,
-``H3_VAE_FP16_WEIGHTS``) are XPU-only, and the compile switch additionally
-requires the pipeline's eager/inductor decision (``allow_decoder_compile``).
-Non-XPU construction must be a quiet no-op: no wraps, no casts, no ERROR.
+``H3_VAE_XEFMHA`` and ``H3_VAE_COMPILE`` are XPU-only, and the compile switch
+additionally requires the pipeline's eager/inductor decision
+(``allow_decoder_compile``). ``H3_VAE_FP16_WEIGHTS`` is XPU (default on) and
+NPU (opt-in), and applies only while the decode dtype is FP16 and the decoder
+matches the fused path's structure. On every other device construction must be
+a quiet no-op: no wraps, no casts, no ERROR.
 """
 
 import json
@@ -147,6 +149,66 @@ def test_non_xpu_is_a_quiet_noop(component_dir, compile_spy, linears, fake_check
     assert all(lin.weight.dtype == torch.float32 for lin in linears)
     assert all(b.attn.perform_attention is b.attn._original for b in decoder.transformer_blocks)
     assert getattr(decoder, "_h3_xefmha_stats", None) is None
+
+
+class _NpuDevice:
+    """Stock torch has no "npu" device type; the constructor only reads ``.type``."""
+
+    type = "npu"
+    index = 0
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, torch.float32), ("0", torch.float32), ("1", torch.float16)])
+def test_npu_fp16_weights_is_opt_in_and_installs_nothing_else(
+    component_dir, compile_spy, linears, fake_checkpoint, monkeypatch, env, expected
+):
+    for var in ("H3_VAE_XEFMHA", "H3_VAE_COMPILE", "H3_VAE_FP16_WEIGHTS"):
+        monkeypatch.delenv(var, raising=False)
+    if env is not None:
+        monkeypatch.setenv("H3_VAE_FP16_WEIGHTS", env)
+    vae = MiniMaxH3VideoVAE(component_dir, device=_NpuDevice(), trust_remote_code=True, allow_decoder_compile=True)
+    decoder = vae.remote.model.decoder
+
+    assert all(lin.weight.dtype == expected for lin in linears)
+    # The attention reroute and the compile stay XPU-only.
+    assert not compile_spy
+    assert all(b.attn.perform_attention is b.attn._original for b in decoder.transformer_blocks)
+    assert getattr(decoder, "_h3_xefmha_stats", None) is None
+
+
+def test_fp16_weights_skipped_when_the_decode_dtype_is_not_fp16(
+    component_dir, compile_spy, linears, fake_checkpoint, monkeypatch
+):
+    """The cast only matches reference decode under an FP16 autocast.
+
+    ``decode_dtype`` is a runtime value, so an enabled switch must not persist FP16 weights
+    for a BF16 decode, where every matmul would upcast them and lose three mantissa bits.
+    """
+    for var in ("H3_VAE_XEFMHA", "H3_VAE_COMPILE", "H3_VAE_FP16_WEIGHTS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("H3_VAE_FP16_WEIGHTS", "1")
+    monkeypatch.setattr(MiniMaxH3VideoVAE, "decode_dtype", torch.bfloat16)
+
+    MiniMaxH3VideoVAE(component_dir, device=_NpuDevice(), trust_remote_code=True, allow_decoder_compile=True)
+
+    assert all(lin.weight.dtype == torch.float32 for lin in linears)
+
+
+def test_fp16_weights_warns_when_the_decoder_structure_is_rejected(
+    component_dir, compile_spy, linears, fake_checkpoint, monkeypatch
+):
+    """An enabled switch that matches no linears must name the reason, not log a count of zero."""
+    for var in ("H3_VAE_XEFMHA", "H3_VAE_COMPILE", "H3_VAE_FP16_WEIGHTS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("H3_VAE_FP16_WEIGHTS", "1")
+    monkeypatch.setattr(vae_ops, "_decoder_block_linears", lambda _decoder: None)
+    warned: list[str] = []
+    monkeypatch.setattr(vae_module.logger, "warning", lambda msg, *a: warned.append(msg % a if a else msg))
+
+    MiniMaxH3VideoVAE(component_dir, device=_NpuDevice(), trust_remote_code=True, allow_decoder_compile=True)
+
+    assert all(lin.weight.dtype == torch.float32 for lin in linears)
+    assert any("does not match the fused-path structure" in line for line in warned)
 
 
 def test_xpu_compile_denied_keeps_other_two(component_dir, compile_spy, linears, fake_checkpoint, monkeypatch):
