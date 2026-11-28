@@ -49,6 +49,7 @@ from .vdnh3 import VDNConfig, VDNH3HybridAttention
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+    from .adaln_plan import MiniMaxH3AdalnPlan
     from .reference_isolation import MiniMaxH3ReferenceIsolation
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
@@ -756,17 +757,41 @@ class MiniMaxH3AdalnProj(nn.Module):
             else self._adaln_cache.project(self._cache_name, self.linear, t_emb, project)
         )
 
+    def _project_and_plan(self, t_emb: torch.Tensor, plan: MiniMaxH3AdalnPlan) -> torch.Tensor:
+        """This forward's per-step projection, plus the request's table from the same weight in one staging."""
+        self._prepare_weight_stager(t_emb.device)
+        x = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        rows = plan.rows()
+        if self._weight_stager is not None:
+            self._weight_stager.load()
+        try:
+            per_step = self.linear(x)[0]
+            table = self.linear(rows.reshape(-1, rows.shape[-1]))[0].view(rows.shape[0], rows.shape[1], -1)
+        finally:
+            if self._weight_stager is not None:
+                self._weight_stager.offload()
+        plan.record(self, table, per_step)
+        return per_step
+
     @torch.compiler.disable
     def _project_cached(self, t_emb: torch.Tensor) -> torch.Tensor:
         # Cache decisions, TP hit voting and CPU storage rebinding are host
         # control flow. Keep this small boundary eager while the surrounding
         # norms, attention projections and MLP remain eligible for compilation.
+        plan = self._adaln_cache.plan if self._adaln_cache is not None else None
+        if plan is not None:
+            planned = plan.lookup(self, t_emb)
+            if planned is not None:
+                return planned
+            if plan.wants(self, t_emb):
+                # Built here, inside the block's forward, so an offloaded weight is staged or materialized.
+                return self._project_and_plan(t_emb, plan)
         return self._project(t_emb)
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
         use_cache_boundary = self._adaln_cache is not None and (
-            self._adaln_cache.max_bytes > 0 or self._offload_weights
+            self._adaln_cache.max_bytes > 0 or self._offload_weights or self._adaln_cache.plan_enabled
         )
         x = self._project_cached(t_emb) if use_cache_boundary else self._project(t_emb)
         m = x.shape[0]

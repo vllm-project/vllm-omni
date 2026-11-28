@@ -27,6 +27,7 @@ from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_STATE
 from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
+from .adaln_plan import build_adaln_plan
 from .latent_mask import MiniMaxH3LatentEdit
 from .reference_isolation import MiniMaxH3ReferenceIsolation, reference_isolation_enabled
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
@@ -494,7 +495,18 @@ def minimax_h3_denoise_loop(
             device=device,
         )
     reference_kv_state = None
+    adaln_plan = None
     try:
+        if video_edit is None and audio_edit is None and reference_isolation is None:
+            # Latent edits set per-row target timesteps, and reference isolation overrides the condition
+            # timestep; the plan models neither.
+            adaln_plan = build_adaln_plan(
+                model,
+                positive,
+                sigmas_video,
+                sigmas_audio,
+                (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
+            )
         create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
         if callable(create_reference_kv_state):
             reference_kv_state = create_reference_kv_state(
@@ -558,6 +570,8 @@ def minimax_h3_denoise_loop(
                 step_context=step_context,
             )
     finally:
+        if adaln_plan is not None and model.adaln_cache.plan is adaln_plan:
+            model.adaln_cache.plan = None
         minimax_h3_publish_denoise_progress(None, None, None)
         positive.static_kwargs.pop("reference_kv_state", None)
         positive.static_kwargs.pop(REFERENCE_ISOLATION_STATE, None)
