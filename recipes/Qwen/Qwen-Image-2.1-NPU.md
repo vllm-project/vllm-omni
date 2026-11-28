@@ -1,10 +1,112 @@
 # Qwen-Image-2.1 on Ascend NPU
 
+Use this recipe for Qwen-Image-2.1 and Qwen-Image-2.1-Turbo on
+[Ascend A3](#ascend-a3) or [Atlas 800I A2](#atlas-800i-a2).
+
+## Ascend A3
+
+`QwenImage21Pipeline` serves both checkpoints through the OpenAI-compatible
+Images API. Each A3 card has two NPU dies with 64 GiB of HBM per die.
+[Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) ·
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo)
+
+### Ascend A3 performance
+
+| NPU dies | Physical cards | Ulysses degree | Base P50 (s) | Turbo P50 (s) | Base peak extra HBM (GiB/die) | Turbo peak extra HBM (GiB/die) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 4 | 8 | 1.83 | 1.06 | 37.23 | 37.93 |
+| 4 | 2 | 4 | 2.65 | 1.36 | 37.32 | 37.32 |
+| 2 | 1 | 2 | 4.19 | 1.94 | 37.24 | 37.24 |
+| 1 | 1 (one die) | 1 | 6.34 | 2.72 | 36.67 | 36.66 |
+
+The base checkpoint ran with `num_inference_steps=20`. Turbo used its fixed
+eight-step distilled schedule. Both used BF16 eager mode,
+`true_cfg_scale=1.0`, and seed 42 with a CPU generator. Multi-die runs used
+Ulysses sequence parallelism with replicated weights. Some base runs
+overlapped checkpoint downloads to shared storage.
+
+Tests ran on one Atlas 900 A3 SuperPoD node at 1024×1024 and concurrency 1.
+Each profile ran two rounds with one warm-up and five timed requests each.
+The warm-ups used `p20` and `p19`. Timed requests used `p01` through `p10` in order.
+[Prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl)
+
+P50 is the median of ten request latencies measured through receipt of the
+full HTTP response. Peak extra HBM is the largest increase over each die's
+pre-launch reading. The runs used `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`
+and sampled HBM with `npu-smi info`, with three seconds between calls.
+
+### A3 checkpoint
+
+Download the checkpoints on the host.
+
+```bash
+modelscope download --model Qwen/Qwen-Image-2.1 --local_dir ./models/Qwen-Image-2.1
+modelscope download --model Qwen/Qwen-Image-2.1-Turbo --local_dir ./models/Qwen-Image-2.1-Turbo
+```
+
+### A3 environment
+
+Use `quay.io/ascend/vllm-omni:v0.34.0-a3` with `--privileged` and
+`--network host` in place of port mapping. Mount `./models` at `/models`.
+Expose the selected free dies and set `ASCEND_RT_VISIBLE_DEVICES` to their
+logical IDs. Use `npu-smi info -m` to select both dies on each physical card
+for the 2-, 4-, and 8-die profiles.
+[NPU Docker setup](../../docs/getting_started/installation/npu.md#set-up-using-docker)
+
+### Start an A3 server
+
+Run one of these commands in the container. For 1, 2, or 4 dies, set both
+`--num-gpus` and `--usp` to the selected die count.
+
+#### Qwen-Image-2.1
+
+```bash
+vllm serve /models/Qwen-Image-2.1 --omni \
+  --host 127.0.0.1 --port 18089 --served-model-name Qwen/Qwen-Image-2.1 \
+  --dtype bfloat16 --enforce-eager --trust-remote-code --max-num-seqs 1 \
+  --num-gpus 8 --usp 8 --ulysses-mode strict
+```
+
+#### Qwen-Image-2.1-Turbo
+
+```bash
+vllm serve /models/Qwen-Image-2.1-Turbo --omni \
+  --host 127.0.0.1 --port 18089 --served-model-name Qwen/Qwen-Image-2.1-Turbo \
+  --dtype bfloat16 --enforce-eager --trust-remote-code --max-num-seqs 1 \
+  --num-gpus 8 --usp 8 --ulysses-mode strict
+```
+
+### Text-to-image request
+
+```bash
+set -o pipefail
+curl -fsS http://127.0.0.1:18089/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"Qwen/Qwen-Image-2.1",
+    "prompt":"A ceramic teapot on a wooden table",
+    "size":"1024x1024",
+    "n":1,
+    "num_inference_steps":20,
+    "true_cfg_scale":1.0,
+    "seed":42,
+    "generator_device":"cpu",
+    "response_format":"b64_json",
+    "output_format":"png"
+  }' | jq -er '.data[0].b64_json' | base64 -d > qwen-image.png
+```
+
+For Turbo, set `model` to `Qwen/Qwen-Image-2.1-Turbo` and omit
+`num_inference_steps` to use its eight-step schedule. For the image-editing API, see the
+[Qwen-Image-2.1 recipe](Qwen-Image-2.1.md#online-serving).
+
+## Atlas 800I A2
+
 > Low-latency text-to-image and image-conditioned generation on a single-machine
 > 8-card Ascend 910B1 (Atlas 800I A2) — a serving reference measured for
 > single-image latency.
 
-## Summary
+### Summary
 
 - Vendor: Qwen
 - Model: [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1),
@@ -35,7 +137,7 @@ adds a measured low-latency serving reference. Differences from the GPU path:
   [Qwen-Image-2.1.md § NPU performance defaults](Qwen-Image-2.1.md#npu-performance-defaults)),
   not by this flag.
 
-## Low-latency at a glance
+### Low-latency at a glance
 
 Three facts drive the low-latency config on an 8-card 910B1.
 
@@ -64,9 +166,9 @@ one device's 64 GB HBM, so single-card TP1 is the simplest configuration, and a
 | Base, one card | TP1 | base | 20 | 1 | 6.25 s (1024×1024) |
 | Base, default steps | TP1 | base | 50 | 1 | 15.26 s (1024×1024) |
 
-## Prerequisites
+### Prerequisites
 
-### Checkpoint
+#### Checkpoint
 
 ```bash
 export TURBO=/path/to/Qwen-Image-2.1-Turbo
@@ -78,7 +180,7 @@ export BASE=/path/to/Qwen-Image-2.1
 `vllm serve` accepts the repository id or a local path and resolves the nested
 text-encoder / DiT / VAE components automatically.
 
-### Environment
+#### Environment
 
 Use the official vLLM-Omni NPU image for Atlas 800I A2 (see the
 [NPU installation guide](../../docs/getting_started/installation/npu.md)) and a
@@ -90,7 +192,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 ```
 
-## Start a server (single card)
+### Start a server (single card)
 
 This is the simplest configuration and the recommended starting point.
 `--enforce-eager` makes the eager intent explicit (there is no diffusion graph
@@ -120,7 +222,7 @@ requests with HTTP 400. Set `num_inference_steps` per request (`20` for lower
 latency, `40` for the reference default, `50` is the server default). To change
 the shape, use `size` in the request.
 
-## Scale out on one 8-card machine
+### Scale out on one 8-card machine
 
 The 8 cards do two different jobs, and they do not stack for a single image:
 
@@ -145,7 +247,7 @@ vllm serve /path/to/Qwen-Image-2.1-Turbo \
   --enforce-eager --trust-remote-code --port 8092
 ```
 
-## HTTP API
+### HTTP API
 
 The request contract is identical to the GPU recipe; see
 [Qwen-Image-2.1.md § Online Serving](Qwen-Image-2.1.md#online-serving). The
@@ -163,7 +265,7 @@ curl -sS -X POST "http://127.0.0.1:${PORT}/v1/images/generations" \
   | jq -r '.data[0].b64_json' | base64 -d > out.png
 ```
 
-## Benchmarks (measured)
+### Benchmarks (measured)
 
 Measured on one Ascend 910B1 (64 GB) with CANN 9.1.0, `torch_npu` 2.10.0,
 `triton_ascend` 3.2.2, vLLM 0.32.0, vLLM-Omni commit `5917730a4`, BF16, CFG 1,
@@ -190,7 +292,7 @@ as the robust result and leave a few percent of headroom on the absolutes. The
 ordering held across re-measurements at different load levels: Turbo < base, and
 for the base model SP4 < SP2 < TP1 ≈ TP2.
 
-## Multi-card parallelism
+### Multi-card parallelism
 
 At 1024×1024 / 20 steps on the base model, measured against **6.25 s** on one
 card:
@@ -221,7 +323,7 @@ throughput lever too. Do not use `--tensor-parallel-size` expecting a latency
 win; prefer `--ulysses-degree` for latency or independent single-card servers
 for throughput.
 
-## Known limitations
+### Known limitations
 
 - Ascend 910B1 has no FP8, so FP8 quantization and FP8 prefix-KV are unavailable
   here.
@@ -238,7 +340,7 @@ for throughput.
   the 4-card Ulysses `--ulysses-degree 4` server in ~1.47 s at 1024×1024
   (engine).
 
-## Additional resources
+### Additional resources
 
 - [Qwen-Image-2.1.md](Qwen-Image-2.1.md) — full GPU guide (CUDA graphs, FP8,
   prefix KV cache, quality comparison)
