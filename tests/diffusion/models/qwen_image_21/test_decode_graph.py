@@ -9,11 +9,29 @@ import torch
 from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.models.qwen_image_21 import decode_graph
+from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import QwenImage21Transformer2DModel
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.fixture(autouse=True)
+def _stub_tp_group(monkeypatch):
+    """CPU unit tests construct the transformer without a distributed init;
+    stub the TP group so decode-graph eligibility queries don't require it."""
+    import types
+
+    import vllm.distributed as vd
+    import vllm.distributed.parallel_state as ps
+
+    stub = types.SimpleNamespace(world_size=1, rank_in_group=0)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: stub, raising=False)
+    monkeypatch.setattr(vd, "get_tp_group", lambda: stub, raising=False)
+    monkeypatch.setattr(vd, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(vd, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
 
 
 class DecodeModel(torch.nn.Module):
@@ -87,6 +105,8 @@ def decode(manager, cache, layout=(1, 2, 2)):
 def test_release_idle_entries_drops_dead_owners_and_keeps_live_ones(graph_case):
     manager, device, cleanup = graph_case
     manager.max_entries = 8
+    # Legacy (pre-A2) behavior: idle entries are dropped each request.
+    manager.persistent_entries = False
     other = (1, 2, 2)
     live = (1, 4, 2)
     same_key_later = (1, 8, 2)
@@ -118,6 +138,161 @@ def test_release_idle_entries_drops_dead_owners_and_keeps_live_ones(graph_case):
     assert live_key in manager.entries
     assert manager._owners[live_key]() is still_running[0]["cond"]["key"]
     assert cleanup
+
+
+@pytest.mark.cpu
+def test_persistent_entries_retain_idle_graphs_for_reuse(graph_case):
+    manager, device, cleanup = graph_case
+    manager.persistent_entries = True
+    manager.max_entries = 8
+
+    first = make_cache(device, 1.0)
+    register(manager, first)
+    key = entry_key(manager, (1, 2, 2))
+    entry = manager.entries[key]
+    entry.refresh_prefix(first)
+    buffer_ref = weakref.ref(entry.k[0])
+    del first
+    gc.collect()
+
+    # The owner is dead, but persistent mode keeps the entry and its buffers
+    # so the next matching request can replay without recapturing (#8586 A2).
+    manager.release_idle_entries()
+    assert key in manager.entries
+    assert manager.entries[key] is entry
+    assert buffer_ref() is not None
+    assert not cleanup  # nothing dropped, so no empty_cache reclaim
+
+    # A new request with the same key re-adopts the retained entry rather than
+    # allocating a replacement, and its prefix is refreshed on the next decode.
+    second = make_cache(device, 5.0)
+    register(manager, second)
+    assert len(manager.entries) == 1
+    assert manager.entries[key] is entry
+    assert manager._owners[key]() is second[0]["cond"]["key"]
+    assert not entry.prefix_sources
+
+
+@pytest.mark.cpu
+def test_persistent_entries_still_evict_at_lru_cap(graph_case):
+    manager, device, _ = graph_case
+    manager.persistent_entries = True
+    manager.max_entries = 2
+    # Idle entries are retained, but the LRU cap still bounds memory: a third
+    # distinct key evicts the oldest even though no owner is live.
+    for value, layout in zip((1, 2, 3), [(1, 2, 2), (1, 3, 2), (1, 4, 2)]):
+        cache = make_cache(device, float(value))
+        register(manager, cache, layout)
+        del cache
+        manager.release_idle_entries()
+    assert len(manager.entries) == manager.max_entries
+    assert all(key[3] != ((1, 2, 2),) for key in manager.entries)
+
+
+@pytest.mark.cpu
+def test_persistent_entries_drop_failure_markers_for_retry(graph_case, monkeypatch):
+    manager, device, cleanup = graph_case
+    manager.persistent_entries = True
+    cache = make_cache(device, 1.0)
+    constructor = decode_graph.QwenImage21DecodeGraphEntry
+
+    def fail_allocation(**kwargs):
+        raise torch.OutOfMemoryError("injected allocation OOM")
+
+    monkeypatch.setattr(decode_graph, "QwenImage21DecodeGraphEntry", fail_allocation)
+    register(manager, cache)
+    assert list(manager.entries.values()) == [None]
+    # Persistent mode keeps captured graphs but still clears failure markers so
+    # a later request can retry instead of staying eager for that key forever.
+    manager.release_idle_entries()
+    assert len(manager.entries) == 0
+    assert cleanup
+    monkeypatch.setattr(decode_graph, "QwenImage21DecodeGraphEntry", constructor)
+    register(manager, cache)
+    assert len(manager.entries) == 1
+    assert next(iter(manager.entries.values())) is not None
+
+
+@pytest.mark.cpu
+def test_persistence_is_opt_in_default(graph_case):
+    manager, device, cleanup = graph_case
+    # Retention trades VRAM for recapture latency, so it is opt-in: the
+    # default keeps the #8831 drop-idle-entries-each-request reclaim.
+    assert manager.persistent_entries is False
+    cache = make_cache(device, 1.0)
+    register(manager, cache)
+    key = entry_key(manager, (1, 2, 2))
+    del cache
+    gc.collect()
+    manager.release_idle_entries()
+    assert key not in manager.entries
+    assert cleanup
+
+
+@pytest.mark.cpu
+def test_persistent_readoption_refuses_second_live_owner(graph_case):
+    manager, device, _ = graph_case
+    manager.persistent_entries = True
+    manager.max_entries = 8
+    first = make_cache(device, 1.0)
+    register(manager, first)
+    key = entry_key(manager, (1, 2, 2))
+    entry = manager.entries[key]
+    del first
+    gc.collect()
+    manager.release_idle_entries()
+    assert manager.entries[key] is entry
+
+    # Re-adoption by a new request makes it the single live owner again.
+    second = make_cache(device, 5.0)
+    register(manager, second)
+    assert manager._owners[key]() is second[0]["cond"]["key"]
+
+    # A third in-flight request aliasing the re-adopted key is refused: the
+    # re-adopting owner keeps the static buffers until its cache is released.
+    third = make_cache(device, 9.0)
+    register(manager, third)
+    assert manager.entries[key] is entry
+    assert manager._owners[key]() is second[0]["cond"]["key"]
+    assert bool((third[0]["cond"]["key"] == 9).all())
+
+
+@pytest.mark.cpu
+def test_persistent_lru_cap_with_mixed_live_and_dead_owners(graph_case):
+    manager, device, _ = graph_case
+    manager.persistent_entries = True
+    manager.max_entries = 2
+    dead = make_cache(device, 1.0)
+    register(manager, dead, (1, 2, 2))
+    dead_key = entry_key(manager, (1, 2, 2))
+    dead_buffer = weakref.ref(manager.entries[dead_key].k[0])
+    del dead
+    gc.collect()
+    manager.release_idle_entries()
+    assert dead_key in manager.entries  # idle entry retained
+
+    live = make_cache(device, 2.0)
+    register(manager, live, (1, 3, 2))
+    live_key = entry_key(manager, (1, 3, 2))
+    live_entry = manager.entries[live_key]
+
+    # At the cap, the LRU (dead-owner) entry is evicted first; the live
+    # owner's entry and ownership survive untouched.
+    newest = make_cache(device, 3.0)
+    register(manager, newest, (1, 4, 2))
+    assert len(manager.entries) == manager.max_entries
+    assert dead_key not in manager.entries
+    gc.collect()
+    assert dead_buffer() is None
+    assert manager.entries[live_key] is live_entry
+    assert manager._owners[live_key]() is live[0]["cond"]["key"]
+
+    # A later idle sweep keeps the live owner and retains the now-dead newest.
+    del newest
+    gc.collect()
+    manager.release_idle_entries()
+    assert len(manager.entries) == 2
+    assert manager._owners[live_key]() is live[0]["cond"]["key"]
 
 
 @pytest.mark.cpu
@@ -327,6 +502,49 @@ def test_replay_uses_active_request_and_layout(graph_case):
         assert all(entry.captures == 1 for entry in manager.entries.values())
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+def test_persistent_entry_replays_across_requests_without_recapture(graph_case):
+    manager, device, _ = graph_case
+    manager.persistent_entries = True
+    first, second = make_cache(device, 1.0), make_cache(device, 5.0)
+    with torch.inference_mode():
+        register(manager, first)
+        out_first = decode(manager, first)
+        expected_first = (
+            torch.ones_like(out_first).sin() + first[0]["cond"]["key"].mean() + first[0]["cond"]["value"].mean() + 2
+        )
+        torch.testing.assert_close(out_first, expected_first)
+        key = entry_key(manager, (1, 2, 2))
+        entry = manager.entries[key]
+        assert entry.captures == 1
+
+        # The request finishes. Persistent mode keeps the captured graph and
+        # static buffers instead of dropping them (#8586 A2).
+        del first
+        manager.release_idle_entries()
+        assert manager.entries[key] is entry
+
+        # A new request with the same key re-adopts the entry, refreshes the
+        # prefix into the static buffers, and replays without recapturing.
+        register(manager, second)
+        out_second = decode(manager, second)
+        expected_second = (
+            torch.ones_like(out_second).sin() + second[0]["cond"]["key"].mean() + second[0]["cond"]["value"].mean() + 2
+        )
+        torch.testing.assert_close(out_second, expected_second)
+        assert manager.entries[key] is entry
+        assert entry.captures == 1
+
+        # A third live request aliasing the re-adopted key is refused decode
+        # until the re-adopting owner's cache is released (single live owner).
+        third = make_cache(device, 9.0)
+        register(manager, third)
+        assert decode(manager, third) is None
+        assert manager._owners[key]() is second[0]["cond"]["key"]
+        torch.testing.assert_close(decode(manager, second), expected_second)
+        assert entry.captures == 1
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize("inference", [False, True])
 def test_prefix_reuse_refreshes_every_layer_without_retaining_requests(graph_case, inference):
@@ -458,3 +676,65 @@ def test_evicting_a_graph_keeps_survivor_workspace_when_warmup_aliases_capture(g
     # Survivor terms: key 2, value 3, RoPE frequencies equal to the layout rows.
     expected = torch.ones_like(result).sin() + 2.0 + 3.0 + layouts[1][1] + gemm_mean
     torch.testing.assert_close(result, expected, rtol=0, atol=5e-2)
+
+
+def _tiny_transformer(od_config=None, **kwargs):
+    """One-block transformer small enough to construct on CPU in unit tests."""
+    return QwenImage21Transformer2DModel(
+        od_config=od_config if od_config is not None else OmniDiffusionConfig(),
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        in_channels=4,
+        out_channels=4,
+        context_in_dim=8,
+        axes_dims_rope=(2, 2, 4),
+        **kwargs,
+    )
+
+
+@pytest.mark.cpu
+def test_transformer_ctor_persistent_decode_false_drops_idle_entries(monkeypatch):
+    # Constructor-level opt-out: the manager keeps the legacy drop-idle path
+    # (#8831 reclaim) instead of retaining entries across requests.
+    import vllm.distributed as vd
+
+    monkeypatch.setattr(vd, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    transformer = _tiny_transformer(cuda_graph_persistent_decode=False)
+    manager = transformer._decode_graph_manager
+    assert manager is not None
+    assert manager.persistent_entries is False
+    monkeypatch.setattr(manager, "eligible", lambda: True)
+    monkeypatch.setattr(manager, "_backend_name", lambda: "test")
+    cache = make_cache("cpu", 1.0)
+    register(manager, cache)
+    key = entry_key(manager, (1, 2, 2))
+    del cache
+    gc.collect()
+    manager.release_idle_entries()
+    assert key not in manager.entries
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("ctor_kwarg", "od_value", "expected"),
+    [
+        ({}, None, False),  # default: retention opt-in off
+        ({"cuda_graph_persistent_decode": False}, True, True),  # operator opts in
+        ({"cuda_graph_persistent_decode": True}, False, False),  # operator opts out
+        ({"cuda_graph_persistent_decode": True}, None, True),  # checkpoint opts in
+    ],
+)
+def test_transformer_ctor_persistent_decode_resolution(ctor_kwarg, od_value, expected, monkeypatch):
+    # The operator-facing knob (CLI --cuda-graph-persistent-decode / stage
+    # YAML, carried by OmniDiffusionConfig) overrides the checkpoint-level
+    # constructor default when set; None defers to the constructor.
+    import vllm.distributed as vd
+
+    monkeypatch.setattr(vd, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    od_config = OmniDiffusionConfig()
+    od_config.cuda_graph_persistent_decode = od_value
+    transformer = _tiny_transformer(od_config=od_config, **ctor_kwarg)
+    manager = transformer._decode_graph_manager
+    assert manager is not None
+    assert manager.persistent_entries is expected
