@@ -1034,6 +1034,7 @@ class PinnedResidentLayerGroup:
         rank_local_mmap: bool = False,
         defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
+        fused_sources: dict[int, Any] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
@@ -1053,6 +1054,7 @@ class PinnedResidentLayerGroup:
                     params,
                     bufs,
                     tensor_transforms,
+                    fused_sources,
                 )
                 cpu_shards: dict[torch.dtype, torch.Tensor] = {}
             else:
@@ -2022,6 +2024,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 rank_local_mmap=self._using_rank_local_mmap,
                 defer_staging=bool(self._all_hook_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                fused_sources=self._mmap_fused_by_tensor_id,
             )
             pipeline._dlo_residency_controller = self
             self._residency_pipeline_ref = weakref.ref(pipeline)

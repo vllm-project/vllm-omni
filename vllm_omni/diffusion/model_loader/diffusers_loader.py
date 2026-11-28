@@ -892,12 +892,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             plan,
                             selected=resolved_offload.offloads(TEXT_ENCODER_COMPONENT),
                             use_hsdp=use_hsdp,
-                            dp_size=dlo_group_size,
+                            # The backend transports an AllGather component over
+                            # the data-parallel group, so this gate must use the
+                            # same group size the resolver and the backend see.
+                            # ``dlo_group_size`` falls back to sequence parallel
+                            # when DP is single, which would withhold a
+                            # rank-local encoder the backend can stream.
+                            dp_size=data_parallel_size,
                             uses_allgather=(
                                 resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
                                 and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
                             ),
-                            dit_mmap_ready=not dit_uses_allgather or dlo_group_size <= 1,
+                            dit_mmap_ready=not dit_uses_allgather or data_parallel_size <= 1,
                         ),
                     )
                     self.host_weight_plan = plan_result.plan
