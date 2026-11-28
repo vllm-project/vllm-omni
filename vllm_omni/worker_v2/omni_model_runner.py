@@ -516,14 +516,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._mm_rng_state = MMRequestRNGState(self.model) if supports_mm_request_rng(self.model) else None
 
         self._publish_shared_backbone_if_configured()
-        # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
-        # V2 does not use the V1 MoE annotate/select hooks, so this is the
-        # fail-fast for Mammoth FULL + use_v2_model_runner mismatches (#9911).
-        from vllm_omni.cudagraph.moe_routing_compat import (
-            ensure_moe_specialty_runner_compatible,
-        )
 
-        ensure_moe_specialty_runner_compatible(self)
+    def initialize_kv_cache(self, *args: object, **kwargs: object) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        # A model may add graph variants before capture. The memory-profiling
+        # build runs here too, so the profiler counts them.
+        specialize = getattr(self.model, "specialize_cudagraph_manager", None)
+        if callable(specialize) and self.cudagraph_manager is not None:
+            specialize(self.cudagraph_manager)
 
     def reload_weights(self, *args: Any, **kwargs: Any) -> None:
         """Preserve upstream reload arguments, but reject updates to shared weights."""
@@ -1191,7 +1191,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 if stepped.multimodal_outputs:
                     self._last_multimodal_outputs = cast(dict[str, Any], stepped.multimodal_outputs)
             else:
-                replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
+                # A specialized manager may hold several graphs per shape.
+                select = getattr(self.cudagraph_manager, "select_replay_graph", None)
+                replay_desc = select(batch_desc, input_batch) if callable(select) else batch_desc
+                replayed = self.cudagraph_manager.run_fullgraph(replay_desc)
                 shared_aux = self._shares_drafter_aux_output()
                 if self.use_aux_hidden_state_outputs and not shared_aux:
                     replayed, draft_aux_hidden_states = replayed

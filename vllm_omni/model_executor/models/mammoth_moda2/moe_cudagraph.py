@@ -15,7 +15,9 @@ per batch size (similar spirit to ``cudagraph_specialize_lora``):
 | ALL_UND | ``und_expert`` only | mask all false |
 | ALL_GEN | ``gen_expert`` only | mask all true |
 
-Host ``sum().item()`` runs **outside** the captured region (graph dispatch).
+On Model Runner V2, ``install_moe_routing_graphs`` adds the ALL_UND and
+ALL_GEN captures to the runner's graph manager. Before each FULL replay the
+manager classifies the unpadded token ids on the host and picks the graph.
 Inside the graph, mixed still uses the #9764 blend path.
 """
 
@@ -24,11 +26,19 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, fields
 from enum import IntEnum
 
 import torch
-
-from vllm_omni.cudagraph.moe_routing_compat import moe_routing_specialize_enabled
+from vllm.config import CUDAGraphMode
+from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CreateForwardFn,
+    CudaGraphManager,
+    ModelCudaGraphManager,
+)
+from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
 class MoERoutingKey(IntEnum):
@@ -40,7 +50,7 @@ class MoERoutingKey(IntEnum):
 
 
 # Active specialty while a graph is being captured. Replay does not consult
-# this: the runner selects the already-recorded graph via BatchDescriptor.
+# this: the graph manager selects the already-recorded graph.
 # Default BLEND preserves #9764 if capture forgets to enter a scope.
 _moe_routing_key: ContextVar[MoERoutingKey] = ContextVar(
     "mammoth_moda2_moe_routing_key",
@@ -50,10 +60,6 @@ _moe_routing_key: ContextVar[MoERoutingKey] = ContextVar(
 
 def get_moe_routing_key() -> MoERoutingKey:
     return _moe_routing_key.get()
-
-
-def set_moe_routing_key(key: MoERoutingKey) -> None:
-    _moe_routing_key.set(key)
 
 
 @contextmanager
@@ -96,247 +102,108 @@ def moe_routing_key_from_input_ids(
     return moe_routing_key_from_mask(input_ids >= gen_vocab_start_index)
 
 
-def routing_ids_for_replay(
-    cpu_ids: torch.Tensor | None,
-    gpu_ids: torch.Tensor | None,
-    *,
-    num_tokens: int,
-    prev_sampled_token_ids: torch.Tensor | None,
-) -> torch.Tensor | None:
-    """Scheduled token ids used to pick a specialty graph on replay.
+# ---------------------------------------------------------------------------
+# Model Runner V2 graph manager
+# ---------------------------------------------------------------------------
 
-    ``num_tokens`` is the unpadded scheduled count. CUDA-graph padding sits
-    in the tail and is usually 0, which classifies as understanding. Including
-    it turns an all-gen decode into a mixed batch, so the runner would keep
-    replaying the blend graph.
+_SPECIALTY_KEYS = (MoERoutingKey.ALL_UND, MoERoutingKey.ALL_GEN)
 
-    Async scheduling writes the newest decode ids only into the GPU buffer
-    (from ``prev_sampled_token_ids``). The CPU buffer is stale for those
-    positions; reading it would pick the wrong expert.
+
+@dataclass(frozen=True)
+class MoERoutingBatchExecutionDescriptor(BatchExecutionDescriptor):
+    """A FULL graph captured with a single-expert MoE specialty.
+
+    BLEND graphs keep the upstream descriptor, so upstream dispatch tables
+    stay valid. This keyed subclass never compares equal to them.
     """
-    if num_tokens <= 0:
-        return None
 
-    def _slice(ids: torch.Tensor | None) -> torch.Tensor | None:
-        if ids is None or ids.numel() < num_tokens:
-            return None
-        return ids[:num_tokens]
-
-    if prev_sampled_token_ids is not None:
-        gpu_slice = _slice(gpu_ids)
-        if gpu_slice is not None:
-            return gpu_slice
-    cpu_slice = _slice(cpu_ids)
-    if cpu_slice is not None:
-        return cpu_slice
-    return _slice(gpu_ids)
+    moe_routing_key: int = int(MoERoutingKey.BLEND)
 
 
-def capture_mask_for_routing_key(
-    num_tokens: int,
-    key: MoERoutingKey,
-    *,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Dummy ``gen_token_mask`` matching the specialty being captured."""
-    if key is MoERoutingKey.ALL_GEN:
-        return torch.ones(num_tokens, dtype=torch.bool, device=device)
-    if key is MoERoutingKey.ALL_UND:
-        return torch.zeros(num_tokens, dtype=torch.bool, device=device)
-    # BLEND: mixed pattern so torch.where stays live in the recorded graph.
-    mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-    if num_tokens > 0:
-        mask[0] = True
-    if num_tokens > 1:
-        mask[1] = False
-    if num_tokens > 2:
-        mask[2:] = True
-    return mask
+def _keyed(desc: BatchExecutionDescriptor, key: MoERoutingKey) -> MoERoutingBatchExecutionDescriptor:
+    values = {f.name: getattr(desc, f.name) for f in fields(BatchExecutionDescriptor)}
+    return MoERoutingBatchExecutionDescriptor(**values, moe_routing_key=int(key))
 
 
-# ---------------------------------------------------------------------------
-# Runner-facing helpers (used by MammothGPUARModelRunner only)
-# ---------------------------------------------------------------------------
+class _MoERoutingCaptureScope(CudaGraphManager):
+    """Run each capture forward under its descriptor's MoE specialty.
+
+    ``ModelCudaGraphManager.capture`` builds the forward functions and hands
+    them to ``super().capture``. Sitting after it in the MRO lets this class
+    wrap them without copying the upstream body.
+    """
+
+    def capture(
+        self,
+        create_forward_fn: CreateForwardFn,
+        progress_bar_desc: str = "Capturing CUDA graphs",
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        def create_keyed_forward_fn(desc: BatchExecutionDescriptor, warmup: bool):
+            forward_fn = create_forward_fn(desc, warmup)
+            key = MoERoutingKey(getattr(desc, "moe_routing_key", MoERoutingKey.BLEND))
+
+            def keyed_forward_fn(cg_mode: CUDAGraphMode) -> None:
+                with moe_routing_key_scope(key):
+                    forward_fn(cg_mode)
+
+            return keyed_forward_fn
+
+        super().capture(create_keyed_forward_fn, progress_bar_desc, stream)
 
 
-def find_gen_vocab_start_index(runner: object) -> int | None:
-    cursor = getattr(runner, "model", None)
-    # Mammoth pipeline wraps AR as ``model.ar.language_model``.
-    for _ in range(4):
-        if cursor is None:
-            return None
-        gen_start = getattr(cursor, "gen_vocab_start_index", None)
-        if gen_start is not None:
-            return int(gen_start)
-        cursor = getattr(cursor, "language_model", None) or getattr(cursor, "ar", None)
-    return None
+class MoERoutingCudaGraphManager(ModelCudaGraphManager, _MoERoutingCaptureScope):
+    """``ModelCudaGraphManager`` that also captures single-expert FULL graphs."""
+
+    gen_vocab_start_index: int
+    _moe_routing_descs: dict[tuple[BatchExecutionDescriptor, MoERoutingKey], MoERoutingBatchExecutionDescriptor]
+
+    def select_replay_graph(self, desc: BatchExecutionDescriptor, input_batch: InputBatch) -> BatchExecutionDescriptor:
+        """Return the specialty graph for this batch, else ``desc``.
+
+        Only the unpadded ids count: pad ids classify as understanding tokens
+        and would turn an all-gen decode into a mixed batch. Reading the ids
+        costs one device sync per FULL replay.
+        """
+        if desc.cg_mode != CUDAGraphMode.FULL:
+            return desc
+        input_ids = input_batch.input_ids[: input_batch.num_tokens]
+        key = moe_routing_key_from_input_ids(input_ids, self.gen_vocab_start_index)
+        if key is MoERoutingKey.BLEND:
+            return desc
+        return self._moe_routing_descs.get((desc, key), desc)
 
 
-def _warn_missing_gen_vocab_start_index_once(runner: object) -> None:
-    if getattr(runner, "_warned_missing_gen_vocab_start_index", False):
+def install_moe_routing_graphs(manager: ModelCudaGraphManager, gen_vocab_start_index: int) -> None:
+    """Add ALL_UND / ALL_GEN captures for every FULL descriptor of ``manager``.
+
+    Runs right after the runner builds its graph manager and before capture,
+    including the memory-profiling build, so the profiler counts every graph.
+    """
+    if type(manager) is not ModelCudaGraphManager or not current_platform.is_cuda_alike():
+        raise RuntimeError(
+            "cudagraph_specialize_moe_routing is enabled but "
+            f"{type(manager).__name__} on {current_platform.device_name} does not implement MoE specialty "
+            "capture/replay. Use a cudagraph_mode without FULL."
+        )
+    manager.__class__ = MoERoutingCudaGraphManager
+    assert isinstance(manager, MoERoutingCudaGraphManager)
+    manager.gen_vocab_start_index = int(gen_vocab_start_index)
+    manager._moe_routing_descs = {}
+
+    full_descs = manager._capture_descs.get(CUDAGraphMode.FULL)
+    if not full_descs:
         return
-    runner._warned_missing_gen_vocab_start_index = True  # type: ignore[attr-defined]
-    from vllm.logger import init_logger
-
-    init_logger(__name__).warning(
-        "cudagraph_specialize_moe_routing is enabled but no gen_vocab_start_index "
-        "was found on the model; MoE CUDA-graph replay will stay on the BLEND "
-        "graph and the ALL_UND / ALL_GEN graphs will never be selected. Check "
-        "the model wrapper path used by this stage."
-    )
-
-
-def resolve_moe_routing_key(
-    runner: object,
-    *,
-    force_moe_routing_key: int | None = None,
-    num_tokens: int | None = None,
-    token_ids: torch.Tensor | None = None,
-    token_ids_provided: bool = False,
-) -> MoERoutingKey:
-    if force_moe_routing_key is not None:
-        return MoERoutingKey(int(force_moe_routing_key))
-    if not moe_routing_specialize_enabled(runner):
-        return MoERoutingKey.BLEND
-    gen_start = find_gen_vocab_start_index(runner)
-    if gen_start is None:
-        # Specialize is on, so ALL_UND / ALL_GEN graphs are being captured
-        # for a model we cannot classify. Warning once here keeps the
-        # pre-fix failure mode (capture then never select) visible instead
-        # of silent.
-        _warn_missing_gen_vocab_start_index_once(runner)
-        return MoERoutingKey.BLEND
-    if token_ids_provided:
-        return moe_routing_key_from_input_ids(token_ids, int(gen_start))
-    if num_tokens is None:
-        return MoERoutingKey.BLEND
-    input_ids = runner.input_ids.gpu[:num_tokens]  # type: ignore[attr-defined]
-    return moe_routing_key_from_input_ids(input_ids, int(gen_start))
-
-
-def annotate_moe_routing_batch_descriptor(
-    runner: object,
-    batch_desc,
-    *,
-    num_tokens: int,
-    force_moe_routing_key: int | None = None,
-):
-    """Pin the MoE specialty on the graph key used for capture."""
-    from vllm_omni.cudagraph.moe_routing_dispatcher import with_moe_routing_key
-
-    moe_key = resolve_moe_routing_key(
-        runner,
-        force_moe_routing_key=force_moe_routing_key,
-        num_tokens=num_tokens,
-    )
-    return with_moe_routing_key(batch_desc, moe_key)
-
-
-def select_moe_replay_batch_descriptor(runner: object, mode, batch_desc, num_tokens: int):
-    """Choose the FULL specialty graph for this step's scheduled tokens.
-
-    Capture records BLEND / ALL_UND / ALL_GEN. ``CudagraphDispatcher.dispatch``
-    is invoked by upstream padding logic without a routing key, so the
-    descriptor it returns is BLEND. Replay has to retarget that descriptor
-    before ``set_forward_context`` or the specialized graphs never run.
-    """
-    from vllm.logger import init_logger
-
-    from vllm_omni.cudagraph.moe_routing_dispatcher import apply_moe_routing_key
-
-    if not moe_routing_specialize_enabled(runner):
-        return batch_desc
-    input_ids = getattr(runner, "input_ids", None)
-    prev_sampled = getattr(getattr(runner, "input_batch", None), "prev_sampled_token_ids", None)
-    token_ids = routing_ids_for_replay(
-        None if input_ids is None else getattr(input_ids, "cpu", None),
-        None if input_ids is None else getattr(input_ids, "gpu", None),
-        num_tokens=num_tokens,
-        prev_sampled_token_ids=prev_sampled,
-    )
-    requested = resolve_moe_routing_key(runner, token_ids=token_ids, token_ids_provided=True)
-    dispatcher = getattr(runner, "cudagraph_dispatcher", None)
-    captured = () if dispatcher is None else dispatcher.cudagraph_keys.get(mode, ())
-    selected = apply_moe_routing_key(mode, batch_desc, requested, captured, enabled=True)
-    selected_key = int(getattr(selected, "moe_routing_key", int(MoERoutingKey.BLEND)))
-    logger = init_logger(__name__)
-    # Mixed und/gen traffic flips this every few steps, so only the first
-    # selection is worth INFO. Later flips stay at DEBUG to keep the worker
-    # log readable.
-    if getattr(runner, "_last_moe_routing_replay_key", None) is not None:
-        logger.debug(
-            "Mammoth MoE CUDA-graph replay specialty %s (requested %s, num_tokens=%s, mode=%s)",
-            MoERoutingKey(selected_key).name,
-            requested.name,
-            num_tokens,
-            getattr(mode, "name", mode),
-        )
-    else:
-        logger.info(
-            "Mammoth MoE CUDA-graph replay specialty is %s (requested %s, num_tokens=%s, mode=%s); "
-            "further changes log at DEBUG",
-            MoERoutingKey(selected_key).name,
-            requested.name,
-            num_tokens,
-            getattr(mode, "name", mode),
-        )
-    runner._last_moe_routing_replay_key = selected_key  # type: ignore[attr-defined]
-    return selected
-
-
-def warmup_and_capture_with_moe_routing(
-    runner: object,
-    desc,
-    cudagraph_runtime_mode,
-    profile_seq_lens: int | None = None,
-    allow_microbatching: bool = False,
-    num_warmups: int | None = None,
-    profiler=None,
-) -> None:
-    """Capture one graph; honour ``desc.moe_routing_key`` when specializing (#9865)."""
-    from contextlib import nullcontext
-
-    import torch
-    from vllm.config import CUDAGraphMode
-
-    if profiler is None:
-        profiler = nullcontext()
-    if num_warmups is None:
-        num_warmups = runner.compilation_config.cudagraph_num_of_warmups  # type: ignore[attr-defined]
-    force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
-    moe_key = int(getattr(desc, "moe_routing_key", MoERoutingKey.BLEND))
-    # Always force the capture key on the Mammoth runner — BLEND included —
-    # so the resolver cannot reclassify a uniform dummy buffer as ALL_UND/ALL_GEN.
-    moe_kwargs = {"force_moe_routing_key": moe_key} if moe_routing_specialize_enabled(runner) else {}
-    for _ in range(num_warmups):
-        runner._dummy_run(  # type: ignore[attr-defined]
-            desc.num_tokens,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            force_attention=force_attention,
-            uniform_decode=desc.uniform,
-            allow_microbatching=allow_microbatching,
-            skip_eplb=True,
-            remove_lora=False,
-            num_active_loras=desc.num_active_loras,
-            profile_seq_lens=profile_seq_lens,
-            **moe_kwargs,
-        )
-    if num_warmups > 0:
-        torch.accelerator.synchronize()
-    with (
-        profiler,
-        torch.profiler.record_function(f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}_moe{moe_key}"),
-        moe_routing_key_scope(MoERoutingKey(moe_key)),
-    ):
-        runner._dummy_run(  # type: ignore[attr-defined]
-            desc.num_tokens,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            uniform_decode=desc.uniform,
-            allow_microbatching=allow_microbatching,
-            skip_eplb=True,
-            remove_lora=False,
-            num_active_loras=desc.num_active_loras,
-            is_graph_capturing=True,
-            profile_seq_lens=profile_seq_lens,
-            **moe_kwargs,
-        )
+    expanded: list[BatchExecutionDescriptor] = []
+    for desc in full_descs:
+        expanded.append(desc)
+        # Microbatch threads do not inherit the capture scope's ContextVar.
+        if desc.num_ubatches > 1:
+            continue
+        for key in _SPECIALTY_KEYS:
+            keyed = _keyed(desc, key)
+            manager._moe_routing_descs[(desc, key)] = keyed
+            expanded.append(keyed)
+    # Stable sort keeps BLEND first within a size; capture stays widest first.
+    expanded.sort(key=lambda d: d.num_tokens, reverse=True)
+    manager._capture_descs[CUDAGraphMode.FULL] = expanded
