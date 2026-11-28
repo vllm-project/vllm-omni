@@ -32,7 +32,7 @@ Override `MODEL`, `PORT`, `HOST`, `DEPLOY_CONFIG`, or `SERVED_MODEL_NAME` throug
 The core `pip install -e .` setup does not include the extra packages used by the DreamZero example scripts.
 
 - `openpi_client.py`:
-  `openpi-client`, `websockets`, `opencv-python`
+  `openpi-client`, `websockets`, `opencv-python-headless`
 - `droid_sim_eval_client.py`:
   `mediapy`, `websockets`, `openpi-client`
 

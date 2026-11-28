@@ -18,7 +18,7 @@ import numpy as np
 try:
     import cv2
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError("DreamZero OpenPI example requires `opencv-python`.") from exc
+    raise ImportError("DreamZero OpenPI example requires `opencv-python-headless`.") from exc
 
 try:
     example_dir = str(Path(__file__).resolve().parent)
