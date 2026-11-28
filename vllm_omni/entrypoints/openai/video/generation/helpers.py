@@ -99,6 +99,7 @@ MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 
 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
+MINIMAX_H3_REFERENCE_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 
 CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
@@ -522,13 +523,18 @@ async def _persist_uploaded_reference(
     field_name: str,
     suffix: str,
     max_bytes: int,
+    chunk_size: int = 1024 * 1024,
+    allow_empty: bool = False,
+    size_limit_detail: str | None = None,
 ) -> str:
     """Stream one bounded upload to request-scoped local storage."""
+    if size_limit_detail is None:
+        size_limit_detail = f"{field_name} exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
     declared_size = upload.size
     if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=f"{field_name} exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+            detail=size_limit_detail,
         )
 
     fd, path = tempfile.mkstemp(prefix=f"vllm_omni_{field_name}_", suffix=suffix)
@@ -536,15 +542,15 @@ async def _persist_uploaded_reference(
     persisted = False
     try:
         with os.fdopen(fd, "wb") as output:
-            while chunk := await upload.read(min(1024 * 1024, max_bytes - size + 1)):
+            while chunk := await upload.read(min(chunk_size, max_bytes - size + 1)):
                 size += len(chunk)
                 if size > max_bytes:
                     raise HTTPException(
                         status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"{field_name} exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+                        detail=size_limit_detail,
                     )
                 output.write(chunk)
-        if size == 0:
+        if size == 0 and not allow_empty:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"{field_name} must not be empty.",
@@ -881,13 +887,13 @@ def _minimax_h3_upload_limit(upload: UploadFile) -> int:
     return MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES
 
 
-async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None) -> bytes:
-    """Read an upload with an optional hard byte limit."""
-    if max_bytes is None:
+async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None, discard: bool = False) -> bytes:
+    """Read with an optional byte limit; discard=True returns b"" without buffering."""
+    if max_bytes is None and not discard:
         return await upload.read()
 
     declared_size = getattr(upload, "size", None)
-    if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
+    if max_bytes is not None and isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
@@ -896,16 +902,18 @@ async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = No
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = await upload.read(min(1024 * 1024, max_bytes - total + 1))
+        read_size = 1024 * 1024 if max_bytes is None else min(1024 * 1024, max_bytes - total + 1)
+        chunk = await upload.read(read_size)
         if not chunk:
             break
         total += len(chunk)
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
             )
-        chunks.append(chunk)
+        if not discard:
+            chunks.append(chunk)
     return b"".join(chunks)
 
 
@@ -949,9 +957,9 @@ async def _persist_uploaded_media_references(
 ) -> tuple[list[Image.Image], list[str], list[str]]:
     """Persist a mixed MiniMax H3 multipart reference list.
 
-    Images are decoded in memory; videos and audio remain files because H3's
-    reference encoders need the original container streams (including video
-    soundtracks).
+    Decode images in memory and stream video and audio into request-owned
+    files. The H3 input pipeline probes the container contents, including
+    zero-byte uploads.
     """
     images: list[Image.Image] = []
     videos: list[str] = []
@@ -963,8 +971,9 @@ async def _persist_uploaded_media_references(
         )
     for upload in uploads:
         kind = _uploaded_media_kind(upload)
-        payload = await _read_upload_limited(upload, max_bytes=_minimax_h3_upload_limit(upload))
+        max_bytes = _minimax_h3_upload_limit(upload)
         if kind == "image":
+            payload = await _read_upload_limited(upload, max_bytes=max_bytes)
             try:
                 _validate_minimax_h3_image_payload(payload, filename=upload.filename)
                 images.append(
@@ -975,28 +984,34 @@ async def _persist_uploaded_media_references(
                 )
             except InvalidInputReferenceError as exc:
                 raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+            del payload
             continue
+
         suffix = Path(upload.filename or "").suffix.lower()
-        if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
+        is_audio = kind == "audio"
+        allowed_suffixes = MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES if is_audio else MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES
+        if suffix and suffix not in allowed_suffixes:
+            # Preserve read/size error priority without writing a rejected upload.
+            await _read_upload_limited(upload, max_bytes=max_bytes, discard=True)
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="MiniMax H3 reference videos must use an MP4 or MOV file.",
+                detail=(
+                    "MiniMax H3 reference audio must use a WAV or MP3 file."
+                    if is_audio
+                    else "MiniMax H3 reference videos must use an MP4 or MOV file."
+                ),
             )
-        if kind == "audio" and suffix and suffix not in MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="MiniMax H3 reference audio must use a WAV or MP3 file.",
-            )
-        if not suffix or len(suffix) > 8:
-            suffix = ".mp3" if kind == "audio" else ".mp4"
-        fd, path = tempfile.mkstemp(prefix="vllm_omni_reference_", suffix=suffix)
+        path = await _persist_uploaded_reference(
+            upload,
+            field_name="reference",
+            suffix=suffix or (".mp3" if is_audio else ".mp4"),
+            max_bytes=max_bytes,
+            chunk_size=MINIMAX_H3_REFERENCE_UPLOAD_CHUNK_BYTES,
+            allow_empty=True,
+            size_limit_detail=f"Uploaded reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+        )
         resources.add(path)
-        with os.fdopen(fd, "wb") as output:
-            output.write(payload)
-        if kind == "audio":
-            audios.append(path)
-        else:
-            videos.append(path)
+        (audios if is_audio else videos).append(path)
     return images, videos, audios
 
 
