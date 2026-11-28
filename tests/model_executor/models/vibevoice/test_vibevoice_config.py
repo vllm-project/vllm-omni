@@ -13,7 +13,7 @@ from transformers import AutoConfig, PreTrainedTokenizerFast
 from transformers.models.vibevoice_acoustic_tokenizer.feature_extraction_vibevoice_acoustic_tokenizer import (
     VibeVoiceAcousticTokenizerFeatureExtractor,
 )
-from vllm.config import ModelConfig
+from vllm.config import DeviceConfig, ModelConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache import MultiModalProcessorOnlyCache
@@ -21,6 +21,7 @@ from vllm.multimodal.processing import InputProcessingContext
 from vllm.multimodal.processing.context import TimingContext
 from vllm.multimodal.processing.inputs import ProcessorInputs
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config, merge_pipeline_deploy
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.models.vibevoice.pipeline import VIBEVOICE_PIPELINE
@@ -94,6 +95,18 @@ def test_registration_and_deploy():
     # VibeVoice is eager-only: graph, async scheduling and prefix caching must stay off.
     assert args["enforce_eager"] and not args["async_scheduling"] and not args["enable_prefix_caching"]
     assert args["use_v2_model_runner"] and args["max_num_seqs"] == 4
+
+
+def test_model_reports_unsupported_v2_sampling_hooks():
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    model_config = object.__new__(OmniModelConfig)
+    model_config.hf_config = VibeVoiceConfig()
+    model_config.enforce_eager = True
+    config.model_config = model_config
+    model_cls = OmniModelRegistry._try_load_model_cls(ARCH)
+    assert model_cls is not None
+    with pytest.raises(ValueError, match="model runner V2"):
+        model_cls(vllm_config=config)
 
 
 def test_prompt():

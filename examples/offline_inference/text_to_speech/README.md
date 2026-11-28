@@ -29,7 +29,7 @@ list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
-| VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | 1 (LLM_AR, eager) | ✓ (optional) | — | offline only; no example script (use `vllm_omni.model_executor.models.vibevoice.prompt`) | 24 kHz |
+| VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | 1 (LLM_AR, eager) | ✓ (optional) | — | requires the retired V1 runner | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
@@ -938,7 +938,7 @@ python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
 
 ## VibeVoice
 
-Single-stage eager offline TTS for the native Transformers checkpoint `vibevoice/VibeVoice-1.5B-hf` (single speaker, 24 kHz mono). There is no example script; build the prompt with the model's helper:
+This example requires Model Runner V1. VibeVoice offline TTS is unavailable with vLLM 0.34. The historical example uses the native Transformers checkpoint `vibevoice/VibeVoice-1.5B-hf` (single speaker, 24 kHz mono).
 
 ```python
 import soundfile as sf

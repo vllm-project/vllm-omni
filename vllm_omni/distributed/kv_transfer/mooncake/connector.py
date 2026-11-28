@@ -339,8 +339,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
     def _validate_supported(config: VllmConfig, kv_config: KVCacheConfig | None) -> None:
         model = config.model_config
         parallel = config.parallel_config
-        if not current_platform.is_cuda() or not config.use_v2_model_runner:
-            raise ValueError("Mooncake KV/HS requires CUDA and Model Runner V2")
+        if not current_platform.is_cuda():
+            raise ValueError("Mooncake KV/HS requires CUDA")
         if any(
             size != 1
             for size in (

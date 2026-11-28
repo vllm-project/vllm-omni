@@ -341,7 +341,8 @@ voice cloning, streaming, concurrency and request validation across those
 workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
 serving replacements; LFM3-Audio uses a different checkpoint and profile.
 Drama jobs are removed from CUDA Weekly and AMD CI. The Merge matrix also
-excludes VibeVoice. These exclusions do not count as passing V2 model tests.
+excludes VibeVoice, whose offline decoder depends on V1 post-sampling hooks.
+These exclusions do not count as passing V2 model tests.
 
 Retiring V1 dispatch also reduces the following Weekly CI coverage:
 

@@ -892,8 +892,6 @@ def _delete_dummy_load_format(
     )
 
 
-# Weekly CI sets this so the launched deploy YAML selects the runner. Upstream
-# VLLM_USE_V2_MODEL_RUNNER does not: Omni stages read deploy ``model_runner``.
 def stage_config_path_for_run_level(stage_config_path: str | None, run_level: str) -> str | None:
     """Apply run-level deploy YAML tweaks for weight loading (dummy vs real)."""
     if run_level in {"advanced_model", "full_model"}:

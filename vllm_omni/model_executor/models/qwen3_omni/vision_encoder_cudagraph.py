@@ -104,7 +104,7 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         reason = None
         if not _audio_graphs_requested(vllm_config):
             reason = "additional_config sets audio_encoder_cudagraph to false"
-        elif getattr(vllm_config, "use_v2_model_runner", False):
+        elif getattr(vllm_config.model_config, "use_v2_model_runner", True):
             reason = "model runner v2 is in use"
         elif mm.mm_encoder_tp_mode == "data":
             reason = "the multimodal encoder runs data parallel"

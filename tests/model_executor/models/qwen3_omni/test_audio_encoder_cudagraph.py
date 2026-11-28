@@ -183,6 +183,7 @@ def _platform(name):
         "budget_below_one_chunk",
         "embeds",
         "model_runner_v2",
+        "upstream_model_config",
         "opted_out",
         "opted_out_as_string",
         "rocm_aiter_backend",
@@ -212,7 +213,9 @@ def test_audio_graph_gate(monkeypatch, change):
     elif change == "embeds":
         mm.enable_mm_embeds = True
     elif change == "model_runner_v2":
-        cfg.use_v2_model_runner = True
+        cfg.model_config.use_v2_model_runner = True
+    elif change == "upstream_model_config":
+        del cfg.model_config.use_v2_model_runner
     elif change == "opted_out":
         cfg.additional_config = {"audio_encoder_cudagraph": False}
     elif change == "opted_out_as_string":

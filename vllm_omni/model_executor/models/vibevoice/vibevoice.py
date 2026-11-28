@@ -337,8 +337,9 @@ def _check_supported_config(vllm_config: VllmConfig) -> None:
     parallel = vllm_config.parallel_config
     unsupported = {
         "enforce_eager=False": not vllm_config.model_config.enforce_eager,
-        # The step loop relies on V1 runner sampling hooks; the negative pool is BF16.
-        "model runner V2": vllm_config.use_v2_model_runner,
+        "model runner V2 (VibeVoice requires V1 post-sampling hooks)": getattr(
+            vllm_config.model_config, "use_v2_model_runner", True
+        ),
         "a quantized KV cache": vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"),
         "async_scheduling": vllm_config.scheduler_config.async_scheduling,
         "enable_prefix_caching": vllm_config.cache_config.enable_prefix_caching,
