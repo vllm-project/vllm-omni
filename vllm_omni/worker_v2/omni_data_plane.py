@@ -828,16 +828,17 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         connector = getattr(self, "_omni_connector", None)
         if not isinstance(connector, SharedMemoryConnector):
             return 0
-        return connector.cleanup_prefix(f"{external_req_id}_{self._stage_id}_")
+        return connector.cleanup_prefix(f"{external_req_id}_{self._stage_id}_", defer_if_busy=True)
 
     def release_shm_resources(self, request_ids: list[str]) -> int:
-        """Unlink segments these requests left unconsumed; return the count.
+        """Return the number of unconsumed segments unlinked during this call.
 
         Safe only once every stage has finished with the request: a consumer
         that stopped early (or never ran, e.g. a text-only request's Talker)
         never unlinks what this stage put. The orchestrator drives this, and
         can do so before this stage's terminal put lands, so a request still
         live here is reclaimed when its terminal delivery is cleaned up.
+        Busy publications with a known identity are retried by the sender.
         """
         if not isinstance(getattr(self, "_omni_connector", None), SharedMemoryConnector):
             return 0

@@ -384,6 +384,60 @@ class TestCleanup:
         connector.close()
         assert len(connector._pending_keys) == 0
 
+    def test_repeated_close_preserves_busy_replacement_without_storage_identity(self, connector, monkeypatch):
+        monkeypatch.setattr(connector, "_segment_identity", lambda name: None)
+        key = f"close_no_identity_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        with open(connector._lock_file(key), "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            connector.close()
+
+        writer = SharedMemoryConnector({})
+        try:
+            ok, size, _ = writer.put("0", "1", key, "replacement")
+            assert ok
+            connector.close()
+            assert writer.get("0", "1", key) == ("replacement", size)
+        finally:
+            writer.close()
+
+    def test_v1_shutdown_finishes_while_peer_holds_publication_lock(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
+
+        monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "1")
+        scope = uuid.uuid4().hex
+        sender = SharedMemoryConnector({"stage_id": 0, "wakeup_scope": scope})
+        receiver = SharedMemoryConnector({"stage_id": 1, "wakeup_scope": scope})
+        adapter = OmniTransferAdapterBase({})
+        adapter.connector = sender
+        busy, idle = f"busy_{scope}", f"idle_{scope}"
+        try:
+            assert sender.put("0", "1", busy, "busy payload")[0]
+            assert sender.put("0", "1", idle, "idle payload")[0]
+            assert sender.get_wakeup_generation() is not None
+            marker, fifo = sender._visibility_path, sender._wake_path
+            assert os.path.exists(marker) and os.path.exists(fifo)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with open(sender._lock_file(busy), "rb") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX)
+                    shutdown = executor.submit(adapter.shutdown)
+                    assert adapter.stop_event.wait(5)
+                    shutdown.result(timeout=2)
+                    assert os.path.samefile(holder.fileno(), sender._lock_file(busy))
+                    assert sender._shm_exists(busy)
+                    assert not sender._shm_exists(idle)
+                    assert not os.path.exists(sender._lock_file(idle))
+                    assert not os.path.exists(marker)
+                    assert not os.path.exists(fifo)
+
+            assert receiver.get("0", "1", busy)[0] == "busy payload"
+        finally:
+            adapter.shutdown()
+            receiver.close()
+
 
 @pytest.mark.parametrize("suffix", ["_1_2", "_1", "_suffix"])
 def test_cleanup_preserves_other_request_keys(connector, suffix):

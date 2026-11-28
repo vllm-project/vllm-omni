@@ -20,6 +20,7 @@ from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase, PermanentTransferError
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -1199,6 +1200,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     def _save_loop(self) -> None:
         """Background thread: send outgoing data via connector."""
+        next_shm_reap = 0.0
         while not self._stop_event.is_set():
             task = None
             with self._lock:
@@ -1227,6 +1229,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     self._requeue_or_drop_failed_send(task, error=send_error)
                 continue
 
+            connector = self._omni_connector
+            if isinstance(connector, SharedMemoryConnector) and time.monotonic() >= next_shm_reap:
+                connector.reap_consumed(max_keys=4)
+                next_shm_reap = time.monotonic() + 0.1
             self._save_work_available.wait(timeout=0.01)
             self._save_work_available.clear()
 

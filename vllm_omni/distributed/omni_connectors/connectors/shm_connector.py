@@ -155,8 +155,8 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _segment_identity(self, name: str) -> object | None:
         """Return an identity that changes on replacement, or raise FileNotFoundError if absent.
 
-        Backends with separate storage may override this hook. None disables waiting for a
-        busy lock because this backend cannot distinguish a replacement from the original.
+        Backends with separate storage may override this hook. None disables deferred
+        release because this backend cannot distinguish a replacement from the original.
         """
         if type(self)._shm_exists is not SharedMemoryConnector._shm_exists:
             return None
@@ -574,11 +574,14 @@ class SharedMemoryConnector(OmniConnectorBase):
                     self._pending_keys.pop(key, None)
                 _unlink_current_lock(fd, lock_file)
         except OSError as e:
-            if defer_if_busy and publication is not None and expected is not None:
+            if defer_if_busy and publication is not None:
                 with self._pending_keys_lock:
-                    publication.retry_after = (
-                        time.monotonic() + _BUSY_CLEANUP_RETRY_SECONDS if isinstance(e, BlockingIOError) else None
-                    )
+                    if expected is not None:
+                        publication.retry_after = (
+                            time.monotonic() + _BUSY_CLEANUP_RETRY_SECONDS if isinstance(e, BlockingIOError) else None
+                        )
+                    elif isinstance(e, BlockingIOError) and self._pending_keys.get(key) is publication:
+                        del self._pending_keys[key]
             logger.debug("cleanup: could not acquire SHM lock for %s: %s", key, e)
         return unlinked
 
@@ -593,11 +596,11 @@ class SharedMemoryConnector(OmniConnectorBase):
         return sum(self._cleanup_key(key, publication, defer_if_busy=defer_if_busy) for key, publication in matches)
 
     def close(self) -> None:
-        """Attempt to reclaim remaining publications and close this connector's local resources."""
+        """Try each remaining publication without waiting, then close the local resources."""
         with self._pending_keys_lock:
             remaining = list(self._pending_keys.items())
         for key, publication in remaining:
-            self._cleanup_key(key, publication)
+            self._cleanup_key(key, publication, defer_if_busy=True)
         self._drop_visibility()
         self._close_wakeups()
 
