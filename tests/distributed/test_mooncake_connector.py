@@ -171,6 +171,7 @@ class HFConfigSeam:
 
 @dataclass
 class ModelConfigSeam:
+    use_v2_model_runner: bool = True
     model_stage: str = "thinker"
     hf_config: HFConfigSeam | Qwen3OmniMoeConfig = field(default_factory=HFConfigSeam)
     session_mode: str = "turn"
@@ -199,7 +200,6 @@ class CacheConfigSeam:
 @dataclass
 class ServingConfigSeam:
     kv_transfer_config: KVTransferConfig
-    use_v2_model_runner: bool = True
     model_config: ModelConfigSeam = field(default_factory=ModelConfigSeam)
     parallel_config: ParallelConfigSeam = field(default_factory=ParallelConfigSeam)
     cache_config: CacheConfigSeam = field(default_factory=CacheConfigSeam)
@@ -1005,6 +1005,15 @@ def test_supported_turn_configuration_passes_startup_guard(supported_config):
     OmniMooncakeStoreConnector._validate_supported(*supported_config)
 
 
+def test_startup_guard_reads_runner_selection_from_model_in_real_vllm_config(supported_config):
+    supported, kv_config = supported_config
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.model_config = supported.model_config
+    config.kv_transfer_config = supported.kv_transfer_config
+    assert not hasattr(config, "use_v2_model_runner")
+    OmniMooncakeStoreConnector._validate_supported(config, kv_config)
+
+
 @pytest.mark.parametrize("configured,resolved", [(True, False), (False, True)])
 def test_quantization_rejected_for_an_otherwise_identical_checkpoint(supported_config, configured, resolved):
     from vllm.config.quantization import resolve_quantization_config
@@ -1035,7 +1044,7 @@ def test_duplex_sessions_pass_startup_guard(supported_config):
 @pytest.mark.parametrize(
     ("owner", "field", "value", "message"),
     [
-        (None, "use_v2_model_runner", False, "Model Runner V2"),
+        ("model_config", "use_v2_model_runner", False, "Model Runner V2"),
         ("parallel_config", "tensor_parallel_size", 2, "single TP=1"),
         ("parallel_config", "pipeline_parallel_size", 2, "single TP=1"),
         ("parallel_config", "data_parallel_size", 2, "single TP=1"),

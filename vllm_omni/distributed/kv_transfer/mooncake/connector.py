@@ -76,6 +76,8 @@ from .thinker_captures import CaptureTensors, HSBlockSpec, RequestHS, decode_hs,
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from vllm_omni.config.model import OmniModelConfig
+
 logger = init_logger(__name__)
 _INIT_LOCK = threading.Lock()
 _HS_HEADER_ALLOWANCE = 16392
@@ -378,9 +380,9 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
     @staticmethod
     def _validate_supported(config: VllmConfig, kv_config: KVCacheConfig | None) -> None:
-        model = config.model_config
+        model = cast("OmniModelConfig", config.model_config)
         parallel = config.parallel_config
-        if not current_platform.is_cuda() or not config.use_v2_model_runner:
+        if not current_platform.is_cuda() or not model.use_v2_model_runner:
             raise ValueError("Mooncake KV/HS requires CUDA and Model Runner V2")
         if any(
             size != 1
