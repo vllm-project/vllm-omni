@@ -692,3 +692,58 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Optional Video VAE fused infer attention
+
+To opt in to Ascend FIA for MiniMax-H3 Video VAE decode, add this option to the existing `vllm serve` command:
+
+```bash
+--additional-config '{"video_vae_fused_infer_attention": true}'
+```
+
+The option is a JSON boolean. Omitting it or passing `false` keeps the checkpoint's original attention. FIA applies to non-causal, unmasked FP16/BF16 self-attention with matching, nonempty Q/K/V shapes. Unsupported inputs keep the original attention; errors from a selected FIA operator propagate. Validate the workload on the target SoC and CANN version before enabling it.
+
+FIA restores the BSND output layout and applies `nan_to_num(0.0)`, matching the attention helper in the validated Ref2VA checkpoint. This maps NaN to zero and positive/negative infinity to the output dtype's largest/smallest finite value. Operator exceptions still propagate. This output normalization does not establish numerical correctness or compatibility with other custom checkpoint helpers.
+
+### VAE decode ablation
+
+Use separate Python environments containing editable installs of the baseline and candidate sources on the same vLLM and CANN stack. Run the arms serially on the same cards with the same checkpoint, input latents and unrelated optimization settings.
+
+```bash
+# MAIN_PYTHON and CANDIDATE_PYTHON select the two editable installs.
+# MODEL is the Ref2VA partition; LATENTS contains torch.save((video_z, audio_z)).
+BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_decode.py"
+"$MAIN_PYTHON" -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm main --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir main-results --warmups 3 --formals 5 --precision
+"$CANDIDATE_PYTHON" -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm pr-off --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir pr-off-results --warmups 3 --formals 5 --precision
+"$CANDIDATE_PYTHON" -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm pr-on --model "$MODEL" --inputs "$LATENTS" \
+  --additional-config '{"video_vae_fused_infer_attention": true}' \
+  --output-dir pr-on-results --warmups 3 --formals 5 --precision
+```
+
+### Historical results (pre-rebase)
+
+The following data is from the original FIA change on vLLM 0.33 and CANN 9.2.1, not a comparison against the current main. Scope: **resident Video VAE decode, max of eight ranks**.
+
+| Arm | Mean ± sample std (s) | Min–max (s) | Independent round means (s) |
+| --- | ---: | ---: | --- |
+| main | 4.062523 ± 0.007200 | 4.054639–4.070466 | 4.055762, 4.069284 |
+| PR | 3.613800 ± 0.000713 | 3.612586–3.614838 | 3.613377, 3.614222 |
+
+Latency reduction: **11.045%**; speedup: **1.124169x** (main mean / PR mean).
+
+Main samples (s): 4.056119, 4.056571, 4.055717, 4.054639, 4.055761, 4.069841, 4.070460, 4.070466, 4.067707, 4.067945.
+
+PR samples (s): 3.613071, 3.613699, 3.613786, 3.613746, 3.612586, 3.613361, 3.614838, 3.614735, 3.613734, 3.614442.
+
+Peak device memory in the accepted repeat (max rank/request, allocated / reserved GiB): main 14.801 / 16.180; PR 14.804 / 15.994.
+
+Full normalized Float32 video: RMSE 4.418180802e-05, max absolute difference 0.003160476685. Canonical RGB24 and ordinary decode RGB: maximum difference 1, PSNR 71.286561 dB. Audio PCM is bit-exact. Video is **not bit-exact**. These values pass the engineering gates declared before candidate runs (video RMSE <= 0.002, max <= 0.02, RGB PSNR >= 50 dB and max difference <= 3); they are numeric validation on this fixed input, not a subjective or general quality guarantee.
+
+The actual default-codec MP4 capture is decoded and measured separately: H.264 RGB PSNR 41.718508 dB, max channel difference 40; AAC-decoded PCM is bit-exact (including codec padding). These H.264 differences are not treated as isolated patch error: encoding the SAME saved immutable RGB/PCM twice through the unchanged main encoder produces different decoded RGB hashes, and setting threads=1 did not remove this reference variability. The predeclared precision acceptance uses the complete PRE-CODEC tensors above; encoded MP4 bit equality is not claimed. Both the repeatability diagnostic and all per-arm MP4 differences are retained.
+
+The result measures decoder work on eight 910B4-1 NPUs using the nightly image software stack (CANN 9.2.1), main `b7bbfbdb4f2b3c070d9632043ea6cd2b1c601270`, original Ref2VA weights and identical captured latents. Each of two launches uses three warmups and five formal samples. It excludes conditioning/DiT and HTTP latency.
