@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -49,20 +49,21 @@ def test_signature_counts_tensors_by_shape_and_values_by_value() -> None:
     hash(kwargs_signature(a))
 
 
-def test_clone_static_and_copy_into_follow_the_tree() -> None:
+@pytest.mark.parametrize("batched", [False, True])
+def test_clone_static_and_copy_into_follow_the_tree(batched: bool) -> None:
     live = {"x": torch.arange(6.0).view(2, 3), "inner": {"pos": torch.tensor([1, 2])}, "n": 4, "t": (torch.ones(2),)}
     static = clone_static(live)
     assert static["x"].data_ptr() != live["x"].data_ptr()
     assert torch.equal(static["x"], live["x"]) and static["n"] == 4
     live["x"].fill_(7.0)
     live["inner"]["pos"].fill_(9)
-    assert copy_into(static, live) == 3
+    assert copy_into(static, live, batched=batched) == 3
     assert torch.equal(static["x"], torch.full((2, 3), 7.0))
     assert torch.equal(static["inner"]["pos"], torch.tensor([9, 9]))
     with pytest.raises(ValueError):
-        copy_into(static, {**live, "x": torch.zeros(3, 2)})
+        copy_into(static, {**live, "x": torch.zeros(3, 2)}, batched=batched)
     with pytest.raises(ValueError):
-        copy_into(static, {**live, "extra": 1})
+        copy_into(static, {**live, "extra": 1}, batched=batched)
 
 
 class _Doubler(nn.Module):
@@ -299,3 +300,23 @@ def test_pinned_entries_survive_real_lru_eviction(monkeypatch) -> None:
     assert plan_ref() is not None
     graph.clear()
     assert graph.enabled and graph.num_graphs == 0 and plan_ref() is None
+
+
+def test_capture_warms_up_before_sync_probe(monkeypatch) -> None:
+    from vllm_omni.diffusion import cuda_graph
+
+    module = _Doubler()
+    graph = GraphedForward(module, device=torch.device("cpu"))
+    graph.enabled = True
+
+    @contextmanager
+    def probe(mode):
+        assert module.calls == graph.warmup_iters
+        yield
+
+    monkeypatch.setattr(cuda_graph, "_sync_debug_mode", probe)
+    monkeypatch.setattr(cuda_graph.current_omni_platform, "is_graph_capturing", lambda: False)
+    monkeypatch.setattr(graph, "_warmup_stream", nullcontext)
+    monkeypatch.setattr(graph, "_capture_graph", lambda body: (SimpleNamespace(replay=lambda: None), body()))
+    graph(x=torch.ones(2), scale=2.0)
+    assert graph.enabled and graph.captures == 1
