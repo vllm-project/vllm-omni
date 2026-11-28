@@ -153,6 +153,20 @@ def _invalid_function_call_message(plugin: object, model_result: Mapping[str, ob
     return _ARGUMENTS_MUST_BE_JSON
 
 
+def _committed_append_turn_id(result: Mapping[str, object]) -> int | None:
+    """The turn a data-plane append was committed under, as the data plane reports it."""
+    stage_results = result.get("stage_results")
+    if not isinstance(stage_results, list):
+        return None
+    for item in stage_results:
+        inner = item.get("result") if isinstance(item, Mapping) else None
+        if isinstance(inner, Mapping) and inner.get("data_plane_append") is True:
+            turn_id = inner.get("turn_id")
+            if isinstance(turn_id, int) and not isinstance(turn_id, bool):
+                return turn_id
+    return None
+
+
 class SilenceContinuationScheduler(Protocol):
     """Runs one continuation append as a tracked task (see ``_schedule_silence_continuation``)."""
 
@@ -304,7 +318,7 @@ class ModelChannel:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
-        self._mark_accepted_append_request_start(payload)
+        self._mark_accepted_append_request_start(payload, result)
         # Commit timing state before returned output events can clear the
         # silence-continuation chain (e.g. a terminal turn-end).
         if on_append_accepted is not None:
@@ -321,10 +335,17 @@ class ModelChannel:
             return False, emitted_response
         return True, emitted_response
 
-    def _mark_accepted_append_request_start(self, payload: object) -> None:
-        """Stamp TTFT/TTFP origin only after the data plane accepted this append."""
+    def _mark_accepted_append_request_start(self, payload: object, result: Mapping[str, object]) -> None:
+        """Stamp TTFT/TTFP origin only after the data plane accepted this append.
+
+        The stamp belongs to the turn the append was committed under, which the
+        data plane reports; that can be newer than the active response's turn
+        when the user talks over a reply (see ``helpers.append_fence``).
+        """
         session = self._ctx.session
-        turn_id = payload_turn_id(payload)
+        turn_id = _committed_append_turn_id(result)
+        if turn_id is None:
+            turn_id = payload_turn_id(payload)
         if turn_id is None:
             turn_id = (
                 session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id

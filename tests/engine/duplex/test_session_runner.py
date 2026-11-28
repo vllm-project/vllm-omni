@@ -4325,6 +4325,29 @@ async def test_stale_epoch_append_does_not_own_request_start() -> None:
         await close_harness(h)
 
 
+@pytest.mark.asyncio
+async def test_append_over_a_reply_stamps_request_start_on_the_newer_turn() -> None:
+    """The user talks over a reply: the reply's turn still owns the response slot, the append is
+    committed under the newer accepted turn, and its request start belongs to that turn."""
+    clock = {"now": 1000.0}
+    h = await open_harness(clock=lambda: clock["now"])
+    try:
+        session = h.session
+        session.complete_model_turn(0)
+        session.complete_model_turn(1)
+        session.begin_response(turn_id=1)
+        assert session.active_response_turn_id < session.accepted_fence.turn_id
+        reply_started = session._response.active_response_request_started_at_s
+        clock["now"] = 1000.5
+        append_ok, _ = await h.runner.model.append_runtime_input({}, final=False)
+        assert append_ok is True
+        newer_turn = session.accepted_fence.turn_id
+        assert session._response.request_started_at_s_by_turn.get(newer_turn) == pytest.approx(1000.5)
+        assert session._response.active_response_request_started_at_s == reply_started
+    finally:
+        await close_harness(h)
+
+
 # --------------------------------------------------------------------------- #
 # Server VAD                                                                  #
 # --------------------------------------------------------------------------- #
