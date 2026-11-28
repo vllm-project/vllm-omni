@@ -11,6 +11,7 @@ import base64
 import copy
 import io
 import json
+import logging
 from argparse import Namespace
 from http import HTTPStatus
 from pathlib import Path
@@ -24,6 +25,7 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.config_factory import StageConfigFactory
@@ -288,6 +290,7 @@ def async_omni_test_client():
             self.default_sampling_params_list = default_sampling_params_list
             self.captured_sampling_params_list = None
             self.captured_prompt = None
+            self.captured_request_id = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
@@ -297,6 +300,7 @@ def async_omni_test_client():
             else:
                 self.captured_sampling_params_list = [sampling_params]
             self.captured_prompt = prompt
+            self.captured_request_id = request_id
             images = [img.copy() for img in self._images]
             yield MockGenerationResult(images)
 
@@ -921,6 +925,116 @@ def test_multistage_generate_without_layers_keeps_default(async_omni_test_client
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert captured[1].layers == OmniDiffusionSamplingParams().layers
+
+
+def test_multistage_generate_uses_x_request_id_header(async_omni_test_client):
+    """Multi-stage /v1/images/generations reuses ``X-Request-Id`` like vLLM chat."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat"},
+        headers={"X-Request-Id": "trace-123"},
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    assert engine.captured_request_id == "img_gen-trace-123"
+
+
+def test_multistage_generate_without_x_request_id_uses_random_id(async_omni_test_client):
+    """Without the header, two requests still get distinct ``img_gen-`` ids."""
+    engine = async_omni_test_client.app.state.engine_client
+    request_ids = []
+    for _ in range(2):
+        response = async_omni_test_client.post("/v1/images/generations", json={"prompt": "a cat"})
+        assert response.status_code == 200
+        request_ids.append(engine.captured_request_id)
+
+    assert all(rid.startswith("img_gen-") and len(rid) > len("img_gen-") for rid in request_ids)
+    assert request_ids[0] != request_ids[1]
+
+
+def test_multistage_generate_logs_request_summary(async_omni_test_client, caplog):
+    """``--enable-log-requests`` logs the request ID and allowlisted params, not stage objects."""
+    chat_handler = async_omni_test_client.app.state.openai_serving_chat
+    chat_handler.request_logger = RequestLogger(max_log_len=None)
+
+    with caplog.at_level(logging.INFO, logger="vllm_omni.entrypoints.openai.serving_chat"):
+        response = async_omni_test_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "a cat",
+                "size": "128x256",
+                "seed": 7,
+                "num_inference_steps": 12,
+                "generator_device": "cpu\nINJECTED",
+            },
+            headers={"X-Request-Id": "trace-123"},
+        )
+    assert response.status_code == 200
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "img_gen-trace-123" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    message = messages[0]
+    assert "'num_inference_steps': 12" in message
+    assert "'width': 128" in message
+    assert "'height': 256" in message
+    assert "'seed': 7" in message
+    assert "'num_frames': 1" in message  # effective defaults are logged, as in vLLM
+    assert "a cat" not in message
+    assert "INJECTED" not in message  # free-form request strings are not logged
+    for raw_field in ("latents", "generator", "generator_device", "extra_step_kwargs", "extra_args", "kv_metadata"):
+        assert f"'{raw_field}':" not in message
+
+
+def test_multistage_generate_log_summary_drops_unvalidated_extra_values(async_omni_test_client, caplog):
+    """Undeclared request fields can reach logged params; only bounded numbers are logged."""
+    chat_handler = async_omni_test_client.app.state.openai_serving_chat
+    chat_handler.request_logger = RequestLogger(max_log_len=None)
+
+    with caplog.at_level(logging.INFO, logger="vllm_omni.entrypoints.openai.serving_chat"):
+        response = async_omni_test_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "a cat",
+                "num_inference_steps": 12,
+                "num_frames": 2**64,
+                "num_outputs_per_prompt": "INJECTED_N",
+                "cfg_scale": "INJECTED_CFG",
+            },
+            headers={"X-Request-Id": "trace-123"},
+        )
+    assert response.status_code == 200
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "img_gen-trace-123" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    message = messages[0]
+    assert "'num_inference_steps': 12" in message
+    assert "INJECTED" not in message
+    for dropped_field in ("num_frames", "num_outputs_per_prompt", "true_cfg_scale"):
+        assert f"'{dropped_field}':" not in message
+
+
+def test_multistage_generate_without_log_requests_logs_summary_at_debug(async_omni_test_client, caplog):
+    """Without ``--enable-log-requests`` the summary is DEBUG only and the prompt is not logged."""
+    with caplog.at_level(logging.DEBUG, logger="vllm_omni.entrypoints.openai.serving_chat"):
+        response = async_omni_test_client.post(
+            "/v1/images/generations",
+            json={"prompt": "a cat"},
+            headers={"X-Request-Id": "trace-123"},
+        )
+    assert response.status_code == 200
+
+    records = [record for record in caplog.records if "img_gen-trace-123" in record.getMessage()]
+    assert [record.levelno for record in records] == [logging.DEBUG]
+    assert "a cat" not in records[0].getMessage()
 
 
 def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion):
