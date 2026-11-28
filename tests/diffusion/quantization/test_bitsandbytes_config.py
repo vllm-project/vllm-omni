@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for BitsAndBytes quantization config."""
 
 import importlib.util
@@ -16,7 +16,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
 
@@ -36,7 +36,7 @@ def _ensure_bitsandbytes_importable(monkeypatch: pytest.MonkeyPatch) -> None:
         return
     bnb = types.ModuleType("bitsandbytes")
     bnb_functional = types.ModuleType("bitsandbytes.functional")
-    bnb.functional = bnb_functional
+    setattr(bnb, "functional", bnb_functional)
     monkeypatch.setitem(sys.modules, "bitsandbytes", bnb)
     monkeypatch.setitem(sys.modules, "bitsandbytes.functional", bnb_functional)
 
@@ -124,6 +124,133 @@ def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+def test_bitsandbytes_ignored_layers_match_mode(
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`ignored_layers` matches full prefixes by default and short patterns in substring mode."""
+    from vllm_omni.quantization.bitsandbytes_config import (
+        BnBOnlineLinearMethod,
+        DiffusionBitsAndBytesConfig,
+    )
+
+    layer = mocker.Mock(spec=LinearBase)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+
+    short_config = build_quant_config("bitsandbytes", ignored_layers=["to_out"])
+    assert isinstance(short_config, DiffusionBitsAndBytesConfig)
+    assert short_config.ignored_layers_match_mode == "exact"
+    assert isinstance(short_config.get_quant_method(layer, "layers.0.attention.to_out.0"), BnBOnlineLinearMethod)
+
+    short_config.ignored_layers_match_mode = "substring"
+    assert isinstance(short_config.get_quant_method(layer, "layers.0.attention.to_out.0"), UnquantizedLinearMethod)
+    assert isinstance(short_config.get_quant_method(layer, "layers.0.attention.to_qkv"), BnBOnlineLinearMethod)
+
+    full_config = build_quant_config("bitsandbytes", ignored_layers=["layers.0.attention.to_out.0"])
+    assert isinstance(full_config, DiffusionBitsAndBytesConfig)
+    assert isinstance(full_config.get_quant_method(layer, "layers.0.attention.to_out.0"), UnquantizedLinearMethod)
+    assert isinstance(full_config.get_quant_method(layer, "layers.1.attention.to_out.0"), BnBOnlineLinearMethod)
+
+
+def test_enable_pattern_ignored_layers():
+    """Shared helper raises substring mode only on configs with non-empty `ignored_layers`."""
+    from vllm_omni.quantization.bitsandbytes_config import DiffusionBitsAndBytesConfig
+    from vllm_omni.quantization.component_config import (
+        ComponentQuantizationConfig,
+        enable_pattern_ignored_layers,
+    )
+
+    assert enable_pattern_ignored_layers(None) is None
+
+    empty_config = build_quant_config("bitsandbytes")
+    assert isinstance(empty_config, DiffusionBitsAndBytesConfig)
+    assert enable_pattern_ignored_layers(empty_config) is empty_config
+    assert empty_config.ignored_layers_match_mode == "exact"
+
+    component_config = build_quant_config(
+        {"transformer": {"method": "bitsandbytes", "ignored_layers": ["to_out"]}, "vae": None}
+    )
+    assert isinstance(component_config, ComponentQuantizationConfig)
+    assert enable_pattern_ignored_layers(component_config) is component_config
+    transformer_cfg = component_config.component_configs["transformer"]
+    assert isinstance(transformer_cfg, DiffusionBitsAndBytesConfig)
+    assert transformer_cfg.ignored_layers_match_mode == "substring"
+
+
+def test_zimage_transformer_honours_bitsandbytes_ignored_layers(
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """ZImageTransformer2DModel raises BitsAndBytes to substring mode so documented short names skip layers."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+    from vllm.utils.network_utils import get_file_store_init_method
+
+    import vllm_omni.diffusion.models.z_image.z_image_transformer as z_image_module
+    from vllm_omni.quantization.bitsandbytes_config import (
+        BnBOnlineLinearMethod,
+        DiffusionBitsAndBytesConfig,
+    )
+
+    mocker.patch(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        return_value=default_unquantized_gemm,
+    )
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    mocker.patch.object(z_image_module, "Attention", return_value=torch.nn.Identity())
+
+    def _build_model(quant_config: DiffusionBitsAndBytesConfig):
+        return z_image_module.ZImageTransformer2DModel(
+            all_patch_size=(2,),
+            all_f_patch_size=(1,),
+            in_channels=4,
+            dim=64,
+            n_layers=2,
+            n_refiner_layers=1,
+            n_heads=2,
+            n_kv_heads=2,
+            cap_feat_dim=32,
+            axes_dims=[8, 12, 12],
+            axes_lens=[16, 16, 16],
+            quant_config=quant_config,
+        )
+
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+        backend="gloo",
+    )
+    try:
+        with set_current_vllm_config(VllmConfig()):
+            initialize_model_parallel()
+
+            short_cfg = build_quant_config("bitsandbytes", ignored_layers=["to_out"])
+            assert isinstance(short_cfg, DiffusionBitsAndBytesConfig)
+            short_model = _build_model(short_cfg)
+            for block in (*short_model.noise_refiner, *short_model.context_refiner, *short_model.layers):
+                assert isinstance(block.attention.to_out[0].quant_method, UnquantizedLinearMethod)
+                assert isinstance(block.attention.to_qkv.quant_method, BnBOnlineLinearMethod)
+                assert isinstance(block.feed_forward.w13.quant_method, BnBOnlineLinearMethod)
+                assert isinstance(block.feed_forward.w2.quant_method, BnBOnlineLinearMethod)
+            assert short_cfg.ignored_layers_match_mode == "substring"
+
+            full_cfg = build_quant_config("bitsandbytes", ignored_layers=["layers.0.attention.to_out.0"])
+            assert isinstance(full_cfg, DiffusionBitsAndBytesConfig)
+            full_model = _build_model(full_cfg)
+            assert isinstance(full_model.layers[0].attention.to_out[0].quant_method, UnquantizedLinearMethod)
+            assert isinstance(full_model.layers[1].attention.to_out[0].quant_method, BnBOnlineLinearMethod)
+            assert isinstance(full_model.noise_refiner[0].attention.to_out[0].quant_method, BnBOnlineLinearMethod)
+    finally:
+        cleanup_dist_env_and_memory()
+
+
 class TestBnBOnlineLinearMethod:
     @pytest.fixture
     def mock_quant_config(self, mocker):
@@ -161,7 +288,7 @@ class TestBnBOnlineLinearMethod:
 
         method = BnBOnlineLinearMethod(mock_quant_config)
         layer = Module()
-        layer.weight = Parameter(torch.randn(64, 32))
+        layer.weight = Parameter(torch.randn(64, 32), requires_grad=False)
         mocker.patch.object(torch.Tensor, "cuda", return_value=layer.weight.data)
 
         method.process_weights_after_loading(layer)

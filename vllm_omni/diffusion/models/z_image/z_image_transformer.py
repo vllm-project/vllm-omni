@@ -58,6 +58,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.quantization.component_config import enable_pattern_ignored_layers
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -772,6 +773,8 @@ class ZImageTransformer2DModel(CachedTransformer):
             tp_size,
             tuple(supported_tp_candidates),
         )
+
+        quant_config = enable_pattern_ignored_layers(quant_config)
 
         all_x_embedder = {}
         all_final_layer = {}

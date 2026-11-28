@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """BitsAndBytes 4-bit quantization config for diffusion transformers.
 
 Supports online (dynamic) NF4/FP4 weight-only quantization from BF16/FP16
 checkpoints on CUDA GPUs.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch.nn import Module
@@ -57,6 +57,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
         self.quant_type = quant_type
         self.compress_statistics = compress_statistics
         self.ignored_layers = ignored_layers or []
+        self.ignored_layers_match_mode: Literal["exact", "substring", "suffix"] = "exact"
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -102,6 +103,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                match_mode=self.ignored_layers_match_mode,
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_cuda():

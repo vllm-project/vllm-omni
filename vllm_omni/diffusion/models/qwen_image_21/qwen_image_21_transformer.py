@@ -41,6 +41,9 @@ from vllm_omni.diffusion.layers.exact_bf16_rope_musa import musa_qk_rotary, musa
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+from vllm_omni.quantization.component_config import (
+    enable_pattern_ignored_layers as _enable_pattern_ignored_layers,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -493,30 +496,6 @@ class QwenImage21Rope(nn.Module):
             ],
             dim=-1,
         )
-
-
-def _enable_pattern_ignored_layers(quant_config: QuantizationConfig | None) -> QuantizationConfig | None:
-    """Switch vLLM FP8-style `ignored_layers` to pattern (substring) matching.
-
-    vLLM's ``Fp8Config`` matches ``ignored_layers`` against full layer prefixes
-    exactly, but the diffusion quantization docs and CLI describe them as name
-    patterns (e.g. ``img_mlp``) — under exact matching such patterns silently
-    skip nothing. Substring matching is a strict superset for exact full
-    prefixes, so existing exact-prefix configs keep working.
-    """
-    if quant_config is None:
-        return quant_config
-    component_configs = getattr(quant_config, "component_configs", None)
-    if component_configs is not None:
-        configs = [*component_configs.values(), getattr(quant_config, "default_config", None)]
-    else:
-        configs = [quant_config]
-    for config in configs:
-        if config is None:
-            continue
-        if getattr(config, "ignored_layers", None) and hasattr(config, "ignored_layers_match_mode"):
-            config.ignored_layers_match_mode = "substring"
-    return quant_config
 
 
 class QwenImage21Attention(nn.Module):
