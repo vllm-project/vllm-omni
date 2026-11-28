@@ -3847,9 +3847,8 @@ def test_wan21_vace_weekly_has_two_exact_blocking_rocm_jobs() -> None:
     [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_WEEKLY_PIPELINE],
     ids=["ready", "merge", "weekly"],
 )
-def test_v1_only_drama3_is_not_scheduled(pipeline_path: Path) -> None:
-    """The retired V1-only workflow must not be advertised as an executable job."""
-    assert not Path("tests/e2e/online_serving/test_drama_3.py").exists()
+def test_drama3_is_not_scheduled_on_amd(pipeline_path: Path) -> None:
+    """The Drama 3 end-to-end tests currently target CUDA."""
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     for step in _walk_steps(pipeline["steps"]):
         assert "Drama 3" not in step.get("label", "")

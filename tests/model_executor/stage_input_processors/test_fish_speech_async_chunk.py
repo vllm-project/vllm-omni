@@ -304,3 +304,25 @@ def test_final_backlog_drop_flushes_entire_pending_tail():
         if out is not None:
             emitted.extend(out.codes.audio[0, out.meta.left_context_size :].tolist())
     assert emitted == list(range(1, 41))
+
+
+def test_slow_ar_to_dac_async_chunk_reads_mrv2_frames():
+    transfer_manager = _make_transfer_manager(tensor_payload=True, chunk_frames=1, left_context=0)
+    request = _make_request()
+
+    # A final prefill span: only its last row carries the frame the step sampled.
+    prefill = {
+        "codes": {"audio": torch.tensor([[0, 0, 0], [0, 0, 0], [4, 5, 6]])},
+        "meta": {"codec_frame_valid": torch.tensor([0, 0, 1], dtype=torch.int8)},
+    }
+    payload = slow_ar_to_dac_decoder_async_chunk(transfer_manager, prefill, request)
+    assert payload is not None
+    assert torch.equal(payload.codes.audio, torch.tensor([[4], [5], [6]], dtype=torch.long))
+
+    # The im_end step samples no frame.
+    eos = {
+        "codes": {"audio": torch.tensor([[1, 2, 3]])},
+        "meta": {"codec_frame_valid": torch.tensor([0], dtype=torch.int8)},
+    }
+    assert slow_ar_to_dac_decoder_async_chunk(transfer_manager, eos, request) is None
+    assert len(transfer_manager.code_prompt_token_ids["req"]) == 1

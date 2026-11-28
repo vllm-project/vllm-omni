@@ -37,6 +37,24 @@ def test_default_adapter_flattens_tensor_codes() -> None:
     assert update == SchedulingMetadataUpdate(prompt_token_ids=(1, 2, 3))
 
 
+@pytest.mark.parametrize(
+    "codes,prompt",
+    [
+        (torch.zeros((10, 64), dtype=torch.long), (0,)),
+        (torch.empty((10, 0), dtype=torch.long), ()),
+        (torch.tensor([1, 2, 3], dtype=torch.long), (1, 2, 3)),
+    ],
+    ids=["window", "empty_window", "flat_codes"],
+)
+def test_window_codes_as_placeholder_schedules_one_token_per_window(codes, prompt) -> None:
+    update = DefaultSchedulingMetadataAdapter(window_codes_as_placeholder=True).extract(
+        {"codes": {"audio": codes}},
+        model_mode="generation",
+    )
+
+    assert update == SchedulingMetadataUpdate(prompt_token_ids=prompt)
+
+
 def test_default_adapter_does_not_leak_codec_metadata_to_scheduler() -> None:
     update = DefaultSchedulingMetadataAdapter().extract(
         {"meta": {"left_context_size": 7}},
@@ -46,14 +64,15 @@ def test_default_adapter_does_not_leak_codec_metadata_to_scheduler() -> None:
     assert update is None
 
 
-def test_default_adapter_extracts_duplex_perf_chunk_with_codes() -> None:
-    update = DefaultSchedulingMetadataAdapter().extract(
-        {"codes": {"audio": [1, 2]}, "meta": {"duplex_perf_chunk": [0, 2]}},
+@pytest.mark.parametrize("window_codes_as_placeholder,prompt", [(False, (1, 2)), (True, (0,))])
+def test_default_adapter_extracts_duplex_perf_chunk_with_codes(window_codes_as_placeholder, prompt) -> None:
+    update = DefaultSchedulingMetadataAdapter(window_codes_as_placeholder=window_codes_as_placeholder).extract(
+        {"codes": {"audio": torch.tensor([[1, 2]])}, "meta": {"duplex_perf_chunk": [0, 2]}},
         model_mode="generation",
     )
 
     assert update == SchedulingMetadataUpdate(
-        prompt_token_ids=(1, 2),
+        prompt_token_ids=prompt,
         duplex_perf_chunk=(0, 2),
     )
 

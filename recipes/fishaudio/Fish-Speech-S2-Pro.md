@@ -44,25 +44,12 @@ No extra packages are required: the DAC codec architecture is vendored in
 vLLM-Omni (`vllm_omni/model_executor/models/fish_speech/dac_modules/`), so the
 model runs out of the box, including in the official Docker image.
 
-#### Kvcache attention fast path
+#### Decode attention
 
-Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
-default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
-`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
-installed.
-
-```bash
-# Verify fast path availability.
-python - <<'PY'
-from vllm_omni.attention import fish_kvcache_attn
-
-print(fish_kvcache_attn.is_available())
-print(fish_kvcache_attn.load_error())
-PY
-
-# Optional: disable the runtime fast path.
-export VLLM_OMNI_FISH_KVCACHE_ATTN=0
-```
+The eager Slow AR profile uses the standard attention backend when the
+per-request CPU sequence-length bounds needed by the Fish Triton decode
+kernel are unavailable. Leave `VLLM_OMNI_FISH_KVCACHE_ATTN` at its default
+for this profile.
 
 #### Command
 
@@ -75,7 +62,10 @@ Notes:
 - `--omni` is required.
 - The default deploy config `vllm_omni/deploy/fish_qwen3_omni.yaml` is loaded
   automatically by model registry (HF `model_type=fish_qwen3_omni`).
-
+- Both stages use Model Runner V2. The Slow AR stage runs eagerly and completes
+  each sampled codec frame before the next step. The DAC receives the frame
+  windows through the native data plane. Prefix caching is disabled because
+  the Slow AR builds its prompt embeddings from the first prompt token.
 
 #### Verification
 
@@ -90,6 +80,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "response_format": "wav"
     }' --output output.wav
 ```
+
 [output.wav](https://github.com/user-attachments/files/27134970/output.wav)
 
 Voice cloning:
@@ -104,10 +95,9 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_text": "Transcript of the reference audio."
     }' --output cloned.wav
 ```
+
 [reference.wav](https://github.com/user-attachments/files/27134971/reference.wav) <br>
 [cloned.wav](https://github.com/user-attachments/files/27134969/cloned.wav)
-
-
 
 #### Notes
 
