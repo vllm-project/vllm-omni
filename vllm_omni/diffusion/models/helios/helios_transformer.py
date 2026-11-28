@@ -55,6 +55,18 @@ def center_down_sample_3d(x, kernel_size):
     return F.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 
+def history_rope_grid(latent_height: int, latent_width: int) -> tuple[int, int]:
+    """Return the rotary grid for one multi-term-memory history component.
+
+    The short/mid/long patches use (1, 2, 2), (2, 4, 4) and (4, 8, 8) strides,
+    so their rope is evaluated at half the latent grid and then average-pooled
+    by 2 (mid) or 4 (long) to line up with the patch grid. Deriving the grid
+    from each component's own latent shape keeps the branches independent:
+    previously mid/long reused the ``H1``/``W1`` locals of the short branch.
+    """
+    return latent_height // 2, latent_width // 2
+
+
 def apply_rotary_emb_helios(
     hidden_states: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -912,14 +924,16 @@ class HeliosTransformer3DModel(nn.Module):
         # 2. Process short history latents
         if latents_history_short is not None and indices_latents_history_short is not None:
             latents_history_short = latents_history_short.to(hidden_states)
+            short_height, short_width = history_rope_grid(
+                latents_history_short.shape[-2], latents_history_short.shape[-1]
+            )
             latents_history_short = self.patch_short(latents_history_short)
-            _, _, _, H1, W1 = latents_history_short.shape
             latents_history_short = latents_history_short.flatten(2).transpose(1, 2)
 
             rotary_emb_history_short = self.rope(
                 frame_indices=indices_latents_history_short,
-                height=H1,
-                width=W1,
+                height=short_height,
+                width=short_width,
                 device=latents_history_short.device,
             )
             rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(1, 2)
@@ -934,13 +948,14 @@ class HeliosTransformer3DModel(nn.Module):
         if latents_history_mid is not None and indices_latents_history_mid is not None:
             latents_history_mid = latents_history_mid.to(hidden_states)
             latents_history_mid = pad_for_3d_conv(latents_history_mid, (2, 4, 4))
+            mid_height, mid_width = history_rope_grid(latents_history_mid.shape[-2], latents_history_mid.shape[-1])
             latents_history_mid = self.patch_mid(latents_history_mid)
             latents_history_mid = latents_history_mid.flatten(2).transpose(1, 2)
 
             rotary_emb_history_mid = self.rope(
                 frame_indices=indices_latents_history_mid,
-                height=H1,
-                width=W1,
+                height=mid_height,
+                width=mid_width,
                 device=latents_history_mid.device,
             )
             rotary_emb_history_mid = pad_for_3d_conv(rotary_emb_history_mid, (2, 2, 2))
@@ -957,13 +972,14 @@ class HeliosTransformer3DModel(nn.Module):
         if latents_history_long is not None and indices_latents_history_long is not None:
             latents_history_long = latents_history_long.to(hidden_states)
             latents_history_long = pad_for_3d_conv(latents_history_long, (4, 8, 8))
+            long_height, long_width = history_rope_grid(latents_history_long.shape[-2], latents_history_long.shape[-1])
             latents_history_long = self.patch_long(latents_history_long)
             latents_history_long = latents_history_long.flatten(2).transpose(1, 2)
 
             rotary_emb_history_long = self.rope(
                 frame_indices=indices_latents_history_long,
-                height=H1,
-                width=W1,
+                height=long_height,
+                width=long_width,
                 device=latents_history_long.device,
             )
             rotary_emb_history_long = pad_for_3d_conv(rotary_emb_history_long, (4, 4, 4))
