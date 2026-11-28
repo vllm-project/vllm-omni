@@ -1063,6 +1063,18 @@ class DuplexSessionRunner:
             self._on_get_session_stats(command)
 
     async def _on_internal(self, item: _Internal) -> None:
+        if item.kind == "interruption_submit_failed":
+            # A rejected predecessor can prevent the control from reaching
+            # Stage 0. Its LISTEN will never arrive; retire the stream before
+            # another reply can escape suppression. A later epoch owns itself.
+            if (
+                not self.run.closing
+                and self.session.state == DuplexSessionState.OPEN
+                and self.session.epoch == item.payload["epoch"]
+                and self.run.interruption_pending
+            ):
+                await self._on_cancel({"type": "input.cancel"}, reason="interruption_control_failed")
+            return
         if item.kind == "input_clock_settle":
             task = item.payload.get("task")
             if isinstance(task, asyncio.Task):
@@ -2733,14 +2745,14 @@ class DuplexSessionRunner:
             and not model_state.committed_audio_consume_started
         )
 
-    async def _on_cancel(self, event: dict[str, object]) -> None:
+    async def _on_cancel(self, event: dict[str, object], *, reason: str | None = None) -> None:
         session = self.session
         model_state = self.model_state
         event_type = str(event.get("type"))
         if event_type == "barge_in" and not session.capabilities.supports_barge_in:
             self._emit_events([helpers.barge_in_unsupported_error()])
             return
-        cancel_reason = (
+        cancel_reason = reason or (
             "output_audio_buffer_clear"
             if event_type == "output_audio_buffer.clear"
             else "client_cancelled"
@@ -2926,7 +2938,14 @@ class DuplexSessionRunner:
         # Already accepted units finish before this control, and subsequent
         # client input follows it. Cancelling their submit tasks would
         # compensate by aborting the resident KV.
-        await self._start_append(payload, final=False)
+        epoch = session.epoch
+        task = await self._start_append(payload, final=False)
+
+        def settle_control(done: asyncio.Task[bool]) -> None:
+            if done.cancelled() or done.exception() is not None or not done.result():
+                self._mailbox.put_nowait(_Internal("interruption_submit_failed", {"epoch": epoch}))
+
+        task.add_done_callback(settle_control)
         return True
 
     async def _cancel_active_response(

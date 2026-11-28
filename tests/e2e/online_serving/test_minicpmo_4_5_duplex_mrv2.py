@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+import websockets
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     MODEL,
@@ -20,6 +21,7 @@ from tests.e2e.online_serving.test_minicpmo_4_5_duplex import _run_seeded_text_t
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.clients.duplex import build_realtime_url
 
 pytestmark = [pytest.mark.omni, pytest.mark.advanced_model]
 
@@ -29,6 +31,116 @@ _SERVER = OmniServerParams(
     use_stage_cli=False,
     server_args=["--trust-remote-code"],
 )
+
+
+async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: str, event_path: Path):
+    """Send the follow-up immediately after cancel, without playback ACKs or filler inputs."""
+    events = []
+    try:
+        async with websockets.connect(build_realtime_url(url, model, autostart=False), max_size=None) as ws:
+
+            async def send(event):
+                await ws.send(json.dumps(event))
+
+            async def receive_until(predicate):
+                async def receive():
+                    while True:
+                        event = json.loads(await ws.recv())
+                        events.append(event)
+                        assert event.get("type") != "error", event
+                        if predicate(event):
+                            return event
+
+                return await asyncio.wait_for(receive(), timeout=60)
+
+            await send(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "model": model,
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.0,
+                        "extra_body": {"auto_response": True, "force_listen_count": 0},
+                        "turn_detection": None,
+                        "playback_commit_policy": "ack_only",
+                    },
+                }
+            )
+            await receive_until(lambda e: e.get("type") == "session.created")
+            await send(
+                {
+                    "type": "input.text.append",
+                    "text": f"Remember the secret word {secret}. Do not say it unless asked.",
+                    "force_listen": True,
+                }
+            )
+            await receive_until(lambda e: e.get("type") == "response.listen")
+            await send({"type": "input.text.append", "text": "Count to 50."})
+            audio_types = {"response.output_audio.delta", "response.audio.delta"}
+            audio = await receive_until(lambda e: e.get("type") in audio_types and e.get("delta"))
+            old_id = audio["response_id"]
+            await send({"type": cancel, "response_id": old_id})
+            await send(
+                {
+                    "type": "input.text.append",
+                    "text": "What is the secret word I asked you to remember? Say only that word.",
+                }
+            )
+            cancelled = await receive_until(
+                lambda e: e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id
+            )
+            assert cancelled["response"]["status"] == "cancelled", cancelled
+            boundary = len(events)
+            done = await receive_until(
+                lambda e: e.get("type") == "response.done" and e.get("response", {}).get("id") != old_id
+            )
+            tail = events[boundary:]
+            transcript_types = {
+                "response.output_audio_transcript.delta",
+                "response.audio_transcript.delta",
+                "response.output_text.delta",
+            }
+            transcript = "".join(e.get("delta", "") for e in tail if e.get("type") in transcript_types)
+            packets = [e for e in tail if e.get("type") in audio_types and e.get("delta")]
+            await send({"type": "session.close"})
+            await receive_until(lambda e: e.get("type") == "session.closed")
+            assert done["response"]["status"] == "completed", done
+            assert packets, tail
+            assert all(e["response_id"] == done["response"]["id"] for e in packets), tail
+            assert secret.casefold() in transcript.casefold(), transcript
+            return transcript
+    finally:
+        event_path.write_text(json.dumps(events, ensure_ascii=False, indent=2))
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
+@pytest.mark.parametrize(
+    "cancel,sessions",
+    [
+        ("response.cancel", 1),
+        ("output_audio_buffer.clear", 1),
+        ("barge_in", 1),
+        ("response.cancel", 2),
+    ],
+)
+def test_mrv2_duplex_immediate_recall_after_interrupt(omni_server, tmp_path: Path, cancel: str, sessions: int):
+    async def recall():
+        return await asyncio.gather(
+            *(
+                _run_interrupted_recall(
+                    url=realtime_url(omni_server),
+                    model=omni_server.model,
+                    cancel=cancel,
+                    secret=secret,
+                    event_path=tmp_path / f"{secret}.json",
+                )
+                for secret in ("robin", "squirrel")[:sessions]
+            )
+        )
+
+    asyncio.run(recall())
+
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.
 # The AMD READY lane executes the resolver contract before selecting these

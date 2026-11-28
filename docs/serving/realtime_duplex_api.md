@@ -673,6 +673,19 @@ official native implementation, KV can contain generated speech the client has
 not played; playback acknowledgements govern conversation history and do not
 roll back the Thinker KV.
 
+These interruption commands also retain partial PCM buffered before the
+interruption, including explicit `barge_in`. For example, 250 ms buffered
+before `barge_in` can combine with 750 ms sent afterward into the next
+1000 ms input unit. Send `input_audio_buffer.clear` separately to discard
+that unsubmitted audio while retaining the resident Thinker request.
+
+If the ordered interruption control cannot be submitted (including when a
+preceding append is rejected), the server falls back to destructive
+cancellation. It advances the epoch and sends `input_audio_buffer.cleared`,
+rather than suppressing all subsequent replies
+while waiting for a control that never reached the model. Input queued behind
+the failed control is cancelled too; clients may submit it again afterward.
+
 `input.cancel`, manual response sessions, context invalidation and session
 teardown retain the destructive cancellation path. On a locally managed
 Stage-0 replica, its replacement re-prefills the accepted Thinker context before

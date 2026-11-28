@@ -1038,7 +1038,13 @@ for queue updates and the final validity check before delivery.
   Repeated interruptions retain their order relative to intervening inputs;
   output stays suppressed until all queued controls finish. Input-clocked
   sessions keep accounting for submitted units; the control carries zero input
-  duration. `input.cancel`, manual response sessions, context invalidation and
+  duration. Pending audio awaiting transcript belongs to its model turn;
+  control completion discards cancelled turns' pending audio so it cannot
+  consume the next turn's text. If control submission fails, including behind
+  a rejected append, the runner uses destructive input cancellation with
+  reason `interruption_control_failed`. This retires the epoch and queued
+  input before allowing new replies; it does not wait indefinitely for LISTEN.
+  `input.cancel`, manual response sessions, context invalidation and
   teardown retain destructive cancellation. Other plugins must explicitly opt
   in via `interruption_payload`; MiniCPM-derived tool plugins retain their
   epoch cancellation contract.

@@ -28,6 +28,7 @@ EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 @dataclass(slots=True)
 class _TurnState:
+    pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     sent_segment_text: str = ""
     last_text_chunk: tuple[int, int] | None = None
     has_text: bool = False
@@ -57,7 +58,6 @@ class _RequestState:
     #: yet. See :meth:`MiniCPMO45DataPlaneSession.slice_cumulative_audio`.
     audio_restart_candidate: int | None = None
     uses_segment_text_metadata: bool = False
-    pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
     stage0_consumed_tokens: int = 0
@@ -266,6 +266,10 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
+            if interruption and request_state is not None:
+                for turn_id, turn_state in request_state.turns.items():
+                    if turn_id is None or (output_turn_id is not None and turn_id <= output_turn_id):
+                        turn_state.pending_audio_without_text.clear()
             explicit_reply = coerce_int(mm_output.get("duplex_explicit_reply")) == 1
             listen_result = runtime_result(
                 stage_role="llm",
@@ -400,11 +404,11 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 )
                 turn_has_text = text_turn_state is not None and text_turn_state.has_text
                 if not future_model_turn and not response_turn_bound and not turn_has_text:
-                    if request_state is not None:
+                    if text_turn_state is not None:
                         if tts_segment_end:
-                            request_state.pending_audio_without_text.clear()
+                            text_turn_state.pending_audio_without_text.clear()
                         else:
-                            request_state.pending_audio_without_text.extend(audio_results)
+                            text_turn_state.pending_audio_without_text.extend(audio_results)
                     if tts_segment_end:
                         terminal_result = dict(audio_results[-1])
                         terminal_result.update(
@@ -415,16 +419,16 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                         )
                         yield terminal_result
                     return
-                if request_state is not None and request_state.pending_audio_without_text:
-                    pending = request_state.pending_audio_without_text
-                    request_state.pending_audio_without_text = []
+                if text_turn_state is not None and text_turn_state.pending_audio_without_text:
+                    pending = text_turn_state.pending_audio_without_text
+                    text_turn_state.pending_audio_without_text = []
                     yield from pending
             yield from audio_results
             return
 
-        if context.auto_responds and request_state is not None and isinstance(text, str) and text:
-            pending_audio = request_state.pending_audio_without_text
-            request_state.pending_audio_without_text = []
+        if context.auto_responds and text_turn_state is not None and isinstance(text, str) and text:
+            pending_audio = text_turn_state.pending_audio_without_text
+            text_turn_state.pending_audio_without_text = []
             if pending_audio:
                 delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
                 if delta_text:
@@ -445,7 +449,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                         pending_audio[-1]["abort_data_plane_request"] = True
                     yield from pending_audio
                     return
-                request_state.pending_audio_without_text = pending_audio
+                text_turn_state.pending_audio_without_text = pending_audio
 
         if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
             # Venus text also carries delegation control. Deliver it even
@@ -471,9 +475,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             return
 
         if tts_segment_end:
-            if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
-                request_state.pending_audio_without_text[-1]["end_of_turn"] = True
-                request_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
+            if unit_end_of_turn and text_turn_state is not None and text_turn_state.pending_audio_without_text:
+                text_turn_state.pending_audio_without_text[-1]["end_of_turn"] = True
+                text_turn_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
@@ -507,10 +511,8 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             return
 
         if request_id is not None and context.auto_responds and unit_end_of_turn and context.active_response_id is None:
-            # The legacy projector only removed the request-scoped pending
-            # buffer here when no explicit model-turn key was present.
-            if request_state is not None and output_turn_id is None:
-                request_state.pending_audio_without_text.clear()
+            if text_turn_state is not None and output_turn_id is None:
+                text_turn_state.pending_audio_without_text.clear()
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,

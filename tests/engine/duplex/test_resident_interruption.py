@@ -5,6 +5,7 @@
 
 import asyncio
 
+import pybase64 as base64
 import pytest
 
 from tests.engine.duplex.test_minicpmo_input_clock import _speak_segment_end
@@ -35,6 +36,7 @@ from tests.engine.test_duplex_orchestrator import (
     _submit,
 )
 from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import INTERRUPTION_KEY
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
@@ -84,7 +86,11 @@ async def test_cancel_keeps_request_context_and_filters_late_output(thinker_only
 
         # Old speech can arrive after cancellation, before the control unit.
         events = await h.deliver_and_settle(tts_output(request_id, text="late"))
-        assert not {"response.created", "response.text.delta", "audio.delta"}.intersection(types(events))
+        assert not {
+            "response.created",
+            "response.output_audio_transcript.delta",
+            "response.output_audio.delta",
+        }.intersection(types(events))
         control_output = _stage0(request_id, [*old_tokens, LISTEN] if thinker_only else [LISTEN], "", stop=True)
         control_output.multimodal_output[INTERRUPTION_KEY] = True
         await h.deliver_and_settle(control_output, stage_id=0, segment_finished=True, model_turn_id=0)
@@ -141,6 +147,126 @@ async def test_interrupt_does_not_cancel_an_inflight_append():
     finally:
         if h.port.submit_gate is not None:
             h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_predecessor", [False, True])
+async def test_failed_interruption_submission_allows_the_next_reply(mocker, fail_predecessor):
+    h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
+    release = asyncio.Event()
+    started = asyncio.Event()
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id()))
+        original = h.runner.model.append_runtime_input
+
+        async def reject_once(*args, **kwargs):
+            started.set()
+            await release.wait()
+            raise DuplexInputCapacityError("Capacity exhausted", code="test_capacity")
+
+        mocked = mocker.patch.object(h.runner.model, "append_runtime_input", side_effect=reject_once)
+        if fail_predecessor:
+            h.submit(append_audio())
+            await asyncio.wait_for(started.wait(), 2)
+        h.submit(commands.CancelResponse())
+        await h.settle(timeout_s=0.1)
+        assert h.runner.run.interruption_pending
+        h.submit(commands.AppendText(text="Queued behind the rejected control"))
+        release.set()
+        failure_events = await h.settle()
+        mocked.side_effect = original
+        assert not h.runner.closing
+        assert not h.runner.run.interruption_pending
+        assert h.session.epoch == 1
+        assert find(failure_events, "input_audio_buffer.cleared").epoch == 1
+
+        await h.run(append_audio())
+        events = await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), text="recovered", epoch=h.session.epoch, turn_id=h.session.turn_id)
+        )
+        assert "response.created" in types(events)
+        assert "response.output_audio.delta" in types(events)
+        assert find(events, "response.output_audio_transcript.delta").delta == "recovered"
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_control_task_does_not_cancel_the_replacement_epoch():
+    h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id()))
+        h.port.submit_gate = asyncio.Event()
+        h.submit(commands.CancelResponse())
+        await asyncio.wait_for(h.port.submit_started.wait(), 2)
+        h.submit(commands.CancelInput())
+        events = await h.settle()
+        assert h.session.epoch == 1
+        assert not h.runner.run.interruption_pending
+        assert types(events).count("input_audio_buffer.cleared") == 1
+        h.port.submit_gate.set()
+        await h.run(append_audio())
+        events = await h.deliver_and_settle(tts_output(h.stage0_request_id(), epoch=h.session.epoch))
+        assert "response.output_audio.delta" in types(events)
+        assert h.session.epoch == 1
+    finally:
+        if h.port.submit_gate is not None:
+            h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_audio_cannot_consume_next_turn_text():
+    h = await open_harness(plugin=_plugin(False), stage_count=3, extra_body={"silence_continuation": False})
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        # Cancellation may precede the first transcript, while codec output
+        # from the interrupted turn is still in flight.
+        await h.run(commands.BargeIn())
+        events = await h.deliver_and_settle(tts_output(request_id, text=""), stage_id=2)
+        assert "response.output_audio.delta" not in types(events)
+        control = _stage0(request_id, [LISTEN], "", stop=True)
+        control.multimodal_output[INTERRUPTION_KEY] = True
+        await h.deliver_and_settle(control, stage_id=0, segment_finished=True, model_turn_id=0)
+        await h.run(commands.AppendText(text="New question"))
+        events = await h.deliver_and_settle(tts_output(request_id, samples=0, text="new answer", turn_id=1), stage_id=2)
+        assert "response.output_audio.delta" not in types(events)
+        events += await h.deliver_and_settle(
+            tts_output(request_id, samples=48000, text="new answer", turn_id=1), stage_id=2
+        )
+        assert types(events).count("response.output_audio_transcript.delta") == 1
+        assert find(events, "response.output_audio_transcript.delta").delta == "new answer"
+        assert "response.output_audio.delta" in types(events)
+        assert not h.port.aborts and not h.port.cleanups
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear_input", [False, True])
+async def test_barge_in_retains_partial_input_until_explicit_clear(clear_input):
+    h = await open_harness(plugin=_plugin(False), extra_body={"silence_continuation": False})
+    try:
+        await h.run(append_audio())
+        await h.run(append_audio(samples=4000))  # 250 ms, below the native unit size.
+        await h.run(commands.BargeIn())
+        assert len(h.port.submissions) == 2  # First unit, then interruption control.
+        if clear_input:
+            await h.run(commands.ClearInput())
+        await h.run(append_audio(samples=12000))  # Another 750 ms.
+        if clear_input:
+            assert len(h.port.submissions) == 2
+            await h.run(append_audio(samples=4000))
+        assert len(h.port.submissions) == 3
+        payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert len(base64.b64decode(payload["audio"])) == 16000 * 4
+        assert not h.port.aborts and not h.port.cleanups
+    finally:
         await close_harness(h)
 
 
