@@ -73,6 +73,9 @@ def test_wan_vae_execution_context_uses_platform_autocast(mocker):
     [
         (True, (11, 0), torch.bfloat16, 384, True),
         (True, (11, 5), torch.float16, 384, True),
+        (True, (12, 5), torch.bfloat16, 384, True),
+        (True, (12, 5), torch.bfloat16, 256, False),
+        (True, (12, 0), torch.bfloat16, 384, False),
         (True, (9, 4), torch.bfloat16, 384, False),
         (False, (11, 0), torch.bfloat16, 384, False),
         (True, (11, 0), torch.float32, 384, False),
