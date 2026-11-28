@@ -58,50 +58,64 @@ vllm serve "$MODEL" --omni \
 SageAttention (`SAGE_ATTN`) 2.2.0 can produce black or corrupted images ([#8660](https://github.com/vllm-project/vllm-omni/issues/8660)).
 Use `FLASH_ATTN` as above or `TORCH_SDPA` with the default compilation settings instead.
 
-## NPU (Design text-to-image bring-up)
+## NPU
 
-The Ascend profile runs one BF16 request at a time, with eager execution on
-both stages and `TORCH_SDPA` on the diffusion stage. The A3 environment used
-for bring-up exposed two logical devices with 64 GiB each on one physical
-card. Stage 0 used device 0 and stage 1 used device 1.
+The Ascend profile runs one BF16 request at a time for `Ming-Image-0.1-Design`
+text-to-image, with eager execution on both stages and `TORCH_SDPA` on the
+diffusion stage. The validated A3 environment exposed two logical devices
+(`Ascend910_9382`, 64 GiB HBM each) on one physical card, with Stage 0 on
+device 0 (~52.1 GiB HBM) and Stage 1 on device 1 (~22.9 GiB HBM).
 
-The tested stack was CANN 9.1.0, driver 26.1.1, PyTorch 2.10.0,
-torch-npu 2.10.0.post4, vLLM 0.32.0 and Transformers 5.19.0 on aarch64.
-The vLLM-Ascend revision was `450e556980df9f1b09392b77952d552d75e4cba2`.
-In the A3 image, initialize CANN and ATB before starting the server:
+### Environment (Ascend A3)
+
+- Image: `quay.io/ascend/vllm-omni:v0.34.0-a3` (Ubuntu 22.04.5 LTS, aarch64)
+- CANN / driver: CANN 9.3.0, driver 25.5.0
+- Stack: Python 3.12.13, PyTorch 2.10.0, torch-npu 2.10.0.post7, vLLM 0.34.0,
+  Transformers 5.19.0, Diffusers 0.42.0, vLLM-Ascend `19c063b54`
+
+In the A3 container, initialize CANN and ATB before starting the server:
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
   --revision c57c49689d12ef7d4e24a170014f1dc43d3ce258 \
   --deploy-config vllm_omni/deploy/ming_image.yaml --port 8091
 ```
 
-Use the text-to-image request below. For the serving smoke test, run
-`pytest tests/e2e/online_serving/test_ming_image.py -m 'full_model and npu and A3' --run-level full_model`.
+Use the text-to-image request below. For the serving smoke test, run:
+
+```bash
+pytest -s -v tests/e2e/online_serving/test_ming_image.py \
+  -m 'full_model and npu and A3' --run-level full_model
+```
+
 Set `MING_IMAGE_TEST_MODEL` to use a local copy of the pinned checkpoint.
 
-### Bring-up measurements
+### Validation measurements
 
-These measurements used vLLM-Omni `5917730a` with the C4 bring-up changes.
-The prompt, revision, seed, resolution, guidance scale and 12 denoising steps
-matched on both devices. Each median covers three sequential requests after
-one warmup. The H100 NVL used co-located stages; the A3 used the two devices
-described above.
+The prompt (`A clean editorial botanical poster`), revision, seed (`42`),
+resolution (`1024x1024`), guidance scale (`1.0`), and 12 denoising steps
+matched on both platforms. Each median covers three sequential requests after
+one warmup. The H100 NVL baseline ran co-located stages on vLLM 0.32.0
+(`5917730a`); the A3 run used the default two-device `ming_image.yaml` profile
+on the vLLM 0.34.0 stack above.
 
-| Median | H100 NVL | A3 |
+| Median | H100 NVL | Ascend A3 |
 | --- | ---: | ---: |
-| Client end-to-end latency (s) | 3.083 | 4.140 |
-| Stage 0 generation (ms) | 85.843 | 87.424 |
-| Stage 1 generation (ms) | 2697.153 | 3811.630 |
-| Stage 1 duration divided by 12 (ms, includes VAE and stage overhead) | 224.763 | 317.636 |
+| Client end-to-end latency (s) | 3.083 | 4.169 |
+| Stage 0 generation (ms) | 85.843 | 116.734 |
+| Stage 1 generation (ms) | 2697.153 | 3806.727 |
+| Stage 1 duration divided by 12 (ms, includes VAE and stage overhead) | 224.763 | 317.227 |
 
-All four A3 requests produced identical 1024×1024 RGBA PNG files. The repository
-RGB image helpers measured SSIM 0.899985 and PSNR 19.7015 dB against the
-CUDA image. CUDA/NPU numerical parity remains under review. Coverage here
-is limited to Design text-to-image.
+All four A3 requests produced byte-identical 1024x1024 RGBA PNG files (matching
+earlier A3 validation byte for byte). Against the H100 NVL reference image, the
+repository RGB image helpers measured SSIM 0.899985, PSNR 19.7015 dB, mean
+absolute pixel difference 0.049394, and P99 0.545098 on the `[0, 1]` scale.
+Current NPU coverage is limited to `Ming-Image-0.1-Design` text-to-image in
+eager mode; image editing, Design-Layer, and stage-1 `torchair`/GE execution
+remain follow-up work.
 
 ## Text-to-image
 
