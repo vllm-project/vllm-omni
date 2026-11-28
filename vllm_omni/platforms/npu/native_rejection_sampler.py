@@ -3,12 +3,12 @@
 
 """Restore the torch-native rejection sampler on the 910_93 part.
 
-vllm-ascend module-patches vllm's ``rejection_sample`` (and its two helpers)
-onto Triton kernels (``vllm_ascend/patch/worker/patch_rejection_sampler.py``).
-On the 910_93 vector core those kernels fault (acl 507035) during their
-warmup, which is why ``rejection_sampler`` sits in the warmup skip set. The
-skip only moves the fault to the first request -- every verify then
-JIT-compiles the kernel family on the fly, and both stages stall there:
+vllm-ascend rebinds vllm's ``rejection_sample`` onto its own Triton kernels
+(``vllm_ascend/patch/worker/patch_triton.py``). On the 910_93 vector core
+those kernels fault (acl 507035) during their warmup, which is why
+``rejection_sampler`` sits in the warmup skip set. The skip only moves the
+fault to the first request -- every verify then JIT-compiles the kernel
+family on the fly, and both stages stall there:
 stage 0 verifies the n-gram drafts of every decode step, and stage 1
 verifies the always-``continue`` drafts behind the K-step block-table
 growth.
@@ -22,6 +22,14 @@ multi-frame decode is armed there (stage 1's ``speculative_config``). That is
 the one path whose spec width the 910B kernels cannot take, so the restore on
 a 910B is tied to that arming, never to the SoC alone: a 910B deployment
 without the Talker ``speculative_config`` keeps its sampler byte-for-byte.
+
+Current status: the restore is not armed on the current stack. Its caller
+went with the MRv1 runner (removed in #10365), and vllm 0.34 moved the
+sampler to ``vllm.v1.worker.gpu.spec_decode.rejection_sampler`` with a
+Triton implementation of its own, so the module this one reloads
+(``vllm.v1.sample.rejection_sampler``) no longer exists and the restore
+returns early. The gate below therefore only decides -- re-arming the
+restore against the current layout is a separate change.
 """
 
 import importlib.util
@@ -40,8 +48,15 @@ _RESTORE_SOC_PREFIXES = ("ascend910_93", "ascend910c")
 _KSTEP_SOC_PREFIXES = ("ascend910b",)
 
 
-def _target_soc(vllm_config: Any = None) -> bool:
-    name = _probe_soc_name().strip().lower()
+def _target_soc(soc_name: str, vllm_config: Any = None) -> bool:
+    """Whether this part needs the torch-native sampler.
+
+    ``soc_name`` is passed in so that one probe decides both this check and
+    the latch in ``restore_native_rejection_sampler``: two probes can disagree
+    (the device name is not readable yet on the first call), and a disagreement
+    skips the restore on the parts that need it.
+    """
+    name = soc_name.strip().lower()
     if any(name.startswith(prefix) for prefix in _RESTORE_SOC_PREFIXES):
         return True
     return any(name.startswith(prefix) for prefix in _KSTEP_SOC_PREFIXES) and _kstep_armed(vllm_config)
@@ -57,14 +72,18 @@ def restore_native_rejection_sampler(vllm_config: Any = None) -> None:
     global _RESTORED
     if _RESTORED:
         return
-    if not _target_soc(vllm_config):
+    soc_name = _probe_soc_name()
+    if not _target_soc(soc_name, vllm_config):
         # Latch only on a confirmed non-target SoC: "probe once" describes a
         # real part. An empty probe result is "unknown", not "non-target" --
         # leaving _RESTORED False here lets the next call retry instead of
         # skipping the restore for the whole process lifetime. The probe is
         # an env/name lookup and this function runs once per worker init, so
-        # the retry costs nothing.
-        if _probe_soc_name().strip():
+        # the retry costs nothing. The one probe read above decides the
+        # target check, this latch and the log line below: a second probe
+        # could report a part that the first one could not read, and that
+        # disagreement would latch the skip.
+        if soc_name.strip():
             _RESTORED = True
         return
     _RESTORED = True
@@ -90,5 +109,5 @@ def restore_native_rejection_sampler(vllm_config: Any = None) -> None:
             "their warmup is already skipped) and JIT-compiling them on "
             "the first request stalls every stage mid-verify",
             ", ".join(restored),
-            _probe_soc_name(),
+            soc_name,
         )
