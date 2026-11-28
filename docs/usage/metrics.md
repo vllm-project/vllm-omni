@@ -192,9 +192,10 @@ defaults report what the pipeline resolved where the pipeline reports it
 | `num_inference_steps` | Requested denoising steps (`null` when the model default applied). |
 | `completed_steps` | Denoising steps the pipeline completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
 | `flow_shift` | Shift the pipeline reported, else the request's or server's value; `null` when unknown. |
-| `guidance_scale` | Value set by the request; `null` means the model default applied (e.g. none for CFG-distilled models). |
-| `num_outputs_per_prompt`, `attention_schedule`, `lora` | Request settings that change the work done. |
-| other keys | Further values the pipeline resolved, e.g. MiniMax-H3's `audio_flow_shift`. |
+| `guidance_scale` | Value set by the request; `null` when the request left it to the model default or the pipeline runs without CFG (`cfg: false`). |
+| `num_outputs_per_prompt` | Outputs generated for the request. |
+| `lora` | LoRA adapters in effect: the request's and the one the server loaded at startup (`lora_path`); `null` for none. |
+| other keys | Further values the pipeline resolved, e.g. MiniMax-H3's `audio_flow_shift` and `cfg: false` (CFG-distilled, no guidance). |
 
 `runtime` is how the stage ran it; the engine computes it once at startup and the
 worker once after the model loads:

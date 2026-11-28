@@ -85,7 +85,7 @@ def test_diffusion_facts_prefer_values_the_pipeline_resolved():
     ]
     output = DiffusionOutput(
         num_completed_steps=50,
-        execution_facts={"width": 1344, "height": 768, "flow_shift": 12.0, "audio_flow_shift": 5.0},
+        execution_facts={"width": 1344, "height": 768, "flow_shift": 12.0, "audio_flow_shift": 5.0, "cfg": False},
     )
 
     facts = execution.diffusion_facts(request, output, formatted)
@@ -93,7 +93,30 @@ def test_diffusion_facts_prefer_values_the_pipeline_resolved():
     assert (facts["width"], facts["height"], facts["size_source"]) == (1344, 768, "pipeline")
     assert (facts["num_frames"], facts["frames_source"]) == (209, "encoder")
     assert (facts["flow_shift"], facts["audio_flow_shift"]) == (12.0, 5.0)
+    assert (facts["guidance_scale"], facts["cfg"]) == (None, False)
+    assert "attention_schedule" not in facts
     assert (facts["num_inference_steps"], facts["completed_steps"]) == (None, 50)
+
+
+def test_diffusion_facts_report_guidance_only_when_the_pipeline_applies_it():
+    params = OmniDiffusionSamplingParams(seed=1, guidance_scale=5.0)
+    request = OmniDiffusionRequest(prompt="a cat", sampling_params=params, request_id="cfg-0a1b2c3d")
+
+    assert execution.diffusion_facts(request, DiffusionOutput())["guidance_scale"] == 5.0
+    ignored = execution.diffusion_facts(request, DiffusionOutput(execution_facts={"cfg": False}))
+    assert (ignored["guidance_scale"], ignored["cfg"]) == (None, False)
+
+
+def test_diffusion_facts_list_request_and_static_lora():
+    request = _request()
+    request.sampling_params.lora_request = SimpleNamespace(lora_name="style")
+    od_config = SimpleNamespace(lora_path="/loras/base.safetensors", flow_shift=None)
+
+    assert execution.diffusion_facts(request, DiffusionOutput(), None, od_config)["lora"] == [
+        "style",
+        "/loras/base.safetensors",
+    ]
+    assert execution.diffusion_facts(_request(), DiffusionOutput())["lora"] is None
 
 
 def test_model_identity_resolves_hub_snapshot_behind_symlink_view(tmp_path):

@@ -113,11 +113,16 @@ def _output_fps(output: DiffusionOutput | None, formatted_outputs: Sequence[Any]
     return fps
 
 
-def _lora(lora_request: Any) -> list[str] | None:
-    if lora_request is None:
-        return None
-    requests = lora_request if isinstance(lora_request, list) else [lora_request]
-    return [str(getattr(item, "lora_name", item)) for item in requests]
+def _lora(lora_request: Any, static_lora_path: Any = None) -> list[str] | None:
+    """Names of the LoRA adapters in effect: the request's, then the server's static one."""
+    names = []
+    if lora_request is not None:
+        requests = lora_request if isinstance(lora_request, list) else [lora_request]
+        names += [str(getattr(item, "lora_name", item)) for item in requests]
+    if static_lora_path:
+        paths = static_lora_path if isinstance(static_lora_path, list) else [static_lora_path]
+        names += [str(path) for path in paths]
+    return names or None
 
 
 def diffusion_facts(
@@ -140,7 +145,10 @@ def diffusion_facts(
     ``num_inference_steps`` is the requested step count; ``completed_steps``
     is the denoising steps the model runner counted (``None`` without a
     progress signal).
-    ``guidance_scale`` is ``None`` unless the request set it.
+    ``guidance_scale`` is the request's value, ``None`` when the request left
+    it to the model default or the pipeline reports it runs without CFG
+    (``cfg: false``). ``lora`` lists the adapters in effect: the request's and
+    the one the server loaded at startup (``lora_path``).
     """
     sp = request.sampling_params
     reported = getattr(output, "execution_facts", None) or {}
@@ -176,11 +184,12 @@ def diffusion_facts(
         "seed": sp.seed,
         "num_inference_steps": sp.num_inference_steps,
         "completed_steps": output.num_completed_steps,
-        "guidance_scale": sp.guidance_scale if sp.guidance_scale_provided else None,
+        "guidance_scale": (
+            sp.guidance_scale if sp.guidance_scale_provided and reported.get("cfg") is not False else None
+        ),
         "flow_shift": flow_shift,
         "num_outputs_per_prompt": sp.num_outputs_per_prompt,
-        "attention_schedule": _jsonable(sp.attention_schedule),
-        "lora": _lora(sp.lora_request),
+        "lora": _lora(sp.lora_request, getattr(od_config, "lora_path", None)),
     }
     # Other values the pipeline resolved (e.g. ``audio_flow_shift``).
     for key, value in reported.items():

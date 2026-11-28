@@ -433,6 +433,8 @@ def _minimax_h3_execution_facts(height: int, width: int, context: Mapping[str, A
         "height": int(height),
         "flow_shift": context.get("video_shift"),
         "audio_flow_shift": context.get("audio_shift"),
+        # H3 checkpoints are CFG-distilled: no negative branch, guidance unused.
+        "cfg": False,
     }
 
 
