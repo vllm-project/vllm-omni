@@ -17,7 +17,7 @@ import time as _time
 from collections.abc import Callable, Coroutine
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.inputs import split_enc_dec_input
 from vllm.logger import init_logger
@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
 
     from vllm_omni.engine import OmniEngineCoreOutputs
+    from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
     from vllm_omni.engine.stage_pool import StagePool
     from vllm_omni.metrics.stats import StageRequestStats
 
@@ -83,6 +84,9 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    #: Set when the H50 scheduled-row handoff forked this request from another,
+    #: so cleanup can keep a parent alive until its children are gone.
+    parent_request_id: str | None = None
     # Session stats (RFC #8325): per stage, the chunks with spans since its last
     # session output, and the chunk of its latest producing step.
     pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
@@ -98,6 +102,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     keeps ``Orchestrator`` free of duplex code.
     """
 
+    # Class-level defaults so any path that runs before ``__init__`` (or a test
+    # that builds the object via ``object.__new__``) still sees the fork
+    # bookkeeping instead of an AttributeError.
+    _fork_parents: set[str] = set()
+    _fork_children: dict[str, set[str]] = {}
+
     def __init__(
         self,
         # Any: ``*args`` / ``**kwargs`` are forwarded verbatim to ``OrchestratorBase.__init__``.
@@ -111,6 +121,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.plugin = plugin
+        #: Parents that forked at least one independently scheduled child
+        #: (Duo's H50 handoff). The parent owns the Intent-side KV the next
+        #: block reads, so it must outlive every child and every block: the
+        #: set is sticky until abort or session teardown. Without it a
+        #: finished block retires its own parent and the next
+        #: ``fork_stage_request`` has nothing to fork from.
+        self._fork_parents: set[str] = set()
+        #: parent request id -> child request ids it forked. Used to cascade an
+        #: abort to in-flight children, which would otherwise stay registered
+        #: against a session that is already being torn down.
+        self._fork_children: dict[str, set[str]] = {}
         self.duplex_session_config = duplex_session_config
         self.replica_placement: DuplexReplicaPlacement | None = None
         self._window_replicas: dict[str, tuple[int, Any]] = {}
@@ -252,7 +273,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         replica_id: int,
         req_state: OrchestratorRequestState,
     ) -> None:
-        del replica_id
         if not isinstance(req_state, DuplexOrchestratorRequestState) or req_state.fence is None:
             return
         runner = self.session_manager.runner_for_request_id(request_id)
@@ -262,6 +282,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         req_state.stage_fences[stage_id] = fence
         try:
             runner.session.bind_stage_request(stage_id, request_id, fence=fence)
+            if req_state.parent_request_id is not None:
+                # The input stream owns native model KV across child retirement.
+                # Keep its replica binding until epoch/session teardown, otherwise
+                # cleaning a forked child unbinds the parent that the next block
+                # still needs.
+                parent_id = req_state.parent_request_id
+                self.stage_pools[stage_id].bind_request_to_replica(parent_id, replica_id)
+                runner.session.bind_stage_request(stage_id, parent_id, fence=fence)
         except DuplexFenceMismatchError:
             # The session already advanced past this request's epoch (cancel
             # raced the submit); the cancel path aborts the stale request id.
@@ -563,6 +591,31 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 )
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
+        # ``request_states`` is the only place ``fork_stage_request`` finds a
+        # parent, so every decision about keeping one alive has to be taken
+        # before ``super()`` pops it. Filtering afterwards cannot work.
+        child_to_parent = {child: parent for parent, kids in self._fork_children.items() for child in kids}
+        if abort or release_owners:
+            # Teardown ends the whole family. Cascade to the children that are
+            # still streaming; they are registered against the session being
+            # closed and would otherwise outlive it.
+            for request_id in list(cleanup_ids):
+                for child_id in self._fork_children.get(request_id, ()):
+                    if child_id not in cleanup_ids:
+                        cleanup_ids.append(child_id)
+        else:
+            # A forked parent owns the Intent-side KV that the next block reads,
+            # so a retiring child must not clean it. Hold every forking parent
+            # out of the batch: the parent lives until its session ends, not
+            held = [rid for rid in cleanup_ids if rid in self._fork_parents]
+            if held:
+                cleanup_ids = [rid for rid in cleanup_ids if rid not in self._fork_parents]
+                logger.debug(
+                    "[DuplexOrchestrator] keeping forked parent(s) %s alive while children retire",
+                    held,
+                )
+                if not cleanup_ids:
+                    return []
         try:
             outputs = await super()._cleanup_request_ids(
                 cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
@@ -575,6 +628,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise
         for request_id in cleanup_ids:
             self.session_manager.unregister_request(request_id)
+            parent_id = child_to_parent.get(request_id)
+            if parent_id is not None:
+                children = self._fork_children.get(parent_id)
+                if children is not None:
+                    children.discard(request_id)
+                    if not children:
+                        self._fork_children.pop(parent_id, None)
+            # Only a parent that is itself gone stops protecting the family.
+            self._fork_parents.discard(request_id)
+            self._fork_children.pop(request_id, None)
         return outputs
 
     # ------------------------------------------------------------------ #
@@ -745,6 +808,49 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise RuntimeError(f"request {context.request_id} is not session-owned")
         self._sync_bridge_state(request_state, context)
         self.session_manager.register_request(context.request_id, context.session_id)
+
+    def fork_stage_request(self, parent_request_id: str, request_id: str, stage_id: int):
+        """Reserve an independently scheduled child under the same session fence.
+
+        Duo's H50 scheduled-row handoff runs the next Intent block as its own
+        request so the Realization window can be trimmed while the child is
+        still streaming. The child inherits the parent's fence, config
+        generation and sampling params, so it cannot outlive or outvote the
+        session it belongs to.
+        """
+        parent = self.request_states.get(parent_request_id)
+        if parent is None:
+            # Cleanup now keeps a forking parent alive until its session ends,
+            # so reaching this means the session was torn down (or the parent
+            # was never registered). Fail with the reason instead of a bare
+            # KeyError from the dict lookup.
+            raise RuntimeError(
+                f"cannot fork {request_id} from {parent_request_id}: parent request is no longer registered"
+            )
+        parent = cast(DuplexOrchestratorRequestState, parent)
+        bridge = parent.streaming.bridge_states["duplex"]
+        context = DuplexStageRequestContext(
+            request_id=request_id,
+            session_id=parent.session_id,
+            fence=cast(DuplexFence, parent.fence),
+            stage_id=stage_id,
+            final_stage_id=parent.final_stage_id,
+            config_generation=parent.config_generation,
+            sampling_params=tuple(parent.sampling_params_list),
+            session_config=bridge["session_config"],
+            runtime_config=bridge["runtime_config"],
+        )
+        self.ensure_request(context)
+        child = cast(DuplexOrchestratorRequestState, self.request_states[request_id])
+        child.parent_request_id = parent_request_id
+        # Record the edge in both directions. The parent must outlive every
+        # child it forked, and an abort of the parent must reach the children
+        # that are still streaming.
+        self._fork_parents.add(parent_request_id)
+        self._fork_children.setdefault(parent_request_id, set()).add(request_id)
+        runner = cast("DuplexSessionRunner", self.session_manager.runner_for_request_id(request_id))
+        runner.session.reserve_stage_request(stage_id, request_id, fence=context.fence, forked=True)
+        return child
 
     def _upgrade_processed_stage_request(self, request, raw_prompt):
         request = super()._upgrade_processed_stage_request(request, raw_prompt)
@@ -985,15 +1091,20 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         The orchestrator owns this await so abort cancels the submit with the
         poll, and a failed submit surfaces instead of a fire-and-forget task.
         """
-        await self._forward_to_next_stage(
-            req_state.request_id,
-            source_stage_id,
-            plan.output,
-            req_state,
-            src_replica_id=self._partial_forward_source_replica(source_stage_id, req_state, replica_id),
-            is_streaming_session=True,
-            is_final_update=plan.is_final_update and not plan.queue_close_after,
-        )
+        # ``forward=False`` marks a settle-only update: it carries a completion
+        # notification that updates model state but must not be resubmitted
+        # downstream. Duo's Intent->Realization handoff uses it, and the
+        # follow-up below still runs so a sentence close can be submitted.
+        if plan.forward:
+            await self._forward_to_next_stage(
+                req_state.request_id,
+                source_stage_id,
+                plan.output,
+                req_state,
+                src_replica_id=self._partial_forward_source_replica(source_stage_id, req_state, replica_id),
+                is_streaming_session=True,
+                is_final_update=plan.is_final_update and not plan.queue_close_after,
+            )
         followup = self.plugin.partial_stage_followup(plan, req_state)
         if followup is None:
             return
@@ -1054,8 +1165,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         await self._cleanup_request_ids(request_ids, abort=abort)
 
     async def abort_requests(self, request_ids: list[str]) -> None:
-        if request_ids:
-            await self._abort_request_ids(list(dict.fromkeys(request_ids)))
+        if not request_ids:
+            return
+        # Route through ``_cleanup_request_ids`` so an aborted parent takes its
+        # still-streaming forked children with it. Calling ``_abort_request_ids``
+        # directly would leave those children registered against a session that
+        # is about to disappear.
+        await self._cleanup_request_ids(list(dict.fromkeys(request_ids)), abort=True)
 
 
 __all__ = ["DuplexOrchestrator", "DuplexOrchestratorRequestState"]

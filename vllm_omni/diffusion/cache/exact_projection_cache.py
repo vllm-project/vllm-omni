@@ -176,5 +176,11 @@ def tensor_digest(tensor: torch.Tensor) -> str:
     """Hash dtype, shape and actual bytes, including BF16, without widening."""
     value = tensor.detach().cpu().contiguous()
     digest = hashlib.sha256(canonical_json([str(value.dtype), list(value.shape)]).encode())
-    digest.update(memoryview(value.reshape(-1).view(torch.uint8).numpy()))
+    # An empty tensor is a legitimate input (Duo's Realization prefix carries a
+    # zero-length audio track). ``memoryview`` of a zero-element array raises
+    # "cannot cast view with zeros in shape or strides", so only hash bytes when
+    # there are any; dtype and shape are already in the digest above.
+    flat = value.reshape(-1)
+    if flat.numel():
+        digest.update(memoryview(flat.view(torch.uint8).numpy()).cast("B"))
     return digest.hexdigest()

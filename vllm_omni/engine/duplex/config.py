@@ -152,6 +152,9 @@ class DuplexCapabilities:
     supports_session_resume: bool = False
     session_admission_mode: str = "serving_managed"
     supports_audio_truncate: bool = False
+    #: Duo publishes a duplex ``video`` extension carrying JPEG frames next to
+    #: the audio stream, so serving must know video is an output modality.
+    supports_output_video: bool = False
     #: ``none`` refuses ``tools``; ``declared`` takes client tools; ``delegate_only``
     #: takes only the model's own delegate function.
     tool_mode: str = "none"
@@ -224,6 +227,7 @@ class DuplexCapabilities:
             "supports_session_resume": self.supports_session_resume,
             "session_admission_mode": self.session_admission_mode,
             "supports_audio_truncate": self.supports_audio_truncate,
+            "supports_output_video": self.supports_output_video,
             "tool_mode": self.tool_mode,
             "function_call_output_continuation": self.function_call_output_continuation,
             "max_tools": self.max_tools,

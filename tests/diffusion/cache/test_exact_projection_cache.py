@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.cache.exact_projection_cache import ExactProjectionCache
+from vllm_omni.diffusion.cache.exact_projection_cache import ExactProjectionCache, tensor_digest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -268,3 +268,13 @@ def test_inference_weights_without_versions_use_safe_runtime_path(mocker):
         linear.weight.add_(1)
         assert torch.equal(cache.project("a", linear, x, compute), linear(x))
         assert compute.call_count == 2 and not cache._entries
+
+
+@pytest.mark.parametrize("shape", [(1, 0, 32), (0,)])
+def test_tensor_digest_accepts_a_zero_element_tensor(shape):
+    # Duo's Realization prefix carries an empty audio track; hashing it must not
+    # raise "cannot cast view with zeros in shape or strides".
+    digest = tensor_digest(torch.zeros(*shape, dtype=torch.bfloat16))
+    assert len(digest) == 64
+    # Shape is part of the digest, so different empties stay distinguishable.
+    assert digest != tensor_digest(torch.zeros(1, 0, 16, dtype=torch.bfloat16))
