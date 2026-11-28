@@ -99,7 +99,7 @@ async_chunk_stage_config = modify_stage_config(default_stage_config, _async_chun
 # The fixture's default stage deadline (600 s) is a cold-cache hazard for the
 # 59.54 GiB / 15-shard thinker: on a runner with a cold page cache the weight
 # load alone took 298 s and the whole stage-0 init pushed past the deadline,
-# killing the shared server and cascading into 8 ERRORs (#11281). The cold
+# killing the shared server and cascading into 8 test errors (#11281). The cold
 # allowances only fire when exceeded, so warm runners (160-180 s total init)
 # are unaffected. Both server params boot the same model, so both take them.
 realtime_sync_server_params = [
