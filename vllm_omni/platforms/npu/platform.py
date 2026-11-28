@@ -392,8 +392,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
-        # Try FLASH_ATTN if mindiesd is available, otherwise fall back to SDPA
-        if find_spec("mindiesd"):
+        # Try FLASH_ATTN if mindiesd is available on non-310P NPUs, otherwise
+        # fall back to TORCH_SDPA (310P routes diffusion SDPA through its
+        # _310p attention patch and does not support MindIE-SD kernels).
+        if cls.supports_diffusion_dense_flash_attention():
             # Configure ASCEND_CUSTOM_OPP_PATH for mindiesd custom ops upon import
             import mindiesd  # noqa: F401
 
@@ -406,9 +408,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def supports_diffusion_dense_flash_attention(cls) -> bool:
         """Return whether MindIE-SD is installed for dense NPU FlashAttention."""
-
         from importlib.util import find_spec
 
+        from vllm_omni.platforms.npu._310p import is_310p
+
+        if is_310p():
+            return False
         return find_spec("mindiesd") is not None
 
     @classmethod
