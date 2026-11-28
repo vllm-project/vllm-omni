@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -5,7 +8,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Protocol, TypeVar, cast
 
 import torch
 import torch.distributed
@@ -810,7 +814,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 }
             else:
                 if self.recv_buffer[name].get(segment_idx, None) is not None:
-                    logger.warning(f"Recv buffer [name: {name}, segment_idx: {segment_idx}] already exist. updating...")
+                    logger.warning("Receive buffer already exists.", extra={"buffer": name, "segment": segment_idx})
                 self.recv_buffer[name][segment_idx] = torch.zeros(recv_prev_shape, device=self.device, dtype=self.dtype)
 
     def _communicate_shapes(self, tensor_send_to_next=None, recv_prev=False):
@@ -1005,6 +1009,39 @@ class PipelineGroupCoordinator(GroupCoordinator):
         super().destroy()
 
 
+class ParallelResource(Protocol):
+    def close(self) -> None:
+        """Drain work before process-group teardown."""
+
+
+R = TypeVar("R", bound=ParallelResource)
+
+
+class SequenceParallelResources:
+    """Coordinator-owned executor state, shared by layers on one group/device.
+
+    Construction and close order must agree across ranks. Execution is
+    serialized by the worker; a failed close retains storage for shutdown retry.
+    """
+
+    def __init__(self) -> None:
+        self._resources: dict[tuple, ParallelResource] = {}
+        self._closed = False
+
+    def get_or_create(self, key: tuple, factory: Callable[[], R]) -> R:
+        if self._closed:
+            raise RuntimeError("sequence-parallel resources are closed")
+        if key not in self._resources:
+            self._resources[key] = factory()
+        return cast(R, self._resources[key])
+
+    def close(self) -> None:
+        for key in tuple(self._resources):
+            self._resources[key].close()
+            del self._resources[key]
+        self._closed = True
+
+
 class SequenceParallelGroupCoordinator(GroupCoordinator):
     def __init__(
         self,
@@ -1044,8 +1081,10 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
         self.allgather_world_size = torch.distributed.get_world_size(self.allgather_group)
         self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
+        self.resources = SequenceParallelResources()
 
     def destroy(self):
+        self.resources.close()
         groups = [self.ulysses_group, self.ring_group, self.allgather_group]
         seen = {id(self.device_group), id(self.cpu_group)}
         for group in groups:

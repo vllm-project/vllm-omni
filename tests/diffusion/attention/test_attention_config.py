@@ -63,6 +63,23 @@ def _clear_inherited_attention_backend(monkeypatch):
 
 
 class TestAttentionSpec:
+    @pytest.mark.parametrize(
+        "sparse_type,precision,backend",
+        [
+            ("rf_v2", "mix", "eagle"),
+            ("rf_v2", "mxfp8", "cann"),
+            ("rf_v3", "mxfp8", "eagle"),
+            ("rf_v3", "bf16", "cann"),
+            ("rf_v3", "fp8", "eagle"),
+        ],
+    )
+    def test_mindie_parallel_rejects_routes_outside_the_four_path_contract(self, sparse_type, precision, backend):
+        with pytest.raises(ValueError):
+            AttentionSpec(
+                backend="RAINFUSION_ATTN",
+                block_sparse=dict(sparse_type=sparse_type, precision=precision, bsa_backend=backend, parallel={}),
+            )
+
     def test_construct_no_skip_softmax(self):
         spec = AttentionSpec(backend="FLASH_ATTN")
         assert spec.skip_softmax is None
@@ -238,6 +255,23 @@ class TestAttentionSpec:
             "end_step": 3,
             "precision": "fp8",
         }
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_block_sparse_parallel_config_forwarded(self, enabled):
+        parallel = {
+            "overlap_comm": enabled,
+            "rainfusion_reorder_hoist": enabled,
+            "optimize_attention_pipeline": enabled,
+            "quantized_comm": not enabled,
+        }
+        spec = AttentionSpec(backend="RAINFUSION_ATTN", block_sparse={"sparse_type": "rf_v3", "parallel": parallel})
+        assert spec.backend_kwargs()["parallel"] == parallel
+        assert spec.backend_kwargs()["sparse_type"] == "rf_v3"
+
+    @pytest.mark.parametrize("invalid", [1, "true"])
+    def test_block_sparse_parallel_rejects_ambiguous_booleans(self, invalid):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            AttentionSpec(backend="RAINFUSION_ATTN", block_sparse={"parallel": {"overlap_comm": invalid}})
 
     def test_block_sparse_precision_enum_input_normalized(self):
         """RainFusionPrecision enum members must normalize to their string value.
