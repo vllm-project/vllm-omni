@@ -74,6 +74,23 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 logger = init_logger(__name__)
 
 
+def resolve_checkpoint_root(model: str, revision: str | None = None) -> str:
+    """Return a local directory holding the native SA3 checkpoint.
+
+    SA3 ships ``model_config.json``, the weights and the T5Gemma encoder in one
+    Hub repo, so a Hub ID is resolved to its (cached) snapshot. Accepted
+    spellings of the official ID download the canonical repo; local paths and
+    other IDs (e.g. forks selected with ``--model-class-name``) are unchanged.
+    """
+    if os.path.isdir(model):
+        return model
+    from vllm_omni.diffusion.utils.hf_utils import canonical_stable_audio_3_hub_id
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    repo_id = canonical_stable_audio_3_hub_id(model) or model
+    return hf_api().snapshot_download(repo_id=repo_id, revision=revision)
+
+
 def get_stable_audio_3_post_process_func(od_config: OmniDiffusionConfig):
     """Audio post-process factory — registered in registry.py."""
 
@@ -145,7 +162,8 @@ class StableAudio3Pipeline(
         # Load model_config.json from the checkpoint root.
         # SA3 ships {repo}/model_config.json + {repo}/model.safetensors.
         # ----------------------------------------------------------------
-        model_path = od_config.model
+        model_path = resolve_checkpoint_root(od_config.model, od_config.revision)
+        self.checkpoint_root = model_path
         config_path = os.path.join(model_path, "model_config.json")
         with open(config_path) as f:
             sa3_config = json.load(f)
@@ -289,10 +307,9 @@ class StableAudio3Pipeline(
             ctype = cinfo["type"]
             ccfg = {"output_dim": cond_dim, **cinfo["config"]}
             if ctype == "t5gemma":
-                # Local checkpoint: load T5Gemma from {model}/{subfolder} instead of
-                # the HF repo_id (which would require network access).
-                if os.path.exists(self.od_config.model):
-                    ccfg.setdefault("model_path", self.od_config.model)
+                # Load T5Gemma from {checkpoint_root}/{subfolder}, which the SA3
+                # repo bundles, instead of a separate HF repo_id download.
+                ccfg.setdefault("model_path", self.checkpoint_root)
                 conditioners[cid] = T5GemmaConditioner(**ccfg)
             elif ctype == "number":
                 conditioners[cid] = NumberConditioner(**ccfg)

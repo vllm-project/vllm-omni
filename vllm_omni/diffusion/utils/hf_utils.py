@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 import os
 from collections.abc import Mapping
 from functools import lru_cache
@@ -22,6 +23,10 @@ _MAGI2_REQUIRED_FILES = (
     "vae/Wan2.2_VAE.pth",
     "turbo_vae/checkpoint.ckpt",
 )
+
+# Stability ships SA3 in its own format: ``model_config.json`` + weights, with
+# no Diffusers index and no root ``config.json``.
+_STABLE_AUDIO_3_MODEL_IDS = frozenset({"stabilityai/stable-audio-3-medium"})
 
 
 def get_diffusion_model_index(
@@ -71,6 +76,35 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+def canonical_stable_audio_3_hub_id(model_name: str) -> str | None:
+    """Return the canonical SA3 Hub ID for an accepted spelling, else ``None``.
+
+    Detection and checkpoint download share this so every accepted form
+    (case, surrounding whitespace, trailing slash) also loads.
+    """
+    normalized = str(model_name).strip().rstrip("/").lower()
+    return normalized if normalized in _STABLE_AUDIO_3_MODEL_IDS else None
+
+
+def _looks_like_stable_audio_3(model_name: str) -> bool:
+    """Detect the official SA3 Hub ID or a local copy of its native checkpoint.
+
+    A local directory is matched by its ``model_config.json`` declaring a
+    T5Gemma text conditioner, which Stable Audio Open (``t5``) does not use.
+    """
+    if canonical_stable_audio_3_hub_id(model_name) is not None:
+        return True
+    config_path = os.path.join(str(model_name).strip(), "model_config.json")
+    if not os.path.isfile(config_path):
+        return False
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            conditioning = json.load(f)["model"]["conditioning"]["configs"]
+        return any(cond.get("type") == "t5gemma" for cond in conditioning)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def _looks_like_praxis1(model_name: str, *, revision: str | None = None) -> bool:
     """Recognize a native Praxis-1 checkpoint (``model_type: praxis``) without importing its runtime."""
     try:
@@ -99,6 +133,8 @@ def resolve_native_diffusion_model_class(model_name: str) -> str | None:
 
     if _looks_like_magi2(model_name):
         return "Magi2Pipeline"
+    if _looks_like_stable_audio_3(model_name):
+        return "StableAudio3Pipeline"
     if resolve_checkpoint(model_name) is not None:
         return "VideoDepthAnythingPipeline"
     return None

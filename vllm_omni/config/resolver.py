@@ -254,7 +254,10 @@ def resolve_omni_config(
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
     if not supported:
         raise ValueError(
-            f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
+            f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model. "
+            "If this checkpoint is a supported diffusion model shipped without a Diffusers model_index.json "
+            "or a root config.json (for example a fine-tuned or renamed copy), select its pipeline "
+            "explicitly with --model-class-name <PipelineClass>."
         )
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)

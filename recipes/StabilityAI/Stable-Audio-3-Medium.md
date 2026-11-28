@@ -45,21 +45,16 @@ CPU-targeted and lower quality; Large (2.7B) is API-only and out of scope.
 #### Command
 
 `stabilityai/stable-audio-3-medium` is **gated** -- accept the license on the
-model page and run `hf auth login` first. The HF repo does not ship the
-`model_index.json` / `transformer/config.json` that the engine uses for model
-discovery, so prepare a local directory with the helper script (it fetches the
-weights and writes both files):
-
-```bash
-python tools/download_stable_audio_3.py \
-    --output-dir ./stable-audio-3-medium
-```
+model page and run `hf auth login` first. The engine recognizes the bare Hub
+ID, and a local copy of the repo (for example from `hf download`), from SA3's
+native `model_config.json`, so no extra preparation is needed. Directories
+prepared by `tools/download_stable_audio_3.py` keep working.
 
 Offline (text-to-audio) via the shared `text_to_audio.py` driver:
 
 ```bash
 python examples/offline_inference/text_to_audio/text_to_audio.py \
-    --model ./stable-audio-3-medium \
+    --model stabilityai/stable-audio-3-medium \
     --prompt "An ambient drone evolving slowly with shimmering overtones" \
     --audio-length 30.0 \
     --num-inference-steps 100 \
@@ -70,8 +65,7 @@ python examples/offline_inference/text_to_audio/text_to_audio.py \
 Online (`/v1/audio/generate`):
 
 ```bash
-vllm-omni serve ./stable-audio-3-medium \
-    --model-class-name StableAudio3Pipeline \
+vllm-omni serve stabilityai/stable-audio-3-medium \
     --trust-remote-code \
     --enforce-eager \
     --port 8091
