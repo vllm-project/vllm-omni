@@ -1009,8 +1009,8 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help=(
                 "Log what each request actually ran as one [OmniExecution] JSON line next to [OmniTiming]: "
-                "per-stage facts such as the generated size, seed and counted denoising steps of diffusion "
-                "stages, plus the configuration and attention backends of each diffusion stage at startup."
+                "per diffusion stage the generated size, seed, flow shift and counted denoising steps, plus "
+                "the runtime it ran with (versions, model revision, dtype, quantization, attention backends)."
             ),
         )
         omni_config_group.add_argument(

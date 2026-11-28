@@ -69,7 +69,68 @@ def test_diffusion_facts_read_frame_counts_of_encoded_video():
 
     facts = execution.diffusion_facts(_request(), DiffusionOutput(), formatted)
 
-    assert (facts["num_frames"], facts["size_source"]) == (124, "metadata")
+    assert (facts["num_frames"], facts["frames_source"]) == (124, "metadata")
+    assert facts["size_source"] == "request"
+
+
+def test_diffusion_facts_prefer_values_the_pipeline_resolved():
+    # The request left size and shift to the model defaults; the pipeline encoded
+    # the video in the worker and reported what it ran with.
+    request = OmniDiffusionRequest(
+        prompt="a cat", sampling_params=OmniDiffusionSamplingParams(seed=42), request_id="defaults-0a1b2c3d"
+    )
+    formatted = [
+        SimpleNamespace(images=[b"mp4"], multimodal_output={"metadata": {"video": {"fps": 24, "frame_counts": [209]}}})
+    ]
+    output = DiffusionOutput(
+        num_scheduled_steps=50,
+        num_completed_steps=50,
+        execution_facts={"width": 1344, "height": 768, "flow_shift": 12.0, "audio_flow_shift": 5.0},
+    )
+
+    facts = execution.diffusion_facts(request, output, formatted)
+
+    assert (facts["width"], facts["height"], facts["size_source"]) == (1344, 768, "pipeline")
+    assert (facts["num_frames"], facts["frames_source"]) == (209, "metadata")
+    assert (facts["flow_shift"], facts["audio_flow_shift"]) == (12.0, 5.0)
+    assert (facts["num_inference_steps"], facts["num_completed_steps"]) == (None, 50)
+
+
+def test_model_identity_resolves_hub_snapshot_behind_symlink_view(tmp_path):
+    commit = "42ed227ee7df40d41602854ae760620d6eb651fe"
+    snapshot = tmp_path / "hub" / "models--MiniMaxAI--MiniMax-H3" / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text("{}")
+    view = tmp_path / "model-view"
+    view.mkdir()
+    (view / "model_index.json").symlink_to(snapshot / "model_index.json")
+
+    assert execution._model_identity(str(view)) == ("MiniMaxAI/MiniMax-H3", commit)
+    assert execution._model_identity(str(tmp_path / "missing")) == (str(tmp_path / "missing"), None)
+
+
+def test_engine_runtime_reports_config():
+    od_config = SimpleNamespace(
+        model="org/name",
+        revision="abc",
+        model_class_name="Pipe",
+        dtype=torch.bfloat16,
+        quantization_config=None,
+        cache_backend="none",
+        parallel_config=SimpleNamespace(ulysses_degree=2),
+        max_num_seqs=1,
+    )
+
+    runtime = execution.engine_runtime(od_config)
+
+    assert {key: runtime[key] for key in ("model", "model_revision", "dtype", "quantization", "cache_backend")} == {
+        "model": "org/name",
+        "model_revision": "abc",
+        "dtype": "bfloat16",
+        "quantization": None,
+        "cache_backend": "none",
+    }
+    assert runtime["parallel_config"]["ulysses_degree"] == 2
 
 
 @pytest.mark.parametrize(
@@ -93,7 +154,12 @@ def test_request_event(monkeypatch, completed, reason, status, failure_reason):
         )
     ]
     agg.accumulate_diffusion_metrics(
-        "diffusion", rid, SimpleNamespace(metrics={"execution": {"num_completed_steps": 50}}), stage_id=0
+        "diffusion",
+        rid,
+        SimpleNamespace(
+            metrics={"execution": {"diffusion": {"num_completed_steps": 50}, "runtime": {"dtype": "bfloat16"}}}
+        ),
+        stage_id=0,
     )
     if completed:
         agg.e2e_done.add(rid)
@@ -104,7 +170,10 @@ def test_request_event(monkeypatch, completed, reason, status, failure_reason):
     assert event == "request"
     assert (payload["request_id"], payload["external_request_id"]) == (rid, "abc123")
     assert (payload["status"], payload["failure_reason"]) == (status, failure_reason)
-    assert payload["stages"][0]["diffusion"] == {"num_completed_steps": 50}
+    [stage] = payload["stages"]
+    assert stage["diffusion"] == {"num_completed_steps": 50}
+    assert stage["runtime"] == {"dtype": "bfloat16"}
+    assert "num_tokens_in" not in stage
 
 
 class _Pipeline(ProgressBarMixin):

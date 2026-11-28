@@ -87,7 +87,7 @@ from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics.definitions import SCHEDULER_QUEUE_WAIT_MS
-from vllm_omni.metrics.execution import EXECUTION_METRICS_KEY, diffusion_facts, log_config, num_tensor_frames
+from vllm_omni.metrics.execution import EXECUTION_METRICS_KEY, diffusion_facts, engine_runtime, num_tensor_frames
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
     extract_diffusion_denoise_ms,
@@ -349,8 +349,10 @@ class DiffusionEngine:
             self._init_runtime_state()
             self._init_execute_fn()
             self._log_execution_mode(od_config)
-            if getattr(od_config, "enable_execution_summary", False) is True:
-                log_config(od_config)
+            # Configuration facts of every execution summary; the worker adds its own.
+            self._execution_runtime = (
+                engine_runtime(od_config) if getattr(od_config, "enable_execution_summary", False) is True else None
+            )
         except Exception:
             # close() cannot be used because runtime synchronization state may not exist yet.
             scheduler_to_close = getattr(self, "scheduler", None)
@@ -643,7 +645,12 @@ class DiffusionEngine:
                 return None, num_streamed_frames
             # Streamed requests return their video in chunks; the facts cover the whole clip.
             clip_frames = num_streamed_frames if output.chunk_index else None
-            return diffusion_facts(request, output, formatted_outputs, self.od_config, clip_frames), num_streamed_frames
+            runtime = {**(getattr(self, "_execution_runtime", None) or {}), **(output.execution_runtime or {})}
+            facts = {
+                "diffusion": diffusion_facts(request, output, formatted_outputs, self.od_config, clip_frames),
+                "runtime": runtime or None,
+            }
+            return facts, num_streamed_frames
         except Exception:
             logger.warning("Failed to build the execution summary for %s", request.request_id, exc_info=True)
             return None, num_streamed_frames

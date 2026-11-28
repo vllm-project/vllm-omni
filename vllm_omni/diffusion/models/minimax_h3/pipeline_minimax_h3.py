@@ -426,6 +426,16 @@ def _minimax_h3_output_canvas(
     return target.height, target.width
 
 
+def _minimax_h3_execution_facts(height: int, width: int, context: Mapping[str, Any]) -> dict[str, Any]:
+    """Size and flow shifts the request ran with, for ``--enable-execution-summary``."""
+    return {
+        "width": int(width),
+        "height": int(height),
+        "flow_shift": context.get("video_shift"),
+        "audio_flow_shift": context.get("audio_shift"),
+    }
+
+
 class _MiniMaxH3EncodedOutput(NamedTuple):
     video: bytes | list[bytes]
     frame_counts: list[int]
@@ -4627,6 +4637,7 @@ class MiniMaxH3Pipeline(
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+            execution_facts=_minimax_h3_execution_facts(height, width, context),
         )
 
     def _cache_clip_latents(
@@ -4837,6 +4848,8 @@ class MiniMaxH3Pipeline(
                     "latent_continuation": context.get("latent_continuation"),
                     "latent_cache_key": context.get("latent_cache_key"),
                     "num_frames": context["num_frames"],
+                    "video_shift": context.get("video_shift"),
+                    "audio_shift": context.get("audio_shift"),
                 },
             }
         )
@@ -4976,6 +4989,7 @@ class MiniMaxH3Pipeline(
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+            execution_facts=_minimax_h3_execution_facts(height, width, shape),
         )
 
 

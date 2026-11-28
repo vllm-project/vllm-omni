@@ -168,33 +168,53 @@ by the pipeline instrumentation.
 
 Pass `--enable-execution-summary` to log what each request actually ran, for
 example to check a benchmark run against its declared workload. `[OmniTiming]`
-reports how long a request took; `[OmniExecution]` reports what it ran. Each line
-is one JSON object with `schema_version` (currently `1`) and an `event`:
-
-| `event` | When | Fields |
-| --- | --- | --- |
-| `request` | Once per finished request, next to `[OmniTiming]` | `request_id` (internal id, as in `[OmniTiming] req=`), `external_request_id` (the id the client sees: the `POST /v1/videos` job `id` or the `X-Request-Id` header), `status` (`completed` or `failed`), `failure_reason` (as in `vllm_omni:requests_failed`, e.g. `client_disconnect`, `stage_error`), `stages` |
-| `config` | Once per diffusion stage at startup | `vllm_omni_version`, `vllm_version`, `torch_version`, `model`, `model_revision`, `model_class_name`, `dtype`, `quantization`, `attention_backend` (configured; `null` lets the platform choose), `cache_backend`, `parallel_config`, `enforce_eager`, `step_execution`, `max_num_seqs` |
-| `attention` | Once per diffusion stage after the model loads | `device`, `world_size`, `num_layers`, `backends` (the backend each attention layer resolved, counted per role) |
-
-Each entry of `stages` has `stage_id`, `replica_id`, `output_type`, `batch_size`,
-`num_tokens_in` and `num_tokens_out`. Stages that output audio samples add `audio` (`duration_s`,
-`sample_rate`). Diffusion stages add `diffusion`:
+reports how long a request took; `[OmniExecution]` reports what it ran: one JSON
+line per finished request, logged next to its `[OmniTiming]` line, with
+`schema_version` (currently `1`) and `event: "request"`. Each line stands on its
+own; there are no separate startup lines to correlate.
 
 | Field | Meaning |
 | --- | --- |
-| `width`, `height`, `num_frames` | Size of what the pipeline generated where the output allows it, before optional frame interpolation (streamed requests sum the chunks' frames). |
-| `size_source` | `tensor` (typed video tensor), `image`, `metadata` (frame count reported with video the worker already encoded; width and height from the request) or `request` (resolved sampling parameters). |
+| `request_id` | Internal id, as in `[OmniTiming] req=`. |
+| `external_request_id` | The id the client sees: the `POST /v1/videos` job `id` or the `X-Request-Id` header. |
+| `status`, `failure_reason` | `completed` or `failed`; the reason as in `vllm_omni:requests_failed` (e.g. `client_disconnect`, `stage_error`). |
+| `stages` | One entry per stage: `stage_id`, `replica_id`, `output_type`, `batch_size`; `diffusion` and `runtime` for diffusion stages, `num_tokens_in` and `num_tokens_out` for the others, `audio` (`duration_s`, `sample_rate`) for stages that output audio samples. |
+
+`diffusion` is what the request ran. Values the request left to the model
+defaults report what the pipeline resolved where the pipeline reports it
+(`DiffusionOutput.execution_facts`, e.g. MiniMax-H3's size and flow shifts):
+
+| Field | Meaning |
+| --- | --- |
+| `width`, `height`, `size_source` | Output size and its source: `tensor` (typed video tensor), `image`, `pipeline` (reported by the pipeline, e.g. for video it encoded in the worker) or `request` (resolved sampling parameters). |
+| `num_frames`, `frames_source` | Frame count before optional frame interpolation and its source: `tensor`, `metadata` (frame counts of video the worker encoded), `stream` (sum of streamed chunks) or `request`. |
 | `fps`, `seed` | Output rate; resolved seed, including a server-assigned random seed. |
-| `num_inference_steps` | Requested denoising steps. |
+| `num_inference_steps` | Requested denoising steps (`null` when the model default applied). |
 | `num_scheduled_steps`, `num_completed_steps` | Denoising steps the pipeline scheduled and completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
-| `guidance_scale`, `flow_shift` | Values set by the request or the server; `null` means the model default applied. |
+| `flow_shift` | Shift the pipeline reported, else the request's or server's value; `null` when unknown. |
+| `guidance_scale` | Value set by the request; `null` means the model default applied (e.g. none for CFG-distilled models). |
 | `num_outputs_per_prompt`, `attention_schedule`, `lora` | Request settings that change the work done. |
+| other keys | Further values the pipeline resolved, e.g. MiniMax-H3's `audio_flow_shift`. |
+
+`runtime` is how the stage ran it; the engine computes it once at startup and the
+worker once after the model loads:
+
+| Field | Meaning |
+| --- | --- |
+| `vllm_omni_version`, `vllm_version`, `torch_version` | Software versions (`dev` when vLLM-Omni runs from a source tree without version metadata). |
+| `model`, `model_revision` | Model as served; a local directory that resolves into a Hugging Face hub snapshot reports the repo id and snapshot commit. |
+| `model_class_name`, `dtype`, `quantization` | Pipeline class, weight dtype, quantization method (`null` for none). |
+| `cache_backend` | Step cache backend (`none` when off). |
+| `parallel_config`, `max_num_seqs` | Parallel degrees; maximum requests batched together. |
+| `device`, `world_size` | Accelerator name and number of ranks. |
+| `attention` | The backend each attention layer resolved, counted per role. |
+
+MiniMax-H3 on one B300, with only `prompt`, `aspect_ratio` and `seed` set in the request:
 
 ```text
-[OmniExecution] {"schema_version": 1, "event": "request", "request_id": "video_gen_<job id>-<8 hex>", "external_request_id": "video_gen_<job id>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "num_tokens_in": 0, "num_tokens_out": 0, "diffusion": {"width": 1344, "height": 768, "num_frames": 124, "size_source": "metadata", "fps": 24.0, "seed": 11, "num_inference_steps": 49, "num_scheduled_steps": 49, "num_completed_steps": 49, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "attention_schedule": null, "lora": null}}]}
+[OmniExecution] {"schema_version": 1, "event": "request", "request_id": "video_gen_<job id>-<8 hex>", "external_request_id": "video_gen_<job id>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "diffusion": {"width": 1344, "height": 768, "size_source": "pipeline", "num_frames": 209, "frames_source": "metadata", "fps": 24, "seed": 42, "num_inference_steps": null, "num_scheduled_steps": 50, "num_completed_steps": 50, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "attention_schedule": null, "lora": null, "audio_flow_shift": 3.0}, "runtime": {"vllm_omni_version": "dev", "vllm_version": "0.34.0", "torch_version": "2.14.0+cu130", "model": "MiniMaxAI/MiniMax-H3", "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe", "model_class_name": "MiniMaxH3ModularPipeline", "dtype": "bfloat16", "quantization": null, "cache_backend": "none", "parallel_config": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1, "data_parallel_size": 1, "sequence_parallel_size": 1, "ulysses_degree": 1, "ring_degree": 1, "cfg_parallel_size": 1, "vae_patch_parallel_size": 1, "use_hsdp": false}, "max_num_seqs": 1, "device": "NVIDIA B300 SXM6 AC", "world_size": 1, "attention": {"minimax_h3.token_refiner": {"FLASHINFER_ATTN": 2}, "self": {"FLASHINFER_ATTN": 50}}}}]}
 ```
 
-Failed requests whose diffusion stage did not return have no `diffusion` entry.
-Nothing is logged per denoising step; counting adds one integer update per step
-and only runs while the flag is set.
+Failed requests whose diffusion stage did not return have no `diffusion` or
+`runtime` entry. Nothing is logged per denoising step; counting adds one integer
+update per step and only runs while the flag is set.

@@ -6,10 +6,11 @@
 what it ran, so a benchmark harness can check a run against its declared
 workload. Each line is one JSON object with ``schema_version`` and ``event``:
 
-- ``request``: once per finished request, next to ``[OmniTiming]``; common
-  fields per stage plus ``diffusion`` or ``audio`` fields;
-- ``config``: once per diffusion stage at startup;
-- ``attention``: once per diffusion stage, the backends its layers resolved.
+- ``request``: once per finished request, next to ``[OmniTiming]``. Each
+  diffusion stage reports what the request ran (``diffusion``) and how the
+  stage ran it (``runtime``: versions, model revision, dtype, quantization,
+  resolved attention backends, cache and parallel config), so a single line
+  verifies a request without correlating startup logs.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
+import os
+import re
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -126,36 +129,47 @@ def diffusion_facts(
 ) -> dict[str, Any]:
     """What one finished diffusion request ran.
 
-    Size comes from what the pipeline generated where the output allows it;
-    ``size_source`` names the source: ``tensor`` (typed video tensor),
-    ``image``, ``metadata`` (frame count reported with video the worker
-    already encoded; width and height from the request) or ``request``.
+    Values come from what the pipeline generated or resolved where available,
+    so requests that leave parameters to the model defaults still report the
+    values that ran. ``size_source`` names where ``width``/``height`` come
+    from: ``tensor`` (typed video tensor), ``image``, ``pipeline`` (the size
+    the pipeline reported, e.g. for video it encoded in the worker) or
+    ``request``; ``frames_source`` does the same for ``num_frames`` (``tensor``,
+    ``metadata`` for the encoder's frame counts, ``stream`` or ``request``).
     ``num_scheduled_steps`` and ``num_completed_steps`` are the denoising
     steps the model runner counted (``None`` without a progress signal).
-    ``guidance_scale`` and ``flow_shift`` are ``None`` when neither the request
-    nor the server set them and the model default applied.
+    ``guidance_scale`` is ``None`` unless the request set it.
     """
     sp = request.sampling_params
-    width, height, num_frames, size_source = sp.width, sp.height, sp.num_frames, "request"
+    reported = getattr(output, "execution_facts", None) or {}
+    width, height, size_source = sp.width, sp.height, "request"
+    num_frames, frames_source = sp.num_frames, "request"
+    output_size = _output_size(formatted_outputs)
     tensor_size = _tensor_size(output)
     if tensor_size is not None:
-        (width, height, num_frames), size_source = tensor_size, "tensor"
-    elif (output_size := _output_size(formatted_outputs)) is not None:
-        out_width, out_height, out_frames, size_source = output_size
-        width = out_width if out_width is not None else width
-        height = out_height if out_height is not None else height
-        num_frames = out_frames if out_frames is not None else num_frames
+        width, height, num_frames = tensor_size
+        size_source = frames_source = "tensor"
+    else:
+        if output_size is not None and output_size[0] is not None:
+            width, height, size_source = output_size[0], output_size[1], output_size[3]
+        elif reported.get("width") is not None and reported.get("height") is not None:
+            width, height, size_source = reported["width"], reported["height"], "pipeline"
+        if output_size is not None and output_size[2] is not None:
+            num_frames, frames_source = output_size[2], output_size[3]
     if num_streamed_frames:
         # Streamed requests return their video in chunks; report the whole clip.
-        num_frames = num_streamed_frames
-    flow_shift = (sp.extra_args or {}).get("flow_shift")
+        num_frames, frames_source = num_streamed_frames, "stream"
+    flow_shift = reported.get("flow_shift")
+    if flow_shift is None:
+        flow_shift = (sp.extra_args or {}).get("flow_shift")
     if flow_shift is None and od_config is not None:
         flow_shift = getattr(od_config, "flow_shift", None)
-    return {
+    facts = {
         "width": width,
         "height": height,
-        "num_frames": num_frames,
         "size_source": size_source,
+        "num_frames": num_frames,
+        "frames_source": frames_source,
         "fps": sp.fps if sp.fps is not None else _output_fps(output, formatted_outputs),
         "seed": sp.seed,
         "num_inference_steps": sp.num_inference_steps,
@@ -167,74 +181,101 @@ def diffusion_facts(
         "attention_schedule": _jsonable(sp.attention_schedule),
         "lora": _lora(sp.lora_request),
     }
+    # Other values the pipeline resolved (e.g. ``audio_flow_shift``).
+    for key, value in reported.items():
+        facts.setdefault(key, _jsonable(value))
+    return facts
 
 
-# ----------------------------------------------------------------------------- startup events
+# ----------------------------------------------------------------------------- runtime facts
+
+# ``<cache>/models--<org>--<name>/snapshots/<commit>`` of a Hugging Face hub download.
+_HF_SNAPSHOT = re.compile(r"models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})")
 
 
-def log_config(od_config: OmniDiffusionConfig) -> None:
-    """``config`` event: what a diffusion stage runs with, once at engine startup."""
+def _model_identity(model: Any) -> tuple[Any, str | None]:
+    """(hub repo id, snapshot commit) when ``model`` resolves into a hub cache snapshot.
+
+    Serving wrappers often pass a local directory of symlinks into the snapshot,
+    so the directory and its entries are resolved.
+    """
+    if not isinstance(model, str) or not os.path.isdir(model):
+        return model, None
+    candidates = [model]
     try:
-        import vllm
+        candidates += [os.path.join(model, name) for name in sorted(os.listdir(model))[:16]]
+    except OSError:
+        pass
+    for path in candidates:
+        match = _HF_SNAPSHOT.search(os.path.realpath(path))
+        if match is not None:
+            return f"{match.group(1)}/{match.group(2)}", match.group(3)
+    return model, None
 
-        import vllm_omni
 
-        quantization = getattr(od_config, "quantization_config", None)
-        if hasattr(quantization, "get_name"):
-            quantization = quantization.get_name()
-        parallel = getattr(od_config, "parallel_config", None)
-        parallel_fields = (
-            "tensor_parallel_size",
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "sequence_parallel_size",
-            "ulysses_degree",
-            "ring_degree",
-            "cfg_parallel_size",
-            "vae_patch_parallel_size",
-            "use_hsdp",
-        )
-        log_execution(
-            "config",
-            {
-                "vllm_omni_version": vllm_omni.__version__,
-                "vllm_version": vllm.__version__,
-                "torch_version": torch.__version__,
-                "model": getattr(od_config, "model", None),
-                "model_revision": getattr(od_config, "revision", None),
-                "model_class_name": getattr(od_config, "model_class_name", None),
-                "dtype": str(getattr(od_config, "dtype", None)),
-                "quantization": _jsonable(quantization),
-                "attention_backend": getattr(
-                    getattr(od_config.diffusion_attention_config, "default", None), "backend", None
-                ),
-                "cache_backend": getattr(od_config, "cache_backend", None),
-                "parallel_config": (
-                    {name: getattr(parallel, name, None) for name in parallel_fields} if parallel is not None else None
-                ),
-                "enforce_eager": getattr(od_config, "enforce_eager", None),
-                "step_execution": getattr(od_config, "step_execution", None),
-                "max_num_seqs": getattr(od_config, "max_num_seqs", None),
-            },
-        )
+def engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any] | None:
+    """Configuration part of a diffusion stage's ``runtime`` facts; computed once at startup."""
+    try:
+        return _engine_runtime(od_config)
     except Exception:
-        logger.warning("Failed to log the execution config", exc_info=True)
+        logger.warning("Failed to collect the execution runtime config", exc_info=True)
+        return None
 
 
-def log_attention(pipeline: torch.nn.Module | None) -> None:
-    """``attention`` event: the backend each attention layer resolved, per role (first rank only)."""
-    if pipeline is None or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0):
-        return
+def _engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any]:
+    import vllm
+
+    import vllm_omni
+
+    model, snapshot = _model_identity(getattr(od_config, "model", None))
+    quantization = getattr(od_config, "quantization_config", None)
+    if hasattr(quantization, "get_name"):
+        quantization = quantization.get_name()
+    parallel = getattr(od_config, "parallel_config", None)
+    parallel_fields = (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "sequence_parallel_size",
+        "ulysses_degree",
+        "ring_degree",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+        "use_hsdp",
+    )
+    return {
+        "vllm_omni_version": vllm_omni.__version__,
+        "vllm_version": vllm.__version__,
+        "torch_version": torch.__version__,
+        "model": model,
+        "model_revision": getattr(od_config, "revision", None) or snapshot,
+        "model_class_name": getattr(od_config, "model_class_name", None),
+        "dtype": str(getattr(od_config, "dtype", None)).removeprefix("torch."),
+        "quantization": _jsonable(quantization),
+        "cache_backend": getattr(od_config, "cache_backend", None),
+        "parallel_config": (
+            {name: getattr(parallel, name, None) for name in parallel_fields} if parallel is not None else None
+        ),
+        "max_num_seqs": getattr(od_config, "max_num_seqs", None),
+    }
+
+
+def worker_runtime(pipeline: torch.nn.Module | None) -> dict[str, Any] | None:
+    """Worker part of a diffusion stage's ``runtime`` facts: device and resolved attention backends.
+
+    Computed once after the model loads; ``attention`` counts the backend each
+    attention layer resolved, per role.
+    """
+    if pipeline is None:
+        return None
     try:
         from vllm_omni.diffusion.attention.layer import Attention
         from vllm_omni.platforms import current_omni_platform
 
         backends: dict[str, dict[str, int]] = {}
-        num_layers = 0
         for module in pipeline.modules():
             if not isinstance(module, Attention):
                 continue
-            num_layers += 1
             backend_cls = getattr(module, "attn_backend", None)
             # Model-owned kernels (``custom_attention``) bypass backend selection.
             if backend_cls is not None:
@@ -243,34 +284,36 @@ def log_attention(pipeline: torch.nn.Module | None) -> None:
                 name = type(getattr(module, "attention", None)).__name__
             counts = backends.setdefault(str(getattr(module, "role", None)), {})
             counts[name] = counts.get(name, 0) + 1
-        log_execution(
-            "attention",
-            {
-                "device": current_omni_platform.get_device_name(),
-                "world_size": torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
-                "num_layers": num_layers,
-                "backends": backends,
-            },
-        )
+        return {
+            "device": current_omni_platform.get_device_name(),
+            "world_size": torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
+            "attention": backends,
+        }
     except Exception:
-        logger.warning("Failed to log the attention backends", exc_info=True)
+        logger.warning("Failed to collect the attention backends", exc_info=True)
+        return None
 
 
 # ----------------------------------------------------------------------------- request event
 
 
-def stage_entry(stage_stats: Any, diffusion: Mapping[str, Any] | None) -> dict[str, Any]:
-    """One stage of a ``request`` event: common fields plus its modality fields."""
+def stage_entry(stage_stats: Any, execution: Mapping[str, Any] | None) -> dict[str, Any]:
+    """One stage of a ``request`` event: common fields plus its modality facts.
+
+    A diffusion stage adds the ``diffusion`` and ``runtime`` facts its engine
+    attached to the output; token counts only apply to the other stages.
+    """
     entry: dict[str, Any] = {
         "stage_id": getattr(stage_stats, "stage_id", None),
         "replica_id": getattr(stage_stats, "replica_id", None),
         "output_type": getattr(stage_stats, "final_output_type", None),
         "batch_size": getattr(stage_stats, "batch_size", None),
-        "num_tokens_in": getattr(stage_stats, "num_tokens_in", None),
-        "num_tokens_out": getattr(stage_stats, "num_tokens_out", None),
     }
-    if diffusion is not None:
-        entry["diffusion"] = dict(diffusion)
+    if execution is not None:
+        entry.update({key: _jsonable(value) for key, value in execution.items()})
+    else:
+        entry["num_tokens_in"] = getattr(stage_stats, "num_tokens_in", None)
+        entry["num_tokens_out"] = getattr(stage_stats, "num_tokens_out", None)
     if getattr(stage_stats, "audio_duration_s", 0):
         entry["audio"] = {
             "duration_s": getattr(stage_stats, "audio_duration_s", None),

@@ -2199,6 +2199,12 @@ class DiffusionOutput:
     # report progress (no shared progress bar) or counting was disabled.
     num_completed_steps: int | None = None
     num_scheduled_steps: int | None = None
+    # Values the pipeline resolved itself (e.g. ``width``, ``height``,
+    # ``flow_shift`` when the request left them to the model defaults), and the
+    # worker's runtime facts (resolved attention backends, device), reported by
+    # the execution summary (``--enable-execution-summary``).
+    execution_facts: dict[str, Any] | None = None
+    execution_runtime: dict[str, Any] | None = None
 
     # In-process ownership only; never part of the pipeline constructor contract.
     _ready_event: torch.Event | None = field(default=None, init=False, repr=False, compare=False)

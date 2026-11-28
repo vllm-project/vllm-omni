@@ -1041,7 +1041,7 @@ class OrchestratorAggregator:
         rid = str(request_id)
         completed = rid in self.e2e_done
         stage_evts = self._sorted_stage_events(rid)
-        diffusion = self.diffusion_execution.pop(rid, {})
+        execution = self.diffusion_execution.pop(rid, {})
         log_execution(
             "request",
             {
@@ -1049,7 +1049,7 @@ class OrchestratorAggregator:
                 "external_request_id": external_request_id,
                 "status": "completed" if completed else "failed",
                 "failure_reason": None if completed else normalize_failure_reason(failure_reason),
-                "stages": [stage_entry(evt, diffusion.get(evt.stage_id)) for evt in stage_evts],
+                "stages": [stage_entry(evt, execution.get(evt.stage_id)) for evt in stage_evts],
             },
         )
 

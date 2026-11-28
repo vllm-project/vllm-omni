@@ -107,7 +107,7 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.metrics.execution import log_attention
+from vllm_omni.metrics.execution import worker_runtime
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -470,7 +470,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
         if self._execution_summary_enabled():
-            log_attention(self.pipeline)
+            self._execution_runtime = worker_runtime(self.pipeline)
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
         if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
@@ -1077,6 +1077,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     for output in outputs:
                         output.num_completed_steps = completed
                         output.num_scheduled_steps = scheduled
+                        output.execution_runtime = getattr(self, "_execution_runtime", None)
                 with record_function("prepare_output_for_transport"):
                     outputs = [
                         self._prepare_output_for_transport(output, req.sampling_params)
@@ -1121,6 +1122,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if self._execution_summary_enabled():
             output.num_completed_steps = state.step_index
             output.num_scheduled_steps = state.total_steps
+            output.execution_runtime = getattr(self, "_execution_runtime", None)
 
         # In streaming output mode with interaction, acknowledge which events are handled in this chunk.
         meta = state.interaction_chunk_metadata
