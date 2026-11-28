@@ -34,6 +34,18 @@ def test_packed_qkv_selection(monkeypatch, mocker, flag, platform_kind):
     assert strategy._packed_qkv is (flag == "1")
 
 
+@pytest.mark.parametrize("chunks", [0, 2])
+def test_packed_qkv_is_mutually_exclusive_with_overlap(monkeypatch, mocker, chunks):
+    """The head-chunk overlap owns its exchange, so packed QKV must stay off."""
+    monkeypatch.setenv("VLLM_OMNI_PACKED_QKV", "1")
+    group = mocker.Mock(spec=SequenceParallelGroupCoordinator)
+    group.ulysses_group = object()
+    group.ulysses_world_size = 4
+    group.ring_world_size = group.allgather_world_size = 1
+    strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False, ce_overlap_chunks=chunks)
+    assert strategy._packed_qkv is (chunks == 0)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda", "xpu", "privateuseone"])
 @pytest.mark.parametrize("use_sync", [False, True])
 def test_packed_qkv_sync_uses_platform_backend(monkeypatch, mocker, device, use_sync):

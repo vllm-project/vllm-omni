@@ -38,6 +38,10 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("allgather", [1, 2])
 def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, enabled, allgather):
+    from vllm_omni.platforms import current_omni_platform
+
+    # CUDA copy-engine semantics; the NPU validator has its own eager requirement.
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     parallel_context.ulysses_a2a_backend = "copy_engine" if enabled else "nccl"
     parallel_context.allgather_degree = allgather
     strategy = Mock()
@@ -51,6 +55,9 @@ def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, e
 
 @pytest.mark.parametrize("chunks", [0, 4])
 def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_context, chunks):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     parallel_context.ulysses_overlap_chunks = chunks
     parallel_context.ulysses_a2a_backend = "copy_engine"  # the overlap runs on the copy-engine exchange only
     strategy = Mock()
@@ -59,3 +66,20 @@ def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_c
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
     assert strategy.call_args.kwargs["ce_overlap_chunks"] == chunks
+
+
+def test_ce_overlap_chunks_are_forwarded_on_npu_over_the_default_transport(monkeypatch, parallel_context):
+    """The NPU chunked HCCL overlap does not need the copy-engine transport to be selected."""
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    parallel_context.ulysses_overlap_chunks = 4
+    parallel_context.ulysses_a2a_backend = "nccl"
+    strategy = Mock()
+    monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
+
+    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+
+    kwargs = strategy.call_args.kwargs
+    assert kwargs["ulysses_a2a_permute"] is False
+    assert kwargs["ce_overlap_chunks"] == 4

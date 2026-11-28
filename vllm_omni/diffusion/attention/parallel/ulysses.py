@@ -262,7 +262,10 @@ class UlyssesParallelAttention:
         self._ulysses_a2a_permute = ulysses_a2a_permute
         # Every rank must use the same setting. Unsupported layouts keep their
         # existing exchange, and explicit symmetric memory takes precedence.
-        self._packed_qkv = not ulysses_a2a_permute and envs.VLLM_OMNI_PACKED_QKV
+        # The head-chunk overlap owns its exchange, so it is mutually exclusive with
+        # the packed QKV exchange (on CUDA the two already exclude each other through
+        # the copy-engine requirement).
+        self._packed_qkv = not ulysses_a2a_permute and self.ce_overlap_chunks == 0 and envs.VLLM_OMNI_PACKED_QKV
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,

@@ -156,7 +156,7 @@ def select_transport(
         found = _group_probe(group, world_size)[1]
         _log_once(f"Using 'copy_engine' Ulysses all-to-all for group {group.group_name!r} (auto: {found})")
         return COPY_ENGINE
-    ignored = "; ulysses_overlap_chunks ignored" if overlap_chunks else ""
+    ignored = "; ulysses_overlap_chunks ignored" if overlap_chunks and not current_omni_platform.is_npu() else ""
     _log_once(f"Using 'nccl' Ulysses all-to-all for group {group.group_name!r} (auto: {reason}{ignored})")
     return NCCL
 

@@ -67,6 +67,32 @@ The NPU attention factory rejects Ulysses × AllGather-KV when this option is
 enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
 The same topology remains available through the standard communication path.
 
+### NPU chunked HCCL overlap
+
+`--ulysses-overlap-chunks N` splits the rank-local heads into `N` groups and
+overlaps each group's exchange with attention on the compute stream. On CUDA
+this rides the copy-engine transport described above. Ascend has no copy
+engines, so on NPU the same pipeline uses asynchronous HCCL
+`all_to_all_single` collectives on a side stream instead; it does **not** need
+the symmetric-memory transport or `cann-shmem`, and works with the default
+(`auto`/`nccl`) exchange.
+
+Ordering is asymmetric because the two directions have different primitives.
+Attention completion is propagated to the side stream with an `NPU Event`
+(events recorded on the compute stream are observed faithfully). An HCCL
+work submitted with `async_op=True` is not observed by a later stream event,
+so communication completion is taken from the returned `Work` objects with
+`wait()`, which blocks the host while the device stays busy on the next
+chunk's collective.
+
+The same exactness guard as the CUDA path applies: the first call for each
+attention kernel and shape runs both the overlapped and the standard exchange
+on every rank and keeps the overlap only if all ranks are bit-identical.
+Because HCCL charges a fixed cost (about 0.2 ms on one HCCS domain) per
+collective, chunking only pays when each chunk's per-peer slice is large
+enough; on NPU the path is skipped below 3 MiB per peer, which keeps small
+shapes on the standard exchange. CUDA-graph capture also disables it.
+
 ## Packed QKV exchanges
 
 Set `VLLM_OMNI_PACKED_QKV=1` before worker startup to opt into a packed

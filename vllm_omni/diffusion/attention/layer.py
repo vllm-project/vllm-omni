@@ -437,6 +437,24 @@ def _is_nvidia_cuda() -> bool:
     return current_omni_platform.is_cuda() and torch.version.hip is None
 
 
+# Smallest per-peer slice (bytes) worth cutting out of one head chunk on NPU. Splitting the exchange
+# multiplies the collective count, and HCCL charges a fixed ~0.2 ms per collective on the measured
+# HCCS domain, so below this crossover the added fixed cost exceeds what the overlap can hide.
+_NPU_OVERLAP_MIN_CHUNK_BYTES = 3 << 20
+
+
+def _stream_capture_active(device_type: str) -> bool:
+    """Whether the current stream is being captured on the given device backend."""
+    if device_type == "npu":
+        capture = getattr(torch.npu, "is_current_stream_capturing", None)
+        return bool(capture()) if capture is not None else False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        # A CUDA-less build (e.g. an NPU wheel) cannot be capturing a CUDA graph.
+        return False
+
+
 class Attention(nn.Module):
     _scheduler_paged_kv = False
     _has_custom_attention = False
@@ -1209,29 +1227,45 @@ class Attention(nn.Module):
         return self._forward_impl(query, key, value, attn_metadata)
 
     def _ulysses_ce_overlap_chunks(self, strategy, query, key, value, attn_metadata, use_paged_attention) -> int:
-        """Chunk count for the copy-engine overlapped strict-Ulysses path, or 0 when it does not apply."""
+        """Chunk count for the overlapped strict-Ulysses path (copy engine on CUDA, chunked HCCL on NPU),
+        or 0 when it does not apply."""
         chunks = int(getattr(strategy, "ce_overlap_chunks", 0))
         if chunks <= 0 or strategy.name != "ulysses" or use_paged_attention or self.use_ring:
             return 0
-        if getattr(self, "_explicit_cross_contract", False) or not getattr(strategy, "_ulysses_a2a_permute", False):
+        if getattr(self, "_explicit_cross_contract", False):
+            return 0
+        if not getattr(strategy, "_ulysses_a2a_permute", False) and query.device.type != "npu":
+            # On CUDA the gate is the copy-engine exchange; the NPU runner does its own permute and
+            # only needs plain HCCL.
             return 0
         if getattr(strategy, "_scatter_idx", None) != 2 or getattr(strategy, "_gather_idx", None) != 1:
             return 0
         sp_group = getattr(strategy, "_sp_group", None)
         if sp_group is None or sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1:
             return 0
-        if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
-            return 0
-        if torch.cuda.is_current_stream_capturing():
-            # The overlap's cross-rank flags carry host-side epochs that a replayed graph would not advance.
-            return 0
-        if self._has_custom_attention:
+        if get_ulysses_mode(default="strict") != "strict":
             return 0
         if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
             return 0
-        if any(x.dtype != query.dtype or x.stride(-1) != 1 or x.stride(-2) != x.shape[-1] for x in (query, key, value)):
-            return 0
         if query.shape[2] % (sp_group.ulysses_world_size * chunks):
+            return 0
+        if query.device.type == "npu":
+            # Each extra chunk adds one collective per tensor, and HCCL charges ~0.2 ms of fixed cost
+            # per collective here. Splitting only pays when every chunk's per-peer slice is big enough
+            # to dominate that cost; below the crossover the overlap hides less than it adds.
+            per_peer = query.shape[1] * (query.shape[2] // (sp_group.ulysses_world_size * chunks)) * query.shape[3]
+            if per_peer * query.element_size() < _NPU_OVERLAP_MIN_CHUNK_BYTES:
+                return 0
+        elif query.is_cuda and _is_nvidia_cuda():
+            pass
+        else:
+            return 0
+        if _stream_capture_active(query.device.type):
+            # Both runners keep host-side state that a replayed graph would not advance.
+            return 0
+        if self._has_custom_attention:
+            return 0
+        if any(x.dtype != query.dtype or x.stride(-1) != 1 or x.stride(-2) != x.shape[-1] for x in (query, key, value)):
             return 0
         if attn_metadata is not None and (
             attn_metadata.attn_mask is not None
@@ -1289,11 +1323,17 @@ class Attention(nn.Module):
             raise
         if not VERDICTS[verdict_key]:
             logger.info_once(
-                "Ulysses copy-engine overlap skipped for %s with %d chunks on %s: chunked attention is not "
+                "Ulysses chunked overlap skipped for %s with %d chunks on %s: chunked attention is not "
                 "bit-identical at this shape",
                 tuple(query.shape),
                 chunks,
                 type(impl).__name__,
+            )
+        else:
+            logger.info_once(
+                "Ulysses chunked overlap active on %s with %d chunks (bit-identical to the standard exchange)",
+                query.device.type,
+                chunks,
             )
         return reference
 
