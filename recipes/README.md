@@ -78,6 +78,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`facebook/SAM3-Video-H200.md`](./facebook/SAM3-Video-H200.md) | Video concept segmentation and tracking (text prompts) | 1x H200 141GB |
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
+| [`FunAudioLLM/CosyVoice3-8GB.md`](./FunAudioLLM/CosyVoice3-8GB.md) | Online voice-cloned TTS | 1x 8GB CUDA GPU (WSL2) |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
 | [`Gradium/Phonon-31M-EN-RTX3090.md`](./Gradium/Phonon-31M-EN-RTX3090.md) | English default-voice streaming TTS, B=1, TP=1 | 1x RTX 3090 24GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
