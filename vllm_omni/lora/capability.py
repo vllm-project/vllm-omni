@@ -571,6 +571,10 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "Audio8TTSCodecDecoder": _not_capable(_NON_LLM_STAGE),
     "Audio8TTSSlowARForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "AuraQwen3VLForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "AuraQwen3_5ForConditionalGeneration": _not_capable(
+        "inherits upstream SupportsLoRA and packed_modules_mapping; "
+        "the AURA duplex stage does not implement SupportsMergedLoRA"
+    ),
     "BailingMM2NativeForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "BailingMoeV3AudioForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "BailingTalker2": _not_capable(_PENDING_AR_MAPPING),

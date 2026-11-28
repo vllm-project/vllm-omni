@@ -25,6 +25,7 @@ from tests.dfx.reliability.scenarios import (
 from tests.dfx.reliability.test_qwen3_omni import Qwen3Omni
 from tests.helpers.mark import hardware_marks
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
 _DEPLOY = Path(get_deploy_config_path("ci/qwen3_omni_moe_multi_replicas_4gpu.yaml"))
 
@@ -74,7 +75,11 @@ def test_replica_crash_at_exit(omni_server_function, online_client_function) -> 
     ReplicaCrashAtExit().run(MODEL, omni_server_function, online_client_function)
 
 
-@launch_scenario_params(MODEL, ReplicaCrashAtLaunch, skip_reason="vllm-omni issue#10378")
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="ROCm startup fault validation pending: https://github.com/vllm-project/vllm-omni/issues/10378",
+)
+@launch_scenario_params(MODEL, ReplicaCrashAtLaunch)
 def test_replica_crash_at_launch(launch_params) -> None:
     """Kill a stage-1 replica before readiness; require the original instance to serve."""
     ReplicaCrashAtLaunch().run(MODEL, launch_params)
