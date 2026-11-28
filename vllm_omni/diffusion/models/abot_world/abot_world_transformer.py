@@ -44,10 +44,11 @@ def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
     if dim % 2:
         raise ValueError(f"freq_dim must be even, got {dim}.")
     half_dim = dim // 2
-    timestep = timestep.to(torch.float64)
+    compute_dtype = torch.float32 if timestep.device.type == "npu" else torch.float64
+    timestep = timestep.to(compute_dtype)
     frequencies = torch.pow(
         10000,
-        -torch.arange(half_dim, device=timestep.device, dtype=torch.float64) / half_dim,
+        -torch.arange(half_dim, device=timestep.device, dtype=compute_dtype) / half_dim,
     )
     phase = torch.outer(timestep, frequencies)
     return torch.cat((phase.cos(), phase.sin()), dim=1)
