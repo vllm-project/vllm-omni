@@ -1441,12 +1441,7 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def cos_sin(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if positions.dim() == 2 and positions.shape[0] == 3:
             y_pos = positions[1].float()
             x_pos = positions[2].float()
@@ -1456,9 +1451,6 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
             x_pos = positions.float()
 
         num_tokens = y_pos.shape[0]
-        dtype = query.dtype
-        query_shape = query.shape
-        key_shape = key.shape
 
         inv_freq = self.inv_freq.to(device=y_pos.device, dtype=torch.float32)
 
@@ -1472,9 +1464,18 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         freqs = torch.stack([y_freqs, x_freqs], dim=-1).reshape(num_tokens, -1)
 
         emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos().to(dtype).unsqueeze(1)
-        sin = emb.sin().to(dtype).unsqueeze(1)
+        return emb.cos().unsqueeze(1), emb.sin().unsqueeze(1)
 
+    def forward(
+        self,
+        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = positions if isinstance(positions, tuple) else self.cos_sin(positions)
+        cos, sin = cos.to(query.dtype), sin.to(query.dtype)
+        num_tokens = cos.shape[0]
+        query_shape, key_shape = query.shape, key.shape
         query = query.view(num_tokens, -1, self.head_dim)
         key = key.view(num_tokens, -1, self.head_dim)
 
@@ -1809,6 +1810,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
                 layer.self_attn.rotary_emb = custom_rope
                 replaced += 1
+        if replaced:
+            self.model.shared_rotary_emb = custom_rope
         logger.info(
             "Replaced %d rotary embeddings with HunyuanImage3RotaryEmbedding "
             "(interleaved 2D RoPE, head_dim=%d, rope_theta=%.1f)",

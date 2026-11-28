@@ -192,7 +192,7 @@ class HunYuanAttention(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor,
+        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         hidden_states: torch.Tensor,
         kv_states: tuple[torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -298,7 +298,7 @@ class HunYuanCrossAttention(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor,
+        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         hidden_states: torch.Tensor,
         kv_states: tuple[torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -501,7 +501,7 @@ class HunYuanDecoderLayer(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor,
+        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         kv_states: tuple[torch.Tensor] | None = None,
@@ -600,9 +600,11 @@ class HunYuanModel(nn.Module, EagleModelMixin):
         cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        shared_rope = getattr(self, "shared_rotary_emb", None)
+        layer_positions = positions if shared_rope is None else shared_rope.cos_sin(positions)
         for i, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             hidden_states, residual, kv_states = layer(
-                positions,
+                layer_positions,
                 hidden_states,
                 residual,
                 prev_kv_states,
