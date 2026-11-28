@@ -15,6 +15,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -341,9 +342,13 @@ class MiniMaxH3Rope(nn.Module):
 
     def __init__(self, inv_freq_len: int) -> None:
         super().__init__()
+        # Diffusers checkpoints derive and omit this buffer, while the native
+        # H3 checkpoint serializes it. Initialize it so both layouts are safe.
+        exponents = torch.arange(inv_freq_len, dtype=_FP32_DTYPE) / inv_freq_len
+        inv_freq = 1.0 / (10000.0**exponents)
         self.register_buffer(
             "inv_freq",
-            torch.empty(inv_freq_len, dtype=_FP32_DTYPE),
+            inv_freq,
             persistent=True,
         )
 
@@ -1105,7 +1110,9 @@ class MiniMaxH3DiTModel(nn.Module):
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
         for name, loaded_weight in weights:
+            source_name = name
             layout = "plain"
+            target = None
             if diffusers_weights:
                 if name in source_names:
                     raise ValueError(f"duplicate Diffusers H3 weight: {name}")
@@ -1118,30 +1125,64 @@ class MiniMaxH3DiTModel(nn.Module):
                     continue
                 module, _, kind = name.rpartition(".")
                 target = _resolve_native_target(module)
-                if target is None or kind not in {"weight", "bias", "weight_scale"}:
-                    raise ValueError(f"unsupported Diffusers H3 weight: {name}")
-                if kind == "weight_scale":
-                    # FastVideo stores per-channel scales as [N, 1]; vLLM's
-                    # channel-scale parameter and TP loaders consume [N].
-                    loaded_weight = loaded_weight.squeeze(-1)
-                name, layout = f"{target[0]}.{kind}", target[1]
-            param = params.get(name)
+                if target is not None and kind in {"weight", "bias", "weight_scale", "input_scale"}:
+                    if kind == "weight_scale":
+                        # FastVideo stores per-channel scales as [N, 1]; vLLM's
+                        # channel-scale parameter and TP loaders consume [N].
+                        loaded_weight = loaded_weight.squeeze(-1)
+                    name, layout = f"{target[0]}.{kind}", target[1]
+
+            target_name = name
+            qkv_shard_id = layout if layout in {"q", "k", "v"} else None
+            diffusers_fc1 = layout == "swap_halves"
+            # The ModelOpt checkpoint adapter emits native names that keep the
+            # Diffusers packed-loader route (see the pipeline's
+            # ``remap_checkpoint_key``): ``qkv_proj.to_{q,k,v}.*`` and
+            # ``mlp.fc1.diffusers_*`` with swapped gate/up halves.
+            qkv_match = re.search(r"\.attn\.qkv_proj\.to_([qkv])\.(weight|weight_scale|input_scale)$", name)
+            if qkv_match is not None:
+                qkv_shard_id, suffix = qkv_match.groups()
+                target_name = name[: qkv_match.start()] + f".attn.qkv_proj.{suffix}"
+
+            fc1_match = re.search(r"\.mlp\.fc1\.diffusers_(weight(?:_scale)?)$", name)
+            if fc1_match is not None:
+                diffusers_fc1 = True
+                target_name = name[: fc1_match.start()] + f".mlp.fc1.{fc1_match.group(1)}"
+
+            if diffusers_weights and target is None and target_name == name:
+                raise ValueError(f"unsupported Diffusers H3 weight: {source_name}")
+            param = params.get(target_name)
             if param is None:
                 if diffusers_weights:
-                    raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
-                logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
+                    raise ValueError(f"Diffusers H3 weight has no model parameter: {source_name}")
+                logger.warning("Skipping MiniMax H3 weight not present in model: %s", source_name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if layout in {"q", "k", "v"}:
+            if qkv_shard_id is not None:
                 # vLLM can load each projection directly into its packed QKV
                 # parameter, including TP slicing and online quantization.
-                weight_loader(param, loaded_weight, layout)
-                qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
+                weight_loader(param, loaded_weight, qkv_shard_id)
+                qkv_parts.setdefault(target_name, set()).add(qkv_shard_id)
+            elif target_name.endswith(".attn.qkv_proj.input_scale") or (
+                target_name.endswith(".attn.qkv_proj.weight_scale") and loaded_weight.numel() == 3
+            ):
+                # ModelOpt per-tensor FP8 serializes one scale per Q/K/V shard,
+                # or one shared activation scale after strict QKV amax fusion;
+                # vLLM keeps three logical scale shards until post-load.
+                shards = ("q", "k", "v")
+                scales = loaded_weight.reshape(-1)
+                if scales.numel() not in (1, len(shards)):
+                    raise ValueError(
+                        f"MiniMax H3 fused QKV scale must contain 1 or 3 values, got {tuple(loaded_weight.shape)}"
+                    )
+                shard_scales = scales.expand(len(shards)) if scales.numel() == 1 else scales
+                for shard_id, scale in zip(shards, shard_scales, strict=True):
+                    weight_loader(param, scale, shard_id)
+            elif target_name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
                 # The native checkpoint groups Q/K/V per head for both the
                 # weight and its scale. Transform both before entering vLLM's
                 # loader so each scale stays aligned with its weight rows.
-                if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
+                if target_name.endswith(".weight_scale") and loaded_weight.numel() == 1:
                     weight_loader(param, loaded_weight)
                 else:
                     loaded_weight = _reorder_grouped_qkv_to_qkv(
@@ -1151,7 +1192,7 @@ class MiniMaxH3DiTModel(nn.Module):
                         head_dim=self.arch.attention_head_dim,
                     )
                     weight_loader(param, loaded_weight)
-            elif name.endswith(
+            elif target_name.endswith(
                 (
                     ".attn.qkv_proj.qweight",
                     ".attn.qkv_proj.proj_up",
@@ -1168,7 +1209,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 )
                 weight_loader(param, loaded_weight)
-            elif name.endswith(".attn.qkv_proj.wscales"):
+            elif target_name.endswith(".attn.qkv_proj.wscales"):
                 # E8M0 scales are stored [K // block, N], so reorder their N
                 # axis through the same grouped-QKV permutation.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
@@ -1178,22 +1219,30 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 ).T.contiguous()
                 weight_loader(param, loaded_weight)
-            elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
-                if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
-                    weight_loader(param, loaded_weight)
-                else:
-                    if loaded_weight.shape[0] % 2:
-                        raise ValueError(
-                            "MiniMax H3 fc1 checkpoint rows must split evenly into "
-                            f"gate/up matrices, got {tuple(loaded_weight.shape)}"
-                        )
-                    first, second = loaded_weight.chunk(2, dim=0)
-                    gate, up = (second, first) if layout == "swap_halves" else (first, second)
-                    weight_loader(param, gate, 0)
-                    weight_loader(param, up, 1)
+            elif target_name.endswith(".mlp.fc1.weight_scale") and loaded_weight.numel() == 1:
+                weight_loader(param, loaded_weight)
+            elif target_name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale", ".mlp.fc1.input_scale")):
+                is_weight = target_name.endswith(".weight")
+                is_input_scale = target_name.endswith(".input_scale")
+                values = loaded_weight if is_weight else loaded_weight.reshape(-1)
+                # Per-tensor scales hold one value (shared) or one per gate/up
+                # shard; per-channel scales split by rows like the weight.
+                static_scale = not is_weight and values.numel() in (1, 2)
+                split_size = 2 if static_scale and values.numel() == 1 else values.shape[0]
+                can_split = split_size > 0 and split_size % 2 == 0 and (not is_input_scale or static_scale)
+                if not can_split:
+                    tensor_kind = target_name.rpartition(".")[2]
+                    raise ValueError(
+                        f"MiniMax H3 fused fc1 {tensor_kind} cannot split into gate/up shards: "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                first, second = (values[0], values[-1]) if static_scale else values.chunk(2, dim=0)
+                gate, up = (second, first) if diffusers_fc1 else (first, second)
+                weight_loader(param, gate, 0)
+                weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
-            loaded.add(name)
+            loaded.add(target_name)
         if diffusers_weights:
             for name, parts in qkv_parts.items():
                 if parts != {"q", "k", "v"}:

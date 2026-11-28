@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Serialized AutoRound MXFP4 loading for the MiniMax-H3 text encoder."""
+"""Serialized AutoRound MXFP4 and ModelOpt FP8 loading for the MiniMax-H3 text encoder."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def _mx_quant_config() -> dict[str, object]:
     }
 
 
-def _tiny_qwen3_vl_config() -> Qwen3VLConfig:
+def _tiny_qwen3_vl_config(quant_config: dict[str, object] | None = None) -> Qwen3VLConfig:
     text_config = Qwen3VLTextConfig(
         vocab_size=_VOCAB,
         hidden_size=_HIDDEN,
@@ -109,12 +109,15 @@ def _tiny_qwen3_vl_config() -> Qwen3VLConfig:
         text_config=text_config.to_dict(),
         vision_config=vision_config.to_dict(),
     )
-    setattr(config, "quantization_config", _mx_quant_config())
+    setattr(config, "quantization_config", quant_config or _mx_quant_config())
     return config
 
 
-def _build_encoder(monkeypatch: pytest.MonkeyPatch) -> MiniMaxH3Qwen3VLEncoder:
-    config = _tiny_qwen3_vl_config()
+def _build_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_config: dict[str, object] | None = None,
+) -> MiniMaxH3Qwen3VLEncoder:
+    config = _tiny_qwen3_vl_config(quant_config)
     monkeypatch.setattr(
         Qwen3VLConfig,
         "from_pretrained",
@@ -291,3 +294,83 @@ def test_encoder_rejects_missing_mxfp4_fused_scale_shard(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"qkv_proj\.weight_scale: \['v'\]"):
         encoder.load_weights(weights)
+
+
+def _modelopt_fp8_quant_config() -> dict[str, object]:
+    return {
+        "quant_method": "modelopt",
+        "quant_algo": "FP8_PER_CHANNEL_PER_TOKEN",
+        "ignore": ["model.language_model.layers.0.mlp.down_proj"],
+        "producer": {"name": "modelopt"},
+    }
+
+
+def _fp8_shard(prefix: str, rows: int, columns: int, *, scale: float) -> list[tuple[str, torch.Tensor]]:
+    return [
+        (f"{prefix}.weight", torch.full((rows, columns), 1.0, dtype=torch.float8_e4m3fn)),
+        (f"{prefix}.weight_scale", torch.full((rows,), scale, dtype=torch.float32)),
+    ]
+
+
+def _modelopt_fp8_checkpoint_weights(text_model: nn.Module) -> list[tuple[str, torch.Tensor]]:
+    weights: list[tuple[str, torch.Tensor]] = [
+        ("model.language_model.embed_tokens.weight", torch.zeros(_VOCAB, _HIDDEN, dtype=torch.bfloat16)),
+    ]
+    q_width = _NUM_HEADS * _HEAD_DIM
+    kv_width = _NUM_KV_HEADS * _HEAD_DIM
+    for index in range(len(text_model.layers)):
+        prefix = f"model.language_model.layers.{index}"
+        weights += _fp8_shard(f"{prefix}.self_attn.q_proj", q_width, _HIDDEN, scale=1.0)
+        weights += _fp8_shard(f"{prefix}.self_attn.k_proj", kv_width, _HIDDEN, scale=2.0)
+        weights += _fp8_shard(f"{prefix}.self_attn.v_proj", kv_width, _HIDDEN, scale=3.0)
+        weights += _fp8_shard(f"{prefix}.self_attn.o_proj", _HIDDEN, q_width, scale=4.0)
+        weights += _fp8_shard(f"{prefix}.mlp.gate_proj", _INTERMEDIATE, _HIDDEN, scale=5.0)
+        weights += _fp8_shard(f"{prefix}.mlp.up_proj", _INTERMEDIATE, _HIDDEN, scale=6.0)
+        if index == 0:
+            weights.append(
+                (f"{prefix}.mlp.down_proj.weight", torch.full((_HIDDEN, _INTERMEDIATE), 7.0, dtype=torch.bfloat16))
+            )
+        else:
+            weights += _fp8_shard(f"{prefix}.mlp.down_proj", _HIDDEN, _INTERMEDIATE, scale=8.0)
+        weights += [
+            (f"{prefix}.self_attn.q_norm.weight", torch.zeros(_HEAD_DIM, dtype=torch.bfloat16)),
+            (f"{prefix}.self_attn.k_norm.weight", torch.zeros(_HEAD_DIM, dtype=torch.bfloat16)),
+            (f"{prefix}.input_layernorm.weight", torch.zeros(_HIDDEN, dtype=torch.bfloat16)),
+            (f"{prefix}.post_attention_layernorm.weight", torch.zeros(_HIDDEN, dtype=torch.bfloat16)),
+        ]
+    return weights
+
+
+def test_modelopt_fp8_encoder_keeps_serialized_fp8_state(monkeypatch):
+    encoder = _build_encoder(monkeypatch, _modelopt_fp8_quant_config())
+    assert encoder.quant_config.get_name() == "modelopt"
+
+    # Construction must not upcast serialized FP8 weights or their FP32 scales
+    # while casting the remaining encoder state to BF16.
+    layer = encoder.text_model.layers[1]
+    for linear in (layer.self_attn.qkv_proj, layer.self_attn.o_proj, layer.mlp.gate_up_proj, layer.mlp.down_proj):
+        assert linear.weight.dtype == torch.float8_e4m3fn
+        assert linear.weight_scale.dtype == torch.float32
+    bf16_down = encoder.text_model.layers[0].mlp.down_proj
+    assert isinstance(bf16_down.quant_method, UnquantizedLinearMethod)
+    assert bf16_down.weight.dtype == torch.bfloat16
+    assert layer.input_layernorm.weight.dtype == torch.bfloat16
+
+    loaded = encoder.load_weights(_modelopt_fp8_checkpoint_weights(encoder.text_model))
+    assert loaded == set(dict(encoder.named_parameters()))
+
+    q_width = _NUM_HEADS * _HEAD_DIM
+    kv_width = _NUM_KV_HEADS * _HEAD_DIM
+    expected_qkv_scale = torch.cat(
+        (torch.full((q_width,), 1.0), torch.full((kv_width,), 2.0), torch.full((kv_width,), 3.0))
+    )
+    torch.testing.assert_close(layer.self_attn.qkv_proj.weight_scale.flatten(), expected_qkv_scale, rtol=0, atol=0)
+    expected_gate_up_scale = torch.cat((torch.full((_INTERMEDIATE,), 5.0), torch.full((_INTERMEDIATE,), 6.0)))
+    torch.testing.assert_close(layer.mlp.gate_up_proj.weight_scale.flatten(), expected_gate_up_scale, rtol=0, atol=0)
+    torch.testing.assert_close(layer.mlp.down_proj.weight_scale.flatten(), torch.full((_HIDDEN,), 8.0), rtol=0, atol=0)
+    torch.testing.assert_close(
+        bf16_down.weight,
+        torch.full((_HIDDEN, _INTERMEDIATE), 7.0, dtype=torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
