@@ -731,7 +731,7 @@ class HeliosPipeline(
         state = states[0]
         cache = state.extra.get("helios_conditioning_cache")
         if cache is None:
-            cache = HeliosConditioningCache(state.request_id)
+            cache = HeliosConditioningCache(state.request_id, immutable_accelerator_sources=True)
             state.extra["helios_conditioning_cache"] = cache
         try:
             with cache.activate():
