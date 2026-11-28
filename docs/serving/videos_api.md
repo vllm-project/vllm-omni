@@ -157,6 +157,10 @@ and content endpoints return 404. A record may remain visible between its
 `expires_at` timestamp and the next sweep. If file deletion fails, its metadata
 is retained and deletion is retried on a later sweep.
 
+The sweeper expires an artifact using the object's `last_modified` timestamp when
+the storage backend exposes one, and otherwise falls back to reading `expires_at`
+from the job record.
+
 ## Examples
 
 ### Image-to-Video
@@ -706,8 +710,55 @@ stored:
 export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
 
+Two object families live under that root:
+
+```
+artifacts/{video_id}        # the generated video payload
+meta/{video_id}.json        # the job record (status, created_at, expires_at, ...)
+```
+
+Because the job record is persisted, `GET /v1/videos/{video_id}` and
+`GET /v1/videos` keep returning jobs after a server restart. Jobs that were still
+`queued`/`in_progress` when the previous process exited are reported as `failed`
+on startup, and any partially written artifact for them is removed.
+
+That recovery is destructive, so **one API process owns a storage root at a
+time**. The process keeps an `.owner` lease record in the store and refreshes it
+while serving; a second process pointed at the same root refuses to run the
+destructive recovery (it logs an error and leaves the live jobs untouched). The
+lease is handed back on shutdown, and a lease left behind by a killed process is
+taken over once its heartbeat is 90 seconds old — the second process retries in
+the background, so interrupted jobs are still recovered without another restart.
+While a process does not own the root it rejects `POST /v1/videos` with `503`
+instead of writing jobs that the owner's recovery would later treat as
+interrupted, and recovery never fails a job whose generation is still running in
+the process. Multi-replica deployments must give each replica its own storage
+root.
+
 > `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
 > use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
+
+### S3-compatible object storage
+
+```bash
+export VLLM_OMNI_SERVER_STORAGE__TYPE=s3
+export VLLM_OMNI_SERVER_STORAGE__BUCKET=vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__REGION=us-east-1
+# MinIO / self-hosted S3-compatible endpoint; omit for AWS S3.
+export VLLM_OMNI_SERVER_STORAGE__ENDPOINT_URL=http://minio:9000
+export VLLM_OMNI_SERVER_STORAGE__PREFIX=omni
+# Redirect /v1/videos/{id}/content to a presigned URL (default), or stream the
+# artifact through the API server instead.
+export VLLM_OMNI_SERVER_STORAGE__PRESIGN=true
+export VLLM_OMNI_SERVER_STORAGE__PRESIGN_EXPIRES=3600
+export VLLM_OMNI_SERVER_STORAGE__PROXY=false
+```
+
+Credentials are never part of the server configuration: the standard provider
+chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, IAM
+roles) is used. With presigning enabled, `/v1/videos/{id}/content` answers with a
+302 redirect to the object store; `VLLM_OMNI_SERVER_STORAGE__PROXY=true` keeps the
+bytes flowing through the API server instead.
 
 ## Model-Specific Examples
 

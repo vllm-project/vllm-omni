@@ -2,14 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import time
+from collections.abc import Iterable
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol.videos import VideoResponse
+from vllm_omni.entrypoints.openai.protocol.videos import VideoError, VideoGenerationStatus, VideoResponse
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+from vllm_omni.entrypoints.openai.storage.base import StorageBackend
+from vllm_omni.entrypoints.openai.video.paths import lidar_storage_key
+
+logger = init_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 U = TypeVar("U")
+
+ORPHANED_JOB_MESSAGE = "The server restarted before this job finished; please submit the request again."
 
 
 class TaskRegistry:
@@ -20,6 +30,11 @@ class TaskRegistry:
     async def get(self, key: str) -> asyncio.Task[None] | None:
         async with self._lock:
             return self._tasks.get(key)
+
+    async def keys(self) -> list[str]:
+        """Jobs whose generation task is still running in this process."""
+        async with self._lock:
+            return list(self._tasks)
 
     async def pop(self, key: str) -> asyncio.Task[None] | None:
         async with self._lock:
@@ -77,6 +92,199 @@ class AsyncDictStore(Generic[T]):
         async with self._lock:
             return list(self._items.values())
 
+    async def reconcile_orphans(self) -> list[str]:
+        """Fail records that a previous process left unfinished.
 
-VIDEO_STORE: AsyncDictStore[VideoResponse] = AsyncDictStore()
+        Stores that persist their items override this; the in-memory store has
+        nothing that can outlive the process, so it is a no-op.
+        """
+        return []
+
+
+class VideoStore(AsyncDictStore[VideoResponse]):
+    """Video job records, mirrored into the storage backend's record layer.
+
+    The in-memory copy is the read/write path for the running server; every
+    mutation is also written through to ``meta/{video_id}.json`` so that job
+    metadata (and therefore ``GET /v1/videos/{id}``) survives a restart.
+
+    Persistence is best-effort: a failing record write must not break video
+    generation, so errors are logged and the in-memory record stays
+    authoritative for this process.
+    """
+
+    def __init__(self, backend: StorageBackend | None = None) -> None:
+        super().__init__()
+        self._backend = backend
+        self._loaded = False
+
+    async def upsert(self, key: str, value: VideoResponse) -> None:
+        await super().upsert(key, value)
+        await self._persist_best_effort(key, value)
+
+    async def update_fields(
+        self,
+        key: str,
+        updates: dict[str, Any],
+        *,
+        durable: bool = False,
+    ) -> VideoResponse | None:
+        """Apply ``updates``, optionally publishing them only once durable.
+
+        ``durable=True`` is used for terminal states: the record is written
+        first and the in-memory copy is published only if that write succeeds,
+        so an acknowledged completion cannot be lost by a later restart.
+        """
+        if not durable:
+            item = await super().update_fields(key, updates)
+            if item is not None:
+                await self._persist_best_effort(key, item)
+            return item
+
+        async with self._lock:
+            current = self._items.get(key)
+            if current is None:
+                return None
+            item = current.model_copy(update=updates)
+            await self._persist(key, item)
+            self._items[key] = item
+            return item
+
+    async def pop(self, key: str) -> VideoResponse | None:
+        item = await super().pop(key)
+        if self._backend is not None:
+            try:
+                await self._backend.record_pop(key)
+            except Exception:
+                logger.warning("Failed to drop job record for %s", key, exc_info=True)
+        return item
+
+    async def get(self, key: str) -> VideoResponse | None:
+        item = await super().get(key)
+        if item is not None or self._backend is None:
+            return item
+        return await self._load_one(key)
+
+    async def load(self, *, attempts: int = 3, retry_delay: float = 0.1) -> int:
+        """Warm the in-memory store from persisted job records.
+
+        Records whose read fails are retried: a job that is skipped here would
+        otherwise look `in_progress` forever, because startup reconciliation
+        only visits jobs that made it into memory.
+        """
+        if self._backend is None or self._loaded:
+            return 0
+
+        try:
+            keys = await self._backend.record_keys()
+        except Exception:
+            logger.warning("Failed to enumerate persisted job records", exc_info=True)
+            return 0
+        self._loaded = True
+
+        loaded = 0
+        pending = keys
+        for attempt in range(1, attempts + 1):
+            retry: list[str] = []
+            for key in pending:
+                item, failed = await self._try_load_one(key)
+                if item is not None:
+                    loaded += 1
+                elif failed:
+                    retry.append(key)
+            pending = retry
+            if not pending:
+                break
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay)
+
+        if loaded:
+            logger.info("Recovered %d video job record(s) from storage", loaded)
+        if pending:
+            logger.warning(
+                "Could not load %d job record(s) at startup; they stay in progress until the next restart: %s",
+                len(pending),
+                pending,
+            )
+        return loaded
+
+    async def reconcile_orphans(self, *, skip: Iterable[str] = ()) -> list[str]:
+        """Fail jobs that were interrupted by a restart.
+
+        A ``queued``/``in_progress`` record can only linger after the owning
+        process died: nothing will ever finish it, so it is marked ``failed``
+        instead of looking stuck forever. ``skip`` lists jobs this process is
+        still generating — they are live, not interrupted, whatever the durable
+        record says.
+        """
+        await self.load()
+        live = set(skip)
+        orphans = [
+            job
+            for job in await self.list_values()
+            if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS) and job.id not in live
+        ]
+        for job in orphans:
+            # The artifact of an interrupted job can only be partial; the
+            # record survives as history, the payload does not.
+            if self._backend is not None:
+                for storage_key in (job.id, lidar_storage_key(job.id)):
+                    try:
+                        await self._backend.delete_artifact(storage_key)
+                    except Exception:
+                        logger.warning("Failed to remove interrupted artifact for %s", storage_key, exc_info=True)
+            await self.update_fields(
+                job.id,
+                {
+                    "status": VideoGenerationStatus.FAILED,
+                    "completed_at": int(time.time()),
+                    "error": VideoError(code=500, message=ORPHANED_JOB_MESSAGE),
+                },
+            )
+        if orphans:
+            logger.warning("Marked %d interrupted video job(s) as failed after restart", len(orphans))
+        return [job.id for job in orphans]
+
+    async def _load_one(self, key: str) -> VideoResponse | None:
+        item, _ = await self._try_load_one(key)
+        return item
+
+    async def _try_load_one(self, key: str) -> tuple[VideoResponse | None, bool]:
+        """Load one record; ``failed`` marks a read error worth retrying.
+
+        An absent or unparsable record is not retryable: it will not improve.
+        """
+        if self._backend is None:
+            return None, False
+        try:
+            data = await self._backend.record_get(key)
+        except Exception:
+            logger.warning("Failed to read job record for %s", key, exc_info=True)
+            return None, True
+        if data is None:
+            return None, False
+        try:
+            item = VideoResponse.model_validate_json(data)
+        except ValidationError:
+            logger.warning("Discarding unreadable job record for %s", key, exc_info=True)
+            return None, False
+        async with self._lock:
+            self._items.setdefault(key, item)
+        return item, False
+
+    async def _persist(self, key: str, item: VideoResponse) -> None:
+        """Write the record through; raises when the backend rejects the write."""
+        if self._backend is None:
+            return
+        await self._backend.record_set(key, item.model_dump_json().encode())
+
+    async def _persist_best_effort(self, key: str, item: VideoResponse) -> None:
+        """Write the record through, logging instead of raising on failure."""
+        try:
+            await self._persist(key, item)
+        except Exception:
+            logger.warning("Failed to persist job record for %s", key, exc_info=True)
+
+
+VIDEO_STORE: VideoStore = VideoStore(STORAGE_MANAGER)
 VIDEO_TASKS: TaskRegistry = TaskRegistry()

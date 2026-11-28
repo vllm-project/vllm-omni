@@ -1,229 +1,342 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
-Unit tests for the OpenAI video storage managers.
+Unit tests for the OpenAI video storage backend.
 """
 
 import asyncio
+import json
 import os
 import time
+from types import SimpleNamespace
 
+import opendal
 import pytest
 
-from vllm_omni.entrypoints.openai import storage as storage_module
-from vllm_omni.entrypoints.openai.protocol.videos import VideoResponse
-from vllm_omni.entrypoints.openai.storage import FileStorageHandle, LocalStorageManager, LocalStorageTTLManager
-from vllm_omni.entrypoints.openai.stores import AsyncDictStore
+from tests.entrypoints.openai_api.storage_test_utils import build_file_storage, build_memory_storage
+from vllm_omni.entrypoints.openai.storage import (
+    FileStorageHandle,
+    OpenDALBackend,
+    SaveContext,
+    StreamStorageHandle,
+    SweepStrategy,
+    UrlStorageHandle,
+)
+from vllm_omni.entrypoints.openai.storage import opendal_backend as backend_module
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_local_storage_open_returns_file_handle_for_saved_key(tmp_path):
-    storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
-    save_context = asyncio.run(storage.save(b"video-bytes", "video-123"))
+def test_open_returns_file_handle_for_saved_key(tmp_path):
+    storage = build_file_storage(tmp_path)
+    save_context = asyncio.run(storage.save("video-123", b"video-bytes"))
 
     handle = asyncio.run(storage.open(save_context.key))
 
     assert isinstance(handle, FileStorageHandle)
-    assert handle.path == os.path.join(storage.storage_path, "video-123")
+    assert handle.path == os.path.join(storage.storage_path, "artifacts", "video-123")
     with open(handle.path, "rb") as file:
         assert file.read() == b"video-bytes"
 
 
-def test_local_storage_open_returns_none_for_missing_key(tmp_path):
-    storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
+def test_open_returns_none_for_missing_key(tmp_path):
+    storage = build_file_storage(tmp_path)
 
-    handle = asyncio.run(storage.open("missing-video"))
-
-    assert handle is None
+    assert asyncio.run(storage.open("missing-video")) is None
 
 
-@pytest.mark.parametrize("key", ["../outside", "../storage-sibling/file", "/etc/passwd", "", "."])
-def test_local_storage_rejects_keys_outside_storage_dir(tmp_path, key):
-    storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
+def test_delete_removes_artifact_and_record(tmp_path):
+    storage = build_file_storage(tmp_path, default_ttl=60, sweep_interval=300)
+    save_context = asyncio.run(storage.save("video-delete", b"video-bytes"))
+    assert asyncio.run(storage.record_get(save_context.key)) is not None
+
+    assert asyncio.run(storage.delete(save_context.key)) is True
+    assert asyncio.run(storage.open(save_context.key)) is None
+    assert asyncio.run(storage.record_get(save_context.key)) is None
+    # Idempotent: the second delete reports that nothing was removed.
+    assert asyncio.run(storage.delete(save_context.key)) is False
+
+
+def test_delete_artifact_keeps_the_record(tmp_path):
+    storage = build_file_storage(tmp_path, default_ttl=60, sweep_interval=300)
+    asyncio.run(storage.save("video-delete", b"video-bytes"))
+
+    assert asyncio.run(storage.delete_artifact("video-delete")) is True
+
+    assert asyncio.run(storage.open("video-delete")) is None
+    assert asyncio.run(storage.record_get("video-delete")) is not None
+    assert asyncio.run(storage.delete_artifact("video-delete")) is False
+
+
+@pytest.mark.parametrize("key", ["../escape", "a/../../b", "/absolute", "", "trailing/"])
+def test_invalid_keys_are_rejected(tmp_path, key):
+    storage = build_file_storage(tmp_path)
 
     with pytest.raises(ValueError, match="Illegal storage key"):
-        storage.get_full_file_path(key)
-    with pytest.raises(ValueError, match="Illegal storage key"):
-        asyncio.run(storage.open(key))
+        asyncio.run(storage.save(key, b"video-bytes"))
 
 
-def test_local_storage_ttl_save_sets_expiration_metadata(tmp_path, monkeypatch):
-    storage = LocalStorageTTLManager(
-        storage_path=str(tmp_path / "storage"),
-        max_concurrency=1,
-        ttl_seconds=60,
-        sweep_interval_seconds=300,
-    )
-    monkeypatch.setattr(storage_module.time, "time", lambda: 1_700_000_000)
+def test_iter_chunks_streams_artifact(tmp_path):
+    storage = build_file_storage(tmp_path)
+    asyncio.run(storage.save("video-chunks", b"0123456789"))
 
-    save_context = asyncio.run(storage.save(b"video-bytes", "video-ttl"))
+    async def collect():
+        return [chunk async for chunk in storage.iter_chunks("video-chunks", chunk_size=4)]
+
+    assert asyncio.run(collect()) == [b"0123", b"4567", b"89"]
+
+
+def test_save_with_ttl_sets_expiration_and_records_it(tmp_path, monkeypatch):
+    storage = build_file_storage(tmp_path, default_ttl=60, sweep_interval=300)
+    monkeypatch.setattr(backend_module.time, "time", lambda: 1_700_000_000)
+
+    save_context = asyncio.run(storage.save("video-ttl", b"video-bytes"))
 
     assert save_context.key == "video-ttl"
+    assert isinstance(save_context, SaveContext)
     assert save_context.created_at == 1_700_000_000
     assert save_context.expires_at == 1_700_000_060
+    record = json.loads(asyncio.run(storage.record_get("video-ttl")))
+    assert record == {"expires_at": 1_700_000_060}
 
 
-def test_local_storage_ttl_sweeper_removes_expired_file(tmp_path):
-    storage = LocalStorageTTLManager(
-        storage_path=str(tmp_path / "storage"),
-        max_concurrency=1,
-        ttl_seconds=1,
-        sweep_interval_seconds=60,
-    )
+def test_save_merges_ttl_into_existing_record(tmp_path, monkeypatch):
+    storage = build_file_storage(tmp_path, default_ttl=60, sweep_interval=300)
+    monkeypatch.setattr(backend_module.time, "time", lambda: 1_700_000_000)
+    asyncio.run(storage.record_set("video-record", b'{"id": "video-record", "status": "in_progress"}'))
 
-    async def setup_file() -> tuple[str, str]:
-        save_context = await storage.save(b"video-bytes", "video-expired")
-        file_path = storage.get_full_file_path(save_context.key)
-        return save_context.key, file_path
+    asyncio.run(storage.save("video-record", b"video-bytes"))
 
-    storage_key, file_path = asyncio.run(setup_file())
-    expired_mtime = time.time() - 10
-    os.utime(file_path, (expired_mtime, expired_mtime))
-    assert os.path.exists(file_path)
-
-    deleted = asyncio.run(storage._sweep_once(time.time() - 1))
-
-    assert deleted == 1
-    assert not os.path.exists(file_path)
-    assert asyncio.run(storage.open(storage_key)) is None
+    record = json.loads(asyncio.run(storage.record_get("video-record")))
+    assert record == {"id": "video-record", "status": "in_progress", "expires_at": 1_700_000_060}
 
 
-def test_local_storage_ttl_sweeper_keeps_files_when_path_missing(tmp_path):
-    storage = LocalStorageTTLManager(
-        storage_path=str(tmp_path / "storage"),
-        max_concurrency=1,
-        ttl_seconds=1,
-        sweep_interval_seconds=60,
-    )
+def test_records_roundtrip_and_pop(tmp_path):
+    storage = build_file_storage(tmp_path)
 
-    missing_path = storage.get_full_file_path("video-missing")
-    assert not os.path.exists(missing_path)
+    async def scenario():
+        await storage.record_set("a", b"{}")
+        await storage.record_set("b", b"{}")
+        keys = await storage.record_keys()
+        popped = await storage.record_pop("a")
+        return keys, popped, await storage.record_pop("a"), await storage.record_keys()
 
-    deleted = asyncio.run(storage._sweep_once(time.time() - 1))
+    keys, popped, popped_again, remaining = asyncio.run(scenario())
+    assert keys == ["a", "b"]
+    assert popped == b"{}"
+    assert popped_again is None
+    assert remaining == ["b"]
 
-    assert deleted == 0
-    assert not os.path.exists(missing_path)
+
+def test_ttl_requires_a_sweep_interval(tmp_path):
+    with pytest.raises(ValueError, match="sweep_interval"):
+        build_file_storage(tmp_path, default_ttl=60)
 
 
-@pytest.mark.asyncio
-async def test_local_storage_ttl_start_reports_only_successfully_deleted_keys(tmp_path, monkeypatch):
-    storage = LocalStorageTTLManager(
-        storage_path=str(tmp_path / "storage"),
-        ttl_seconds=60,
-        sweep_interval_seconds=60,
-    )
-    expired_keys = {"video-expired-1", "video-expired-2"}
-    failed_key, missing_key, recent_key = "video-failed", "video-missing", "video-recent"
-    for key in [*expired_keys, failed_key, missing_key, recent_key]:
-        await storage.save(b"video-bytes", key)
-        if key != recent_key:
-            path = storage.get_full_file_path(key)
-            expired_mtime = time.time() - 120
-            os.utime(path, (expired_mtime, expired_mtime))
-    storage_path = tmp_path / "storage"
-    (storage_path / "directory").mkdir()
-    target = tmp_path / "outside-video"
-    target.write_bytes(b"keep-outside-video")
-    (storage_path / "symlink").symlink_to(target)
-    expired_mtime = time.time() - 120
-    for path in [storage_path / "directory", target, storage_path / "symlink"]:
-        os.utime(path, (expired_mtime, expired_mtime), follow_symlinks=False)
+def test_ttl_sweeper_removes_expired_artifacts_by_last_modified(tmp_path):
+    storage = build_file_storage(tmp_path, default_ttl=1, sweep_interval=60)
+    asyncio.run(storage.save("video-expired", b"video-bytes"))
+    asyncio.run(storage.save("video-fresh", b"video-bytes"))
+    stale = time.time() - 10
+    os.utime(storage.get_full_file_path("video-expired"), (stale, stale))
 
-    remove = storage_module.os.remove
+    assert asyncio.run(storage.sweeper.strategy()) is SweepStrategy.LAST_MODIFIED
+    assert asyncio.run(storage.sweeper.sweep_once()) == 1
 
-    def remove_with_failures(path):
-        if path == storage.get_full_file_path(failed_key):
-            raise PermissionError("Cannot delete this artifact")
-        remove(path)
-        if path == storage.get_full_file_path(missing_key):
-            raise FileNotFoundError("Artifact disappeared before deletion")
+    assert asyncio.run(storage.open("video-expired")) is None
+    assert asyncio.run(storage.record_get("video-expired")) is None
+    assert asyncio.run(storage.open("video-fresh")) is not None
 
-    monkeypatch.setattr(storage_module.os, "remove", remove_with_failures)
-    batches: list[list[str]] = []
-    notified, release_callback, swept = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    sweep_results: list[int] = []
-    sweep_once = storage._sweep_once
 
-    async def observe_sweep(cutoff):
-        result = await sweep_once(cutoff)
-        sweep_results.append(result)
-        swept.set()
-        return result
+def test_ttl_sweeper_keeps_artifacts_that_have_not_expired(tmp_path):
+    storage = build_file_storage(tmp_path, default_ttl=60, sweep_interval=60)
+    asyncio.run(storage.save("video-fresh", b"video-bytes"))
 
-    async def on_expire(keys):
-        batches.append(keys)
-        notified.set()
-        await release_callback.wait()
+    assert asyncio.run(storage.sweeper.sweep_once()) == 0
+    assert asyncio.run(storage.open("video-fresh")) is not None
 
-    monkeypatch.setattr(storage, "_sweep_once", observe_sweep)
-    await storage.start(on_expire=on_expire)
+
+def test_ttl_sweeper_falls_back_to_record_expiry_without_last_modified():
+    storage = build_memory_storage(default_ttl=60, sweep_interval=60)
+    asyncio.run(storage.save("video-expired", b"video-bytes"))
+    asyncio.run(storage.save("video-fresh", b"video-bytes"))
+    record = json.loads(asyncio.run(storage.record_get("video-expired")))
+    record["expires_at"] = int(time.time()) - 1
+    asyncio.run(storage.record_set("video-expired", json.dumps(record).encode()))
+
+    assert asyncio.run(storage.sweeper.strategy()) is SweepStrategy.RECORD_EXPIRES_AT
+    assert asyncio.run(storage.sweeper.sweep_once()) == 1
+
+    async def remaining():
+        return [key async for key, _ in storage.list_artifacts()]
+
+    assert asyncio.run(remaining()) == ["video-fresh"]
+    assert asyncio.run(storage.record_get("video-expired")) is None
+
+
+def test_ttl_sweeper_skips_backends_without_listing():
+    class _NoListBackend(OpenDALBackend):
+        # e.g. redis: objects expire through a native default_ttl instead.
+        @property
+        def supports_list(self) -> bool:
+            return False
+
+    storage = _NoListBackend(opendal.AsyncOperator("memory"), default_ttl=60, sweep_interval=60)
+
+    assert asyncio.run(storage.sweeper.strategy()) is SweepStrategy.NATIVE_TTL
+    assert asyncio.run(storage.sweeper.sweep_once()) == 0
+
+
+def test_ttl_sweeper_notifies_on_expire(tmp_path):
+    storage = build_file_storage(tmp_path, default_ttl=1, sweep_interval=60)
+    expired: list[str] = []
+
+    async def on_expire(keys: list[str]) -> None:
+        expired.extend(keys)
+
+    asyncio.run(storage.start(on_expire=on_expire))
     try:
-        await asyncio.wait_for(notified.wait(), timeout=5)
-        assert len(batches) == 1
-        assert set(batches[0]) == expired_keys
-        assert not swept.is_set(), "The sweep must await its expiration callback"
-        release_callback.set()
-        await asyncio.wait_for(swept.wait(), timeout=5)
-        assert sweep_results == [2]
-        assert await sweep_once(time.time() - 60) == 0
-        assert len(batches) == 1
-        assert all(not storage.exists(key) for key in expired_keys)
-        assert storage.exists(failed_key)
-        assert not storage.exists(missing_key)
-        assert storage.exists(recent_key)
-        assert (storage_path / "directory").is_dir()
-        assert (storage_path / "symlink").is_symlink()
-        assert target.read_bytes() == b"keep-outside-video"
+        asyncio.run(storage.save("video-expired", b"video-bytes"))
+        asyncio.run(storage.save("video-fresh", b"video-bytes"))
+        stale = time.time() - 10
+        os.utime(storage.get_full_file_path("video-expired"), (stale, stale))
+
+        assert asyncio.run(storage.sweeper.sweep_once()) == 1
     finally:
-        release_callback.set()
-        await storage.stop()
+        asyncio.run(storage.stop())
+
+    assert expired == ["video-expired"]
 
 
-@pytest.mark.asyncio
-async def test_local_storage_ttl_start_stop_and_restart(tmp_path):
-    storage = LocalStorageTTLManager(
-        storage_path=str(tmp_path / "storage"),
-        ttl_seconds=1,
-        sweep_interval_seconds=60,
+def test_ttl_sweeper_survives_a_failing_on_expire(tmp_path):
+    storage = build_file_storage(tmp_path, default_ttl=1, sweep_interval=60)
+
+    async def on_expire(keys: list[str]) -> None:
+        raise RuntimeError("handler broke")
+
+    asyncio.run(storage.start(on_expire=on_expire))
+    try:
+        asyncio.run(storage.save("video-expired", b"video-bytes"))
+        stale = time.time() - 10
+        os.utime(storage.get_full_file_path("video-expired"), (stale, stale))
+
+        # The artifact is gone and the sweep keeps going even if the handler fails.
+        assert asyncio.run(storage.sweeper.sweep_once()) == 1
+        assert asyncio.run(storage.open("video-expired")) is None
+    finally:
+        asyncio.run(storage.stop())
+
+
+class _StubOperator:
+    """Minimal OpenDAL operator stub for the presigned-download path."""
+
+    def __init__(self, *, presign: bool) -> None:
+        self._presign = presign
+
+    def capability(self):
+        return type("Capability", (), {"list": True, "presign": self._presign})()
+
+    async def stat(self, path):
+        return type("Metadata", (), {"is_file": True})()
+
+    async def presign_read(self, path, expire_second):
+        # OpenDAL hands back a PresignedRequest, not a bare URL string.
+        return SimpleNamespace(url=f"https://objects.example/{path}?expires={expire_second}")
+
+
+def test_open_returns_presigned_url_when_supported():
+    backend = OpenDALBackend(_StubOperator(presign=True), presign=True, presign_expires=120)
+
+    handle = asyncio.run(backend.open("video-id"))
+
+    assert isinstance(handle, UrlStorageHandle)
+    assert handle.url == "https://objects.example/artifacts/video-id?expires=120"
+
+
+def test_open_falls_back_to_streaming_when_proxied():
+    backend = OpenDALBackend(_StubOperator(presign=True), presign=True, proxy=True)
+
+    assert isinstance(asyncio.run(backend.open("video-id")), StreamStorageHandle)
+
+
+def test_open_falls_back_to_streaming_when_presign_is_disabled():
+    backend = OpenDALBackend(_StubOperator(presign=True), presign=False)
+
+    assert isinstance(asyncio.run(backend.open("video-id")), StreamStorageHandle)
+
+
+def test_open_falls_back_to_streaming_when_backend_cannot_presign():
+    backend = OpenDALBackend(_StubOperator(presign=False), presign=True)
+
+    assert isinstance(asyncio.run(backend.open("video-id")), StreamStorageHandle)
+
+
+class _RecordingOperator:
+    """Operator stub that records write keywords."""
+
+    def __init__(self, *, object_metadata: bool) -> None:
+        self._object_metadata = object_metadata
+        self.write_kwargs: list[dict] = []
+
+    def capability(self):
+        return type(
+            "Capability",
+            (),
+            {
+                "list": True,
+                "presign": False,
+                "write_with_content_type": self._object_metadata,
+                "write_with_content_disposition": self._object_metadata,
+            },
+        )()
+
+    async def write(self, path, data, **kwargs):
+        self.write_kwargs.append(kwargs)
+
+
+def test_payload_metadata_is_stored_when_supported():
+    operator = _RecordingOperator(object_metadata=True)
+    backend = OpenDALBackend(operator)
+
+    asyncio.run(
+        backend.save(
+            "video-id",
+            b"video-bytes",
+            content_type="video/mp4",
+            content_disposition='attachment; filename="video-id.mp4"',
+        )
     )
-    batches: list[tuple[int, list[str]]] = []
-    await storage.stop()
-    for generation in range(2):
-        key = f"video-generation-{generation}"
-        await storage.save(b"video-bytes", key)
-        expired_mtime = time.time() - 10
-        os.utime(storage.get_full_file_path(key), (expired_mtime, expired_mtime))
-        notified = asyncio.Event()
 
-        async def on_expire(keys):
-            batches.append((generation, keys))
-            notified.set()
-
-        await storage.start(on_expire=on_expire)
-        task = storage._sweeper_task
-        try:
-            await storage.start()
-            assert storage._sweeper_task is task
-            await asyncio.wait_for(notified.wait(), timeout=5)
-            assert batches[-1] == (generation, [key])
-        finally:
-            await storage.stop()
-        assert task is not None and task.cancelled()
-        assert storage._sweeper_task is None
-        await storage.stop()
-    assert len(batches) == 2
+    assert operator.write_kwargs[0] == {
+        "content_type": "video/mp4",
+        "content_disposition": 'attachment; filename="video-id.mp4"',
+    }
 
 
-@pytest.mark.asyncio
-async def test_async_dict_store_remove_many_preserves_unrelated_items():
-    store: AsyncDictStore[VideoResponse] = AsyncDictStore()
-    expired = VideoResponse(model="test-model", prompt="Expired video")
-    retained = VideoResponse(model="test-model", prompt="Retained video")
-    await store.upsert(expired.id, expired)
-    await store.upsert(retained.id, retained)
+def test_payload_metadata_is_dropped_when_unsupported():
+    operator = _RecordingOperator(object_metadata=False)
+    backend = OpenDALBackend(operator)
 
-    await store.remove_many([expired.id, "missing-video", expired.id])
+    asyncio.run(
+        backend.save(
+            "video-id",
+            b"video-bytes",
+            content_type="video/mp4",
+            content_disposition='attachment; filename="video-id.mp4"',
+        )
+    )
 
-    assert await store.get(expired.id) is None
-    assert await store.list_values() == [retained]
+    assert operator.write_kwargs[0] == {}
+
+
+def test_storage_path_can_be_repointed(tmp_path):
+    storage = build_file_storage(tmp_path)
+    asyncio.run(storage.save("video-1", b"video-bytes"))
+
+    other_root = tmp_path / "other"
+    storage.storage_path = str(other_root)
+
+    assert asyncio.run(storage.open("video-1")) is None
+    asyncio.run(storage.save("video-2", b"video-bytes"))
+    assert os.path.exists(os.path.join(str(other_root), "artifacts", "video-2"))
