@@ -270,6 +270,7 @@ class OmniPlatform(Platform):
     def init_diffusion_worker_vllm_config(
         cls,
         vllm_config: Any,
+        od_config: Any = None,
     ) -> None:
         """Initialize platform-specific state for diffusion worker VllmConfig."""
         return None

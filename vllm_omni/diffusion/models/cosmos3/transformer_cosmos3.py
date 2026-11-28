@@ -2151,6 +2151,7 @@ class Cosmos3VFMTransformer(nn.Module):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        action_timesteps: torch.Tensor | None = None,
         action_start_frame_offset: int = 1,
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
@@ -2177,6 +2178,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 action_latents=action_latents,
                 action_domain_ids=action_domain_ids,
                 action_noisy_mask=action_noisy_mask,
+                action_timesteps=action_timesteps,
                 action_start_frame_offset=action_start_frame_offset,
                 action_fps=action_fps,
                 sound_latents=sound_latents,
@@ -2304,6 +2306,7 @@ class Cosmos3VFMTransformer(nn.Module):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        action_timesteps: torch.Tensor | None = None,
         action_start_frame_offset: int = 1,
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
@@ -2340,6 +2343,9 @@ class Cosmos3VFMTransformer(nn.Module):
             Packed GEN inputs and metadata consumed by the shared execution and
             postprocessing helpers.
         """
+        hidden_states = hidden_states.to(self.proj_in.weight.dtype)
+        if action_latents is not None:
+            action_latents = action_latents.to(self.action_modality_embed.dtype)
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)
@@ -2523,8 +2529,18 @@ class Cosmos3VFMTransformer(nn.Module):
                 hidden_video = hidden_video + time_embed.unsqueeze(1)
 
             if hidden_action is not None:
+                action_time_embed = time_embed.unsqueeze(1)
+                if action_timesteps is not None:
+                    if action_timesteps.shape != hidden_action.shape[:2]:
+                        raise ValueError("action_timesteps must have shape [B, T_action]")
+                    with torch.autocast(current_omni_platform.device_type, enabled=False):
+                        action_time_embed = (
+                            self.time_embedder((action_timesteps.reshape(-1) * self.timestep_scale).float())
+                            .reshape(*hidden_action.shape[:2], -1)
+                            .to(hidden_action.dtype)
+                        )
                 if action_noisy_mask is None:
-                    hidden_action = hidden_action + time_embed.unsqueeze(1)
+                    hidden_action = hidden_action + action_time_embed
                 else:
                     if action_noisy_mask.shape != (hidden_action.shape[0], hidden_action.shape[1], 1):
                         raise ValueError(
@@ -2532,7 +2548,7 @@ class Cosmos3VFMTransformer(nn.Module):
                             f"got {tuple(action_noisy_mask.shape)}."
                         )
                     action_noisy_mask = action_noisy_mask.to(dtype=hidden_action.dtype, device=hidden_action.device)
-                    hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask
+                    hidden_action = hidden_action + action_time_embed * action_noisy_mask
 
             if hidden_sound is not None:
                 hidden_sound = hidden_sound + time_embed.unsqueeze(1)

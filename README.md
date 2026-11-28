@@ -117,3 +117,7 @@ Feel free to ask questions, provide feedbacks and discuss with fellow users of v
 ## License
 
 Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
+
+## Cosmos3-Edge on Ascend
+
+See [the Ascend recipe](recipes/cosmos3/Cosmos3-Edge-Ascend910B.md).
