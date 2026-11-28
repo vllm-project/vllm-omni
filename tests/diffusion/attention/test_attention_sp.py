@@ -260,6 +260,46 @@ def test_allgather_joint_key_mask_reaches_flash_hub(backend, tmp_path):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("strategy_cls", [AllGatherKVParallelAttention, UlyssesAllGatherKVParallelAttention])
+def test_allgather_empty_joint_mask_preserves_absent_image_mask(strategy_cls):
+    metadata = AttentionMetadata(
+        joint_attn_mask=torch.empty(1, 0, dtype=torch.bool),
+        joint_key=torch.empty(1, 0, 1, 1),
+    )
+    merged = strategy_cls._merge_joint_attn_mask(metadata, torch.zeros(1, 4, 1, 1))
+    assert merged is not None
+    assert merged.attn_mask is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("joint_strategy", "expected"),
+    [("front", [[False, True, True, True, True]]), ("rear", [[True, True, True, True, False]])],
+)
+def test_allgather_merges_joint_mask_with_global_image_keys(joint_strategy, expected):
+    metadata = AttentionMetadata(
+        joint_attn_mask=torch.tensor([[False]]),
+        joint_key=torch.zeros(1, 1, 1, 1),
+        joint_strategy=joint_strategy,
+    )
+    merged = AllGatherKVParallelAttention._merge_joint_attn_mask(metadata, torch.zeros(1, 5, 1, 1))
+    assert merged is not None and merged.attn_mask is not None
+    assert merged.attn_mask.tolist() == expected
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("image_mask_length", [2, 6])
+def test_allgather_joint_mask_rejects_non_image_mask_length(image_mask_length):
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones(1, image_mask_length, dtype=torch.bool),
+        joint_attn_mask=torch.ones(1, 2, dtype=torch.bool),
+        joint_key=torch.zeros(1, 2, 1, 1),
+    )
+    with pytest.raises(ValueError, match="global image keys"):
+        AllGatherKVParallelAttention._merge_joint_attn_mask(metadata, torch.zeros(1, 6, 1, 1))
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("mask_shape", [(2, 4), (1, 6), (1, 2, 6)])
 def test_allgather_preserves_existing_full_mask(mask_shape):
     key = torch.zeros(1, mask_shape[-1], 1, 1)

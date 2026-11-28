@@ -725,6 +725,25 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(("query_length", "is_cross_attn"), [(2, False), (6, True)])
+def test_unpad_qkv_input_slices_static_cache(query_length, is_cross_attn):
+    """Static-cache padding must not shift selected rows in later batches."""
+    query = torch.arange(2 * query_length, dtype=torch.float32).reshape(2, query_length, 1, 1)
+    key = torch.arange(12, dtype=torch.float32).reshape(2, 6, 1, 1)
+    value = key + 100
+    mask = torch.tensor([[True, False, True, False], [False, True, True, True]])
+
+    q, k, v, indices_q, (cu_q, cu_k), _ = fa._unpad_qkv_input(query, key, value, mask, is_cross_attn=is_cross_attn)
+
+    torch.testing.assert_close(q, query.flatten(0, 1))
+    torch.testing.assert_close(k.flatten(), torch.tensor([0.0, 2.0, 7.0, 8.0, 9.0]))
+    torch.testing.assert_close(v.flatten(), torch.tensor([100.0, 102.0, 107.0, 108.0, 109.0]))
+    assert indices_q is None
+    assert cu_q.tolist() == [0, query_length, 2 * query_length]
+    assert cu_k.tolist() == [0, 2, 5]
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("query_length", [2, 4])
 def test_varlen_masked_routing_by_role(monkeypatch, query_length):
     """Only equal-length self-attention applies the key mask to query rows."""
