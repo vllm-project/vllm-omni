@@ -386,13 +386,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if lightvae_decoder_path is not None and decoder_source is not None:
             raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
         if quant_config is not None:
+            if lightvae_decoder_path is not None:
+                raise ValueError("MiniMax H3 Video VAE online INT8 cannot be combined with a LiteVAE decoder")
             from .vae_int8 import (
                 install_h3_video_vae_int8,
                 validate_h3_video_vae_quant_config,
             )
 
-            # Validate before loading native weights or resolving the alternative
-            # NVFP4 decoder, including its CUDA-only capability check.
             validate_h3_video_vae_quant_config(
                 quant_config,
                 device=device,
@@ -434,8 +434,6 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # weights may be materialized in FP16 because reference decode casts
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
-        # Convert one decoder Linear at a time on the NPU rather than staging
-        # the entire floating-point VAE there before online INT8 conversion.
         weight_device = torch.device("cpu") if decoder_path is not None or quant_config is not None else initial_device
         self.remote.eval().to(device=weight_device, dtype=torch.float32)
         if decoder_path is not None:
@@ -451,8 +449,6 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 storage_device=initial_device,
                 compute_dtype=self.decode_dtype,
             )
-            # Preserve registered INT8 weights and FP32 scales/biases. All
-            # replacements must precede the residency stagers' snapshots.
             self.remote.to(device=initial_device)
             if not self.decode_only and next(self.remote.parameters()).dtype != torch.float32:
                 raise ValueError("MiniMax H3 INT8 video VAE requires an FP32 encoder/boundary first parameter")

@@ -228,7 +228,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
-from .vae_int8 import resolve_h3_video_vae_quant_config
+from .vae_int8 import owns_h3_eager_quantization, resolve_h3_video_vae_quant_config
 from .variant import BASE_H3, FASTH3_PREVIEW, H3Variant, control_task
 from .vdnh3 import VDNCheckpoint
 
@@ -749,6 +749,7 @@ class MiniMaxH3Pipeline(
 ):
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
+    owns_eager_quantization = staticmethod(owns_h3_eager_quantization)
     supports_step_execution: ClassVar[bool] = True
     denoise_step_updates_state: ClassVar[bool] = True
     # DiT implementation constructed for the primary ``transformer``.

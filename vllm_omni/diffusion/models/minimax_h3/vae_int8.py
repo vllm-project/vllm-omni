@@ -48,6 +48,18 @@ def resolve_h3_video_vae_quant_config(config: QuantizationConfig | None) -> Quan
     return components.get("video_vae")
 
 
+def owns_h3_eager_quantization(component: str, config: QuantizationConfig) -> bool:
+    """Return whether H3 converts this component during native VAE construction."""
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    return (
+        component == "video_vae"
+        and isinstance(config, DiffusionInt8Config)
+        and not config.is_checkpoint_int8_serialized
+        and config.activation_scheme == "dynamic"
+    )
+
+
 def _require_npu_device(device: torch.device) -> None:
     if device.type != "npu" or not current_omni_platform.is_npu():
         raise ValueError("H3 Video VAE online INT8 is supported only on NPU")
@@ -122,11 +134,19 @@ def _check_linear(source: nn.Module, path: str) -> None:
             raise ValueError(f"{path}.{name}: non-finite values cannot be quantized")
 
 
+def _check_placement(quant_device: torch.device, storage_device: torch.device, compute_dtype: torch.dtype) -> None:
+    if compute_dtype not in _COMPUTE_DTYPES:
+        raise ValueError("H3 Video VAE INT8 compute_dtype must be FP16 or BF16")
+    if storage_device.type not in ("cpu", quant_device.type):
+        raise ValueError("H3 Video VAE INT8 weights must reside on CPU or NPU")
+
+
 class H3VAEInt8Linear(nn.Module):
     """Tensor-returning native Linear interface backed by the NPU INT8 method.
 
     ``weight`` changes from [N,K] floating to [K,N] INT8 during construction.
     This module does not implement a serialized quantized checkpoint format.
+    The private INT8 method keeps the loader from streaming these eager weights.
     """
 
     weight: nn.Parameter
@@ -146,11 +166,27 @@ class H3VAEInt8Linear(nn.Module):
         compute_dtype: torch.dtype,
     ) -> H3VAEInt8Linear:
         validate_h3_video_vae_quant_config(quant_config, device=quant_device)
-        if compute_dtype not in _COMPUTE_DTYPES:
-            raise ValueError("H3 Video VAE INT8 compute_dtype must be FP16 or BF16")
-        if storage_device.type not in ("cpu", quant_device.type):
-            raise ValueError("H3 Video VAE INT8 weights must reside on CPU or NPU")
+        _check_placement(quant_device, storage_device, compute_dtype)
         _check_linear(source, "linear")
+        return cls._from_validated_linear(
+            source,
+            quant_config,
+            quant_device=quant_device,
+            storage_device=storage_device,
+            compute_dtype=compute_dtype,
+        )
+
+    @classmethod
+    def _from_validated_linear(
+        cls,
+        source: nn.Linear,
+        quant_config: DiffusionInt8Config,
+        *,
+        quant_device: torch.device,
+        storage_device: torch.device,
+        compute_dtype: torch.dtype,
+    ) -> H3VAEInt8Linear:
+        """Convert a preflighted layer without rescanning the floating checkpoint."""
         from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
 
         result = cls()
@@ -164,8 +200,6 @@ class H3VAEInt8Linear(nn.Module):
         result.register_parameter("weight_scale", None)
         bias = source.bias.detach().to(dtype=torch.float32) if source.bias is not None else None
         result.register_parameter("bias", nn.Parameter(bias, requires_grad=False) if bias is not None else None)
-        # A public quant_method would let the diffusion loader mistake this
-        # already-eager-loaded module for a LazyWeightMixin streaming layer.
         result._int8_method = NPUInt8OnlineLinearMethod(quant_config)
         result._int8_method.process_weights_after_loading(result)
         if (
@@ -173,7 +207,6 @@ class H3VAEInt8Linear(nn.Module):
             or tuple(result.weight.shape) != (result.in_features, result.out_features)
             or result.weight_scale.dtype != torch.float32
             or tuple(result.weight_scale.shape) != (result.out_features,)
-            or not getattr(result, "_already_called_process_weights_after_loading", False)
         ):
             raise RuntimeError("H3 Video VAE INT8 post-load method returned an unexpected weight/scale layout")
         if not bool(torch.isfinite(result.weight_scale).all().item()):
@@ -204,34 +237,14 @@ class H3VAEInt8Linear(nn.Module):
 
 
 @dataclass(frozen=True)
-class VAEInt8LayerReport:
-    path: str
-    in_features: int
-    out_features: int
-    quantized: bool
-    device: torch.device
-    weight_dtype: torch.dtype
-    scale_dtype: torch.dtype | None
-    bias_dtype: torch.dtype | None
-    weight_bytes: int
-    scale_bytes: int
-    bias_bytes: int
-
-
-@dataclass(frozen=True)
 class VAEInt8InstallReport:
+    """Summarize conversion at startup without storing per-layer metadata."""
+
     block_count: int
     compute_dtype: torch.dtype
-    layers: tuple[VAEInt8LayerReport, ...]
+    candidate_count: int
+    quantized_count: int
     elapsed_seconds: float
-
-    @property
-    def candidate_count(self) -> int:
-        return len(self.layers)
-
-    @property
-    def quantized_count(self) -> int:
-        return sum(layer.quantized for layer in self.layers)
 
     @property
     def ignored_count(self) -> int:
@@ -242,17 +255,14 @@ class VAEInt8InstallReport:
 class _LinearPlan:
     parent: nn.Module
     leaf: str
-    path: str
     source: nn.Linear
-    ignored: bool
 
 
-def _check_aliases(decoder: nn.Module, plans: list[_LinearPlan]) -> None:
-    selected = [plan.source for plan in plans if not plan.ignored]
+def _check_aliases(decoder: nn.Module, selected: list[_LinearPlan]) -> None:
     module_counts = Counter(id(module) for _, module in decoder.named_modules(remove_duplicate=False))
-    if any(module_counts[id(module)] != 1 for module in selected):
+    if any(module_counts[id(plan.source)] != 1 for plan in selected):
         raise ValueError("H3 Video VAE INT8 does not support shared Linear modules")
-    selected_parameters = {id(parameter) for module in selected for parameter in module.parameters()}
+    selected_parameters = {id(parameter) for plan in selected for parameter in plan.source.parameters()}
     storages: dict[tuple[torch.device, int, int], list[int]] = {}
     for _, parameter in decoder.named_parameters(remove_duplicate=False):
         if parameter.is_meta or parameter.numel() == 0:
@@ -262,24 +272,6 @@ def _check_aliases(decoder: nn.Module, plans: list[_LinearPlan]) -> None:
         storages.setdefault(key, []).append(id(parameter))
     if any(len(ids) > 1 and any(item in selected_parameters for item in ids) for ids in storages.values()):
         raise ValueError("H3 Video VAE INT8 does not support tied or shared weight/bias storage")
-
-
-def _layer_report(path: str, module: nn.Linear | H3VAEInt8Linear, *, quantized: bool) -> VAEInt8LayerReport:
-    scale = getattr(module, "weight_scale", None)
-    bias = module.bias
-    return VAEInt8LayerReport(
-        path=path,
-        in_features=module.in_features,
-        out_features=module.out_features,
-        quantized=quantized,
-        device=module.weight.device,
-        weight_dtype=module.weight.dtype,
-        scale_dtype=scale.dtype if scale is not None else None,
-        bias_dtype=bias.dtype if bias is not None else None,
-        weight_bytes=module.weight.numel() * module.weight.element_size(),
-        scale_bytes=scale.numel() * scale.element_size() if scale is not None else 0,
-        bias_bytes=bias.numel() * bias.element_size() if bias is not None else 0,
-    )
 
 
 @torch.no_grad()
@@ -297,8 +289,7 @@ def install_h3_video_vae_int8(
     during conversion aborts startup; no runtime floating-weight fallback is kept.
     """
     validate_h3_video_vae_quant_config(quant_config, device=quant_device)
-    if compute_dtype not in _COMPUTE_DTYPES:
-        raise ValueError("H3 Video VAE INT8 compute_dtype must be FP16 or BF16")
+    _check_placement(quant_device, storage_device, compute_dtype)
     _check_uncompiled(decoder, "video_vae.decoder")
     identity = (tuple(quant_config.ignored_layers), compute_dtype, str(quant_device), str(storage_device))
     installed = getattr(decoder, "_omni_h3_vae_int8_config", None)
@@ -327,16 +318,12 @@ def install_h3_video_vae_int8(
             )
             if not ignored:
                 _check_linear(source, path)
-            plans.append(_LinearPlan(parent, leaf, path, source, ignored))
-    if all(plan.ignored for plan in plans):
+                plans.append(_LinearPlan(parent, leaf, source))
+    if not plans:
         raise ValueError("H3 Video VAE INT8 was enabled but ignored_layers excludes every candidate")
     _check_aliases(decoder, plans)
-    reports: list[VAEInt8LayerReport] = []
     for plan in plans:
-        if plan.ignored:
-            reports.append(_layer_report(plan.path, plan.source, quantized=False))
-            continue
-        converted = H3VAEInt8Linear.from_linear(
+        converted = H3VAEInt8Linear._from_validated_linear(
             plan.source,
             quant_config,
             quant_device=quant_device,
@@ -344,8 +331,9 @@ def install_h3_video_vae_int8(
             compute_dtype=compute_dtype,
         )
         setattr(plan.parent, plan.leaf, converted)
-        reports.append(_layer_report(plan.path, converted, quantized=True))
-    report = VAEInt8InstallReport(len(blocks), compute_dtype, tuple(reports), perf_counter() - start)
+    report = VAEInt8InstallReport(
+        len(blocks), compute_dtype, len(blocks) * len(_LEAVES), len(plans), perf_counter() - start
+    )
     decoder._omni_h3_vae_int8_config = identity
     decoder._omni_h3_vae_int8_report = report
     logger.info(

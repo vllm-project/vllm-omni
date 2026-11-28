@@ -28,7 +28,7 @@ from .pipeline_minimax_h3 import (
     get_minimax_h3_post_process_func,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
-from .vae_int8 import resolve_h3_video_vae_quant_config
+from .vae_int8 import owns_h3_eager_quantization, resolve_h3_video_vae_quant_config
 
 
 def resolve_minimax_h3_decoder_model_path(
@@ -57,6 +57,7 @@ def resolve_minimax_h3_decoder_model_path(
 class MiniMaxH3DecoderPipeline(
     nn.Module, DiffusionPipelineProfilerMixin, SupportAudioOutput, SupportsComponentDiscovery
 ):
+    owns_eager_quantization = staticmethod(owns_h3_eager_quantization)
     supports_step_execution: ClassVar[bool] = False
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = []

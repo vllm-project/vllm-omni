@@ -65,7 +65,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.registry import DiffusionModelRegistry, initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -228,34 +228,31 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
 
-    def _is_h3_eager_vae_only_quantization(self, load_format: str) -> bool:
-        """Whether online INT8 is owned entirely by H3's eager VAE loader.
+    def _uses_pipeline_owned_quantization(self, load_format: str) -> bool:
+        """Keep host initialization when the native pipeline owns the sole quantized component.
 
-        Only this narrow configuration can keep CPU initialization even though
-        a quantization config is present. Other components still use the shared
-        loader's existing device-side quantization lifecycle.
+        The resolved class must opt in directly with a static
+        ``owns_eager_quantization(component, config)`` predicate. Derived
+        pipelines do not inherit the host initialization exception implicitly.
         """
-        if load_format != "default" or getattr(self.od_config, "model_class_name", None) not in {
-            "MiniMaxH3Pipeline",
-            "MiniMaxH3ModularPipeline",
-            "MiniMaxH3DecoderPipeline",
-        }:
+        if load_format != "default":
             return False
 
         from vllm_omni.quantization.component_config import ComponentQuantizationConfig
-        from vllm_omni.quantization.int8_config import DiffusionInt8Config
 
         config = self.quant_config
         if not isinstance(config, ComponentQuantizationConfig) or config.default_config is not None:
             return False
-        components = config.component_configs
-        vae_config = components.get("video_vae")
-        return (
-            isinstance(vae_config, DiffusionInt8Config)
-            and not vae_config.is_checkpoint_int8_serialized
-            and vae_config.activation_scheme == "dynamic"
-            and all(value is None for name, value in components.items() if name != "video_vae")
-        )
+        active = [(name, method) for name, method in config.component_configs.items() if method is not None]
+        if len(active) != 1:
+            return False
+
+        model_class = DiffusionModelRegistry._try_load_model_cls(getattr(self.od_config, "model_class_name", None))
+        if model_class is None:
+            return False
+        owns_quantization = vars(model_class).get("owns_eager_quantization")
+        component, method = active[0]
+        return callable(owns_quantization) and owns_quantization(component, method)
 
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
@@ -781,7 +778,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             load_device == "cpu"
             and self.quant_config is not None
             and device is not None
-            and not self._is_h3_eager_vae_only_quantization(load_format)
+            and not self._uses_pipeline_owned_quantization(load_format)
         ):
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(

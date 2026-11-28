@@ -178,7 +178,8 @@ cast its scales and biases. Startup logs report the number of quantized and
 ignored linears. No floating-weight fallback is retained after installation.
 
 Serialized INT8 VAE checkpoints, nested `video_vae.*` component routes,
-encode-only quantization, and replacement NVFP4 decoders are rejected. This
-includes automatically detected `vae_decoder_nvfp4` assets; set
-`additional_config.video_vae_decoder` to `null` to use the native decoder
-instead. This minimal path does not add HWR-required or HSDP support.
+encode-only quantization, and replacement NVFP4 or LiteVAE decoders are rejected.
+For a checkpoint with an automatically detected `vae_decoder_nvfp4` asset, set
+`additional_config.video_vae_decoder` to `null` to select the original decoder.
+Omit `additional_config.lightvae_decoder_path` when using online INT8. This
+path does not add HWR-required or HSDP support.
