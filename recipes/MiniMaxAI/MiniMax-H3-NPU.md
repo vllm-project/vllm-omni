@@ -692,3 +692,10 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+### Reference-audio encoder residency
+
+In the manual component-offload path, the full pipeline stages the Audio VAE's
+encoding children together during reference encoding and leaves `decoder`,
+`dec_in_proj`, and `logs_proj` off-device. Encoder-only stage adapters and
+unrecognized checkpoint layouts use whole-component staging.
