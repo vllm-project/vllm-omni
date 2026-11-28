@@ -203,7 +203,14 @@ class RealtimeDuplexClient:
 
         event = self.events._backend_error
         if event is not None:
-            self._raise_protocol_error(event)
+            error = event["error"]
+            assert isinstance(error, dict)
+            raise DuplexProtocolError(
+                str(error.get("message") or error["code"]),
+                code=str(error["code"]),
+                event_id=str(event["event_id"]) if event.get("event_id") else None,
+                raw=event,
+            )
 
         task = self._reader_task
         if task is None or not task.done():
@@ -214,17 +221,6 @@ class RealtimeDuplexClient:
         if error is not None:
             raise ConnectionError("Realtime WebSocket reader failed") from error
         raise ConnectionError("Realtime WebSocket closed before the requested event arrived")
-
-    @staticmethod
-    def _raise_protocol_error(event: dict[str, object]) -> None:
-        error = event["error"]
-        assert isinstance(error, dict)
-        raise DuplexProtocolError(
-            str(error.get("message") or error["code"]),
-            code=str(error["code"]),
-            event_id=str(event["event_id"]) if event.get("event_id") else None,
-            raw=event,
-        )
 
     async def configure(
         self,
@@ -272,17 +268,9 @@ class RealtimeDuplexClient:
             session_extra["duplex_initial_user_text"] = initial_user_text
         if idle_timeout_s is not None:
             session["idle_timeout_s"] = idle_timeout_s
-        event_offset = len(self.events.events)
         await self.send({"type": "session.update", "session": session})
 
         def session_created() -> bool:
-            # Admission errors arrive before the server closes the socket.
-            # Preserve their code and retryability instead of replacing them
-            # with the reader's generic connection-closed error.
-            for event in self.events.events[event_offset:]:
-                error = event.get("error")
-                if event.get("type") == "error" and isinstance(error, dict) and isinstance(error.get("code"), str):
-                    self._raise_protocol_error(event)
             self.raise_if_reader_stopped()
             if self.events.count("session.created") > 0:
                 return True

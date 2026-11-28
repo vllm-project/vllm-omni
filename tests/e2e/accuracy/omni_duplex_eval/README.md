@@ -8,13 +8,6 @@ and a finite correction success rate. MiniCPM-o skips the per-session
 without a non-empty transcript); run-level `required_duplex_metrics` still
 require some samples for the batch.
 
-Session cleanup can temporarily retain capacity after `session.closed`.
-Generation waits at most 120 seconds for admission, reconnecting with backoff
-only when the server returns `resource_exhausted` with `retryable: true`, before
-any sample input is sent. It does not replay an admitted sample through this
-path. Per-sample metadata records `session_admission_rejections` and
-`session_admission_s`; request latency and run wall time include this wait.
-
 The shared `omni_duplex_eval_ci_config.json` still describes the earlier **66
 soundtrack IDs** (30 RTD + 36 PR) and their calibrated floors. Callers that set
 `duplex_eval_accuracy_config` keep that contract.

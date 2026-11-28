@@ -74,17 +74,6 @@ existing behavior.
 Request failures are logged with their cause, and the DFX assertion includes
 the completed count and the first recorded request error.
 
-Omni-DuplexEval preserves configuration rejection codes even when the server
-closes the WebSocket immediately afterwards. Before sending sample input, it
-waits up to 120 seconds for admission, reconnecting only for
-`resource_exhausted` with `error.retryable: true`. Backoff starts at 250 ms and
-caps at 2 seconds. Refused transports are closed before reconnecting. Other
-errors and failures after admission propagate without an admission retry.
-Per-sample metadata records `session_admission_rejections` and
-`session_admission_s` (handshake plus waiting, in seconds); each rejection is
-also logged. Admission time remains part of request latency and benchmark
-wall time, while stream-relative metrics keep their existing origin.
-
 For opted-in multi-stage serving diagnostics, DFX result JSON preserves one
 compact stage snapshot per measured request. The snapshot keeps generation,
 engine phase, scheduler, transfer, pipeline, and event-driven dispatch timing;
