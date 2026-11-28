@@ -91,6 +91,47 @@ def test_pending_archive_views_require_all_layers_and_exclude_transient_conditio
     state.close()
 
 
+@pytest.mark.parametrize("publish", [True, False])
+def test_compact_history_preserves_archive_and_commit_rows(publish):
+    cache = make_cache()
+    free = cache.manager.block_pool.get_num_free_blocks()
+    owner = make_state(cache)
+    state = owner.segmented("main")
+    previous = append(state, (3, 5), offset=7)
+    indices = torch.tensor([0, 4, 7])
+    for _ in range(2):
+        state.prepare_layer_views(4, 3, history_indices=indices)
+    assert state.history_gathers == 1
+
+    pending = state.begin_commit((4,))
+    condition = rows(3, -20)
+    for layer in range(cache.num_layers):
+        media = rows(4, 90 + layer)
+        key, value = state.assemble(layer, condition, -condition, media, -media)
+        expected = torch.cat((rows(8, 7 + 100 * layer)[indices], media, condition))
+        torch.testing.assert_close(key, expected, rtol=0, atol=0)
+        torch.testing.assert_close(value, -expected, rtol=0, atol=0)
+        state.stage(layer)
+    for layer, (key, value) in enumerate(state.pending_layer_views()):
+        torch.testing.assert_close(key, rows(4, 90 + layer), rtol=0, atol=0)
+        torch.testing.assert_close(value, -rows(4, 90 + layer), rtol=0, atol=0)
+
+    if publish:
+        state.commit(retain=previous + pending)
+    else:
+        state.rollback()
+    state.prepare_layer_views(1, 0)
+    for layer in range(cache.num_layers):
+        key, value = state.assemble(layer, rows(0), rows(0), rows(1), -rows(1))
+        history = rows(8, 7 + 100 * layer)
+        if publish:
+            history = torch.cat((history, rows(4, 90 + layer)))
+        torch.testing.assert_close(key[:-1], history, rtol=0, atol=0)
+        torch.testing.assert_close(value[:-1], -history, rtol=0, atol=0)
+    owner.close()
+    assert cache.manager.block_pool.get_num_free_blocks() == free
+
+
 @pytest.mark.parametrize("lengths", [(1, 1), (15, 3), (17, 5)])
 def test_ragged_pages_match_dense_attention_without_padding(lengths):
     cache = make_cache()
