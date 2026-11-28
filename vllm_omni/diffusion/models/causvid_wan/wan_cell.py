@@ -13,8 +13,8 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import ComputeBatch
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import CellAdapter
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Cell
+from vllm_omni.diffusion.models.causvid_wan.flow_euler import FlowEuler
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
 
 class WanCell(CellAdapter):
