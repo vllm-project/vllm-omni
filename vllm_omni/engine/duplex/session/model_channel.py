@@ -1438,6 +1438,7 @@ class ModelChannel:
                 session.runtime_config,
                 call_id=call_id,
                 history_len=len(session.history),
+                name=name,
             )
         except Exception:
             # The call is already in the ledger and the client has not seen it.

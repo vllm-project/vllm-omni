@@ -1159,6 +1159,7 @@ class DuplexModelPlugin(ABC):
         *,
         call_id: str,
         history_len: int,
+        name: str | None = None,
     ) -> dict[str, object] | None:
         """Record where this call sat in session history when it was published.
 
@@ -1166,8 +1167,12 @@ class DuplexModelPlugin(ABC):
         turn can grow the history. A plugin that splices the result back into
         that history stores the length in its own runtime. The default keeps
         nothing.
+
+        ``name`` is the tool the call targets. It is passed so a model that
+        speaks a client-declared on-hold message can pick that tool's phrase;
+        plugins that do not do that ignore it.
         """
-        del runtime_config, call_id, history_len
+        del runtime_config, call_id, history_len, name
         return None
 
     def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
