@@ -127,6 +127,11 @@ terminal ADD for an empty stream. The stage's scheduling policy determines
 how that value is used; cross-stage priority propagation is outside this
 entrypoint guarantee.
 
+The Audio Generate request model rejects non-finite values in the top-level
+`audio_length`, `audio_start`, and `frame_rate` fields, including a non-finite
+end time derived from finite start and length values, before engine submission.
+Duration limits specific to a model remain the pipeline's responsibility.
+
 The serving composition removes inherited `/tokenize`, `/detokenize`, and
 optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
