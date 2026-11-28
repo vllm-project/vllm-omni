@@ -79,6 +79,7 @@ def test_sampler_replay_returns_owned_live_rows_and_refreshes_controls(mocker):
     output = torch.arange(4, dtype=torch.int32)[:, None]
     model = SimpleNamespace(
         config=SimpleNamespace(audio_mrv2_sample_graph_buckets=True),
+        mrv2_options=SimpleNamespace(audio_mrv2_sample_graph_buckets=True),
         num_codebooks=2,
         _ensure_decode_state_capacity=lambda *args: None,
         _finish_audio_staging=mocker.Mock(),

@@ -76,8 +76,9 @@ matching baseline. Existing `--assert-baseline` callers retain their warning and
 skip behavior for missing calibration. Baselines are selected by runtime device
 labels; a pytest selection marker does not establish physical hardware identity.
 
-An opt-in baseline confirmation repeats only the configured sweep point and
-metrics. Repeated attempts are internal evidence, not independent report rows:
+An opt-in baseline confirmation repeats only the configured request-rate or
+max-concurrency sweep point and metrics. Repeated attempts are internal
+evidence, not independent report rows:
 the runner replaces the first attempt's JSON with one canonical result whose
 configured metrics contain the confirmed median and whose
 `baseline_confirmation_result` records every attempt value, applied tolerance,

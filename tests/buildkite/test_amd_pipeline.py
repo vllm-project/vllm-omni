@@ -1641,7 +1641,7 @@ def test_distributed_ready_jobs_mirror_cuda_scopes(label: str, pool: str, expect
     command = " ".join("\n".join(step["commands"]).split())
 
     assert step["agent_pool"] == pool
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
     assert f"run-rocm-diffusion-nightly.sh {expected} tests/distributed/omni_connectors/ {marker}" in command
     # Only the single-process Mooncake connector tests need the TCP path.
@@ -1741,10 +1741,10 @@ def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
     marker = "-m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only'"
 
     assert step["agent_pool"] == "mi300_2"
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["source_file_dependencies"] == "omni_qwen3_omni_duplex_playback_function"
-    assert "assert-pytest-collection.sh 29" in commands
-    assert "if tests != 29 or skipped != 0" in commands
+    assert "assert-pytest-collection.sh 30" in commands
+    assert "if tests != 30 or skipped != 0" in commands
     assert commands.count(marker) == 2
     for path in (
         "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py",
@@ -4259,7 +4259,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "Higgs Audio V3 · 1-GPU": {
             "timeout": 240,
             "test_timeout": 210,
-            "count": 13,
+            "count": 15,
             "artifact_name": "rocm-higgs-audio-v3-weekly",
             "dependency": "tts_higgs_audio_v3_weekly",
             "files": ("tests/e2e/online_serving/test_higgs_audio_v3.py",),
@@ -4458,7 +4458,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_moss_tts_nano_expansion.py": 5,
         "tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py": 3,
         "tests/e2e/online_serving/test_higgs_audio_v2_expansion.py": 6,
-        "tests/e2e/online_serving/test_higgs_audio_v3.py": 13,
+        "tests/e2e/online_serving/test_higgs_audio_v3.py": 15,
         "tests/e2e/offline_inference/test_omnivoice_expansion.py": 2,
         "tests/e2e/online_serving/test_omnivoice_expansion.py": 18,
         "tests/e2e/online_serving/test_omnivoice_parity.py": 2,
@@ -5083,24 +5083,57 @@ def test_minicpmo_accuracy_nightly_jobs_block_on_one_gpu() -> None:
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
 
+def test_minicpmo_daily_omni_uses_deterministic_half_sample() -> None:
+    path = Path("tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assignments = {
+        target.id: statement.value
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    assert ast.literal_eval(assignments["_DAILY_OMNI_NUM_PROMPTS"]) == 599
+
+    test_function = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.FunctionDef) and statement.name == "test_minicpmo_4_5_daily_omni_accuracy_bench"
+    )
+    build_call = next(
+        node
+        for node in ast.walk(test_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_acc_benchmark_cli_argv"
+    )
+    num_prompts = next(keyword.value for keyword in build_call.keywords if keyword.arg == "num_prompts")
+    assert isinstance(num_prompts, ast.Name)
+    assert num_prompts.id == "_DAILY_OMNI_NUM_PROMPTS"
+    assert any(
+        isinstance(node, ast.Constant) and node.value == "--daily-omni-save-eval-items"
+        for node in ast.walk(test_function)
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "should_pass"),
     [
         ({}, True),
         (None, False),
-        ({"daily_omni_evaluated_ok": 1196}, False),
+        ({"daily_omni_evaluated_ok": 598}, False),
         ({"daily_omni_no_gold": 1}, False),
         ({"daily_omni_request_failed": 1}, False),
     ],
-    ids=["complete", "skipped", "partial", "missing-gold", "failed-request"],
+    ids=["half-sample", "skipped", "partial", "missing-gold", "failed-request"],
 )
-def test_minicpmo_daily_omni_requires_complete_dataset(
+def test_minicpmo_daily_omni_requires_half_dataset(
     tmp_path: Path, overrides: dict[str, int] | None, should_pass: bool
 ) -> None:
     step = _find_step("MiniCPM-o 4.5 Daily-Omni Accuracy", AMD_NIGHTLY_PIPELINE)
     check = step["commands"][-1].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     if overrides is not None:
-        metrics = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+        metrics = {"daily_omni_evaluated_ok": 599, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
         metrics.update(overrides)
         (tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_test.json").write_text(json.dumps(metrics), encoding="utf-8")
     result = subprocess.run([sys.executable, "-c", check, str(tmp_path)], capture_output=True, text=True)
