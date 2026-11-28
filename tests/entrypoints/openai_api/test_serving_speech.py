@@ -1589,18 +1589,13 @@ class TestSpeechAPI:
     @pytest.mark.parametrize(
         "stream_options", [{}, {"stream": True}, {"stream_format": "sse"}, {"stream_format": "audio"}]
     )
-    async def test_diffusion_speech_rejects_unsupported_streaming(self, mocker, monkeypatch, tmp_path, stream_options):
+    async def test_diffusion_speech_ignores_unsupported_streaming(self, mocker, monkeypatch, tmp_path, stream_options):
         monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         generation = mocker.patch.object(server, "_create_diffusion_speech", new_callable=mocker.AsyncMock)
         response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", **stream_options))
-        if stream_options:
-            assert response.status_code == 400
-            assert b"Streaming" in response.body
-            generation.assert_not_awaited()
-        else:
-            assert response is generation.return_value
-            generation.assert_awaited_once()
+        assert response is generation.return_value
+        generation.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_diffusion_speech_reports_audio_format_and_duration_na(self, mocker: MockerFixture):
@@ -1850,6 +1845,52 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert expected_message in response.body.decode()
         mock_engine.generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_ignores_sse_and_stage_metrics(
+        self, mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+    ):
+        """Diffusion TTS soft-rejects SSE/metrics and still returns audio."""
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams()]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy-pcm", media_type="audio/pcm")
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            stream=True,
+            stream_format="sse",
+            response_format="pcm",
+            return_stage_metrics=True,
+        )
+
+        target_logger = logging.getLogger("vllm_omni.entrypoints.openai.serving_speech")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(logging.WARNING)
+        try:
+            with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.openai.serving_speech"):
+                response = await server.create_speech(req)
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
+
+        assert response.status_code == 200
+        assert response.media_type == "audio/pcm"
+        assert response.body == b"dummy-pcm"
+        mock_engine.generate.assert_called_once()
+        assert any("does not emit speech SSE" in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -157,7 +157,8 @@ Content-Type: application/json
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 | `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
-| `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
+| `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events (and optional `speech.metrics`). If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
+| `return_stage_metrics` | bool | false | When true, emit a `speech.metrics` SSE event with per-stage performance data. Requires SSE (`stream=true` or `stream_format="sse"`). Invalid with `stream_format="audio"` or a non-streaming request. This is a first-class JSON field on `POST /v1/audio/speech`, not chat `extra_body`. |
 | `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
 For Step-Audio2, `max_new_tokens` overrides the first (Thinker) stage's token
@@ -264,7 +265,8 @@ generation ends, and the batch endpoint and WebSocket streaming do not carry the
 flag; use a non-streaming request or the SSE stream to detect truncation.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
-WAV) as they are decoded.
+WAV) as they are decoded. The body is audio only, so it cannot carry
+`speech.metrics`; `return_stage_metrics=true` is rejected on this path.
 
 `pcm` is 16-bit signed little-endian, interleaved, at the model's native sample
 rate and channel count (24 kHz mono for most models; MOSS-TTS-Local v1.5 emits
@@ -293,6 +295,29 @@ Each event has an `event:` line and a JSON `data:` line:
 
     `sample_rate` and `channels` extend the OpenAI event and describe the
     decoded chunk.
+
+- `speech.metrics` — optional, only when `return_stage_metrics=true` and the
+  server collected a metrics snapshot. Emitted after the last audio delta and
+  before `speech.audio.done`. Field names inside `metrics` follow
+  `vllm_omni/metrics/definitions.py`.
+
+    ```json
+    {
+        "type": "speech.metrics",
+        "metrics": {
+            "stage_id": 2,
+            "final_output_type": "audio",
+            "stage_metrics": {
+                "0": {"stage_name": "thinker"},
+                "1": {"stage_name": "talker"},
+                "2": {"stage_name": "code2wav"}
+            }
+        }
+    }
+    ```
+
+    If metrics were requested but unavailable, the server logs a warning and
+    omits this event; audio deltas and `speech.audio.done` still follow.
 
 - `speech.audio.done` — terminal event, carrying the generated audio `duration`
   and token `usage`:
@@ -326,6 +351,29 @@ Each event has an `event:` line and a JSON `data:` line:
     ```json
     { "type": "speech.audio.error", "error": { "message": "...", "type": "server_error", "param": null, "code": 500 } }
     ```
+
+Successful order when stage metrics are returned:
+
+```text
+event: speech.audio.delta
+...
+event: speech.metrics
+event: speech.audio.done
+```
+
+Example (`Content-Type: text/event-stream`):
+
+```bash
+curl -N http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello",
+        "stream": true,
+        "stream_format": "sse",
+        "response_format": "pcm",
+        "return_stage_metrics": true
+    }'
+```
 
 The `usage` object on `speech.audio.done` is the same shape returned per item by the
 [batch endpoint](#batch-speech-generation):
