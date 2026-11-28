@@ -1156,11 +1156,17 @@ class MiniMaxH3Pipeline(
         self._encoder_modules = ["text_encoder"] if self.load_text_encoder else []
         self._PROFILER_TARGETS = list(type(self)._PROFILER_TARGETS)
         encoder_block_attrs = dict(self._offload_plan.encoder_block_attrs)
-        if not self.load_text_encoder:
-            encoder_block_attrs.pop("text_encoder", None)
+        one_shot_component_paths = set(self._offload_plan.one_shot_component_paths)
+        component_backing = dict(self._offload_plan.component_backing)
         on_demand_component_paths = set(self._offload_plan.on_demand_component_paths)
         if not self.load_text_encoder:
-            on_demand_component_paths.discard("text_encoder")
+            # The declaration must not outlive the component it describes: a
+            # later reader would otherwise treat a component this pipeline never
+            # loads as one-shot and disk-backed.
+            encoder_block_attrs.pop("text_encoder", None)
+            one_shot_component_paths.discard(TEXT_ENCODER_COMPONENT)
+            component_backing.pop(TEXT_ENCODER_COMPONENT, None)
+            on_demand_component_paths.discard(TEXT_ENCODER_COMPONENT)
         if not self.load_vae_decoder:
             on_demand_component_paths.difference_update(("video_vae", "audio_vae"))
             self._vae_modules = []
@@ -1173,6 +1179,8 @@ class MiniMaxH3Pipeline(
             self._offload_plan,
             encoder_block_attrs=encoder_block_attrs,
             on_demand_component_paths=frozenset(on_demand_component_paths),
+            one_shot_component_paths=frozenset(one_shot_component_paths),
+            component_backing=component_backing,
         )
         if not self.load_text_encoder:
             self._PROFILER_TARGETS.remove("encode_prompt")

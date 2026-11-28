@@ -104,20 +104,36 @@ def test_loader_ignores_encoders_without_a_disk_declaration() -> None:
     assert _select(nn.Identity(), plan) == ()
 
 
-def test_encoder_mapping_matches_the_generic_entry_point() -> None:
+def test_encoder_maps_checkpoint_names_onto_runtime_parameters() -> None:
     from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
 
     encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
-    names = (
-        "model.language_model.layers.0.self_attn.q_proj.weight",
-        "model.language_model.layers.0.mlp.gate_proj.weight",
-        "model.language_model.layers.0.input_layernorm.weight",
-        "model.visual.blocks.0.attn.qkv.weight",
-        "lm_head.weight",
-    )
+    expected = {
+        "model.visual.blocks.0.attn.qkv.weight": ("vision.blocks.0.attn.qkv.weight", None),
+        "model.language_model.embed_tokens.weight": ("text_model.embed_tokens.weight", None),
+        "model.language_model.layers.0.input_layernorm.weight": (
+            "text_model.layers.0.input_layernorm.weight",
+            None,
+        ),
+        "model.language_model.layers.0.self_attn.q_proj.weight": (
+            "text_model.layers.0.self_attn.qkv_proj.weight",
+            "q",
+        ),
+        "model.language_model.layers.0.mlp.gate_proj.weight": (
+            "text_model.layers.0.mlp.gate_up_proj.weight",
+            0,
+        ),
+        "model.language_model.layers.0.mlp.up_proj.weight": (
+            "text_model.layers.0.mlp.gate_up_proj.weight",
+            1,
+        ),
+        # Not part of the streamed set.
+        "lm_head.weight": None,
+        "model.language_model.norm.weight": None,
+    }
 
-    for name in names:
-        assert encoder.map_checkpoint_weight_name(name) == encoder._map_weight_name(name)
+    for name, want in expected.items():
+        assert encoder.map_checkpoint_weight_name(name) == want
 
 
 def test_encoder_maps_qkv_slices_onto_one_runtime_tensor() -> None:
