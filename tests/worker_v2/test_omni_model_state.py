@@ -1146,6 +1146,47 @@ def test_rope_shim_constructs_sequential_mrope_state():
     assert [np.asarray(chunk).reshape(-1).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
+@pytest.mark.parametrize("image_to_image", [False, True], ids=["t2i", "i2i"])
+def test_precomputed_rope_uses_request_target_size(image_to_image):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.glm_image.glm_image_ar import GlmImageForConditionalGeneration
+    from vllm_omni.worker_v2.model_states.precomputed_rope import PrecomputedDecodeRopeState
+
+    state = _make_state()
+    state.model = object.__new__(GlmImageForConditionalGeneration)
+    torch.nn.Module.__init__(state.model)
+    state.model.config = SimpleNamespace(image_token_id=167855, image_start_token_id=16384, image_end_token_id=16385)
+    state.prompt_embeds_state = None
+    rope = state.rope_state = object.__new__(PrecomputedDecodeRopeState)
+    rope.max_model_len = 2048
+    rope.num_dims = 3
+    rope.table_lens = SimpleNamespace(np=np.zeros(1))
+    rope.prefill_delta = SimpleNamespace(np=np.zeros(1))
+    rope.prefill_positions = MagicMock()
+
+    tokens = [100, 16384]
+    features = []
+    if image_to_image:
+        tokens += [167855] * 4 + [16385, 16384]
+        features.append(
+            SimpleNamespace(modality="image", data={"image_grid_thw": SimpleNamespace(data=torch.tensor([1, 2, 2]))})
+        )
+    req = SimpleNamespace(req_id="grid", prompt_token_ids=tokens, prefill_token_ids=tokens, mm_features=features)
+    # Reuse the slot for a request without dimensions; it must get the default grid.
+    for extra_args, width in [({"target_h": 256, "target_w": 256}, 8), (None, 32)]:
+        req.sampling_params = SamplingParams(extra_args=extra_args)
+        state.add_request(0, req)
+        rows = np.stack([call.args[2] for call in rope.prefill_positions.stage_write.call_args_list])
+        target = rows[:, len(tokens) :]
+        if not image_to_image:
+            np.testing.assert_array_equal(target[:, 16] - target[:, 0], [0, 1, 0])
+            target = target[:, 16 * 16 :]  # Skip the preview grid.
+        assert target.shape == (3, width * width + 1)  # target grid + EOS
+        np.testing.assert_array_equal(target[:, width] - target[:, 0], [0, 1, 0])
+        rope.prefill_positions.reset_mock()
+
+
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])
 def test_mtp_requires_model_declared_output_key(output_key):
     state = _make_state()

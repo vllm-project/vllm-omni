@@ -322,16 +322,18 @@ class OmniModelState(DefaultModelState):
     # ------------------------------------------------------------------
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
-        rope_req = new_req_data
-        if (
-            getattr(self.model, "precomputed_mrope_decode", False) is True
-            and new_req_data.prompt_token_ids is not None
-            and len(new_req_data.prefill_token_ids) > len(new_req_data.prompt_token_ids)
-        ):
-            # On resume, replayed output tokens already have positions in the
-            # decode grid. Build it from the original prompt at the same offsets.
-            rope_req = replace(new_req_data, prefill_token_ids=new_req_data.prompt_token_ids)
-        super().add_request(req_index, rope_req)
+        if getattr(self.model, "precomputed_mrope_decode", False) is True:
+            from vllm_omni.worker_v2.model_states.precomputed_rope import use_request_target_size
+
+            rope_req = new_req_data
+            prompt = new_req_data.prompt_token_ids
+            if prompt is not None and len(new_req_data.prefill_token_ids) > len(prompt):
+                # Replayed output tokens already have positions in the original decode grid.
+                rope_req = replace(new_req_data, prefill_token_ids=prompt)
+            with use_request_target_size(new_req_data.sampling_params):
+                super().add_request(req_index, rope_req)
+        else:
+            super().add_request(req_index, new_req_data)
         self.intermediate_buffer.add_request(req_index, new_req_data)
         self._mtp_state.resume_audio(new_req_data.req_id, req_index)
         self._initialize_upstream_warmup_buffer(req_index, new_req_data.req_id)

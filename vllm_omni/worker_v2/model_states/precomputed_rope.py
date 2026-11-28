@@ -2,13 +2,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MRv2 position lookup for models that precompute a spatial decode grid."""
 
-from typing import cast
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
-from vllm.model_executor.models.interfaces import SupportsMRoPE
+from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.mm.rope import RopeState
+
+_target_size: ContextVar[dict[str, int] | None] = ContextVar("precomputed_rope_target_size", default=None)
+
+
+@contextmanager
+def use_request_target_size(params: SamplingParams | None) -> Iterator[None]:
+    """Pass the request dimensions through vLLM's synchronous, size-unaware RoPE callback."""
+    extra = (params.extra_args or {}) if params is not None else {}
+    height, width = extra.get("target_h"), extra.get("target_w")
+    size = {"target_h": height, "target_w": width} if isinstance(height, int) and isinstance(width, int) else None
+    token = _target_size.set(size)
+    try:
+        yield
+    finally:
+        _target_size.reset(token)
 
 
 class PrecomputedDecodeRopeState(RopeState):
@@ -21,7 +38,7 @@ class PrecomputedDecodeRopeState(RopeState):
     def init_prefill_positions(
         self, req_idx: int, model: torch.nn.Module, prefill_token_ids: list[int], mm_features: list
     ) -> None:
-        positions, delta = cast(SupportsMRoPE, model).get_mrope_input_positions(prefill_token_ids, mm_features)
+        positions, delta = model.get_mrope_input_positions(prefill_token_ids, mm_features, **(_target_size.get() or {}))
         positions = positions[:, : self.max_model_len].cpu().numpy()
         self.table_lens.np[req_idx] = positions.shape[1]
         self.prefill_delta.np[req_idx] = delta
