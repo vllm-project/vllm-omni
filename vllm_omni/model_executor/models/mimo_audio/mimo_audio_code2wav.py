@@ -26,6 +26,7 @@ from vllm_omni.model_executor.models.mimo_audio.cuda_graph_decoder_wrapper impor
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -456,7 +457,9 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
         self.device = current_omni_platform.get_torch_device()
-        self.sample_rate = getattr(config, "audio_sample_rate", 24000)
+        # Explicit hf-config override wins; otherwise the authoritative rate
+        # is what the audio tokenizer actually decodes at (set below).
+        self.sample_rate = getattr(config, "audio_sample_rate", None)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path, trust_remote_code=True)
         self.codes = MiMoAudioCodes.from_tokenizer(self.tokenizer)
@@ -492,6 +495,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
             config_path=self.tokenizer_config_path,
             audio_tokenizer_path=self.audio_tokenizer_path,
         )
+        if self.sample_rate is None:
+            self.sample_rate = self._tokenizer_service.sample_rate
         # samples per codec frame for streaming context strip (same as tokenizer frames_per_token)
         audio_tokenizer_config = self._tokenizer_service.audio_tokenizer.config
         self.total_upsample = (
@@ -653,7 +658,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
         if code_tensor is None or code_tensor.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty]},
+                multimodal_outputs={
+                    "model_outputs": [empty],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self.sample_rate),
+                },
             )
 
         is_async_chunk = getattr(self.vllm_config.model_config, "async_chunk", False)
@@ -667,7 +675,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
         if is_capturing:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty] * len(request_ids_list)},
+                multimodal_outputs={
+                    "model_outputs": [empty] * len(request_ids_list),
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self.sample_rate, len(request_ids_list)),
+                },
             )
 
         if is_async_chunk:
@@ -683,7 +694,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios},
+            multimodal_outputs={
+                "model_outputs": audios,
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(self.sample_rate, len(audios)),
+            },
         )
 
     def make_omni_output(self, model_output: torch.Tensor | OmniOutput, **kwargs) -> OmniOutput:
@@ -692,11 +706,20 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
             return model_output
         empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
         if model_output is None:
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": [empty]})
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": [empty],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self.sample_rate),
+                },
+            )
         if isinstance(model_output, torch.Tensor):
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [model_output.to(dtype=torch.float32).reshape(-1)]},
+                multimodal_outputs={
+                    "model_outputs": [model_output.to(dtype=torch.float32).reshape(-1)],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self.sample_rate),
+                },
             )
         raise TypeError(f"Unexpected model output type: {type(model_output)}")
 
