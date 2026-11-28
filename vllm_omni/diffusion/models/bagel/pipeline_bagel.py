@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -353,6 +354,14 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
     _dit_modules: ClassVar[list[str]] = ["language_model.model"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # The MoT container keeps token embeddings next to the streamed layers, and
+    # those embeddings do not implement the on-demand loader contract. Keep them
+    # resident with the DiT remainder instead of splitting them into components.
+    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        block_attrs={"language_model.model": ("layers",)},
+        resident_dit_paths=frozenset({"language_model.model"}),
+        resident_dit_children={"language_model.model": frozenset({"embed_tokens"})},
+    )
     _resident_modules: ClassVar[list[str]] = [
         "bagel.time_embedder",
         "bagel.vae2llm",

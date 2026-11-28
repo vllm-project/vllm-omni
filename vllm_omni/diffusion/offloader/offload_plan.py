@@ -40,6 +40,12 @@ class OffloadPlan:
             device when ``dlo_resident_layers`` is nonzero. Keeping this
             model-declared avoids applying a consumer-GPU tuning knob to
             auxiliary or dual DiTs unintentionally.
+        resident_dit_children: DiT path -> child names that stay resident with
+            the DiT's non-block remainder instead of being split into on-demand
+            components. Use it for container DiTs whose block subtree also holds
+            embeddings or connectors that do not implement ``load_to_device`` /
+            ``offload_to_cpu``.
+            e.g. ``{"language_model.model": frozenset({"embed_tokens"})}``
         encoder_component_types: Maps encoder paths to public selector types
             (currently text_encoder). This declaration is used before the
             compatibility name heuristic.
@@ -55,6 +61,7 @@ class OffloadPlan:
     block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
     offload_submodules: dict[str, str] = field(default_factory=dict)
     resident_dit_paths: frozenset[str] = field(default_factory=frozenset)
+    resident_dit_children: dict[str, frozenset[str]] = field(default_factory=dict)
     encoder_component_types: dict[str, str] = field(default_factory=dict)
     encoder_block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
     encoder_dlo_weight_replication: frozenset[str] = field(default_factory=frozenset)

@@ -164,12 +164,16 @@ def _resolve_dit_children(
 
     A submodule qualifies when the model declares it or when it is large enough
     that keeping it resident would defeat streaming. Submodules that are
-    themselves discovered DiTs are left to their own component.
+    themselves discovered DiTs are left to their own component, and children
+    listed in ``resident_dit_children`` stay with the non-block remainder.
     """
     children: list[ResolvedComponent] = []
     block_ids = {id(block) for block in stack.blocks}
+    resident_children = (
+        frozenset() if declaration is None else declaration.resident_dit_children.get(dit_path, frozenset())
+    )
     for name, module in dit_module.named_children():
-        if name in stack.attrs:
+        if name in stack.attrs or name in resident_children:
             continue
         declared_attr = None if declaration is None else declaration.offload_submodules.get(name)
         # A boundary wrapper may alias the parent's streamed blocks (for

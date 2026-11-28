@@ -315,12 +315,18 @@ class MyPipeline(nn.Module):
     _offload_plan = OffloadPlan(
         block_attrs={"transformer": ("blocks",)},
         offload_submodules={"context_encoder": "layers"},
+        resident_dit_children={"transformer": frozenset({"embed_tokens"})},
         encoder_component_types={"prompt_model": "text_encoder"},
         encoder_block_attrs={"prompt_model": ("encoder.layers",)},
         encoder_dlo_weight_replication=frozenset({"prompt_model"}),
         on_demand_component_paths=frozenset({"prompt_model"}),
     )
 ```
+
+`resident_dit_children` keeps named children of a DiT (for example the token
+embeddings of a Mixture-of-Transformers container) resident with its non-block
+remainder; declare them when those modules do not implement `load_to_device` /
+`offload_to_cpu`.
 
 `encoder_component_types` maps arbitrary encoder paths to the public
 `text_encoder` selector. `encoder_dlo_weight_replication` is the explicit
