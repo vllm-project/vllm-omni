@@ -4507,6 +4507,18 @@ class MiniMaxH3Pipeline(
         }
 
     @torch.no_grad()
+    def execution_runtime_facts(self) -> dict[str, Any]:
+        """Precision facts the weights alone do not show, for ``--enable-execution-summary``."""
+        facts: dict[str, Any] = {}
+        video_vae = getattr(self, "video_vae", None)
+        if video_vae is not None:
+            facts["compute_dtypes"] = {"video_vae_decode": str(video_vae.decode_dtype).removeprefix("torch.")}
+            from vllm_omni.diffusion.models.minimax_h3.vae_nvfp4 import PackedNVFP4Linear
+
+            if any(isinstance(module, PackedNVFP4Linear) for module in video_vae.modules()):
+                facts["video_vae_decoder"] = "nvfp4"
+        return facts
+
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")

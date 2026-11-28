@@ -261,7 +261,7 @@ def _engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any]:
         "model": model,
         "model_revision": getattr(od_config, "revision", None) or snapshot,
         "model_class_name": getattr(od_config, "model_class_name", None),
-        "dtype": str(getattr(od_config, "dtype", None)).removeprefix("torch."),
+        "configured_dtype": _dtype_name(getattr(od_config, "dtype", None)),
         "quantization": _jsonable(quantization),
         "cache_backend": cache_backend,
         "cache_config": _jsonable(getattr(od_config, "cache_config", None))
@@ -274,11 +274,54 @@ def _engine_runtime(od_config: OmniDiffusionConfig) -> dict[str, Any]:
     }
 
 
-def worker_runtime(pipeline: torch.nn.Module | None) -> dict[str, Any] | None:
-    """Worker part of a diffusion stage's ``runtime`` facts: device and resolved attention backends.
+def _dtype_name(dtype: Any) -> str | None:
+    return None if dtype is None else str(dtype).removeprefix("torch.")
 
-    Computed once after the model loads; ``attention`` counts the backend each
-    attention layer resolved, per role.
+
+def _weight_dtypes(module: torch.nn.Module, seen: set[int]) -> dict[str, int]:
+    """Elements per dtype of a module's weights: parameters and persistent buffers.
+
+    Persistent buffers count because packed quantized weights (e.g. NVFP4) are
+    buffers; non-persistent ones (caches) do not. Tensors in ``seen`` are skipped.
+    """
+    counts: dict[str, int] = {}
+    for submodule in module.modules():
+        tensors = list(submodule._parameters.values())
+        tensors += [
+            buffer for name, buffer in submodule._buffers.items() if name not in submodule._non_persistent_buffers_set
+        ]
+        for tensor in tensors:
+            if tensor is None or id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
+            name = _dtype_name(tensor.dtype)
+            counts[name] = counts.get(name, 0) + tensor.numel()
+    return counts
+
+
+def _component_weight_dtypes(pipeline: torch.nn.Module) -> dict[str, dict[str, int]]:
+    """``_weight_dtypes`` per top-level pipeline component (e.g. ``transformer``, ``vae``)."""
+    seen_modules: set[int] = set()
+    seen_tensors: set[int] = set()
+    components: dict[str, dict[str, int]] = {}
+    for name, child in pipeline.named_children():
+        # Aliases (e.g. ``vae`` for ``video_vae``) report under their first name.
+        if id(child) in seen_modules:
+            continue
+        seen_modules.add(id(child))
+        counts = _weight_dtypes(child, seen_tensors)
+        if counts:
+            components[name] = counts
+    return components
+
+
+def worker_runtime(pipeline: torch.nn.Module | None) -> dict[str, Any] | None:
+    """Worker part of a diffusion stage's ``runtime`` facts, computed once after the model loads.
+
+    ``attention`` counts the backend each attention layer resolved, per role;
+    ``weight_dtypes`` the weight elements per dtype of each pipeline component,
+    as loaded. A pipeline adds facts only it knows (e.g. the precision it
+    computes in) through ``execution_runtime_facts()``.
     """
     if pipeline is None:
         return None
@@ -298,13 +341,18 @@ def worker_runtime(pipeline: torch.nn.Module | None) -> dict[str, Any] | None:
                 name = type(getattr(module, "attention", None)).__name__
             counts = backends.setdefault(str(getattr(module, "role", None)), {})
             counts[name] = counts.get(name, 0) + 1
-        return {
+        facts = {
             "device": current_omni_platform.get_device_name(),
             "world_size": torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
             "attention": backends,
+            "weight_dtypes": _component_weight_dtypes(pipeline),
         }
+        report = getattr(pipeline, "execution_runtime_facts", None)
+        if callable(report):
+            facts.update(_jsonable(report()))
+        return facts
     except Exception:
-        logger.warning("Failed to collect the attention backends", exc_info=True)
+        logger.warning("Failed to collect the worker runtime facts", exc_info=True)
         return None
 
 

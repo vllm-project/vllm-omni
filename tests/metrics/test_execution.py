@@ -147,10 +147,12 @@ def test_engine_runtime_reports_config():
 
     runtime = execution.engine_runtime(od_config)
 
-    assert {key: runtime[key] for key in ("model", "model_revision", "dtype", "quantization", "cache_backend")} == {
+    assert {
+        key: runtime[key] for key in ("model", "model_revision", "configured_dtype", "quantization", "cache_backend")
+    } == {
         "model": "org/name",
         "model_revision": "abc",
-        "dtype": "bfloat16",
+        "configured_dtype": "bfloat16",
         "quantization": None,
         "cache_backend": "none",
     }
@@ -259,3 +261,29 @@ def test_counts_progress_bar_steps():
                 bar.update()
 
     assert progress.result() == 3
+
+
+class _Packed(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("packed_weight", torch.zeros(4, 2, dtype=torch.uint8))
+        self.register_buffer("cache", torch.zeros(100), persistent=False)
+
+
+class _Components(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transformer = torch.nn.Linear(4, 4, dtype=torch.bfloat16)
+        self.video_vae = torch.nn.Sequential(torch.nn.Linear(2, 2), _Packed())
+        self.vae = self.video_vae  # alias, reported once
+        self.text_encoder = None
+
+
+def test_component_weight_dtypes_count_loaded_weights_per_component():
+    weights = execution._component_weight_dtypes(_Components())
+
+    assert weights == {
+        "transformer": {"bfloat16": 20},
+        # Packed quantized weights are persistent buffers; the cache is not a weight.
+        "video_vae": {"float32": 6, "uint8": 8},
+    }
