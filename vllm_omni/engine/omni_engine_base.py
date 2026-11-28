@@ -231,7 +231,9 @@ class OmniEngineBase:
         # Concurrent same-device stage init (admission + SH/EX phase locks).
         # Sourced from the parallel_stage_init orchestrator/CLI arg (config,
         # not an env var); default False preserves serial init.
-        self._parallel_stage_init: bool = bool(kwargs.get("parallel_stage_init") or False)
+        self._parallel_stage_init: bool = self._resolve_parallel_stage_init(
+            bool(kwargs.get("parallel_stage_init") or False), single_stage_mode
+        )
 
         if single_stage_mode:
             logger.info(
@@ -699,6 +701,21 @@ class OmniEngineBase:
                 self._omni_lb_policy,
             )
             self._omni_lb_policy = str(derived)
+
+    @staticmethod
+    def _resolve_parallel_stage_init(requested: bool, single_stage_mode: bool) -> bool:
+        """Parallel init overlaps the stages that one process launches. A
+        single-stage process (``--stage-id``, including ``--headless``) has
+        nothing to overlap, and admission and the extensible-KV guard only see
+        this process's stages, so it keeps serial init, whose device lock also
+        orders it against stages that other processes launch on the same GPU."""
+        if requested and single_stage_mode:
+            logger.warning(
+                "parallel_stage_init has no effect in single-stage mode (--stage-id, --headless): "
+                "this process launches one stage, which initializes under the serial device lock."
+            )
+            return False
+        return requested
 
     @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list[dict[str, Any]]:

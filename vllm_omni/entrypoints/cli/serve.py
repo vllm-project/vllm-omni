@@ -542,6 +542,15 @@ class OmniServeCommand(CLISubcommand):
             help="The timeout for initializing the stages.",
         )
         omni_config_group.add_argument(
+            "--parallel-stage-init",
+            action="store_true",
+            default=False,
+            help=(
+                "Initialize stages that share a GPU concurrently instead of one after another, "
+                "on GPUs dedicated to this deployment. See docs/configuration/gpu_memory_utilization.md."
+            ),
+        )
+        omni_config_group.add_argument(
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",

@@ -212,6 +212,33 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+def test_serve_parser_exposes_parallel_stage_init() -> None:
+    argv = ["serve", "fake-model", "--omni"]
+    assert _parse_serve_args(argv).parallel_stage_init is False
+    assert _parse_serve_args([*argv, "--parallel-stage-init"]).parallel_stage_init is True
+
+
+def test_serve_validate_accepts_parallel_stage_init_with_headless() -> None:
+    """The engine decides what the flag means for a single-stage process."""
+    args = _parse_serve_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--headless",
+            "--parallel-stage-init",
+            "--stage-id",
+            "1",
+            "--omni-master-address",
+            "127.0.0.1",
+            "--omni-master-port",
+            "20000",
+        ]
+    )
+    OmniServeCommand().validate(args)
+    assert args.parallel_stage_init is True
+
+
 def test_video_output_warmup_cli_options() -> None:
     argv = ["serve", "fake-model", "--omni"]
     args = _parse_serve_args(argv)
