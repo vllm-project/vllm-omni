@@ -1441,12 +1441,7 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def cos_sin(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if positions.dim() == 2 and positions.shape[0] == 3:
             y_pos = positions[1].float()
             x_pos = positions[2].float()
@@ -1456,9 +1451,6 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
             x_pos = positions.float()
 
         num_tokens = y_pos.shape[0]
-        dtype = query.dtype
-        query_shape = query.shape
-        key_shape = key.shape
 
         inv_freq = self.inv_freq.to(device=y_pos.device, dtype=torch.float32)
 
@@ -1471,10 +1463,46 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         # Interleave: [y*θ₀, x*θ₁, y*θ₂, x*θ₃, ...]
         freqs = torch.stack([y_freqs, x_freqs], dim=-1).reshape(num_tokens, -1)
 
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos().to(dtype).unsqueeze(1)
-        sin = emb.sin().to(dtype).unsqueeze(1)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        return torch.cat((cos, cos), dim=-1).unsqueeze(1), torch.cat((sin, sin), dim=-1).unsqueeze(1)
 
+    def prepare_factors(self, positions: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+        cos, sin = self.cos_sin(positions)
+        typed_cos, typed_sin = cos.to(dtype), sin.to(dtype)
+        lower, upper = typed_sin.chunk(2, dim=-1)
+        signed_sin = torch.cat((-lower, upper), dim=-1)
+        return cos, sin, typed_cos, typed_sin, signed_sin
+
+    def _query_factors(self, positions, dtype):
+        factors = positions if isinstance(positions, tuple) else self.cos_sin(positions)
+        if len(factors) >= 4 and factors[2].dtype == dtype:
+            return factors[2], factors[3]
+        return factors[0].to(dtype), factors[1].to(dtype)
+
+    def apply_packed(self, positions, qkv, q_size, kv_size):
+        # Projected Q and K are adjacent along the last dimension.
+        qk = qkv[..., : q_size + kv_size].view(qkv.shape[0], -1, self.head_dim)
+        cos, sin = self._query_factors(positions, qkv.dtype)
+        if isinstance(positions, tuple) and len(positions) == 5 and positions[4].dtype == qkv.dtype:
+            signed_sin = positions[4]
+        else:
+            lower, upper = sin.chunk(2, dim=-1)
+            signed_sin = torch.cat((-lower, upper), dim=-1)
+        left, right = qk.chunk(2, dim=-1)
+        rotated = qk * cos + torch.cat((right, left), dim=-1) * signed_sin
+        q, k = rotated.flatten(1).split((q_size, kv_size), dim=-1)
+        return q.contiguous(), k.contiguous(), qkv[..., q_size + kv_size :]
+
+    def forward(
+        self,
+        positions: torch.Tensor | tuple[torch.Tensor, ...],
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = self._query_factors(positions, query.dtype)
+        num_tokens = cos.shape[0]
+        query_shape, key_shape = query.shape, key.shape
         query = query.view(num_tokens, -1, self.head_dim)
         key = key.view(num_tokens, -1, self.head_dim)
 
@@ -1809,6 +1837,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
                 layer.self_attn.rotary_emb = custom_rope
                 replaced += 1
+        if replaced:
+            self.model.shared_rotary_emb = custom_rope
         logger.info(
             "Replaced %d rotary embeddings with HunyuanImage3RotaryEmbedding "
             "(interleaved 2D RoPE, head_dim=%d, rope_theta=%.1f)",
