@@ -900,6 +900,8 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     assert pipeline._encoder_modules == (["text_encoder"] if expect_encoder else [])
     assert ("text_encoder" in pipeline._offload_plan.encoder_block_attrs) is expect_encoder
     assert ("text_encoder" in pipeline._offload_plan.on_demand_component_paths) is expect_encoder
+    assert ("text_encoder" in pipeline._offload_plan.one_shot_component_paths) is expect_encoder
+    assert ("text_encoder" in pipeline._offload_plan.component_backing) is expect_encoder
     assert ("encode_prompt" in pipeline._PROFILER_TARGETS) is expect_encoder
     assert ("_encode_local_media" in pipeline._PROFILER_TARGETS) is expect_encoder
     assert component_options["video_vae"]["decode_only"] is not expect_encoder
