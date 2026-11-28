@@ -165,6 +165,7 @@ class HeliosFeedForward(nn.Module):
 
 
 _SPATIAL_MESHGRID_CACHE_SIZE = 32
+_ROPE_EMB_CACHE_SIZE = 16
 
 
 class HeliosRotaryPosEmbed(nn.Module):
@@ -180,6 +181,12 @@ class HeliosRotaryPosEmbed(nn.Module):
         self._spatial_meshgrid_cache: OrderedDict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = (
             OrderedDict()
         )
+        self._rope_emb_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+
+    def _apply(self, fn, recurse=True):
+        self._rope_emb_cache.clear()
+        self._spatial_meshgrid_cache.clear()
+        return super()._apply(fn, recurse=recurse)
 
     def _get_freqs_base(self, dim):
         return 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
@@ -209,6 +216,22 @@ class HeliosRotaryPosEmbed(nn.Module):
 
     @torch.no_grad()
     def forward(self, frame_indices, height, width, device):
+        cache_key = None
+        # Helios builds frame indices on CPU. Avoid synchronizing a device
+        # stream when an external caller supplies accelerator indices.
+        if frame_indices.device.type == "cpu":
+            cache_key = (
+                tuple(tuple(row) for row in frame_indices.tolist()),
+                height,
+                width,
+                str(device),
+                torch.is_inference_mode_enabled(),
+            )
+            cached = self._rope_emb_cache.get(cache_key)
+            if cached is not None:
+                self._rope_emb_cache.move_to_end(cache_key)
+                return cached
+
         batch_size = frame_indices.shape[0]
         num_frames = frame_indices.shape[1]
 
@@ -228,7 +251,12 @@ class HeliosRotaryPosEmbed(nn.Module):
             dim=0,
         )
 
-        return result.permute(1, 0, 2, 3, 4)
+        result = result.permute(1, 0, 2, 3, 4)
+        if cache_key is not None:
+            self._rope_emb_cache[cache_key] = result
+            if len(self._rope_emb_cache) > _ROPE_EMB_CACHE_SIZE:
+                self._rope_emb_cache.popitem(last=False)
+        return result
 
 
 class HeliosTimeTextEmbedding(nn.Module):
