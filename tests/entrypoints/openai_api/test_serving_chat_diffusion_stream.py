@@ -78,12 +78,11 @@ def test_text_output_streams_sse_chunks():
     assert engine.prompts[0]["modalities"] == ["text"]
     assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
     assert len({chunk["id"] for chunk in chunks}) == 1
-    content_chunk, finish_chunk, usage_chunk = chunks
+    content_chunk, usage_chunk = chunks
     assert content_chunk["choices"][0]["delta"] == {"role": "assistant", "content": "A cat on a mat."}
-    assert content_chunk["choices"][0]["finish_reason"] is None
-    assert finish_chunk["choices"][0]["finish_reason"] == "stop"
-    assert finish_chunk["metrics"] == {"think_text": "hmm"}
-    assert "usage" not in content_chunk and "usage" not in finish_chunk
+    assert content_chunk["choices"][0]["finish_reason"] == "stop"
+    assert content_chunk["metrics"] == {"think_text": "hmm"}
+    assert "usage" not in content_chunk
     assert usage_chunk["choices"] == []
     assert usage_chunk["usage"]["completion_tokens"] == 5
 
@@ -95,10 +94,9 @@ def test_continuous_usage_is_attached_to_every_chunk():
     generator = asyncio.run(serving_chat._create_chat_completion(request))
     chunks = asyncio.run(_collect(generator))
 
-    content_chunk, finish_chunk, usage_chunk = chunks
+    content_chunk, usage_chunk = chunks
     expected_usage = {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
-    for chunk in (content_chunk, finish_chunk):
-        assert {k: chunk["usage"][k] for k in expected_usage} == expected_usage
+    assert {k: content_chunk["usage"][k] for k in expected_usage} == expected_usage
     assert [chunk for chunk in chunks if chunk["choices"] == []] == [usage_chunk]
     assert {k: usage_chunk["usage"][k] for k in expected_usage} == expected_usage
 
@@ -109,7 +107,7 @@ def test_server_forced_usage_without_stream_options():
     generator = asyncio.run(serving_chat._create_chat_completion(_request(["text"], stream=True)))
     chunks = asyncio.run(_collect(generator))
 
-    assert len(chunks) == 3
+    assert len(chunks) == 2
     assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"]["completion_tokens"] == 5
 
@@ -120,7 +118,7 @@ def test_usage_chunk_omitted_without_include_usage():
     generator = asyncio.run(serving_chat._create_chat_completion(_request(["text"], stream=True)))
     chunks = asyncio.run(_collect(generator))
 
-    assert len(chunks) == 2
+    assert len(chunks) == 1
     assert all("usage" not in chunk for chunk in chunks)
 
 
@@ -128,12 +126,12 @@ def test_image_output_streams_image_content():
     serving_chat, _ = _serving_chat(_image_result())
 
     generator = asyncio.run(serving_chat._create_chat_completion(_request(["image"], stream=True)))
-    content_chunk, finish_chunk = asyncio.run(_collect(generator))
+    (content_chunk,) = asyncio.run(_collect(generator))
 
     assert content_chunk["modality"] == "image"
     image_content = content_chunk["choices"][0]["delta"]["content"]
     assert image_content[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert finish_chunk["choices"][0]["finish_reason"] == "stop"
+    assert content_chunk["choices"][0]["finish_reason"] == "stop"
 
 
 def test_non_stream_request_still_returns_full_response():

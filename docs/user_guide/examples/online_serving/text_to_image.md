@@ -48,6 +48,12 @@ For more details on parallelism acceleration, see the [Parallelism Acceleration 
 
 ## API Calls
 
+For `/v1/chat/completions`, `"stream": true` returns Server-Sent Events using
+the same `chat.completion.chunk` format as multi-stage image generation.
+The image arrives in `choices[0].delta.content` after generation finishes,
+followed by `data: [DONE]`; diffusion steps are not streamed.
+With `"stream": false` (the default), the endpoint returns a JSON completion.
+
 ### Method 1: Using curl
 
 ```bash
