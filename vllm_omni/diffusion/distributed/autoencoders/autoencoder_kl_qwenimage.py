@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
+from diffusers.models.autoencoders.autoencoder_kl_qwenimage import QwenImageCausalConv3d
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
@@ -14,11 +17,97 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.distributed.autoencoders.qwen_spatial_shard import install_qwen_spatial_shard_decode
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
+from vllm_omni.diffusion.distributed.errors import DistributedExecutionError
 
 logger = init_logger(__name__)
 
 
 class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMixin):
+    def clear_cache(self):
+        def _count_cached_conv3d(model) -> int:
+            return sum(isinstance(module, (QwenImageCausalConv3d, WanDistCausalConv3d)) for module in model.modules())
+
+        self._conv_num = _count_cached_conv3d(self.decoder)
+        self._conv_idx = [0]
+        self._feat_map = [None] * self._conv_num
+        self._enc_conv_num = _count_cached_conv3d(self.encoder)
+        self._enc_conv_idx = [0]
+        self._enc_feat_map = [None] * self._enc_conv_num
+
+    def _spatial_decode_requested(self) -> bool:
+        executor = getattr(self, "distributed_executor", None)
+        mode = getattr(executor, "parallel_mode", "tile")
+        installed = getattr(self, "_qwen_spatial_shard_config", None)
+        if installed is not None:
+            group, direction, size = installed
+            if mode != f"spatial_shard_{direction}" or executor.group is not group or executor.parallel_size != size:
+                raise ValueError(
+                    "Qwen spatial-shard mode, group or parallel size changed; create a fresh VAE instance."
+                )
+        return mode in ("spatial_shard_height", "spatial_shard_width")
+
+    def _spatial_decode(self, z: torch.Tensor, return_dict: bool):
+        executor = self.distributed_executor
+        size = executor.parallel_size
+        if size < 1:
+            raise ValueError("Qwen spatial-shard parallel size must be positive.")
+        if not dist.is_initialized():
+            if size != 1:
+                raise RuntimeError("Qwen spatial-shard requires initialized distributed execution for multiple ranks.")
+        else:
+            if size > 1 and executor.group is None:
+                raise ValueError("Qwen spatial-shard requires an explicit executor process group for multiple ranks.")
+            world_size = dist.get_world_size(executor.group)
+            if size != world_size:
+                raise ValueError(
+                    f"Qwen spatial-shard vae_patch_parallel_size={size} must match executor group size={world_size}."
+                )
+        try:
+            installed = getattr(self, "_qwen_spatial_shard_config", None)
+            # The config is set only after installation succeeds. Skip the
+            # installation all_reduce on subsequent decode calls.
+            if size > 1 and installed is None:
+                try:
+                    with executor._sync_errors("spatial decode installation"):
+                        install_qwen_spatial_shard_decode(
+                            self, executor.group, executor.parallel_mode.removeprefix("spatial_shard_")
+                        )
+                except Exception as error:
+                    # Installation mutates the decoder in place; no rank may
+                    # reuse the group if a peer has a partially patched decoder.
+                    raise DistributedExecutionError(
+                        "Qwen spatial decode installation failed; the worker group must be restarted."
+                    ) from error
+            with executor._sync_errors("spatial decode preparation") if size > 1 else nullcontext():
+                if z.shape[2] == 0:
+                    raise ValueError("Qwen spatial-shard decode requires at least one latent frame.")
+                self.clear_cache()
+                x = self.post_quant_conv(z)
+            try:
+                chunks = []
+                for i in range(z.shape[2]):
+                    self._conv_idx = [0]
+                    chunks.append(self.decoder(x[:, :, i : i + 1], feat_cache=self._feat_map, feat_idx=self._conv_idx))
+                out = torch.cat(chunks, dim=2).clamp(-1, 1)
+            except Exception as error:
+                if size > 1:
+                    # A peer may already be waiting in halo/attention/gather
+                    # communication. Another collective cannot report this safely.
+                    raise DistributedExecutionError(
+                        "Qwen spatial decode failed during distributed execution; the worker group must be restarted."
+                    ) from error
+                raise
+        finally:
+            self.clear_cache()
+        return DecoderOutput(sample=out) if return_dict else (out,)
+
+    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+        if self._spatial_decode_requested():
+            return self._spatial_decode(z, return_dict)
+        return super()._decode(z, return_dict=return_dict)
+
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
         model = super().from_pretrained(*args, **kwargs)
@@ -105,6 +194,8 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         return dec
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
+        if self._spatial_decode_requested():
+            return self._spatial_decode(z, return_dict)
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
 

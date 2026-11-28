@@ -10,8 +10,9 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
+from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter, uses_rank_local_dp_concurrency
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL_base
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -635,6 +636,16 @@ def initialize_model(
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         vae_mode = od_config.parallel_config.vae_parallel_mode
         is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        if (
+            vae_pp_size > 1
+            and vae_mode in ("spatial_shard_height", "spatial_shard_width")
+            and isinstance(getattr(model, "vae", None), DistributedAutoencoderKLQwenImage)
+            and uses_rank_local_dp_concurrency(od_config)
+        ):
+            raise ValueError(
+                "Qwen multi-rank spatial VAE decode requires every rank to process the same request. "
+                "With rank-local DP concurrency, shards would come from different requests."
+            )
         if vae_mode == "batch" and not isinstance(getattr(model, "vae", None), DistributedAutoencoderKL_base):
             raise ValueError(
                 "VAE batch parallel decode requires DistributedAutoencoderKL or DistributedAutoencoderKLFlux2"
