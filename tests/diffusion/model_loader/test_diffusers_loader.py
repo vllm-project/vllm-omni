@@ -645,6 +645,17 @@ def test_strict_check_only_validates_source_prefix_parameters():
     loader.load_weights(model)
 
 
+def test_load_weights_prepares_lazy_tracking_for_direct_callers(monkeypatch):
+    model = _DummyPipelineModel(source_prefix="transformer.")
+    loader = _make_loader_with_weights(["transformer.weight"])
+    prepared = []
+    monkeypatch.setattr(loader, "_prepare_lazy_weight_loading", lambda current: prepared.append(current) or 1)
+
+    loader.load_weights(model)
+
+    assert prepared == [model]
+
+
 def test_strict_check_raises_when_source_parameters_are_missing():
     model = _DummyPipelineModel(source_prefix="transformer.")
     loader = _make_loader_with_weights([])

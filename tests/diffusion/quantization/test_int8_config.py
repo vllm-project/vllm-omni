@@ -402,6 +402,133 @@ class TestOffloadAfterQuant:
         assert marked == 1
         assert lazy_int8._offload_after_quant
 
+    @pytest.mark.parametrize("offload_after_quant", [False, True])
+    def test_bias_first_checkpoint_finalizes_each_layer_before_next_load(
+        self, mocker: MockerFixture, offload_after_quant
+    ):
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+        from vllm_omni.quantization.int8_config import LazyWeightMixin
+
+        mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1)
+
+        class RecordingMethod(LazyWeightMixin):
+            def process_weights_after_loading(self, layer):
+                layer.processed = True
+                self._finish_weight_processing(layer)
+
+        def copy_loader(param, loaded_weight, *args, **kwargs):
+            param.data.copy_(loaded_weight)
+
+        def make_layer():
+            layer = Module()
+            layer.has_bias = True
+            layer.bias = Parameter(torch.empty(4), requires_grad=False)
+            layer.bias.weight_loader = copy_loader
+            moved_to = []
+            layer.to = lambda device, *args, **kwargs: moved_to.append(device)  # type: ignore[method-assign]
+            method = RecordingMethod()
+            method.create_weights(
+                layer,
+                input_size_per_partition=8,
+                output_partition_sizes=[4],
+                input_size=8,
+                output_size=4,
+                params_dtype=torch.bfloat16,
+                weight_loader=copy_loader,
+            )
+            layer.quant_method = method
+            return layer, moved_to
+
+        first, first_moved_to = make_layer()
+        second, second_moved_to = make_layer()
+        model = torch.nn.Sequential(first, second)
+
+        assert DiffusersPipelineLoader._prepare_lazy_weight_loading(model) == 2
+        if offload_after_quant:
+            assert DiffusersPipelineLoader._request_offload_after_quant(model) == 2
+
+        bias = torch.randn(4)
+        first.bias.weight_loader(first.bias, bias)
+        assert not getattr(first, "_already_called_process_weights_after_loading", False)
+        first.weight.weight_loader(first.weight, torch.randn(4, 8))
+
+        # The first layer must be final and back on the host before the loader
+        # starts materializing the second layer's weight.
+        assert first.processed
+        assert first._already_called_process_weights_after_loading
+        assert first_moved_to == (["cpu"] if offload_after_quant else [])
+        assert not getattr(second, "_already_called_process_weights_after_loading", False)
+
+        second.bias.weight_loader(second.bias, bias)
+        second.weight.weight_loader(second.weight, torch.randn(4, 8))
+        assert second.processed
+        assert second._already_called_process_weights_after_loading
+        assert second_moved_to == (["cpu"] if offload_after_quant else [])
+
+    def test_weights_first_checkpoint_finalizes_weight_only_layers_without_offload(self, mocker: MockerFixture):
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+        from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod, LazyWeightMixin
+
+        mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1)
+
+        class WeightOnlyMethod(LazyWeightMixin):
+            finalize_requires_bias = False
+
+            def process_weights_after_loading(self, layer):
+                layer.processed = True
+                self._finish_weight_processing(layer)
+
+        assert Int8OnlineLinearMethod.finalize_requires_bias is False
+
+        def copy_loader(param, loaded_weight, *args, **kwargs):
+            param.data.copy_(loaded_weight)
+
+        def make_layer():
+            layer = Module()
+            layer.has_bias = True
+            layer.bias = Parameter(torch.empty(4), requires_grad=False)
+            layer.bias.weight_loader = copy_loader
+            method = WeightOnlyMethod()
+            method.create_weights(
+                layer,
+                input_size_per_partition=8,
+                output_partition_sizes=[4],
+                input_size=8,
+                output_size=4,
+                params_dtype=torch.bfloat16,
+                weight_loader=copy_loader,
+            )
+            layer.quant_method = method
+            return layer
+
+        first = make_layer()
+        second = make_layer()
+        model = torch.nn.Sequential(first, second)
+        assert DiffusersPipelineLoader._prepare_lazy_weight_loading(model) == 2
+        assert not getattr(first, "_lazy_bias_loader_tracked", False)
+        assert not getattr(second, "_lazy_bias_loader_tracked", False)
+
+        # All weights arrive before their biases. Weight-only processing must
+        # still finalize each layer before the next weight is materialized.
+        first.weight.weight_loader(first.weight, torch.randn(4, 8))
+        assert first.processed
+        assert not getattr(second, "_already_called_process_weights_after_loading", False)
+
+        second.weight.weight_loader(second.weight, torch.randn(4, 8))
+        assert second.processed
+
+        bias = torch.randn(4)
+        first.bias.weight_loader(first.bias, bias)
+        second.bias.weight_loader(second.bias, bias)
+        assert first._already_called_process_weights_after_loading
+        assert second._already_called_process_weights_after_loading
+
+        offload_layer = make_layer()
+        offload_layer.quant_method.enable_offload_after_quant(offload_layer)
+        assert offload_layer._lazy_bias_loader_tracked
+
 
 class TestInt8LinearMethod:
     @pytest.fixture

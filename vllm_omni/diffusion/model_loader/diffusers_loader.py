@@ -928,6 +928,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                                 marked,
                             )
                     if load_format == "diffusers":
+                        self._prepare_lazy_weight_loading(model)
                         cast(DiffusersAdapterPipeline, model).load_weights()
                     else:
                         if offload_after_quant:
@@ -992,6 +993,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 reporter(component_name)
 
     @staticmethod
+    def _prepare_lazy_weight_loading(model: nn.Module) -> int:
+        """Install per-layer load tracking before any checkpoint tensor is read."""
+        prepared = 0
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            prepare = getattr(quant_method, "prepare_lazy_loading", None)
+            if prepare is None:
+                continue
+            prepare(module)
+            prepared += 1
+        return prepared
+
+    @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:
         """Ask online-quant layers to return to host memory once quantized.
 
@@ -1011,7 +1025,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not getattr(quant_method, "supports_offload_after_quant", False):
                 continue
-            quant_method.enable_offload_after_quant()
+            quant_method.enable_offload_after_quant(module)
             marked += 1
         return marked
 
@@ -1230,6 +1244,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         weight_name_filter: Callable[[str], bool] | None = None,
         disallow_weights: Iterable[str] = (),
     ) -> None:
+        # Direct callers such as HSDP bypass load_model's preparation hook.
+        self._prepare_lazy_weight_loading(model)
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
         if weight_name_filter is not None:

@@ -317,6 +317,7 @@ PY
         stage "core_model · 1 card" 28m "${one_card}" "${paths[@]}" "${ignore[@]}" \
             -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
         stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
+        stage "convrot config" 2m "${one_card}" tests/diffusion/quantization/test_convrot_config.py
 
         # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image,
         # Wan2.1, Voxtral) with real weights - --run-level advanced_model, not
