@@ -942,3 +942,168 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) ->
     for session in result["sessions"]:
         _assert_request_metrics(session["request_metrics"], expected_count=1)
         _assert_session_metrics(session["session_metrics"], expected_count=1)
+
+
+def _event_response_id(event: dict[str, object]) -> str | None:
+    """Read a response id from either the flat ``response_id`` field or ``response.id``."""
+    response_id = event.get("response_id")
+    if isinstance(response_id, str):
+        return response_id
+    response = event.get("response")
+    if isinstance(response, dict):
+        nested = response.get("id")
+        if isinstance(nested, str):
+            return nested
+    return None
+
+
+async def _run_response_cancel_mid_reply(
+    *,
+    url: str,
+    model: str,
+    ref_audio: Path,
+    input_wav: Path,
+    timeout_s: float = 120.0,
+) -> list[dict[str, object]]:
+    """Stream audio, wait for the reply's first output delta, then cancel (#5644 Q2)."""
+    import wave
+
+    with wave.open(str(input_wav), "rb") as wav:
+        assert wav.getframerate() == 16000 and wav.getnchannels() == 1
+        pcm = wav.readframes(wav.getnframes())
+
+    websocket_url = build_realtime_url(url, model, autostart=False)
+    events: list[dict[str, object]] = []
+    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "model": model,
+                        "modalities": ["audio", "text"],
+                        "ref_audio": _ref_audio_data_url(str(ref_audio)),
+                        "output_audio_format": "pcm16",
+                        "extra_body": {"auto_response": True},
+                    },
+                }
+            )
+        )
+        events.extend(await _receive_protocol_events(ws, {"session.created", "session.updated"}, timeout_s=timeout_s))
+
+        chunk_bytes = 3200
+        for offset in range(0, len(pcm), chunk_bytes):
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm[offset : offset + chunk_bytes]).decode(),
+                    }
+                )
+            )
+            await asyncio.sleep(0.2)
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        response_id = None
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=deadline - asyncio.get_event_loop().time())
+            event = json.loads(raw)
+            events.append(event)
+            if event.get("type") == "response.created":
+                response_id = event["response"]["id"]
+                break
+            if event.get("type") in {"session.closed", "error"}:
+                raise AssertionError(f"Session ended before a response was created: {event}")
+
+        assert response_id is not None, "No response was created"
+
+        # Wait for the created response's first output delta: the reply has
+        # started playing back, so the cancel below interrupts it mid-reply.
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=deadline - asyncio.get_event_loop().time())
+            event = json.loads(raw)
+            events.append(event)
+            if event.get("type") in {"session.closed", "error"}:
+                raise AssertionError(f"Session ended before the reply produced output: {event}")
+            if (
+                event.get("type")
+                in {
+                    "response.output_audio.delta",
+                    "response.output_audio_transcript.delta",
+                    "response.output_text.delta",
+                }
+                and _event_response_id(event) == response_id
+            ):
+                break
+
+        await ws.send(json.dumps({"type": "response.cancel"}))
+
+        # Drain until the cancelled response completes. Match the captured id so
+        # an unrelated response.done cannot satisfy the wait.
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=deadline - asyncio.get_event_loop().time())
+            event = json.loads(raw)
+            events.append(event)
+            if event.get("type") == "response.done" and _event_response_id(event) == response_id:
+                break
+
+        await ws.send(json.dumps({"type": "session.close"}))
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                event = json.loads(raw)
+                events.append(event)
+                if event.get("type") == "session.closed":
+                    break
+            except TimeoutError:
+                break
+    return events
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_duplex_client_response_cancel(omni_server) -> None:
+    """response.cancel interrupts an in-flight MiniCPM-o duplex reply (#5644 Q2).
+
+    The client streams a full utterance, waits for the created response to emit
+    its first output delta, then sends response.cancel. The interrupted response
+    must complete with status "cancelled", its response.done must carry the id
+    captured from response.created, and the session must stay open until the
+    client closes it.
+    """
+    events = asyncio.run(
+        _run_response_cancel_mid_reply(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            ref_audio=resolve_ref_audio(),
+            input_wav=validated_input_wav(),
+        )
+    )
+    event_types = [event.get("type") for event in events]
+    assert "response.created" in event_types
+    created = next(event for event in events if event.get("type") == "response.created")
+    response_id = _event_response_id(created)
+    assert response_id, "response.created carries no response id"
+
+    # The reply had started playing back before the cancel: its first output
+    # delta is in the recorded stream and belongs to the created response.
+    delta_types = {
+        "response.output_audio.delta",
+        "response.output_audio_transcript.delta",
+        "response.output_text.delta",
+    }
+    assert any(event.get("type") in delta_types and _event_response_id(event) == response_id for event in events), (
+        "No output delta of the created response arrived before the cancel"
+    )
+
+    # The cancelled response.done belongs to the same response this test started.
+    done_events = [
+        event for event in events if event.get("type") == "response.done" and _event_response_id(event) == response_id
+    ]
+    assert done_events, "No response.done received for the cancelled response"
+    done = done_events[-1]
+    response = done.get("response", done)
+    assert response.get("status") == "cancelled", f"Expected cancelled, got {response.get('status')!r}"
+    assert event_types[-1] == "session.closed"
