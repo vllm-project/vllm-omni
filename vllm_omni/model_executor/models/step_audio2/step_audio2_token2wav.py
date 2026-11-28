@@ -44,6 +44,7 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
     STREAM_SOURCE_CACHE_LEN,
 )
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -162,7 +163,7 @@ def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
 
 def _build_hift() -> HiFTGenerator:
     return HiFTGenerator(
-        sampling_rate=24000,
+        sampling_rate=DEFAULT_TOKEN2WAV_CONFIG.sample_rate,
         upsample_rates=[8, 5, 3],
         upsample_kernel_sizes=[16, 11, 7],
         source_resblock_kernel_sizes=[7, 7, 11],
@@ -931,7 +932,10 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
             dummy_audio = torch.zeros(1000, device=device, dtype=torch.float32)
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [dummy_audio]},
+                multimodal_outputs={
+                    "model_outputs": [dummy_audio],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(DEFAULT_TOKEN2WAV_CONFIG.sample_rate),
+                },
             )
 
         # ----- synchronous (full-sequence) path -----
@@ -957,7 +961,10 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": [waveform_tensor_cpu]},
+            multimodal_outputs={
+                "model_outputs": [waveform_tensor_cpu],
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(DEFAULT_TOKEN2WAV_CONFIG.sample_rate),
+            },
         )
 
     # ------------------------------------------------------------------
@@ -1017,7 +1024,10 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
                 state.finished = True
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [torch.zeros(1, dtype=torch.float32)]},
+                multimodal_outputs={
+                    "model_outputs": [torch.zeros(1, dtype=torch.float32)],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(DEFAULT_TOKEN2WAV_CONFIG.sample_rate),
+                },
             )
 
         prompt_wav = self._default_prompt_wav
@@ -1045,7 +1055,10 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": [waveform.detach().cpu().contiguous()]},
+            multimodal_outputs={
+                "model_outputs": [waveform.detach().cpu().contiguous()],
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(DEFAULT_TOKEN2WAV_CONFIG.sample_rate),
+            },
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
