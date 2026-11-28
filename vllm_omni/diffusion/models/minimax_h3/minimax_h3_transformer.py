@@ -172,6 +172,33 @@ def _reference_kv_video_layout(
     )
 
 
+def _align_compact_positions(
+    active_positions: torch.Tensor,
+    *,
+    seq_len: int,
+    used_len: int,
+    local_len: int,
+) -> torch.Tensor:
+    """Drop only surplus trailing padding, never a real compact token.
+
+    The reference mask covers valid visual rows only; its sorted complement
+    therefore ends with the original padding [used_len, seq_len). Preserve
+    original positions for embedding, RoPE, and output scatter. The denoise
+    branch reserves padding before step 0 when the original tail is too short.
+    """
+    if local_len == seq_len:
+        return active_positions
+    if local_len <= 0 or seq_len % local_len:
+        raise ValueError(f"original SP layout must evenly shard {seq_len} rows, got {local_len}")
+    if not 0 < used_len <= seq_len:
+        raise ValueError(f"invalid packed used length {used_len} for {seq_len} rows")
+    sp_size = seq_len // local_len
+    trim = int(active_positions.numel()) % sp_size
+    if trim > seq_len - used_len:
+        raise ValueError("reference-KV SP alignment needs padding reserved before the first denoise step")
+    return active_positions[:-trim] if trim else active_positions
+
+
 def _local_compact_positions(
     active_positions: torch.Tensor,
     *,
@@ -1526,6 +1553,12 @@ class MiniMaxH3DiTModel(nn.Module):
                         f"{active_positions.numel()} != "
                         f"{seq_len - reference_rows}"
                     )
+                active_positions = _align_compact_positions(
+                    active_positions,
+                    seq_len=seq_len,
+                    used_len=max_seqlen,
+                    local_len=local_len,
+                )
                 compact_local_positions = _local_compact_positions(
                     active_positions,
                     seq_len=seq_len,
@@ -1534,6 +1567,23 @@ class MiniMaxH3DiTModel(nn.Module):
                 )
                 if compact_local_positions is None:
                     raise ValueError("MiniMax H3 reference-KV target rows cannot form an equal SP shard")
+                trimmed_padding = seq_len - reference_rows - int(active_positions.numel())
+                if (
+                    local_start == 0
+                    and trimmed_padding
+                    and not getattr(reference_kv_state, "_sp_alignment_logged", False)
+                ):
+                    logger.info(
+                        "MiniMax H3 reference-KV SP alignment: original=%d used=%d reference=%d "
+                        "compact=%d sp=%d dropped_padding=%d",
+                        seq_len,
+                        max_seqlen,
+                        reference_rows,
+                        int(active_positions.numel()),
+                        seq_len // local_len,
+                        trimmed_padding,
+                    )
+                    reference_kv_state._sp_alignment_logged = True
 
         rope_table = kwargs.get("rope_table")
         if compact_reference and local_len != seq_len:
@@ -1606,7 +1656,8 @@ class MiniMaxH3DiTModel(nn.Module):
             block_packed_total = int(active_positions.numel())
             block_max_seqlen = max_seqlen - reference_rows
             cu_seqlens = cu_seqlens.clone()
-            cu_seqlens[1:] -= reference_rows
+            cu_seqlens[1] = block_max_seqlen
+            cu_seqlens[-1] = block_packed_total
             if local_len == seq_len:
                 hidden = hidden.index_select(0, active_positions)
                 block_rope = block_rope.index_select(0, active_positions)
