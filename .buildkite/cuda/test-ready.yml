@@ -28,11 +28,14 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       # One sweep. Split when measured durations exceed timeout_in_minutes.
+      # In-shard xdist: 4 workers and --dist loadgroup. cpu tests are one
+      # xdist_group per file (tests/helpers/fixtures/pytest_collection.py).
+      # Nightly Simple · CPU Coverage uses the same flags, plus --cov.
       - label: "Simple Test"
         timeout_in_minutes: 25
         automatic_shard: true
         commands:
-          - "pytest -sv tests/ -m 'core_model and cpu'"
+          - "pytest -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup"
         mirror_hardwares: l4_1
 
       # AMD READY R2-01 is non-blocking, so fail the change that moves its
