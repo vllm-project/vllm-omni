@@ -2460,6 +2460,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if sample_rate_error is not None:
             raise ValueError(sample_rate_error)
 
+        adapter = self._get_tts_adapter()
+        if adapter is not None and request.temperature is not None and not adapter.supports_temperature:
+            raise ValueError(f"Model '{adapter.name}' does not support 'temperature'")
+
         request_id = request_id or f"speech-{random_uuid()}"
 
         # If this is a streaming request with real async chunks, we need to
@@ -2531,7 +2535,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         additional_prompts: list[dict[str, Any]] = []
         segment_silence_ms = 200
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
-        if (adapter := self._get_tts_adapter()) is not None:
+        if adapter is not None:
             adapter.normalize(request)
             validation_error = validate_tts_request(adapter, request)
             if validation_error:
@@ -2915,6 +2919,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             adapter = self._get_tts_adapter()
             if adapter is None:
                 raise ValueError(f"Model {self._diffusion_model_name!r} does not provide a diffusion TTS adapter.")
+
+            if request.temperature is not None:
+                raise ValueError("Diffusion TTS models do not support 'temperature'")
 
             adapter.normalize(request)
 

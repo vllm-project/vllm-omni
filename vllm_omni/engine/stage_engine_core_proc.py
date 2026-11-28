@@ -273,6 +273,14 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
+        # Lift the client-side extra_args opt-in onto the typed field here:
+        # frontends that build a plain EngineCoreRequest (input processors,
+        # run-request ingestion) never see the omni wire field.
+        return_hidden_states = bool(getattr(request, "return_hidden_states", False))
+        if not return_hidden_states:
+            extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", None)
+            return_hidden_states = bool(isinstance(extra_args, dict) and extra_args.get("return_hidden_states"))
+        scheduler_request.return_hidden_states = return_hidden_states
         return scheduler_request, current_wave
 
     @staticmethod

@@ -166,6 +166,7 @@ class SilenceContinuationScheduler(Protocol):
         response_owned: bool,
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
+        fast_path: bool = False,
     ) -> bool: ...
 
 
@@ -183,12 +184,14 @@ class ModelChannel:
         *,
         close_from_runtime: Callable[[str], Awaitable[None]],
         schedule_silence_continuation: SilenceContinuationScheduler,
+        silence_continuation_enabled: Callable[[], bool] = lambda: False,
         abort_request: Callable[..., Awaitable[None]],
     ) -> None:
         self._ctx = ctx
         self._out = out
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
+        self._silence_continuation_enabled = silence_continuation_enabled
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
         self._deferred_text_listen: tuple[int, dict[str, object]] | None = None
@@ -358,28 +361,90 @@ class ModelChannel:
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = [key for key in session.request_resources if not duplex_is_auxiliary_request(key[1])]
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
-                self._ctx.run.concurrent_turn_requests_released
+            concurrent_released = bool(self._ctx.run.concurrent_turn_requests_released)
+            concurrent_turn = session.capabilities.supports_concurrent_turn_requests and concurrent_released
+            draining_stages = self._draining_stage_ids()
+            # Classify by turn. A's Talker-plus-codec drain stays up. B, which
+            # has only submitted Stage0 and a prewarmed receiver, is not speech:
+            # the last draining stage alone is the async-chunk placeholder.
+            turns: dict[int | str, list[tuple[int, str]]] = {}
+            for sid, rid in stale_keys:
+                turn_key = duplex_turn_id_from_request_id(rid)
+                turns.setdefault(turn_key if turn_key is not None else rid, []).append((sid, rid))
+            receiver_stage = max(draining_stages) if len(draining_stages) > 1 else None
+
+            def _turn_kind(bindings: list[tuple[int, str]]) -> str:
+                if any(session.is_draining_request(rid) for _, rid in bindings):
+                    return "drain"
+                bound_drain = {sid for sid, _ in bindings} & draining_stages
+                if not bound_drain:
+                    return "input"
+                if receiver_stage is not None and bound_drain == {receiver_stage}:
+                    return "prewarm"
+                return "drain"
+
+            kinds = {key: _turn_kind(bindings) for key, bindings in turns.items()}
+            real_drain_ids = {rid for key, bindings in turns.items() if kinds[key] == "drain" for _, rid in bindings}
+            # A prewarmed receiver is cancelled only when another turn is
+            # actually speaking. The turn whose Talker submit is still in
+            # flight has no such neighbour and must not be aborted.
+            cancel_prewarm = "drain" in kinds.values()
+            superseded_ids = [
+                rid
+                for key, bindings in turns.items()
+                if cancel_prewarm and kinds[key] == "prewarm"
+                for _, rid in bindings
+            ]
+            has_draining_work = session.capabilities.supports_concurrent_turn_requests and (
+                bool(real_drain_ids) or any(sid in draining_stages for sid, _ in stale_keys)
             )
+            preserve_drain = concurrent_turn or has_draining_work
             # Prior TTS may still drain under the same response_id; acceptance
             # is gated by supports_concurrent_turn_requests, not a per-turn drain id.
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
-            if concurrent_turn:
-                # Input gate already released after assistant text/silent final,
-                # so non-draining stages are idle. Drop their session bindings
-                # only — do not abort engine work. Stages the plugin marks as
-                # draining keep running under the prior response_id.
+            if preserve_drain:
+                # Non-draining stages are idle (or about to be superseded). Drop
+                # their session bindings only — do not abort engine work. Stages
+                # the plugin marks as draining keep running under the prior
+                # response_id.
+                logger.info(
+                    "duplex_ephemeral_supersede mode=drain session=%s stale_ids=%s concurrent_released=%s",
+                    session.session_id,
+                    stale_ids,
+                    concurrent_released,
+                )
                 prior_response_id = session.active_response_id
-                draining_stages = self._draining_stage_ids()
+                superseded = list(dict.fromkeys(superseded_ids))
                 for sid, rid in stale_keys:
+                    if rid in superseded:
+                        continue
                     if sid not in draining_stages:
                         session.request_resources.pop((sid, rid), None)
                     elif prior_response_id is not None and not session.is_draining_request(rid):
                         # Already-draining ids keep their original response_id.
                         session.bind_draining_request(rid, prior_response_id)
+                if superseded:
+                    logger.info(
+                        "duplex_ephemeral_supersede mode=abort session=%s stale_ids=%s concurrent_released=%s",
+                        session.session_id,
+                        superseded,
+                        concurrent_released,
+                    )
+                    try:
+                        await self._ctx.stage_port.cleanup(superseded, abort=True)
+                    except Exception:
+                        logger.warning(
+                            "duplex abort of stale ephemeral request failed session=%s ids=%s",
+                            session.session_id,
+                            superseded,
+                            exc_info=True,
+                        )
+                    for sid, rid in stale_keys:
+                        if rid in superseded:
+                            session.request_resources.pop((sid, rid), None)
                 self._ctx.run.concurrent_turn_requests_released = False
                 if prior_response_id is not None:
                     session.snapshot_active_response_for_drain()
@@ -388,9 +453,15 @@ class ModelChannel:
                 else:
                     session.bind_response_turn(fence.turn_id)
             elif stale_ids:
-                # Input gate not released yet (e.g. commit while Stage1 is still
-                # running): abort the whole prior ephemeral so a later output
-                # stage is not left orphaned.
+                # Input gate not released and Talker not bound yet (e.g. commit
+                # while Stage1 is still running): abort the whole prior
+                # ephemeral so a later output stage is not left orphaned.
+                logger.info(
+                    "duplex_ephemeral_supersede mode=abort session=%s stale_ids=%s concurrent_released=%s",
+                    session.session_id,
+                    stale_ids,
+                    concurrent_released,
+                )
                 try:
                     await self._ctx.stage_port.cleanup(stale_ids, abort=True)
                 except Exception:
@@ -858,6 +929,7 @@ class ModelChannel:
             # Pass-through ASR belongs to the user, not the assistant output
             # projector. Its metrics and transcript still use this mailbox.
             return None
+        fast_path = self._note_fast_path(item)
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
@@ -891,6 +963,21 @@ class ModelChannel:
                     self.maybe_continue_response(expected_epoch=expected_epoch, expected_response_id=response_id),
                     name="duplex-continue",
                 )
+        if fast_path:
+            # The frame's own fence names the turn to append into: a tool call
+            # can start before the model speaks, and then no response exists to
+            # take the turn from.
+            turn_id = item.context.model_turn_id
+            if turn_id is None:
+                turn_id = item.context.identity.fence.turn_id
+            self._ctx.services.spawn(
+                self._continue_fast_path(
+                    request_id=item.request_id,
+                    expected_epoch=expected_epoch,
+                    model_turn_id=turn_id,
+                ),
+                name="duplex-fast-path",
+            )
         return None
 
     async def finish_input_transcription(
@@ -963,6 +1050,10 @@ class ModelChannel:
         """Report a data-plane error and fail the response it interrupted."""
         session = self._ctx.session
         response_id = session.active_response_id
+        # The failed request is not decoding the call any more, so its frames
+        # stop replacing the client's.
+        self._ctx.run.fast_path_active = False
+        self._ctx.run.fast_path_dropped_frames = 0
         self._out.emit_error(
             str(model_result.get("error_code")),
             str(model_result.get("error") or "Duplex native data-plane error"),
@@ -1093,6 +1184,11 @@ class ModelChannel:
         auto_response = self._out.auto_responds()
         close_reason: str | None = None
         emitted_response = False
+        if self._ctx.run.fast_path_active:
+            # Inside a tool call the fast path owns the next frame: this pad
+            # token does not mean the model is listening, and the step is
+            # already scheduled by the output handler.
+            return close_reason, emitted_response
         if (
             auto_response
             and model_result.get("continue_with_partial_input") is True
@@ -1246,12 +1342,64 @@ class ModelChannel:
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
-    async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
+    async def _finish_ephemeral_tool_call_turn(
+        self,
+        model_result: Mapping[str, object],
+        function_call: Mapping[str, object],
+        *,
+        data_plane_request_id: object,
+    ) -> None:
+        """Publish and free a non-resumable turn whose only output is a function call.
+
+        ``auto_response`` keeps ``active_request_id`` after a normal completion,
+        and the function-call branch never reaches that completion. A later
+        ``response.create`` then returns without starting the tool follow-up.
+
+        The call is published inside the response it ends. A ``response.done``
+        without the call reads as a finished turn, and a client may start the
+        next turn before the tool follow-up.
+        """
+        session = self._ctx.session
+        response_id = session.active_response_id
+        if response_id is not None:
+            session.end_response(commit_text=False, preserve_request=False)
+        else:
+            session.clear_request()
+        await self._expose_function_call(function_call, response_id=response_id)
+        if response_id is not None:
+            self._out.emit(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "playback": session.playback.as_dict(),
+                }
+            )
+        if isinstance(data_plane_request_id, str):
+            data_plane = self._ctx.plugin.data_plane
+            mark_terminal = getattr(data_plane, "mark_terminal", None)
+            if callable(mark_terminal):
+                mark_terminal(data_plane_request_id)
+            await self._abort_request([data_plane_request_id], notify=False)
+        model_turn_id = coerce_int(model_result.get("model_turn_id"))
+        if model_turn_id is not None:
+            session.complete_model_turn(model_turn_id)
+        await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+
+    async def _expose_function_call(
+        self,
+        function_call: Mapping[str, object],
+        *,
+        response_id: str | None = None,
+    ) -> None:
         """Register a recognized call before publishing it.
 
         Parsing stays in the model plugin. The session ledger is the admission
         book. After the origin is stored, a plugin that splices the result into
-        history can record where the call sat.
+        history can record where the call sat. ``response_id`` publishes the
+        call inside that response; without it the call gets its own response.
         """
         session = self._ctx.session
         call_id, name = function_call.get("call_id"), function_call.get("name")
@@ -1267,7 +1415,7 @@ class ModelChannel:
             await self._suppress_function_call(call_id, name, arguments, blocked_by)
             return
         item_id = f"item_{uuid.uuid4().hex}"
-        response_id = f"resp_{uuid.uuid4().hex}"
+        response_id = response_id or f"resp_{uuid.uuid4().hex}"
         try:
             self._ctx.tool_calls.register(
                 ToolCallOrigin(
@@ -1415,7 +1563,28 @@ class ModelChannel:
             )
             return close_reason, True
         if isinstance(function_call, dict):
-            await self._expose_function_call(function_call)
+            if (
+                not session.capabilities.supports_core_resumable_request
+                and self._ctx.plugin.function_call_releases_turn(model_result)
+            ):
+                # The call is the whole turn. response.create for the tool
+                # result is dropped while this request id is still bound, and
+                # this branch returns before the normal end-of-turn release.
+                await self._finish_ephemeral_tool_call_turn(
+                    model_result,
+                    function_call,
+                    data_plane_request_id=data_plane_request_id,
+                )
+            else:
+                # A spoken prefix already owns this response. Publishing the
+                # call into a fresh response completes that response at once,
+                # and the proxy's follow-up response.create then hits
+                # response_already_active while speech is still playing.
+                speech_response_id = session.active_response_id
+                await self._expose_function_call(
+                    function_call,
+                    response_id=speech_response_id if isinstance(speech_response_id, str) else None,
+                )
             return close_reason, True
         model_turn_id = coerce_int(model_result.get("model_turn_id"))
         if model_result.get("continue_with_partial_input") is True and model_turn_id is not None:
@@ -1985,6 +2154,114 @@ class ModelChannel:
                 "status_details": {"type": "incomplete", "reason": "continuation_limit"},
             }
         )
+
+    def _fast_path_output_metadata(self, item: StageOutput) -> Mapping[str, object]:
+        """The metadata the plugin's data plane reads for this stage output."""
+        metadata = getattr(item.decision, "metadata", None)
+        if isinstance(metadata, Mapping):
+            return metadata
+        return item.context.segment_output_metadata
+
+    def _note_fast_path(self, item: StageOutput) -> bool:
+        """Track whether this decoded frame is a back-to-back tool-call step.
+
+        Only a decoded frame can start or end the fast path; a partial output
+        neither carries the model's flag nor advances the plugin's step budget.
+        A finished request is never a fast step either: even if the frame that
+        ended it still carried the flag, the model is no longer decoding, so
+        the client's frames must be appended again instead of dropped.
+        """
+        if item.stage_id != 0 or not item.context.segment_finished:
+            return False
+        finished = bool(getattr(item.output, "finished", False))
+        active = not finished and bool(
+            self._ctx.plugin.fast_path_active(item.request_id, self._fast_path_output_metadata(item))
+        )
+        session = self._ctx.session
+        turn_id = item.context.model_turn_id
+        if turn_id is None:
+            turn_id = item.context.identity.fence.turn_id
+        active = (
+            active
+            and self._silence_continuation_enabled()
+            and session.active_request_id == item.request_id
+            and (session.active_response_id is not None or (self._out.auto_responds() and session.turn_id == turn_id))
+        )
+        if active and not self._ctx.run.fast_path_active:
+            self._ctx.run.fast_path_dropped_frames = 0
+        elif self._ctx.run.fast_path_active and not active:
+            model_state = self._ctx.model_state
+            # Back to one token per client frame. Restart the pacing chain from
+            # now: the last fast append moved the anchor, and the paced unit
+            # that follows must not be rejected as stale against it.
+            model_state.last_native_submit_monotonic = time.monotonic()
+            model_state.silence_deadline_monotonic = None
+            logger.debug(
+                "Duplex session %s: tool-call fast path ended, %d client frames dropped",
+                self._ctx.session.session_id,
+                self._ctx.run.fast_path_dropped_frames,
+            )
+        self._ctx.run.fast_path_active = active
+        self._ctx.run.fast_path_config_generation = self._ctx.session.config_generation if active else None
+        return active
+
+    async def _continue_fast_path(
+        self,
+        *,
+        request_id: str,
+        expected_epoch: int | None,
+        model_turn_id: int | None,
+    ) -> None:
+        """Submit the next silence frame at once instead of on the 80 ms clock.
+
+        The fast path is the model decoding a tool call: its tokens come back
+        to back, so waiting for a client frame between them only adds a frame
+        period per token. These steps are not counted against the response
+        continuation limits; the plugin owns the step budget.
+        """
+        session = self._ctx.session
+        if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
+            return
+        if expected_epoch is not None and session.epoch != expected_epoch:
+            return
+        if session.active_request_id != request_id:
+            return
+        response_id = session.active_response_id
+        if response_id is not None:
+            owner_id = f"response:{response_id}"
+            payload_turn_id = (
+                session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+            )
+            response_owned = True
+        elif self._out.auto_responds() and model_turn_id is not None and session.turn_id == model_turn_id:
+            # No response owns the call yet (the model has not spoken): the
+            # session's own turn is the append owner, as for a paced listen.
+            owner_id = f"model-turn:{model_turn_id}"
+            payload_turn_id = model_turn_id
+            response_owned = False
+        else:
+            return
+        payload = self.silence_unit_payload()
+        payload["duplex_turn_id"] = payload_turn_id
+        payload["fast_path"] = True
+        try:
+            scheduled = await self._schedule_silence_continuation(
+                payload,
+                request_id=request_id,
+                owner_id=owner_id,
+                response_id=response_id,
+                response_owned=response_owned,
+                expected_epoch=expected_epoch,
+                expected_model_turn_id=model_turn_id,
+                fast_path=True,
+            )
+            if not scheduled:
+                self._ctx.run.fast_path_active = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._ctx.run.fast_path_active = False
+            logger.exception("Failed to schedule a duplex tool-call fast-path append: %s", exc)
 
     def silence_continuation_is_stale(
         self,

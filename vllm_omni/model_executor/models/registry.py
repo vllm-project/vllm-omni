@@ -543,6 +543,11 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    "AuraQwen3_5ForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_5",
+        "AuraQwen3_5ForConditionalGeneration",
+    ),
     ## Response-judge stage models
     "ResponseJudgeQwen3ForCausalLM": (
         "response_judge",

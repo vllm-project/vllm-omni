@@ -42,6 +42,18 @@ Opting out omits hidden-state output copies, while logits and sampling continue
 to receive the original hidden states. Models without the flag retain the
 existing hidden-state payload behavior.
 
+A request can also opt into its own last-layer hidden states with
+`SamplingParams.extra_args["return_hidden_states"]`, which the engine-core
+side lifts onto `OmniEngineCoreRequest.return_hidden_states`. RL teacher
+rollouts use the tensor for on-policy distillation. The AR runner returns the
+request's prefill rows once, on the step that completes its prefill, under
+`multimodal_output["teacher_hidden_states"]`; requests that did not opt in pay
+no copy. The key is separate from the reserved `hidden_states` payload nest,
+so pooler entries in the same slot are untouched. A later prefill chunk or a
+prefix-cache hit lacks rows of that step's tensor and raises instead of
+returning a partial payload: engines serving the opt-in run with chunked
+prefill and prefix caching disabled.
+
 The MRv2 generation runner has its own control-only fast path. Both its
 control-only and cached-request zero-token paths deliver pending request
 prewarms after finished-request cleanup and run optional idle prefetch only on
