@@ -42,3 +42,19 @@ def test_data_collection_hook_resolves_extractor_at_init():
 
     with pytest.raises(ValueError, match="Unknown model type"):
         DataCollectionHook("NotARegisteredTransformer")
+
+
+def test_sd3_has_calibrated_defaults():
+    """SD3.5 ships its own polynomial and a lower threshold than the global 0.2."""
+    sd3 = _MODEL_COEFFICIENTS["SD3Transformer2DModel"]
+    # Pin the calibrated fit so a recalibration has to update this test deliberately.
+    assert sd3 == pytest.approx([-2.57416593e03, 7.58966325e02, -4.54911308e01, 3.30785652e00, -2.18653269e-03])
+
+    config = TeaCacheConfig(transformer_type="SD3Transformer2DModel")
+    assert config.coefficients == sd3
+    # At the global default the image content changes on this model.
+    assert config.rel_l1_thresh == 0.1
+
+    # An explicit threshold still wins over the model default.
+    explicit = TeaCacheConfig(transformer_type="SD3Transformer2DModel", rel_l1_thresh=0.2)
+    assert explicit.rel_l1_thresh == 0.2
