@@ -1,0 +1,96 @@
+# Sophon-Realtime-32B-Tag on one 80 GB GPU: thinker (FP8 checkpoint) ->
+# CosyVoice3 talker with streaming text input -> CosyVoice3 flow + HiFT.
+#
+# The talker builds its bistream input per request in `preprocess` and keeps
+# per-request sampler state on the host (Model Runner V2 sampler hooks).
+pipeline: sophon_realtime
+async_chunk: true
+# One private MPS daemon for the three stages on the same GPU.
+cuda_mps: true
+# /v1/realtime full duplex (the model decides when the user has finished);
+# /v1/chat/completions keeps working.
+session_mode: duplex
+duplex_session:
+  max_sessions: 32
+  idle_ttl_s: 300
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.002
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      # First flow chunk: 10 speech tokens (voice prompts are a multiple of 10),
+      # then the hop doubles up to codec_max_chunk_frames.
+      codec_chunk_frames: 10
+      codec_stream_scale_factor: 2
+      codec_vocab_size: 6561
+
+stages:
+  - stage_id: 0  # thinker
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.62
+    trust_remote_code: true
+    enable_prefix_caching: true
+    max_model_len: 8192
+    mm_processor_cache_gb: 0
+    devices: "0"
+    limit_mm_per_prompt:
+      audio: 20
+      image: 2
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 400
+
+  - stage_id: 1  # talker
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    gpu_memory_utilization: 0.08
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_model_len: 4096
+    devices: "0"
+    hf_overrides:
+      # [sos] + "You are a helpful assistant.<|endofprompt|>"
+      async_chunk_prewarm_prompt_len: 8
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+      top_k: 25
+      top_p: 0.8
+    disable_hybrid_kv_cache_manager: true
+    mm_processor_cache_gb: 0
+    skip_mm_profiling: true
+
+  - stage_id: 2  # vocoder
+    hf_overrides:
+      # the Tag flow is distilled to 4 Euler steps without guidance
+      flow_n_timesteps: 4
+      flow_inference_cfg_rate: 0.0
+    env:
+      # batch the flow chunks of concurrent replies into one call
+      COSYVOICE3_BATCH_FLOW: "1"
+    max_num_batched_tokens: 32768
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 65536
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true

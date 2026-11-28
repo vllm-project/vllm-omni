@@ -110,6 +110,7 @@ _INHERITED_VLLM = (
     "NO_COLOR",
     "PROMETHEUS_MULTIPROC_DIR",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
+    "VLLM_API_KEY",
     "VLLM_BATCH_INVARIANT",
     "VLLM_CACHE_ROOT",
     "VLLM_DISABLE_LOG_LOGO",
@@ -269,6 +270,11 @@ _MODEL_INTERNALIZE = (
     "MAGI2_ALLOW_UNSUPPORTED_TOPOLOGY",
     "MAGI2_ROUTER_BIAS_SOURCE",
     "NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE",
+    # Sophon-Realtime duplex plugin: served model dir / port / vision tower, read in-process (defaults come from the
+    # `vllm serve` command line).
+    "SOPHON_MODEL",
+    "SOPHON_PORT",
+    "SOPHON_VISION",
     "VLLM_OMNI_CODE2WAV_STATS",
     # CI-only fallback for memory-constrained MOSS Realtime qualification.
     "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
@@ -343,6 +349,7 @@ _REDACTED = frozenset(
         "HF_TOKEN",
         "HUGGINGFACE_HUB_TOKEN",
         "OPENAI_API_KEY",
+        "VLLM_API_KEY",
     }
 )
 

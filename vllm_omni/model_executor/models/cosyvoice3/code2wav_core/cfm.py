@@ -133,8 +133,11 @@ class ConditionalCFM(BASECFM):
         # NOTE when flow run in amp mode, x.dtype is float32, which cause nan in trt fp16
         # inference, so set dtype=spks.dtype.  The batch is doubled for CFG:
         # first B rows are conditioned, second B rows are unconditional.
+        # Without guidance (inference_cfg_rate == 0, e.g. distilled flows) only
+        # the conditioned rows are evaluated.
         batch_size = int(x.size(0))
-        estimator_batch = 2 * batch_size
+        use_cfg = float(self.inference_cfg_rate) != 0.0
+        estimator_batch = 2 * batch_size if use_cfg else batch_size
         estimator_dtype = spks.dtype if spks is not None else x.dtype
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_allocate_2b"):
             x_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
@@ -147,7 +150,8 @@ class ConditionalCFM(BASECFM):
         # them once; only x and t need refreshing on every estimator call.
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_prepare_static_2b"):
             mask_in[:batch_size] = mask
-            mask_in[batch_size:] = mask
+            if use_cfg:
+                mask_in[batch_size:] = mask
             mu_in[:batch_size] = mu
             if spks is not None:
                 spks_in[:batch_size] = spks
@@ -176,7 +180,8 @@ class ConditionalCFM(BASECFM):
                 # Classifier-Free Guidance inference introduced in VoiceBox
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_prepare_dynamic_2b"):
                     x_in[:batch_size] = x
-                    x_in[batch_size:] = x
+                    if use_cfg:
+                        x_in[batch_size:] = x
                     t_in[:] = t
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_forward_estimator"):
                     dphi_dt = self.forward_estimator(
@@ -189,9 +194,10 @@ class ConditionalCFM(BASECFM):
                         estimator_session=trt_session,
                         blocked_attn_mask=blocked_attn_mask,
                     )
-                with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
-                    dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
-                    dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+                if use_cfg:
+                    with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
+                        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
+                        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_euler_update"):
                     x = x + dt * dphi_dt
                     t = t + dt

@@ -254,6 +254,7 @@ def test_secret_values_are_marked_for_redaction():
         "HF_TOKEN",
         "HUGGINGFACE_HUB_TOKEN",
         "OPENAI_API_KEY",
+        "VLLM_API_KEY",
     }
 
 
