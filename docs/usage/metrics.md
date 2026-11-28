@@ -210,7 +210,7 @@ worker once after the model loads:
 | `device`, `world_size` | Accelerator name and number of ranks. |
 | `attention` | The backend each attention layer resolved, counted per role. |
 | `weight_dtypes` | Weight elements per dtype of each pipeline component as loaded on the reporting rank (rank 0; a component sharded with tensor parallelism shows its shard) (parameters and persistent buffers, so packed quantized weights such as NVFP4 show), e.g. `{"transformer": {"bfloat16": …}, "video_vae": {"float32": …, "float16": …}}`. |
-| other keys | Facts the pipeline reports through `execution_runtime_facts()`, e.g. MiniMax-H3's `compute_dtypes` (`video_vae_decode: float16`) and `video_vae_decoder: nvfp4` when the NVFP4 decoder is installed. |
+| other keys | Facts the pipeline reports through `execution_runtime_facts()`. MiniMax-H3 reports `component_quantization` (the method each component loaded with, including checkpoint-shipped FP8/NVFP4 that `--quantization` does not show), `adaln_cache` (whether its exact AdaLN projection cache is on; default on), `compute_dtypes` (`video_vae_decode: float16`) and `video_vae_decoder: nvfp4` when the NVFP4 decoder is installed. |
 
 MiniMax-H3 on one B300; the request set `prompt`, `aspect_ratio`, `seed` and `num_inference_steps=49`:
 

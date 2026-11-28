@@ -1368,7 +1368,7 @@ class MiniMaxH3Pipeline(
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
         self.transformer = transformer_cls(
             od_config,
-            quant_config=transformer_quant_config,
+            quant_config=self._record_component_quantization("transformer", transformer_quant_config),
             diffusers_weights=modular,
         )
         if self._fasth3_checkpoint is not None:
@@ -1482,7 +1482,9 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                quant_config=self._record_component_quantization(
+                    "text_encoder", _resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config)
+                ),
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
@@ -4507,9 +4509,26 @@ class MiniMaxH3Pipeline(
         }
 
     @torch.no_grad()
+    def _record_component_quantization(
+        self, component: str, quant_config: QuantizationConfig | None
+    ) -> QuantizationConfig | None:
+        """Remember the quantization a component loads with, for the execution summary."""
+        name = None if quant_config is None else quant_config.get_name()
+        self.__dict__.setdefault("_component_quantization", {})[component] = name
+        return quant_config
+
     def execution_runtime_facts(self) -> dict[str, Any]:
-        """Precision facts the weights alone do not show, for ``--enable-execution-summary``."""
-        facts: dict[str, Any] = {}
+        """Facts the weights alone do not show, for ``--enable-execution-summary``.
+
+        ``component_quantization`` is the method each component loaded with,
+        including checkpoint-shipped ones (FastH3 FP8/NVFP4) that
+        ``--quantization`` does not show; ``adaln_cache`` whether the exact
+        AdaLN projection cache is on (``minimax_h3_adaln_cache``, default on).
+        """
+        facts: dict[str, Any] = {"component_quantization": dict(self.__dict__.get("_component_quantization", {}))}
+        adaln_cache = getattr(getattr(self, "transformer", None), "adaln_cache", None)
+        if adaln_cache is not None:
+            facts["adaln_cache"] = adaln_cache.max_bytes > 0
         video_vae = getattr(self, "video_vae", None)
         if video_vae is not None:
             facts["compute_dtypes"] = {"video_vae_decode": str(video_vae.decode_dtype).removeprefix("torch.")}
