@@ -96,6 +96,17 @@ class HiggsAudioV2Config(PretrainedConfig):
         audio_tokenizer_id: str | None = "bosonai/higgs-audio-v2-tokenizer",
         # --- Misc ---
         use_cache: bool = True,
+        # --- Stage-1 codec decode CUDA graphs (ported from higgs-audio v3) ---
+        # ``codec_cuda_graph`` resolves the default at model construction:
+        # ``None`` follows the stage's model runner (``use_v2_model_runner``),
+        # an explicit bool wins. Graph shapes are captured exactly (never
+        # padded): ``codec_graph_single_max_frames`` covers every batch-1
+        # length 1..N, and the optional batch/frame tables add multi-request
+        # shapes for batched decodes.
+        codec_cuda_graph: bool | None = None,
+        codec_graph_single_max_frames: int = 150,
+        codec_graph_batch_sizes: tuple[int, ...] | list[int] = (),
+        codec_graph_frame_sizes: tuple[int, ...] | list[int] = (5, 29, 54),
         **kwargs: Any,
     ) -> None:
         for name, token_id in (
@@ -155,6 +166,20 @@ class HiggsAudioV2Config(PretrainedConfig):
         self.audio_tokenizer_subdir = audio_tokenizer_subdir
         self.audio_tokenizer_id = audio_tokenizer_id
         self.use_cache = use_cache
+
+        self.codec_cuda_graph = codec_cuda_graph
+        self.codec_graph_single_max_frames = codec_graph_single_max_frames
+        self.codec_graph_batch_sizes = tuple(codec_graph_batch_sizes)
+        self.codec_graph_frame_sizes = tuple(codec_graph_frame_sizes)
+
+    def resolve_graph_defaults(self, *, use_v2_model_runner: bool) -> bool:
+        """Resolve the codec-decode CUDA graph flag for a stage.
+
+        Mirrors higgs-audio v3's ``resolve_graph_defaults``: a ``None``
+        config value follows the stage's model runner, an explicit bool
+        wins, and the shared checkpoint config is never mutated.
+        """
+        return use_v2_model_runner if self.codec_cuda_graph is None else self.codec_cuda_graph
 
     # Codes [0..codebook_size-1] include 2 stream specials at indices
     # `audio_stream_bos_id` and `audio_stream_eos_id`. Real codes ready for the

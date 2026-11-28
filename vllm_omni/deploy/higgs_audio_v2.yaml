@@ -73,6 +73,14 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
+    # Exact-shape codec decode CUDA graphs (ported from higgs-audio v3,
+    # bit-exact vs the eager decode; shapes beyond codec_graph_single_max_frames
+    # fall back to eager). Left off in this profile because async_chunk is
+    # false here: whole-sequence decodes exceed the graph table anyway. For a
+    # streaming profile (async_chunk: true with codec_chunk_frames: 25 /
+    # codec_left_context_frames: 25), enable with:
+    # hf_overrides:
+    #   codec_cuda_graph: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
