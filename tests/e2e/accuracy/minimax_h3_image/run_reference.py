@@ -85,14 +85,14 @@ def main():
             apply_group_offloading(
                 pipe.transformer, onload_device=device, offload_type="block_level", num_blocks_per_group=1
             )
-        with Image.open(output / "edit-input.png") as source_image:
-            reference = ImageOps.exif_transpose(source_image).convert("RGB")
         for task, case in request["cases"].items():
             width, height = map(int, case["size"].split("x"))
             min_generation_area = case.get("extra_params", {}).get("min_generation_area", 2048 * 2048)
             generator = torch.Generator(device="cpu").manual_seed(case["seed"])
             kwargs = {}
             if task == "edit":
+                with Image.open(output / "edit-input.png") as source_image:
+                    reference = ImageOps.exif_transpose(source_image).convert("RGB")
                 target, anchor = edit_noises(pipe, reference, width, height, min_generation_area, generator)
                 kwargs = {"image": reference, "latents": target, "reference_noise": [anchor]}
             image = pipe(

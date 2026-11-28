@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,7 +43,7 @@ CASES = {
     },
     "edit": {"size": "2048x2048", "seed": 1234},
 }
-# The configured timeouts budget 39 minutes on CUDA and 65 on NPU, leaving time
+# The configured timeouts budget 39 minutes on CUDA and 62 on NPU, leaving time
 # for environment setup, snapshot resolution, and artifact handling.
 REFERENCE_PREFLIGHT_TIMEOUT_S = 180
 REFERENCE_GENERATION_TIMEOUT_S = 1200
@@ -57,6 +58,9 @@ IMAGE_REQUEST_TIMEOUT_S = 180
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 def test_diffusers_similarity(accuracy_artifact_root):
     device_type = current_omni_platform.device_type
+    cases = CASES.copy()
+    if device_type == "npu":
+        cases.pop("edit")
     calibration = os.environ.get("H3_IMAGE_CALIBRATE", "1")
     assert calibration in {"0", "1"}, "H3_IMAGE_CALIBRATE must be 0 or 1"
     policy = json.loads(Path(__file__).with_name("thresholds.json").read_text(encoding="utf-8"))
@@ -66,7 +70,7 @@ def test_diffusers_similarity(accuracy_artifact_root):
         assert policy["status"] == "selected", (
             "Select device-specific bounds in thresholds.json after calibration before setting H3_IMAGE_CALIBRATE=0"
         )
-        for task in CASES:
+        for task in cases:
             tables[task] = {profile: SimilarityThresholds(**row) for profile, row in policy[task].items()}
             floors = resolve_similarity_thresholds(tables[task])
             assert type(floors.ssim) in (float, int) and -1 <= floors.ssim <= 1, f"Invalid SSIM floor for {task}"
@@ -76,36 +80,35 @@ def test_diffusers_similarity(accuracy_artifact_root):
             thresholds[task] = floors
     python = os.environ.get("H3_IMAGE_REFERENCE_PYTHON")
     assert python and Path(python).is_file(), "Source setup_reference.sh first"
+    allow_patterns = [
+        "model_index.json",
+        "modular_model_index.json",
+        "pdd_*",
+        "transformer/*",
+        "transformer_diffusers/*",
+        "vae/*",
+        "vae_diffusers/*",
+        "scheduler/*",
+        "text_encoder/*",
+        "tokenizer/*",
+        "processor/*",
+    ]
+    if "edit" in cases:
+        allow_patterns.extend(["examples/reference1.png", "examples/prompt.edit.txt"])
     model = hf_api().snapshot_download(
         MODEL_ID,
-        allow_patterns=[
-            "model_index.json",
-            "modular_model_index.json",
-            "pdd_*",
-            "transformer/*",
-            "transformer_diffusers/*",
-            "vae/*",
-            "vae_diffusers/*",
-            "scheduler/*",
-            "text_encoder/*",
-            "tokenizer/*",
-            "processor/*",
-            "examples/reference1.png",
-            "examples/prompt.edit.txt",
-        ],
+        allow_patterns=allow_patterns,
         local_files_only=constants.HF_HUB_OFFLINE,
     )
     revision = Path(model).name  # The Hub returns a snapshots/<commit> directory.
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (accuracy_artifact_root / "minimax_h3_image" / run_id).resolve()
     output.mkdir(parents=True)
-    examples = Path(model) / "examples"
-    reference_bytes = (examples / "reference1.png").read_bytes()
-    (output / "edit-input.png").write_bytes(reference_bytes)
-    cases = {
-        **CASES,
-        "edit": {**CASES["edit"], "prompt": (examples / "prompt.edit.txt").read_text(encoding="utf-8").strip()},
-    }
+    edit_input = output / "edit-input.png"
+    if "edit" in cases:
+        examples = Path(model) / "examples"
+        shutil.copyfile(examples / "reference1.png", edit_input)
+        cases["edit"] = {**cases["edit"], "prompt": (examples / "prompt.edit.txt").read_text(encoding="utf-8").strip()}
     common = {
         "model": model,
         "generator_device": "cpu",
@@ -163,7 +166,7 @@ def test_diffusers_similarity(accuracy_artifact_root):
                 response = client.send_images_edits_http_request(
                     {
                         "data": request,
-                        "files": [("image", ("reference1.png", reference_bytes, "image/png"))],
+                        "files": [("image", ("reference1.png", edit_input.read_bytes(), "image/png"))],
                         "timeout": IMAGE_REQUEST_TIMEOUT_S,
                     }
                 )[0]

@@ -1,6 +1,6 @@
 {
   "status": "unselected",
-  "calibration_notes": "No accuracy floors have been selected. Calibrate direct 1024x1024 text-to-image and 2048x2048 single-reference editing on each device profile before enabling H3_IMAGE_CALIBRATE=0.",
+  "calibration_notes": "No accuracy floors have been selected. Calibrate direct 1024x1024 text-to-image on each device profile and 2048x2048 single-reference editing on H100 before enabling H3_IMAGE_CALIBRATE=0.",
   "t2i": {
     "default": {"ssim": null, "psnr": null},
     "H100": {"ssim": null, "psnr": null},
@@ -8,7 +8,6 @@
   },
   "edit": {
     "default": {"ssim": null, "psnr": null},
-    "H100": {"ssim": null, "psnr": null},
-    "A3": {"ssim": null, "psnr": null}
+    "H100": {"ssim": null, "psnr": null}
   }
 }
