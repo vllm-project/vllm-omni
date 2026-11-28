@@ -213,6 +213,35 @@ def test_text_encoder_root_resolution(tmp_path):
         h3i.MiniMaxH3ImagePipeline._resolve_text_encoder_root(index, tmp_path)
 
 
+def test_model_root_downloads_every_required_pattern(monkeypatch, tmp_path):
+    # A Hub ID must fetch every release file __init__ reads, not just the first match.
+    calls: list[dict[str, Any]] = []
+
+    def fake_download(model_name_or_path, cache_dir, allow_patterns, revision=None, require_all=False, **kwargs):
+        calls.append(
+            {"model": model_name_or_path, "patterns": allow_patterns, "revision": revision, "require_all": require_all}
+        )
+        return str(tmp_path)
+
+    monkeypatch.setattr(h3i, "download_weights_from_hf_specific", fake_download)
+
+    assert h3i.MiniMaxH3ImagePipeline._resolve_model_root("MiniMaxAI/MiniMax-H3-Image", "rev") == tmp_path
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["model"] == "MiniMaxAI/MiniMax-H3-Image"
+    assert call["revision"] == "rev"
+    assert call["require_all"] is True
+    assert {"model_index.json", "pdd_*", "tokenizer/*", "processor/*", "vae/*"} <= set(call["patterns"])
+
+
+def test_model_root_uses_a_local_directory_without_downloading(monkeypatch, tmp_path):
+    def fail_download(*args, **kwargs):
+        pytest.fail("a local release directory must not be downloaded")
+
+    monkeypatch.setattr(h3i, "download_weights_from_hf_specific", fail_download)
+    assert h3i.MiniMaxH3ImagePipeline._resolve_model_root(str(tmp_path), None) == tmp_path
+
+
 def test_post_process_truncates_like_the_released_writer():
     post = h3i.get_minimax_h3_image_post_process_func(None)
     pixels = torch.tensor([0.0, 0.5, 254.9 / 255, 1.0]).view(1, 1, 1, 4).expand(1, 3, 1, 4)
