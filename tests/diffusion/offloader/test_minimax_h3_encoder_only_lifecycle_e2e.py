@@ -82,7 +82,6 @@ def test_text_encoder_streams_without_dit_or_vae() -> None:
         parallel_config=DiffusionParallelConfig(ulysses_degree=1),
         model_loaded={
             "transformer": False,
-            "vae": False,
             "text_encoder": True,
             "vae_encoder": False,
             "vae_decoder": False,
@@ -190,6 +189,10 @@ def test_text_encoder_streams_without_dit_or_vae() -> None:
         host_delta = max(samples) - samples[0]
         assert host_delta < 12.0, f"encoder forward grew host RSS by {host_delta:.2f} GiB"
 
+        # Release the offloader's mappings and host registration while the
+        # objects that own them are still reachable; dropping the references
+        # first would leave the lease to the garbage collector.
+        backend.shutdown()
         del pipeline, backend, loader
         gc.collect()
         torch.accelerator.empty_cache()
