@@ -230,6 +230,21 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
+#### Qwen3-VL vision sequence parallelism
+
+Vision SP is available only for the MiniMax-H3 video pipeline on Ascend NPU.
+It reuses the local text encoder's TP group.
+It is independent of DiT `--usp` / `--ring` and adds no devices.
+
+Append `--text-encoder-vision-sp-size 8` to the TP8 serving command above.
+Available degrees are `1` (default), `2`, `4`, and `8`. An enabled degree must
+match `--text-encoder-tp-size`; for TP4, set the vision SP degree to `4`.
+Python and deployment YAML use
+`text_encoder_vision_sp_size` in the diffusion `parallel_config`.
+The default `1` leaves vision computation replicated.
+SP2 is supported, but showed no net speedup in the tested standalone shape;
+it is not a performance recommendation.
+
 #### Cache-DiT
 
 Append to enable DiT block caching with TaylorSeer extrapolation — see the

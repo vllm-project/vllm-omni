@@ -364,6 +364,12 @@ class DiffusionParallelConfig:
       (world size / data_parallel_size).
     """
 
+    text_encoder_vision_sp_size: int = field(default=1, kw_only=True)
+    """MiniMax-H3-only vision SP: 1 (replicated), or 2/4/8 matching text encoder TP.
+
+    Reuses the encoder TP group without increasing the DiT world size.
+    """
+
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
 
@@ -418,6 +424,13 @@ class DiffusionParallelConfig:
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        vision_sp_size = self.text_encoder_vision_sp_size
+        if vision_sp_size not in (1, 2, 4, 8):
+            raise ValueError("text_encoder_vision_sp_size must be one of 1, 2, 4, 8")
+        if vision_sp_size != 1 and self.text_encoder_tp_size != vision_sp_size:
+            raise ValueError(
+                f"text_encoder_vision_sp_size={vision_sp_size} requires text_encoder_tp_size={vision_sp_size}"
+            )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         if self.ulysses_a2a_backend not in ULYSSES_A2A_BACKENDS:
             raise ValueError(

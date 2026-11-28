@@ -736,6 +736,16 @@ class _SingleRankEncoderGroup:
         self.device_group = None
 
 
+class _NonMemberEncoderGroup:
+    """Metadata for DiT ranks that do not run text-encoder collectives."""
+
+    def __init__(self, ranks: list[int]) -> None:
+        self.ranks = ranks
+        self.world_size = len(ranks)
+        self.rank_in_group = -1
+        self.device_group = None
+
+
 class MiniMaxH3Pipeline(
     nn.Module,
     DenoiseProgressMixin,
@@ -749,6 +759,7 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    supports_text_encoder_vision_sp: ClassVar[bool] = True
     denoise_step_updates_state: ClassVar[bool] = True
     # DiT implementation constructed for the primary ``transformer``.
     # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
@@ -1141,6 +1152,8 @@ class MiniMaxH3Pipeline(
             )
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
+        if not self.load_text_encoder and self.parallel_config.text_encoder_vision_sp_size != 1:
+            raise ValueError("text_encoder_vision_sp_size requires a locally loaded text encoder")
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
         if not self.load_vae_decoder and self.load_vae_encoder:
@@ -1470,6 +1483,7 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
+                vision_sp_size=self.parallel_config.text_encoder_vision_sp_size,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
             if rank < text_encoder_tp_size:
@@ -1860,6 +1874,12 @@ class MiniMaxH3Pipeline(
         if text_encoder_tp_size == 1:
             return _SingleRankEncoderGroup(rank=self._dit_rank)
         ranks = list(range(text_encoder_tp_size))
+        if self._dit_rank not in ranks:
+            # Match GroupCoordinator's device/CPU group creation order on all
+            # ranks without constructing its member-only wrapper here.
+            dist.new_group(ranks, backend=current_omni_platform.dist_backend)
+            dist.new_group(ranks, backend="gloo")
+            return _NonMemberEncoderGroup(ranks)
         return init_world_group(
             ranks=ranks,
             local_rank=envs.LOCAL_RANK,

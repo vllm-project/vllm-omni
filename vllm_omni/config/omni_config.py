@@ -308,6 +308,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     vae_patch_parallel_size: int
     vae_parallel_mode: str
     text_encoder_tp_size: int
+    text_encoder_vision_sp_size: int
     use_hsdp: bool
     hsdp_data_parallel: bool
     mask_sp_padding: bool
@@ -911,6 +912,8 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
+    text_encoder_vision_sp_size: int = Field(default=1, ge=1)
+    """MiniMax-H3-only vision SP: 1 (replicated), or 2/4/8 matching text encoder TP."""
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     hsdp_data_parallel: bool = False
@@ -921,6 +924,13 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
         self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
+        vision_sp_size = self.text_encoder_vision_sp_size
+        if vision_sp_size not in (1, 2, 4, 8):
+            raise ValueError("text_encoder_vision_sp_size must be one of 1, 2, 4, 8")
+        if vision_sp_size != 1 and self.text_encoder_tp_size != vision_sp_size:
+            raise ValueError(
+                f"text_encoder_vision_sp_size={vision_sp_size} requires text_encoder_tp_size={vision_sp_size}"
+            )
         if self.allgather_degree > 1 and self.ring_degree > 1:
             raise ValueError(
                 "allgather_degree > 1 cannot be composed with ring_degree > 1: the supported "
