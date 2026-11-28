@@ -29,6 +29,22 @@ if TYPE_CHECKING:
 _INDEXTTS2_EMOTION_KEYS = ("emo_audio", "emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random")
 
 
+def _finite_float(value: Any) -> float | None:
+    """Return a JSON number as a finite float, or ``None`` if it is not one.
+
+    ``bool`` is rejected even though it is an ``int``. An integer too large for a
+    float raises ``OverflowError`` in ``float()``, which would otherwise escape
+    request validation as a 500.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _update_conditioning_hash(h: hashlib._Hash, value: Any) -> None:
     """Hash request conditioning values without serializing huge repr strings."""
     if value is None:
@@ -182,15 +198,14 @@ class IndexTTS2Adapter(ARTTSAdapter):
             if not isinstance(value, list) or len(value) != 8:
                 return "extra_params.emo_vector must be a list of 8 numbers"
             for item in value:
-                if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+                number = _finite_float(item)
+                if number is None:
                     return "extra_params.emo_vector must be a list of 8 finite numbers"
-                if float(item) < 0.0 or float(item) > 1.2:
+                if number < 0.0 or number > 1.2:
                     return "extra_params.emo_vector values must be in [0, 1.2]"
 
-        if "emo_alpha" in extras:
-            value = extras["emo_alpha"]
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                return "extra_params.emo_alpha must be a finite number"
+        if "emo_alpha" in extras and _finite_float(extras["emo_alpha"]) is None:
+            return "extra_params.emo_alpha must be a finite number"
 
         if "emo_text" in extras and extras["emo_text"] is not None and not isinstance(extras["emo_text"], str):
             return "extra_params.emo_text must be a string"
