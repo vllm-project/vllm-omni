@@ -27,7 +27,12 @@ from tests.entrypoints.openai_api.helpers import (
     _run_server_vad_audio_roundtrips,
 )
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, get_model_prefix
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniServer,
+    get_model_prefix,
+)
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 from vllm_omni.clients.tool_calls import DuplexToolRunner
@@ -89,9 +94,19 @@ def qwen_duplex_server(
     assert load_deploy_config(deploy).session_mode == "duplex"
     model = get_model_prefix() + MODEL
     processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
+    # The 59.54 GiB thinker's stage-0 init can exceed the 600 s cold-cache
+    # deadline on a cold runner (#11281); use the shared Qwen3-Omni cold
+    # allowances, which cost warm runners nothing.
     with OmniServer(
         model,
-        ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600"],
+        [
+            "--deploy-config",
+            str(deploy),
+            "--init-timeout",
+            str(QWEN3_OMNI_COLD_INIT_TIMEOUT_S),
+            "--stage-init-timeout",
+            str(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S),
+        ],
         env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts)},
     ) as server:
         yield _DuplexTestRuntime(server=server, processor=processor, artifacts=artifacts)

@@ -62,7 +62,11 @@ from tests.helpers.realtime import (
     WEATHER_TOOL_PROMPT,
     WEATHER_TOOL_SPEC,
 )
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniServerParams,
+)
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -92,12 +96,20 @@ if SERVER_VAD_MODEL_PATH is not None:
     _async_chunk_updates["duplex_session"] = {"server_vad_model_path": SERVER_VAD_MODEL_PATH}
 async_chunk_stage_config = modify_stage_config(default_stage_config, _async_chunk_updates)
 
+# The fixture's default stage deadline (600 s) is a cold-cache hazard for the
+# 59.54 GiB / 15-shard thinker: on a runner with a cold page cache the weight
+# load alone took 298 s and the whole stage-0 init pushed past the deadline,
+# killing the shared server and cascading into 8 ERRORs (#11281). The cold
+# allowances only fire when exceeded, so warm runners (160-180 s total init)
+# are unaffected. Both server params boot the same model, so both take them.
 realtime_sync_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
             stage_config_path=default_stage_config,
             use_stage_cli=True,
+            stage_init_timeout=QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+            init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
         ),
         id="sync",
     ),
@@ -112,6 +124,8 @@ _async_chunk_server = OmniServerParams(
     model=MODEL,
     stage_config_path=async_chunk_stage_config,
     use_stage_cli=True,
+    stage_init_timeout=QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
     server_args=[
         "--tool-call-parser",
         "hermes",
@@ -459,7 +473,7 @@ class TestQwen3OmniRealtimeWebSocket:
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
     def test_livekit_client_vad_replay_without_runtime_jit(self, omni_server) -> None:
         """The shared server's first session answers all three replay turns without compiling kernels mid-request.
