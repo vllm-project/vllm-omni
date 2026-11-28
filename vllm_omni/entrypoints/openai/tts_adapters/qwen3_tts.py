@@ -584,13 +584,11 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         if request.initial_codec_chunk_frames is not None:
             params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
 
+        # All Qwen3-TTS tasks (CustomVoice, VoiceDesign, Base) default to
+        # streaming prompt mode (False) when non_streaming_mode is omitted;
+        # only forward explicit caller overrides.
         if request.non_streaming_mode is not None:
             params["non_streaming_mode"] = [request.non_streaming_mode]
-        # Preserve the legacy VoiceDesign fallback when the request omits an
-        # explicit override. CustomVoice and Base rely on model defaults
-        # (True and False respectively).
-        elif params["task_type"][0] == "VoiceDesign":
-            params["non_streaming_mode"] = [True]
 
         # Do not set ``full_utterance_decode`` here. That flag is an explicit
         # Code2Wav emit opt-in (offline / advanced callers via

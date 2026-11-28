@@ -1177,3 +1177,78 @@ def test_serving_ref_audio_wire_form_survives_engine_ipc_and_normalizes():
     assert out_sr == 24000
     assert out_wav.dtype == np.float32
     assert np.array_equal(out_wav, wav)
+
+
+@pytest.mark.parametrize("task_type", ["CustomVoice", "VoiceDesign"])
+@pytest.mark.parametrize("instruct", ["", "Warm and cheerful tone"])
+@pytest.mark.parametrize("language", ["Auto", "Chinese"])
+@pytest.mark.parametrize("non_streaming_mode", [None, False, True])
+def test_build_prompt_embeds_length_matches_estimator_for_cv_and_vd(
+    task_type: str,
+    instruct: str,
+    language: str,
+    non_streaming_mode: bool | None,
+):
+    builder = _make_minimal_builder()
+    builder._talker_config = SimpleNamespace(
+        codec_nothink_id=10,
+        codec_think_bos_id=11,
+        codec_think_eos_id=12,
+        codec_think_id=13,
+        codec_language_id={"chinese": 20, "english": 21, "sichuan_dialect": 22},
+        codec_pad_id=7,
+        codec_bos_id=8,
+        num_code_groups=2,
+        spk_id={"vivian": 30, "eric": 31},
+        spk_is_dialect={"eric": "sichuan_dialect"},
+        hidden_size=4,
+    )
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._speaker_embed_cache = {}
+    builder._custom_voice_prompt_cache = {}
+    builder._batched_text_embeds = {}
+
+    def fake_tokenize(s: str) -> list[int]:
+        if "<|im_start|>assistant\n" in s:
+            return list(range(12))
+        return list(range(len(s.split()) + 6))
+
+    class FakeTokenizer:
+        def __call__(self, s: str, **_kwargs):
+            ids = fake_tokenize(s)
+            return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+    builder._text_tokenizer = FakeTokenizer()
+
+    info: dict[str, Any] = {
+        "text": ["hello world"],
+        "task_type": [task_type],
+        "language": [language],
+        "instruct": [instruct],
+    }
+    if task_type == "CustomVoice":
+        info["speaker"] = ["Eric" if language == "Chinese" else "Vivian"]
+    if non_streaming_mode is not None:
+        info["non_streaming_mode"] = [non_streaming_mode]
+
+    est = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information=info,
+        task_type=task_type,
+        tokenize_prompt=fake_tokenize,
+        codec_language_id=builder._talker_config.codec_language_id,
+        spk_is_dialect=builder._talker_config.spk_is_dialect,
+    )
+    prompt, trailing, ref_len, ref_code = builder.build_prompt_embeds(
+        task_type=task_type,
+        info_dict=dict(info),
+    )
+
+    assert ref_len is None and ref_code is None
+    assert prompt.shape[0] == est
+    if non_streaming_mode is True:
+        assert trailing.shape[0] == 1
+    else:
+        # 12 assistant tokens - 3 role - 5 suffix = 4 text tokens -> 3 trailing + 1 eos
+        assert trailing.shape[0] == 4

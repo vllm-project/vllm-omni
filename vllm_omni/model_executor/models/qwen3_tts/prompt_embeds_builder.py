@@ -542,25 +542,37 @@ class Qwen3TTSPromptEmbedsBuilder:
         return None if cached is None else (cache_key, cached)
 
     def _cached_custom_voice_prompt(
-        self, info_dict: dict[str, Any], text: Any, language: Any
+        self, info_dict: dict[str, Any], text: Any, language: Any, *, non_streaming_mode: bool
     ) -> tuple[torch.Tensor, torch.Tensor, None, None] | None:
-        """The non-streaming CustomVoice prompt from cached rows, or ``None`` for the full path.
+        """The cached CustomVoice prompt from cached pieces, or ``None`` for the full path.
 
         Applies when an earlier request resolved this speaker/language to a
         cached prefix and the batched preprocess already projected this
-        request's text: the prompt is then prefix + (text + pad row) + eos row
-        + tail, exactly what the full path assembles from the same rows.
+        request's text. Non-streaming assembles ``prefix + (text + pad row) +
+        eos row + tail`` with pad trailing; streaming assembles ``prefix +
+        (text[:1] + codec_bos)`` with ``text[1:] + tts_eos`` as trailing text.
         """
         entry = self._cached_custom_voice_entry(info_dict, text, language)
         req_id = str(info_dict.get("req_id"))
         if entry is None or req_id not in self._batched_text_embeds:
             return None
+        if not non_streaming_mode and self._batched_text_embeds[req_id].shape[1] < 1:
+            return None
         cached = entry[1]
         text_all = self._batched_text_embeds.pop(req_id)
         info_dict.pop(PRECOMPUTED_TEXT_IDS_KEY, None)
         prefix, pad_row, tail, eos_row = cached
-        talker_prompt = torch.cat([prefix, text_all + pad_row, eos_row, tail], dim=1)
-        trailing = self._pad_embed(prefix.device, prefix.dtype)
+        if non_streaming_mode:
+            talker_prompt = torch.cat([prefix, text_all + pad_row, eos_row, tail], dim=1)
+            trailing = self._pad_embed(prefix.device, prefix.dtype)
+            return talker_prompt.squeeze(0), trailing.squeeze(0), None, None
+        codec_bos = self._codec_embeds([self._talker_config.codec_bos_id], prefix.device).view(1, 1, -1)
+        _, tts_eos_embed = self._projected_tokens(
+            [self._config.tts_bos_token_id, self._config.tts_eos_token_id],
+            prefix.device,
+        ).chunk(2, dim=1)
+        talker_prompt = torch.cat([prefix, text_all[:, :1] + codec_bos], dim=1)
+        trailing = torch.cat([text_all[:, 1:], tts_eos_embed], dim=1)
         return talker_prompt.squeeze(0), trailing.squeeze(0), None, None
 
     def custom_voice_prompt_rows(
@@ -1028,6 +1040,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     @staticmethod
     def _non_streaming_mode(info_dict: dict[str, Any], task_type: str) -> bool:
+        del task_type
         if "input_stream" in info_dict:
             return False
         value = info_dict.get("non_streaming_mode")
@@ -1035,10 +1048,9 @@ class Qwen3TTSPromptEmbedsBuilder:
             value = value[0] if value else None
         if isinstance(value, bool):
             return value
-        # Match official inference defaults:
-        # - CustomVoice/VoiceDesign: non_streaming_mode=True
-        # - Base: non_streaming_mode=False
-        return task_type in ("CustomVoice", "VoiceDesign")
+        # Default to streaming text-step prompt mode (False) for all tasks
+        # (CustomVoice, VoiceDesign, Base); set True for legacy full-text prefill.
+        return False
 
     @staticmethod
     def _needs_initial_prompt_preprocess(info_dict: dict[str, Any]) -> bool:
@@ -1101,9 +1113,10 @@ class Qwen3TTSPromptEmbedsBuilder:
         sample-rate group, stashing the precomputed artifacts under
         :data:`PRECOMPUTED_TEXT_IDS_KEY`, :data:`PRECOMPUTED_REF_IDS_KEY`,
         :data:`PRECOMPUTED_REF_CODE_KEY`, and :data:`NORMALIZED_REF_AUDIO_KEY`.
-        For non-streaming CustomVoice / VoiceDesign, projects every request's
-        text at once (:meth:`_project_texts_batch`). The per-request
-        :meth:`build_prompt_embeds` call then skips the equivalent serial work.
+        For CustomVoice / VoiceDesign (both streaming and non-streaming),
+        projects every request's text at once (:meth:`_project_texts_batch`).
+        The per-request :meth:`build_prompt_embeds` call then skips the
+        equivalent serial work.
         """
         pending_text: list[tuple[dict[str, Any], str]] = []
         pending_ref_text: list[tuple[dict[str, Any], str]] = []
@@ -1211,7 +1224,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._batched_text_embeds = self._project_texts_batch(req_infos)
 
     def _project_texts_batch(self, req_infos: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        """Embed and project the text of new non-streaming CustomVoice / VoiceDesign requests at once.
+        """Embed and project the text of new CustomVoice / VoiceDesign requests at once.
 
         Each request otherwise uploads its text ids and runs the text
         embedding + projection MLP on its own. Here every request's ids go up
@@ -1227,7 +1240,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             if not isinstance(req_id, str) or not self._needs_initial_prompt_preprocess(info_dict):
                 continue
             task_type = first_value(info_dict.get("task_type"), "CustomVoice")
-            if task_type not in ("CustomVoice", "VoiceDesign") or not self._non_streaming_mode(info_dict, task_type):
+            if task_type not in ("CustomVoice", "VoiceDesign"):
                 continue
             ids = first_value(info_dict.get(PRECOMPUTED_TEXT_IDS_KEY))
             if isinstance(ids, torch.Tensor) and ids.device.type == "cpu":
@@ -1370,8 +1383,8 @@ class Qwen3TTSPromptEmbedsBuilder:
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
         non_streaming_mode = self._non_streaming_mode(info_dict, task_type)
-        if task_type == "CustomVoice" and non_streaming_mode:
-            fast = self._cached_custom_voice_prompt(info_dict, text, language)
+        if task_type == "CustomVoice":
+            fast = self._cached_custom_voice_prompt(info_dict, text, language, non_streaming_mode=non_streaming_mode)
             if fast is not None:
                 return fast
 
@@ -1787,7 +1800,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             # A text starting with whitespace could merge with the template's
             # newline token, so it keeps the per-request role embedding.
             cache_key = None
-            if non_streaming_mode and instruct_embed is None and not text[:1].isspace():
+            if instruct_embed is None and not text[:1].isspace():
                 cache_key = (
                     str(input_ids.device),
                     int(spk_id),
@@ -1812,8 +1825,8 @@ class Qwen3TTSPromptEmbedsBuilder:
                 self.__dict__.setdefault("_cv_fast_keys", {})[(self._speaker_field(info_dict), language)] = cache_key
             talker_prompt = prefix
 
+            text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
             if non_streaming_mode:
-                text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
                 if text_all is None:
                     text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
                 # (text + eos) + pad row, with the constant eos row added once per speaker.
@@ -1823,9 +1836,12 @@ class Qwen3TTSPromptEmbedsBuilder:
                 if isinstance(stream, dict):
                     first_text = self._project_text_ids(input_ids[:, 3:4])
                     trailing_text_hidden = self._project_text_ids(input_ids[:, 4:-5])
-                else:
+                elif text_all is None or text_all.shape[1] < 1:
                     first_text = text_projection(text_embedding(input_ids[:, 3:4]))
                     trailing_text_hidden = text_projection(text_embedding(input_ids[:, 4:-5]))
+                else:
+                    first_text = text_all[:, :1]
+                    trailing_text_hidden = text_all[:, 1:]
                 first_text = first_text + codec_input[:, -1:]
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
                 if text_input_is_complete(info_dict):
@@ -1840,8 +1856,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             codec_prefix = codec_prefix + codec_input[:, :-1]
             talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
 
+            text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
             if non_streaming_mode:
-                text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
                 if text_all is None:
                     text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
@@ -1861,15 +1877,19 @@ class Qwen3TTSPromptEmbedsBuilder:
                 )
                 trailing_text_hidden = tts_pad_embed
             else:
-                first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
+                if text_all is None or text_all.shape[1] < 1:
+                    first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
+                    trailing_text_hidden = torch.cat(
+                        (
+                            text_projection(text_embedding(input_ids[:, 4:-5])),
+                            tts_eos_embed,
+                        ),
+                        dim=1,
+                    )
+                else:
+                    first_text = text_all[:, :1] + codec_input[:, -1:]
+                    trailing_text_hidden = torch.cat((text_all[:, 1:], tts_eos_embed), dim=1)
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                trailing_text_hidden = torch.cat(
-                    (
-                        text_projection(text_embedding(input_ids[:, 4:-5])),
-                        tts_eos_embed,
-                    ),
-                    dim=1,
-                )
         else:
             raise ValueError(f"Unsupported task_type={task_type}")
 
@@ -1917,8 +1937,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         if isinstance(non_streaming_mode_raw, bool):
             non_streaming_mode = non_streaming_mode_raw
         else:
-            # Official defaults: CustomVoice/VoiceDesign -> non_streaming_mode=True; Base -> False.
-            non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
+            # Default to streaming text-step prompt mode (False) across
+            # CustomVoice, VoiceDesign, and Base; set True for full-text prefill.
+            non_streaming_mode = False
 
         if not isinstance(text, str):
             text = ""

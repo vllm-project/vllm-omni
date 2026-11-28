@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for `estimate_prompt_len_from_additional_information`.
 
 Pins the 2D `voice_clone_prompt.ref_code` shape behaviour. Applying the
@@ -148,3 +151,55 @@ def test_estimate_prompt_len_uses_list_of_int_ref_ids_from_voice_clone_prompt() 
         f"got delta={est_50 - est_30}; expected 20 (= 50 - 30 extra ref_ids). "
         f"Did `_first(ref_ids)` collapse the list to its first int?"
     )
+
+
+@pytest.mark.parametrize(
+    "task_type,speaker,expected_default,expected_nsm_true",
+    [
+        ("CustomVoice", "Vivian", 10, 14),  # role(3) + codec_prefix(6) + 1 vs + (assistant_len=11 - 6)=5
+        ("VoiceDesign", "", 9, 13),  # role(3) + codec_prefix(5) + 1 vs + (assistant_len=11 - 6)=5
+    ],
+)
+def test_estimate_prompt_len_defaults_customvoice_and_voicedesign_to_streaming(
+    task_type: str,
+    speaker: str,
+    expected_default: int,
+    expected_nsm_true: int,
+) -> None:
+    def _tok(text: str, **_kwargs):
+        # build_assistant_text adds header/trailer (8 tokens) + 3 body tokens -> 11
+        return list(range(11))
+
+    base_info: dict = {
+        "task_type": [task_type],
+        "text": ["one two three"],
+        "language": ["English"],
+    }
+    if speaker:
+        base_info["speaker"] = [speaker]
+
+    est_default = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information=base_info,
+        task_type=task_type,
+        tokenize_prompt=_tok,
+        codec_language_id={"english": 0},
+        spk_is_dialect=None,
+    )
+    est_explicit_false = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information={**base_info, "non_streaming_mode": [False]},
+        task_type=task_type,
+        tokenize_prompt=_tok,
+        codec_language_id={"english": 0},
+        spk_is_dialect=None,
+    )
+    est_explicit_true = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information={**base_info, "non_streaming_mode": [True]},
+        task_type=task_type,
+        tokenize_prompt=_tok,
+        codec_language_id={"english": 0},
+        spk_is_dialect=None,
+    )
+
+    assert est_default == expected_default
+    assert est_explicit_false == expected_default
+    assert est_explicit_true == expected_nsm_true

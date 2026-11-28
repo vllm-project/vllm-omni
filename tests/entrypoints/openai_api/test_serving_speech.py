@@ -3620,23 +3620,38 @@ class TestTTSMethods:
         assert "non_streaming_mode" not in params
         assert "full_utterance_decode" not in params
 
-    def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):
-        """Explicit false should not be replaced by the VoiceDesign fallback."""
+    def test_build_tts_params_voicedesign_omits_non_streaming_mode_by_default(self, speech_server):
+        """VoiceDesign should omit non_streaming_mode by default (model defaults to False)."""
         req = OpenAICreateSpeechRequest(
             input="Hello",
             task_type="VoiceDesign",
             instructions="warm and calm",
-            non_streaming_mode=False,
         )
 
         params = speech_server._build_tts_params(req)
 
         assert params["task_type"] == ["VoiceDesign"]
-        assert params["non_streaming_mode"] == [False]
+        assert "non_streaming_mode" not in params
         assert "full_utterance_decode" not in params
 
+    def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):
+        """Explicit non_streaming_mode overrides (True or False) should pass through for VoiceDesign."""
+        for override in (False, True):
+            req = OpenAICreateSpeechRequest(
+                input="Hello",
+                task_type="VoiceDesign",
+                instructions="warm and calm",
+                non_streaming_mode=override,
+            )
+
+            params = speech_server._build_tts_params(req)
+
+            assert params["task_type"] == ["VoiceDesign"]
+            assert params["non_streaming_mode"] == [override]
+            assert "full_utterance_decode" not in params
+
     def test_build_tts_params_streaming_voicedesign_keeps_prompt_mode_not_full_decode(self, speech_server):
-        """Streaming VoiceDesign defaults: prompt-mode True, no full_utterance_decode."""
+        """Streaming VoiceDesign omits non_streaming_mode by default and sets no full_utterance_decode."""
         req = OpenAICreateSpeechRequest(
             input="Hello",
             task_type="VoiceDesign",
@@ -3648,11 +3663,21 @@ class TestTTSMethods:
         params = speech_server._build_tts_params(req)
 
         assert params["task_type"] == ["VoiceDesign"]
-        assert params["non_streaming_mode"] == [True]
+        assert "non_streaming_mode" not in params
         assert "full_utterance_decode" not in params
 
-    def test_build_tts_params_streaming_customvoice_explicit_non_streaming_mode_still_windowed(self, speech_server):
-        """Explicit non_streaming_mode=True must not inject full_utterance_decode."""
+    def test_build_tts_params_streaming_customvoice_omits_default_and_passes_override(self, speech_server):
+        """Streaming CustomVoice omits non_streaming_mode by default and honors explicit overrides."""
+        default_req = OpenAICreateSpeechRequest(
+            input="Hello",
+            voice="Vivian",
+            stream=True,
+            response_format="pcm",
+        )
+        default_params = speech_server._build_tts_params(default_req)
+        assert "non_streaming_mode" not in default_params
+        assert "full_utterance_decode" not in default_params
+
         req = OpenAICreateSpeechRequest(
             input="Hello",
             voice="Vivian",
@@ -7310,7 +7335,7 @@ class TestTTSAsyncOffloading:
     def test_prepare_speech_generation_qwen3_streaming_voicedesign_default_params(
         self, qwen3_tts_server, mocker: MockerFixture
     ):
-        """Streaming VoiceDesign defaults keep prompt-mode True without full_utterance_decode."""
+        """Streaming VoiceDesign defaults omit non_streaming_mode (uses model default False) and full_utterance_decode."""
         qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
         qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
 
@@ -7320,6 +7345,28 @@ class TestTTSAsyncOffloading:
             instructions="warm and calm",
             stream=True,
             response_format="pcm",
+        )
+        _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["VoiceDesign"]
+        assert "non_streaming_mode" not in tts_params
+        assert "full_utterance_decode" not in tts_params
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert "non_streaming_mode" not in prompt["additional_information"]
+        assert "full_utterance_decode" not in prompt["additional_information"]
+
+    def test_prepare_speech_generation_qwen3_voicedesign_non_streaming_mode_true(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """VoiceDesign explicit true should reach the model prompt additional_information."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            non_streaming_mode=True,
         )
         _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
