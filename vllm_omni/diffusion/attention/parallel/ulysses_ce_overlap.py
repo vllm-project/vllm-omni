@@ -27,6 +27,7 @@ Flags (uint32, monotonic epochs, one slot per writer rank) live at the start of 
 from __future__ import annotations
 
 import ctypes
+import sys
 from collections.abc import Callable
 from functools import cache
 
@@ -260,6 +261,11 @@ VERDICTS: dict[tuple, bool] = {}
 def run_ulysses_ce_overlap(pg, query, key, value, attn_fn, *, chunks: int) -> torch.Tensor:
     """One runner per (group, device), grown to the largest shape seen; growth is collective and happens in lockstep
     on all ranks."""
+    if query.device.type == "npu":
+        # Ascend has no copy engines, so the same pipeline is built from asynchronous HCCL collectives.
+        from vllm_omni.diffusion.attention.parallel.ulysses_overlap_npu import run_ulysses_overlap_npu
+
+        return run_ulysses_overlap_npu(pg, query, key, value, attn_fn, chunks=chunks)
     _, s, h, d = query.shape
     cache_key = (pg.group_name, query.device)
     runner = _RUNNERS.get(cache_key)
@@ -273,6 +279,9 @@ def clear_ulysses_ce_overlap_runners() -> None:
     """Release the runners' symmetric-memory workspaces during worker shutdown (called by
     ``a2a_permute.clear_a2a_permute_workspaces``)."""
     VERDICTS.clear()
+    npu = sys.modules.get("vllm_omni.diffusion.attention.parallel.ulysses_overlap_npu")
+    if npu is not None:
+        npu.clear_ulysses_overlap_npu_runners()
     if not _RUNNERS:
         return
     for device in {runner.device for runner in _RUNNERS.values()}:

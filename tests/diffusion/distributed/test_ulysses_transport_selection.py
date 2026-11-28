@@ -94,7 +94,12 @@ def _cpu(make):
         (4, {"requested": "copy_engine", "nvlink": False}, ValueError, None),
     ],
 )
-def test_select_transport(probe, world_size, settings, transport, log):
+def test_select_transport(probe, world_size, settings, transport, log, monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    # These cases describe the CUDA transport: the overlap is ignored when auto resolves to nccl.
+    # On NPU that note is suppressed because the chunked HCCL overlap does run over nccl.
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     if transport is ValueError:
         with pytest.raises(ValueError, match="ulysses_a2a_backend='copy_engine' is not supported here"):
             probe(world_size, **settings)
@@ -136,12 +141,26 @@ def test_probe_is_cached_per_group_and_members(monkeypatch):
         ({"ulysses_a2a_backend": "copy_engine_overlap"}, ValueError),
     ],
 )
-def test_config(values, backend):
+def test_config(values, backend, monkeypatch):
+    # These cases describe the CUDA rule: the overlap needs the copy-engine transport. On NPU the
+    # chunked HCCL overlap works over the default transport, so pin CUDA here and cover NPU below.
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     if backend is ValueError:
         with pytest.raises(ValueError):
             DiffusionParallelConfig(ulysses_degree=2, **values)
     else:
         assert DiffusionParallelConfig(ulysses_degree=2, **values).ulysses_a2a_backend == backend
+
+
+def test_config_npu_allows_overlap_over_the_default_transport(monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    config = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_backend="nccl", ulysses_overlap_chunks=7)
+    assert config.ulysses_overlap_chunks == 7
+    assert config.ulysses_a2a_backend == "nccl"
 
 
 def test_removed_permute_field_is_rejected():

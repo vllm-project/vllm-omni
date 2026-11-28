@@ -106,11 +106,22 @@ class TestParallelConfigPropagation:
             {"ulysses_a2a_backend": "nccl"},
         ],
     )
-    def test_ulysses_ce_overlap_rejects_invalid_config(self, overrides):
+    def test_ulysses_ce_overlap_rejects_invalid_config(self, overrides, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        # The nccl rule is the CUDA rule; NPU allows the default transport (covered separately).
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
         values = dict(ulysses_degree=2, ulysses_a2a_backend="copy_engine", ulysses_overlap_chunks=2)
         values.update(overrides)
         with pytest.raises(ValueError, match="ulysses_overlap_chunks"):
             DiffusionParallelConfig(**values)
+
+    def test_ulysses_ce_overlap_allows_default_transport_on_npu(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+        config = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_backend="nccl", ulysses_overlap_chunks=2)
+        assert config.ulysses_overlap_chunks == 2
 
     def test_unknown_a2a_backend_raises_value_error(self):
         with pytest.raises(ValueError, match="ulysses_a2a_backend must be one of"):

@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.ulysses_transport import AUTO, COPY_ENGINE, select_transport
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -138,14 +139,17 @@ def build_parallel_attention_strategy(
             overlap_chunks=ulysses_overlap_chunks,
         )
         ulysses_a2a_permute = transport == COPY_ENGINE
+        # On NPU the overlap is a chunked HCCL pipeline that does its own permute, so it does not
+        # depend on the copy-engine (symmetric-memory) transport being selected.
+        npu_overlap = ulysses_overlap_chunks > 0 and current_omni_platform.is_npu()
         return UlyssesParallelAttention(
             sp_group=sp_group,
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
             ulysses_a2a_permute=ulysses_a2a_permute,
-            # The overlap runs on the copy-engine exchange only.
-            ce_overlap_chunks=ulysses_overlap_chunks if ulysses_a2a_permute else 0,
+            # On CUDA the overlap runs on the copy-engine exchange only.
+            ce_overlap_chunks=ulysses_overlap_chunks if (ulysses_a2a_permute or npu_overlap) else 0,
         )
 
     # Pure Ring Attention

@@ -838,9 +838,10 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help=(
-                "On the copy-engine transport, split each rank's attention heads into this many chunks and move them "
-                "on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; 0 disables; "
-                "ignored when auto resolves to nccl). Requires strict pure Ulysses. Defaults to disabled."
+                "Split each rank's attention heads into this many chunks and overlap their exchange with attention "
+                "(must divide num_heads / ulysses_degree; 0 disables). On CUDA it uses copy engines on the "
+                "copy-engine transport and is ignored when auto resolves to nccl; on NPU it uses chunked HCCL "
+                "collectives over the default transport. Requires strict pure Ulysses. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(

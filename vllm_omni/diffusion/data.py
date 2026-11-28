@@ -334,13 +334,14 @@ class DiffusionParallelConfig:
     """
 
     ulysses_overlap_chunks: int = 0
-    """Overlap the copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
+    """Overlap the strict-Ulysses exchange with attention in this many head chunks (0 disables).
 
-    Applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL) and requires strict pure
-    Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and outputs return as each
-    chunk finishes. The first call for each attention kernel and shape runs the overlap and the standard path on
-    every rank and keeps the overlap only if all ranks are bit-identical, so results match the unchunked path
-    exactly; other kernels and shapes keep the standard exchange.
+    On CUDA this applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL). On NPU
+    the overlap is a chunked HCCL pipeline that works over the default transport and does not need symmetric memory.
+    Both require strict pure Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and
+    outputs return as each chunk finishes. The first call for each attention kernel and shape runs the overlap and
+    the standard path on every rank and keeps the overlap only if all ranks are bit-identical, so results match the
+    unchunked path exactly; other kernels and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1
@@ -448,18 +449,25 @@ class DiffusionParallelConfig:
         )
         if self.ulysses_overlap_chunks < 0:
             raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
-        if self.ulysses_overlap_chunks > 0 and (
-            self.ulysses_a2a_backend == "nccl"
-            or self.ulysses_mode != "strict"
-            or self.ring_degree != 1
-            or self.allgather_degree != 1
-        ):
-            raise ValueError(
-                "ulysses_overlap_chunks requires the copy-engine transport (ulysses_a2a_backend 'auto' or "
-                "'copy_engine') and strict pure Ulysses (ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
-                f"Got ulysses_a2a_backend={self.ulysses_a2a_backend!r}, ulysses_mode={self.ulysses_mode!r}, "
-                f"ring_degree={self.ring_degree}, allgather_degree={self.allgather_degree}."
-            )
+        if self.ulysses_overlap_chunks > 0:
+            # On NPU the overlap is a chunked HCCL pipeline and works over the default transport, so
+            # ``"nccl"`` is a valid choice there; on CUDA it needs the copy-engine transport.
+            from vllm_omni.platforms import current_omni_platform
+
+            default_transport_ok = self.ulysses_a2a_backend == "nccl" and current_omni_platform.is_npu()
+            if (
+                (self.ulysses_a2a_backend == "nccl" and not default_transport_ok)
+                or self.ulysses_mode != "strict"
+                or self.ring_degree != 1
+                or self.allgather_degree != 1
+            ):
+                raise ValueError(
+                    "ulysses_overlap_chunks requires the copy-engine transport (ulysses_a2a_backend 'auto' or "
+                    "'copy_engine') and strict pure Ulysses (ulysses_mode='strict', ring_degree=1, "
+                    "allgather_degree=1). "
+                    f"Got ulysses_a2a_backend={self.ulysses_a2a_backend!r}, ulysses_mode={self.ulysses_mode!r}, "
+                    f"ring_degree={self.ring_degree}, allgather_degree={self.allgather_degree}."
+                )
 
         # Validate HSDP configuration
         if self.use_hsdp:
