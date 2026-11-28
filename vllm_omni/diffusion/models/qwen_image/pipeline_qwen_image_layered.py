@@ -816,6 +816,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
         is_rgb = torch.tensor([0] * batch_size).to(device=self.device, dtype=torch.long)
 
+        resume_from_step, resume_latents = req.collate_resume_state()
         latents = self.diffuse(
             prompt_embeds,
             prompt_embeds_mask,
@@ -836,6 +837,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 "additional_t_cond": is_rgb,
                 "attention_kwargs": self.attention_kwargs,
             },
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         self._current_timestep = None

@@ -779,6 +779,7 @@ class QwenImageEditPlusPipeline(
         txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
         negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
 
+        resume_from_step, resume_latents = req.collate_resume_state()
         latents = self.diffuse(
             prompt_embeds,
             prompt_embeds_mask,
@@ -798,6 +799,8 @@ class QwenImageEditPlusPipeline(
                 "return_dict": False,
                 "attention_kwargs": self.attention_kwargs,
             },
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         self._current_timestep = None

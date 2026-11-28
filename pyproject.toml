@@ -34,6 +34,13 @@ classifiers = [
 
 [project.optional-dependencies]
 
+# Cross-request DiT cache reuse (cache_backend="inter_request"):
+# CPU→disk tiered latent storage via LMCache's ECCacheEngine. The allocator
+# patch in cache_store.py is verified against this pin.
+inter_request = [
+    "lmcache==0.5.1",
+]
+
 tracing = [
     "opentelemetry-sdk==1.45.2",
     "opentelemetry-exporter-otlp==1.45.2",

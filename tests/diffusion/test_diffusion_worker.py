@@ -10,6 +10,8 @@ This module tests the DiffusionWorker implementation:
 - shutdown: Releasing collective resources before process groups
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -306,6 +308,18 @@ class TestDiffusionWorkerWakeUp:
 
 @pytest.mark.cpu
 class TestDiffusionWorkerShutdown:
+    def test_flushes_cache_before_distributed_teardown(self, mocker: MockerFixture):
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        events = []
+        worker.model_runner = SimpleNamespace(shutdown=lambda: events.append("cache"))
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
+            side_effect=lambda: events.append("process_groups"),
+        )
+        worker.shutdown()
+        worker.shutdown()
+        assert events == ["cache", "process_groups"]
+
     def test_releases_collective_resources_before_process_groups(self, mocker: MockerFixture):
         worker = DiffusionWorker.__new__(DiffusionWorker)
         worker.model_runner = None

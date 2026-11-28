@@ -1731,6 +1731,12 @@ class DiffusionWorker:
                     mgr.close()
             except Exception:
                 logger.exception("Failed to close diffusion KV transfer manager during shutdown")
+            try:
+                runner_shutdown = getattr(model_runner, "shutdown", None)
+                if runner_shutdown is not None:
+                    runner_shutdown()
+            except Exception:
+                logger.exception("Failed to flush diffusion cache during shutdown")
 
         try:
             shutdown_kv_connector()

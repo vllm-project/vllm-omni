@@ -26,7 +26,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
-from vllm_omni.config.stage_config import resolve_diffusion_stage_role
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
@@ -517,6 +517,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     self.od_config.cache_backend,
                     self.od_config.model_class_name,
                 )
+                self.cache_backend.shutdown()
                 self.cache_backend = None
                 self.od_config.cache_backend = None
             else:
@@ -766,6 +767,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return None
         return self.prompt_embed_cache.stats()
 
+    def _update_cache_image_embedding(self, cache_key_hash: str, image_tensor: torch.Tensor) -> None:
+        # Skip image embedding update for video (5D tensor [B,C,T,H,W])
+        if not hasattr(image_tensor, "dim") or image_tensor.dim() == 5:
+            return
+        try:
+            self.cache_backend.update_image_embedding(cache_key_hash, image_tensor)
+        except Exception as e:
+            logger.debug("Failed to update image embedding: %s", e)
+
     def _sample_peak_memory_mb(self) -> float:
         """Return peak reserved GPU memory for the current forward pass in MiB.
 
@@ -879,6 +889,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
         if num_inference_steps is not None:
+            # inter_request resumes by skipping steps at the pipeline loop
+            # level, so backends always see the full step count here.
             self.cache_backend.refresh(self.pipeline, num_inference_steps)
         else:
             logger.warning(
@@ -967,12 +979,46 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     use_prefetch=allow_single_output,
                 )
 
+            # Inter-request cache: check for exact/semantic hits before forward.
+            # Exact-hit requests are removed from the batch and their cached
+            # outputs are returned directly; semantic hits set resume_from_step.
+            # cache_backend may be None (no cache configured / request-scoped
+            # cache-dit adoption cleared it) — hooks are no-ops then.
+            cache_backend = self.cache_backend
+            original_reqs = reqs
+            inter_request_outputs: list[tuple[int, DiffusionOutput]] = []
+            # Reuse only represents the final tensor. Keep staged payloads,
+            # streaming chunks and scheduler-owned KV on the full forward path.
+            if cache_backend is not None and (
+                diffusion_kv_metadata is not None
+                or od_config.streaming_output
+                or getattr(od_config, "stage_input_payload_keys", ())
+                or getattr(od_config, "stage_output_payload_keys", ())
+                or resolve_diffusion_stage_role(
+                    getattr(od_config, "stage_role", None), getattr(od_config, "model_stage", None)
+                )
+                is not DiffusionStageRole.FULL
+                or attention_schedule
+                or sigma_schedule
+            ):
+                cache_backend = None
+            if cache_backend is not None:
+                inter_request_outputs, reqs = cache_backend.short_circuit_requests(reqs, target_device=self.device)
+                if not reqs:
+                    outputs = cache_backend.merge_hit_outputs([], inter_request_outputs)
+                    self._maybe_send_stage_payload(original_reqs, outputs)
+                    return self._runner_output_from_outputs(original_reqs, outputs)
+
             self._refresh_cache_for_requests(reqs, od_config=od_config)
 
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary and record_output_peak_memory:
                 current_omni_platform.reset_peak_memory_stats()
+
+            is_dummy = any(OmniDiffusionRequest.is_dummy_run_request_id(req.request_id) for req in reqs)
+            if cache_backend is not None:
+                cache_backend.before_diffuse(is_dummy=is_dummy)
 
             paged_kv_runtime = None
             paged_kv_context: AbstractContextManager[Any] = nullcontext()
@@ -1077,6 +1123,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 for output in outputs:
                     output.peak_memory_mb = max(output.peak_memory_mb, batch_peak_memory_mb)
 
+            # Inter-request cache: store computed outputs for future reuse.
+            if cache_backend is not None:
+                outputs = cache_backend.post_forward_store(
+                    reqs,
+                    outputs,
+                    target_device=self.device,
+                    runner=self,
+                    is_dummy=is_dummy,
+                )
+                cache_backend.after_diffuse(is_dummy=is_dummy)
+
+                # Merge exact-hit outputs back into position.
+                outputs = cache_backend.merge_hit_outputs(outputs, inter_request_outputs)
+
             # Log prompt-embed cache activity; hits/misses accumulate across requests.
             prompt_embed_cache = getattr(self, "prompt_embed_cache", None)
             if is_primary and prompt_embed_cache is not None:
@@ -1084,15 +1144,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
             runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
             if (
-                od_config.cache_backend == "cache_dit"
+                od_config.cache_backend in ("cache_dit", "inter_request+cache_dit", "cache_dit+inter_request")
                 and od_config.enable_cache_dit_summary
                 and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
 
-        self._maybe_send_stage_payload(reqs, outputs)
-
-        return self._runner_output_from_outputs(reqs, outputs)
+        self._maybe_send_stage_payload(original_reqs, outputs)
+        return self._runner_output_from_outputs(original_reqs, outputs)
 
     def _attach_stepwise_metadata(
         self,
@@ -1852,3 +1911,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             received_at=float(received_at),
             transition_chunks=interaction.get("transition_chunks"),
         )
+
+    def shutdown(self) -> None:
+        logger.info(
+            "DiffusionModelRunner shutdown: cache_backend=%s, type=%s",
+            self.cache_backend,
+            type(self.cache_backend).__name__ if self.cache_backend else None,
+        )
+        if self.cache_backend is not None:
+            self.cache_backend.shutdown()

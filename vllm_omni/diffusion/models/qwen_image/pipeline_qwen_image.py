@@ -1121,6 +1121,7 @@ class QwenImagePipeline(
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
 
+        resume_from_step, resume_latents = req.collate_resume_state()
         latents = self.diffuse(
             ctx["prompt_embeds"],
             ctx["prompt_embeds_mask"],
@@ -1140,6 +1141,8 @@ class QwenImagePipeline(
                 "return_dict": False,
                 "attention_kwargs": self.attention_kwargs,
             },
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         self._current_timestep = None

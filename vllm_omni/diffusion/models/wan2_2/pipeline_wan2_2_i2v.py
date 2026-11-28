@@ -387,15 +387,33 @@ class Wan22I2VPipeline(
         attention_kwargs: dict[str, Any],
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
+        resume_from_step: int = 0,
+        resume_latents: torch.Tensor | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+
+        # Inter-request cache: seed latents from cache when resuming.
+        if resume_from_step > 0 and resume_latents is not None:
+            latents = resume_latents.to(device=latents.device, dtype=latents.dtype)
+            self.scheduler._step_index = resume_from_step
+            self.scheduler.set_begin_index(resume_from_step)
+        # Tell the step-recorder hook (if any) to skip the cached steps.
+        _recorder = getattr(self, "_step_latents_recorder", None)
+        if _recorder is not None:
+            _recorder.resume_from_step = resume_from_step
+
         # Checks a bound attention schedule against the actual sequence and returns its length; None
         # without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
         with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+
+                # Step hooks: callbacks may skip this step (e.g. resume).
+                if not self.on_diffuse_step_begin(step_idx, t):
+                    pbar.update()
+                    continue
 
                 # Select model and guidance scale based on timestep
                 current_model = self.transformer
@@ -455,6 +473,7 @@ class Wan22I2VPipeline(
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                self.on_diffuse_step_end(step_idx, t, latents)
                 pbar.update()
 
         return latents
@@ -722,6 +741,7 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
+        resume_from_step, resume_latents = req.collate_resume_state()
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -735,6 +755,8 @@ class Wan22I2VPipeline(
             attention_kwargs=attention_kwargs,
             condition=condition,
             first_frame_mask=first_frame_mask,
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos

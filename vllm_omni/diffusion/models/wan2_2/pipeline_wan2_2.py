@@ -726,9 +726,22 @@ class Wan22Pipeline(
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
+        resume_from_step: int = 0,
+        resume_latents: torch.Tensor | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+
+        # Inter-request cache: seed latents from cache when resuming.
+        if resume_from_step > 0 and resume_latents is not None:
+            latents = resume_latents.to(device=latents.device, dtype=latents.dtype)
+            self.scheduler._step_index = resume_from_step
+            self.scheduler.set_begin_index(resume_from_step)
+        # Tell the step-recorder hook (if any) to skip the cached steps.
+        _recorder = getattr(self, "_step_latents_recorder", None)
+        if _recorder is not None:
+            _recorder.resume_from_step = resume_from_step
+
         # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
         # length; None without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
@@ -748,6 +761,11 @@ class Wan22Pipeline(
                         else None
                     ),
                 )
+
+                # Step hooks: callbacks may skip this step (e.g. resume).
+                if not self.on_diffuse_step_begin(step_idx, t):
+                    pbar.update()
+                    continue
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -836,6 +854,7 @@ class Wan22Pipeline(
                         latents = pred_clean
                 else:
                     latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                self.on_diffuse_step_end(step_idx, t, latents)
                 pbar.update()
 
         return latents
@@ -1502,6 +1521,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
+        resume_from_step, resume_latents = req.collate_resume_state()
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -1515,6 +1535,8 @@ class Wan22Pipeline(
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
             generator=generator,
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos

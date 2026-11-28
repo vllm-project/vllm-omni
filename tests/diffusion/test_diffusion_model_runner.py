@@ -11,10 +11,13 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.base import CacheBackend
+from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
     AttentionSpec,
+    DiffusionCacheConfig,
     DiffusionOutput,
     VideoOutputTransportConfig,
 )
@@ -388,12 +391,15 @@ def _make_compile_runner(
     return runner
 
 
-class _EnabledCacheBackend:
+class _EnabledCacheBackend(CacheBackend):
     def __init__(self):
         self.refresh_calls = []
 
     def is_enabled(self):
         return True
+
+    def enable(self, pipeline):
+        pass
 
     def refresh(self, pipeline, num_inference_steps, verbose=True):
         self.refresh_calls.append((pipeline, num_inference_steps, verbose))
@@ -1260,6 +1266,44 @@ def _make_scheduler_output(num_reqs: int):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("hit_count, staged", [(1, False), (2, False), (2, True)])
+def test_inter_request_hits_preserve_output_routing(monkeypatch, hit_count, staged):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    pipeline = _BatchPipeline([])
+    pipeline.register_diffuse_step_hook = Mock()
+    runner = _make_batch_runner(pipeline)
+    runner.od_config.cache_backend = "inter_request"
+    runner.od_config.stage_output_payload_keys = ("latents",) if staged else ()
+    runner._maybe_send_stage_payload = Mock()
+    cache = InterRequestCacheBackend(DiffusionCacheConfig())
+    cache.enable(pipeline)
+    runner.cache_backend = cache
+    scheduler_output = _make_scheduler_output(num_reqs=2)
+    requests = [entry.req for entry in scheduler_output.scheduled_new_reqs]
+    for index, req in enumerate(requests):
+        req.prompt = f"prompt {index}"
+        req.sampling_params.seed = index
+        req.is_dummy_run = lambda: False
+        if index < hit_count:
+            cache.store(req, torch.tensor([index]))
+        if staged or index >= hit_count:
+            pipeline._outputs.append(DiffusionOutput(output=torch.tensor([10 + index])))
+
+    try:
+        runner.execute_model_batch(scheduler_output, runner.od_config)
+        published_reqs, outputs = runner._maybe_send_stage_payload.call_args.args
+        assert published_reqs == requests
+        expected = [10, 11] if staged else [0, 11] if hit_count == 1 else [0, 1]
+        assert [out.output.item() for out in outputs] == expected
+        if not staged and hit_count == 2:
+            assert pipeline.last_batch is None
+    finally:
+        runner.shutdown()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_execute_model_batch_rejects_output_count_mismatch(monkeypatch):
     """A pipeline returning the wrong number of outputs must fail loudly,
     not silently drop requests or IndexError on the per-request mapping."""
@@ -1492,6 +1536,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
     class _DummyCacheBackend:
         def __init__(self):
             self.enabled = False
+            self.shutdown = Mock()
 
         def enable(self, pipeline):
             del pipeline
@@ -1540,6 +1585,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+    dummy_cache_backend.shutdown.assert_called_once_with()
 
 
 @pytest.mark.core_model
