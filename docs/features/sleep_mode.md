@@ -90,6 +90,56 @@ Behavior notes:
 
 ## 2. Usage Examples
 
+### Automatic idle sleep
+
+Opt in at the serving entrypoint; omitting `--idle-sleep-timeout` leaves
+automatic sleep disabled:
+
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni \
+  --idle-sleep-timeout 300 \
+  --stage-overrides '{
+    "0": {"enable_sleep_mode": true},
+    "1": {"enable_sleep_mode": true},
+    "2": {"enable_sleep_mode": true}
+  }'
+```
+
+The timeout must be finite and positive. Every resolved stage must have
+`enable_sleep_mode` enabled. This experimental policy requires one frontend
+owning the complete local pipeline; duplex sessions, PD, weight transfer, and
+stage-by-stage `/v1/run` execution (`VLLM_OMNI_ENABLE_RUN_ENDPOINT=1`) are
+unsupported.
+
+The timer starts after startup warmup and after the last tracked generation
+finishes. Streaming generation and background video generation remain tracked
+until their engine work finishes. Empty WebSockets, completed responses,
+health, metrics and result retrieval do not keep the GPU awake. Ordinary
+realtime sessions may sleep between turns and wake on the next generation.
+
+Automatic sleep uses level 1 and all stages. A request arriving during sleep
+waits for that transition; the first remaining request then starts shared
+`wake_up()` (followed by `resume_generation()` when AR admission is held).
+Cancelling a request does not cancel the shared transition. Admission wait time
+spent on sleep/wake is exported via `vllm_omni:idle_wake_wait_s` without
+altering warm request `submit_ts` timing. Manual sleep, wake, pause, resume and
+KV-release operations return HTTP `409` while the automatic policy is enabled;
+other control RPCs (LoRA management, cache resets, profiling, `collective_rpc`)
+return HTTP `409` while asleep or transitioning and pin awake state when active.
+
+If a queue submission is still settling when the timer fires, sleep is
+deferred by another full idle interval. Failed or timed-out transitions (control
+timeout defaults to 120 seconds and can be overridden via
+`VLLM_OMNI_IDLE_SLEEP_CONTROL_TIMEOUT_S`) make health fail and reject further
+generation. The existing engine-death watchdog exits or keeps the API server
+alive according to its keep-alive configuration; automatic retry or recovery is
+not attempted.
+
+Level 1 sleep requires enough host RAM to hold offloaded model weights. The
+example's 300-second timeout is an illustrative value rather than a universal
+default; tune it according to your idle pattern and acceptable cold-wake
+latency. See the [design and verification summary](../design/feature/consumer_idle_sleep.md).
+
 ### Python API Example
 
 You can programmatically control the lifecycle of stages using the `AsyncOmni` engine.

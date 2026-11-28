@@ -27,6 +27,7 @@ from vllm import SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -451,6 +452,68 @@ class TestOmniDiffusionSleepMode:
             assert output is not None, "generate after sleep/wake produced no output"
             assert output.images and output.images[0] is not None, "generate after sleep/wake produced no image"
         finally:
+            await _ensure_awake(diffusion_engine)
+
+    @pytest.mark.omni
+    @pytest.mark.core_model
+    @pytest.mark.asyncio(loop_scope="class")
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    async def test_diffusion_auto_idle_sleep_wake_e2e(self, diffusion_engine: AsyncOmni):
+        """Automatic idle sleep: auto-sleep drops VRAM, control RPC returns 409, next generate auto-wakes with identical output."""
+        prompt = "a red ceramic coffee cup on a wooden desk"
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256, seed=42)
+        await _ensure_awake(diffusion_engine)
+        try:
+            base_output = None
+            async for item in diffusion_engine.generate(prompt, request_id="idle-e2e-base", sampling_params=sp):
+                base_output = item
+            assert base_output is not None and base_output.images and base_output.images[0] is not None
+            base_image = base_output.images[0].convert("RGB")
+
+            current_omni_platform.empty_cache()
+            vram_awake = _get_device_global_memory_used_gib(0)
+
+            diffusion_engine.enable_idle_sleep(1.5)
+            deadline = asyncio.get_running_loop().time() + 60.0
+            while asyncio.get_running_loop().time() < deadline:
+                assert not diffusion_engine.errored, f"Automatic idle sleep failed: {diffusion_engine._idle_error!r}"
+                if await diffusion_engine.is_sleeping() and diffusion_engine._idle_transition is None:
+                    break
+                await asyncio.sleep(0.25)
+            assert await diffusion_engine.is_sleeping(), "Engine did not enter automatic idle sleep within 60s"
+
+            current_omni_platform.empty_cache()
+            vram_asleep = _get_device_global_memory_used_gib(0)
+            drop_gib = vram_awake - vram_asleep
+            assert drop_gib > 0.05, (
+                f"Expected GPU VRAM drop while auto-asleep, got awake={vram_awake:.3f} GiB, "
+                f"asleep={vram_asleep:.3f} GiB (drop={drop_gib:.3f} GiB)"
+            )
+
+            with pytest.raises(OmniClientError) as exc_info:
+                await diffusion_engine.list_loras()
+            assert exc_info.value.status_code == 409
+
+            post_output = None
+            async for item in diffusion_engine.generate(prompt, request_id="idle-e2e-post", sampling_params=sp):
+                post_output = item
+            assert not await diffusion_engine.is_sleeping(), "Engine should be awake after generate()"
+            assert post_output is not None and post_output.images and post_output.images[0] is not None
+            assert np.array_equal(np.asarray(base_image), np.asarray(post_output.images[0].convert("RGB"))), (
+                "Image output changed after automatic idle sleep and wake"
+            )
+        finally:
+            if diffusion_engine._idle_timer is not None:
+                diffusion_engine._idle_timer.cancel()
+                diffusion_engine._idle_timer = None
+            transition = diffusion_engine._idle_transition
+            if transition is not None:
+                try:
+                    await transition
+                except BaseException:
+                    pass
+            diffusion_engine._idle_timeout_s = None
+            diffusion_engine._idle_error = None
             await _ensure_awake(diffusion_engine)
 
 

@@ -258,6 +258,16 @@ def test_wakeup_route_propagates_not_implemented_error(sleep_capable_engine, moc
     assert app.state.sleeping_stages == {0}
 
 
+@pytest.mark.parametrize("operation", ["sleep", "wakeup"])
+def test_manual_lifecycle_conflicts_with_auto_before_skipping(operation, sleep_capable_engine):
+    app = _make_app(sleep_capable_engine)
+    sleep_capable_engine._idle_timeout_s = 300
+    response = TestClient(app).post(f"/v1/omni/{operation}", json={"stage_ids": [0], "level": 1})
+    assert response.status_code == 409
+    sleep_capable_engine.sleep.assert_not_awaited()
+    sleep_capable_engine.wake_up.assert_not_awaited()
+
+
 def test_wakeup_removes_only_requested_stages(sleep_capable_engine):
     app = _make_app(sleep_capable_engine)
     app.state.sleeping_stages = {0, 1, 2}

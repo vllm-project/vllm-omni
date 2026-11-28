@@ -1014,7 +1014,7 @@ steps:
     # The inner timeout leaves five minutes for teardown verification and
     # artifact generation before the Buildkite step timeout.
     - >-
-      bash .buildkite/amd/scripts/assert-pytest-collection.sh 3
+      bash .buildkite/amd/scripts/assert-pytest-collection.sh 4
       tests/entrypoints/
       -m 'core_model and rocm and MI325 and not nvidia_only and not
       (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
@@ -1045,9 +1045,9 @@ steps:
       suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
       tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
       skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-      if tests != 3 or skipped != 0:
+      if tests != 4 or skipped != 0:
           print(
-              f"Expected exactly 3 executed entrypoint GPU tests; "
+              f"Expected exactly 4 executed entrypoint GPU tests; "
               f"reported tests={tests}, skipped={skipped}.",
               file=sys.stderr,
           )
