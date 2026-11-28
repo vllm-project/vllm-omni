@@ -351,8 +351,13 @@ class BailingMoeV3AudioForConditionalGeneration(
             add_generation_prompt=True,
             enable_thinking=False,
         )
+        # Newer transformers return a BatchEncoding from ``tokenize=True``
+        # instead of the plain id list; the engine's prompt processing needs
+        # the list (the dict object breaks multimodal placeholder matching).
+        if not isinstance(prompt_token_ids, (list, tuple)):
+            prompt_token_ids = prompt_token_ids["input_ids"]
         return TokensPrompt(
-            prompt_token_ids=prompt_token_ids,
+            prompt_token_ids=list(prompt_token_ids),
             multi_modal_data={"audio": stt_params.audio},
         )
 

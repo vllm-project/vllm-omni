@@ -67,7 +67,11 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
             if n > 1:
                 matches = (candidates[:, :-1] == sequence[-(n - 1) :]).all(dim=-1)
             banned = torch.zeros(logits.shape[-1], dtype=torch.bool, device=logits.device)
-            banned.scatter_reduce_(0, candidates[:, -1].long(), matches, reduce="amax")
+            # ``scatter_reduce_(..., reduce="amax")`` has no CUDA kernel for
+            # bool tensors; setting the matched tail tokens is exactly the
+            # boolean-or that reduction computed (duplicate tail tokens are
+            # idempotent).
+            banned[candidates[matches, -1]] = True
             if whitelist:
                 allowed = [token for token in whitelist if 0 <= token < logits.shape[-1]]
                 banned[allowed] = False

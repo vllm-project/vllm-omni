@@ -84,6 +84,8 @@ _MCP_UNSUPPORTED_MESSAGE = "Remote MCP tools are not supported"
 # The Realtime PCM contract is mono signed PCM16 at 24 kHz.
 SAMPLE_RATE_HZ = 24000
 BYTES_PER_SAMPLE_PCM16 = 2
+# Sentinel distinguishing "attribute not resolved yet" from a resolved None.
+_UNSET: Any = object()
 # OpenAI's Realtime contract allows playback speed in this range.
 MIN_OUTPUT_SPEED = 0.25
 MAX_OUTPUT_SPEED = 1.5
@@ -193,6 +195,10 @@ class OpenAIFullDuplexConnection:
         self._transcription_mode = False
         self._transcription_language: str | None = None
         self._transcription_prompt: str | None = None
+        # #11074 follow-up: the stage-0 model class when it implements the
+        # vLLM speech-to-text interface (resolved lazily, cached; ``_UNSET``
+        # means "not resolved yet", ``None`` means "no such interface").
+        self._transcription_model_cls: Any = _UNSET
         # Staged by the raw absorber, committed only when the update is
         # accepted: a rejected session.update must not change the live mode.
         self._pending_transcription_session: dict[str, object] | None = None
@@ -810,6 +816,75 @@ class OpenAIFullDuplexConnection:
             finally:
                 self._transcription_queue.task_done()
 
+    def _resolve_transcription_model(self) -> Any:
+        """Resolve the stage-0 model class when it implements the vLLM
+        speech-to-text interface (#11074 follow-up), else ``None``.
+
+        The lookup is the same registry resolution ``/v1/audio/transcriptions``
+        uses. The full interface is required — speech-to-text config, the
+        prompt builder, and the streaming output cleaner — so partial
+        implementations fall back to the instructions-based prompt.
+        """
+        cached = getattr(self, "_transcription_model_cls", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        try:
+            from vllm.model_executor.model_loader import get_model_cls
+
+            model_cls: Any = get_model_cls(self.engine.model_config)
+        except Exception:
+            model_cls = None
+        if model_cls is not None:
+            for interface_method in (
+                "get_speech_to_text_config",
+                "get_generation_prompt",
+                "get_streaming_post_processor_cls",
+            ):
+                if not callable(getattr(model_cls, interface_method, None)):
+                    model_cls = None
+                    break
+        self._transcription_model_cls = model_cls
+        return model_cls
+
+    def _build_model_transcription_request(
+        self,
+        model_cls: Any,
+        audio_b64: str,
+        language: str | None,
+        prompt: str | None,
+    ) -> tuple[Any, Any]:
+        """Build one committed turn through the model's transcription interface.
+
+        Mirrors ``/v1/audio/transcriptions``: the PCM16 turn buffer is decoded
+        and resampled to the model's expected sample rate, ``language`` /
+        ``prompt`` ride the model's own prompt protocol instead of free-text
+        instructions, and the returned streaming cleaner strips the model's
+        raw output framing from the deltas before they reach the client.
+        """
+        from vllm.config.speech_to_text import SpeechToTextParams
+
+        model_config = self.engine.model_config
+        stt_config = model_cls.get_speech_to_text_config(model_config, "transcribe")
+        pcm16 = np.frombuffer(base64.b64decode(audio_b64), dtype=np.int16)
+        audio = pcm16.astype(np.float32) / 32768.0
+        # The session input contract is PCM16 at ``SAMPLE_RATE_HZ``; the
+        # model's feature extractor may expect a different rate (Qwen3-ASR:
+        # 16 kHz).
+        if audio.size and int(stt_config.sample_rate) != SAMPLE_RATE_HZ:
+            resampler = StreamingAudioResampler(SAMPLE_RATE_HZ, int(stt_config.sample_rate))
+            audio = resampler.process(audio, final=True)
+        stt_params = SpeechToTextParams(
+            audio=audio,
+            stt_config=stt_config,
+            model_config=model_config,
+            language=language,
+            task_type="transcribe",
+            request_prompt=prompt or "",
+        )
+        engine_input = model_cls.get_generation_prompt(stt_params)
+        streaming_cleaner = model_cls.get_streaming_post_processor_cls()()
+        return engine_input, streaming_cleaner
+
     async def _run_transcription(
         self,
         item: types.RealtimeConversationItemUserMessage,
@@ -824,6 +899,14 @@ class OpenAIFullDuplexConnection:
         final ``conversation.item.input_audio_transcription.completed``. The
         ``language`` / ``prompt`` options are the ones snapshotted when the
         turn was committed, not the connection's current values.
+
+        When the stage-0 model implements the vLLM speech-to-text interface,
+        the turn is built exactly like ``/v1/audio/transcriptions``:
+        ``get_generation_prompt`` applies the model's own prompt protocol
+        (Qwen3-ASR forces the language through its assistant prefix rather
+        than free-text instructions) and the model's streaming cleaner strips
+        the raw output framing (``language English<asr_text>``) from the
+        deltas before they reach the client.
         """
         audio_content = next(
             (part for part in item.content if getattr(part, "type", None) == "input_audio"),
@@ -838,28 +921,34 @@ class OpenAIFullDuplexConnection:
         if not audio:
             return
 
-        # Build the transcription system prompt from the snapshotted knobs.
-        parts = ["Transcribe the spoken audio exactly."]
-        if language:
-            parts.append(f"The language is {language}.")
-        if prompt:
-            parts.append(f"Context: {prompt}")
-        parts.append("Output only the transcript text, with no commentary.")
-        instructions = " ".join(parts)
-
         item_id = item.id or _gen_id("item")
 
+        streaming_cleaner: Any = None
         # Single-turn engine input: system prompt + the committed audio. The
         # item is already announced and turns run asynchronously, so any
         # preparation failure must be a per-item terminal event — otherwise
         # the client cannot tell which committed item failed.
         try:
-            engine_input = await self._build_full_prompt(
-                instructions=instructions,
-                items=[item],
-            )
+            transcription_model = self._resolve_transcription_model()
+            if transcription_model is not None:
+                engine_input, streaming_cleaner = self._build_model_transcription_request(
+                    transcription_model, audio, language, prompt
+                )
+            else:
+                # Build the transcription system prompt from the snapshotted knobs.
+                parts = ["Transcribe the spoken audio exactly."]
+                if language:
+                    parts.append(f"The language is {language}.")
+                if prompt:
+                    parts.append(f"Context: {prompt}.")
+                parts.append("Output only the transcript text, with no commentary.")
+                instructions = " ".join(parts)
+                engine_input = await self._build_full_prompt(
+                    instructions=instructions,
+                    items=[item],
+                )
         except Exception as exc:
-            logger.warning("[realtime] transcription prompt preparation failed for %s: %s", item_id, exc)
+            logger.warning("[realtime] transcription prompt preparation failed for %s: %s", item_id, exc, exc_info=True)
             await self._send_event(
                 {
                     "type": "conversation.item.input_audio_transcription.failed",
@@ -899,18 +988,27 @@ class OpenAIFullDuplexConnection:
                 outputs = getattr(output, "outputs", None) or ()
                 delta = (outputs[0].text or "") if outputs else ""
                 if delta:
-                    full_transcript += delta
-                    await self._send_event(
-                        {
-                            "type": "conversation.item.input_audio_transcription.delta",
-                            "event_id": _gen_id("evt"),
-                            "item_id": item_id,
-                            "content_index": 0,
-                            "delta": delta,
-                        }
-                    )
+                    if streaming_cleaner is not None:
+                        # Same convention as /v1/audio/transcriptions
+                        # streaming: the cleaner consumes raw model deltas
+                        # and returns only the cleaned increments, so the
+                        # model's raw framing never reaches the client.
+                        delta = streaming_cleaner.process_delta(
+                            delta, getattr(outputs[0], "finish_reason", None) is not None
+                        )
+                    if delta:
+                        full_transcript += delta
+                        await self._send_event(
+                            {
+                                "type": "conversation.item.input_audio_transcription.delta",
+                                "event_id": _gen_id("evt"),
+                                "item_id": item_id,
+                                "content_index": 0,
+                                "delta": delta,
+                            }
+                        )
         except Exception as exc:
-            logger.warning("[realtime] transcription failed for %s: %s", item_id, exc)
+            logger.warning("[realtime] transcription failed for %s: %s", item_id, exc, exc_info=True)
             await self._send_event(
                 {
                     "type": "conversation.item.input_audio_transcription.failed",
