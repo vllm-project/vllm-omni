@@ -27,6 +27,23 @@ on the device and returns streaming PCM directly. The default deployment is
 - vLLM version: 0.32.0
 - GPU: 1x H100 / H200
 
+For a source checkout, follow the [CUDA installation guide](../../docs/getting_started/installation/gpu.md)
+for its matching vLLM version, then install vLLM-Omni from the repository root
+in the activated environment:
+
+```bash
+uv pip install -e .
+uv pip check
+```
+
+An editable installation supplies the `vllm.general_plugins` entry point that
+registers Omni models in vLLM worker processes. Setting `PYTHONPATH` alone does
+not install this registration metadata; a released Omni package alongside the
+source tree is not required. Install vLLM's dependencies as well: installing it
+with `--no-deps` skips requirements that Omni's `requirements/common.txt` does
+not replace. For an existing PyTorch installation, follow the installation
+guide's instructions for building a compatible vLLM.
+
 ### Reference audio
 
 Run from the repository root. These examples use two
@@ -86,6 +103,32 @@ must be positive; `initial_latent_chunk_size` must be between zero and that
 size. Zero skips the initial ramp and uses the regular chunk size. The first
 available audio is still released immediately.
 
+### Decode limits and long text
+
+For single-speaker requests, omitting `max_new_tokens` uses the checkpoint's
+`tts_config.maximum_decode_steps`. The Tiny checkpoint sets this to **250**:
+at 12.5 latent steps per second, that caps generated audio at **20 seconds**.
+The adapter's `MAX_DECODE_STEPS = 800` is the maximum accepted request limit,
+not the default. These limits count audio latent steps, not text tokens.
+
+For longer passages, set `"max_new_tokens": 800` in the `/v1/audio/speech`
+JSON body, as in the voice-cloning example below. This allows up to **64
+seconds**; the model can finish earlier. The request limit must be at least
+the checkpoint's `minimum_decode_steps` (13 for Tiny) and no greater than 800.
+For text that needs more audio than this budget, split it into shorter
+requests and reuse the same reference audio.
+
+Reaching the decode limit can cut off speech mid-sentence. An HTTP 200 response
+or a normal SSE `speech.audio.done` event does not guarantee that the entire
+input was spoken. Check the returned duration and listen to or transcribe the
+audio when completeness matters; increasing the limit is not a guarantee of
+complete speech.
+
+Keep an explicit `seed` when comparing decode limits or debugging short
+outputs, as in the examples below. The flow head samples noise separately
+from text-token sampling, so `temperature=0` alone is not a substitute for
+setting a seed.
+
 ## Voice cloning
 
 Use the downloaded `speaker_1.wav` and its exact transcript. Omit `ref_text`
@@ -101,7 +144,7 @@ jq -n --arg ref_audio "file://$REF_DIR/speaker_1.wav" \
     "ref_text": "在此奉劝大家别乱打美白针。",
     "language": "Chinese",
     "response_format": "wav",
-    "max_new_tokens": 200,
+    "max_new_tokens": 800,
     "extra_params": {"temperature": 0.0, "ming3_cfg": 1.0},
     "seed": 1234
   }' |
