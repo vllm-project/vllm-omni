@@ -270,6 +270,14 @@ def test_split_decode_groups_by_prefill_prompt_seq_len():
     assert QwenImage21Pipeline._split_decode_groups(same) == [same]
 
 
+def test_split_decode_groups_by_prefix_cache_layout():
+    native = _state(_decode_cache(1, 1.0))
+    sharded = _state(_decode_cache(1, 2.0))
+    sharded.extra["kv_cache"][0]["cond"]["_qwen21_sharded_prefix"] = torch.ones(1, 1, dtype=torch.bool)
+    assert QwenImage21Pipeline._needs_decode_seq_len_split([native, sharded])
+    assert QwenImage21Pipeline._split_decode_groups([native, sharded]) == [[native], [sharded]]
+
+
 def test_scatter_kv_cache_splits_rows_back_per_request():
     states = [_state([{}]), _state([{}])]
     merged = [
