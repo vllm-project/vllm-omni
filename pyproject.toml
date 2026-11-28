@@ -126,6 +126,7 @@ local = [
 # separation and loudness normalization.
 longcat-video-avatar = [
     "audio-separator==0.44.2",
+    "librosa==0.11.0",
     "pyloudnorm==0.1.1",
     "soundfile==0.12.1",
 ]

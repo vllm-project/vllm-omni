@@ -22,6 +22,18 @@ def _frames() -> np.ndarray:
     return rng.integers(0, 256, size=(8, 16, 24, 3), dtype=np.uint8)
 
 
+def test_whole_mux_accepts_noncontiguous_audio() -> None:
+    audio = np.zeros((480, 2), dtype=np.float32).T
+    assert not audio.flags.c_contiguous
+
+    payload = mux_video_audio_bytes(_frames()[:1], audio, fps=24, audio_sample_rate=24000)
+
+    with av.open(io.BytesIO(payload)) as container:
+        assert len(list(container.decode(video=0))) == 1
+    with av.open(io.BytesIO(payload)) as container:
+        assert list(container.decode(audio=0))
+
+
 @pytest.fixture
 def audio_done(monkeypatch):
     audio_done = Event()

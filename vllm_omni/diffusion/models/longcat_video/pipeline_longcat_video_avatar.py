@@ -447,6 +447,13 @@ def _as_bool(value: Any, default: bool) -> bool:
     return bool(value)
 
 
+def _resolve_use_distill(extra_args: dict[str, Any], loaded_use_distill: bool) -> bool:
+    requested = extra_args.get("use_distill")
+    if requested is not None and _as_bool(requested, loaded_use_distill) != loaded_use_distill:
+        raise ValueError("use_distill is a load-time setting; set it in additional_config before loading the model.")
+    return loaded_use_distill
+
+
 def _video_tensor_to_pil_frames(video: Any) -> list[Image.Image]:
     if isinstance(video, torch.Tensor):
         array = video.detach().cpu().numpy()
@@ -480,7 +487,7 @@ def _retrieve_latents(
 
 
 def get_longcat_video_avatar_post_process_func(od_config: OmniDiffusionConfig):
-    def post_process_func(video: Any, sampling_params=None):
+    def post_process_func(output: Any, sampling_params=None):
         fps = 25
         if sampling_params is not None:
             fps = int(
@@ -489,11 +496,20 @@ def get_longcat_video_avatar_post_process_func(od_config: OmniDiffusionConfig):
                 or sampling_params.fps
                 or 25
             )
-        return {
+        # The Avatar pipeline pairs the frames with the driving speech so callers
+        # can mux the two without re-reading and re-mixing the input audio.
+        video, audio, audio_sample_rate = (
+            output if isinstance(output, tuple) and len(output) == 3 else (output, None, None)
+        )
+        payload: dict[str, Any] = {
             "video": [_video_tensor_to_pil_frames(video)],
             "custom_output": {"fps": fps},
             "fps": fps,
         }
+        if audio is not None:
+            payload["audio"] = audio
+            payload["audio_sample_rate"] = audio_sample_rate
+        return payload
 
     return post_process_func
 
@@ -914,6 +930,67 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             "stage": stage,
             "resolution": resolution,
         }
+
+    @staticmethod
+    def _resample_waveform(waveform: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
+        """Resample a ``(C, N)`` waveform, keeping every channel."""
+        if orig_sr == target_sr:
+            return waveform
+        try:
+            import torchaudio.functional as taF
+
+            return taF.resample(waveform, orig_sr, target_sr)
+        except ImportError:
+            target_len = max(1, int(round(waveform.shape[-1] * float(target_sr) / float(orig_sr))))
+            return F.interpolate(waveform.unsqueeze(0), size=target_len, mode="linear", align_corners=False)[0]
+
+    def _driving_audio_waveform(
+        self, inputs: dict[str, Any], *, video_duration: float
+    ) -> tuple[np.ndarray, int] | tuple[None, None]:
+        """Mix the driving speech into one mux-ready track.
+
+        Muxing keeps the untouched input audio -- source sample rate and channel
+        layout included -- rather than the 16 kHz mono vocal stem the Whisper
+        embeddings are built from. Only the speaker layout is shared with the
+        embedding path (``para`` overlaps speakers, ``add`` chains them); the
+        length padding that path needs would append silence here, so the track
+        keeps its real speech length and is only trimmed to the video.
+        """
+        import soundfile as sf
+
+        audio_paths = inputs["audio_paths"]
+        if not audio_paths:
+            return None, None
+
+        tracks: list[torch.Tensor] = []
+        rates: list[int] = []
+        for _, path in sorted(audio_paths.items(), key=lambda item: _speaker_sort_key(item[0])):
+            data, rate = sf.read(path, dtype="float32", always_2d=True)
+            tracks.append(torch.from_numpy(data.T).float())
+            rates.append(int(rate))
+        sample_rate = max(rates)
+        tracks = [self._resample_waveform(track, rate, sample_rate) for track, rate in zip(tracks, rates, strict=True)]
+        channels = max(track.shape[0] for track in tracks)
+        tracks = [track.expand(channels, -1) if track.shape[0] == 1 else track for track in tracks]
+
+        if len(tracks) == 1:
+            mixed = tracks[0]
+        else:
+            audio_type = str(inputs["audio_type"]).lower()
+            lengths = [track.shape[-1] for track in tracks]
+            if audio_type == "para":
+                mixed = torch.zeros(channels, max(lengths))
+                for track in tracks:
+                    mixed[:, : track.shape[-1]] += track
+            elif audio_type == "add":
+                mixed = torch.zeros(channels, sum(lengths))
+                offset = 0
+                for track in tracks:
+                    mixed[:, offset : offset + track.shape[-1]] = track
+                    offset += track.shape[-1]
+            else:
+                raise NotImplementedError(f"Unsupported LongCat-Video-Avatar multi-speaker audio_type {audio_type!r}.")
+        return mixed[:, : max(1, round(video_duration * sample_rate))].numpy(), sample_rate
 
     def _extract_vocal(self, audio_path: str) -> str:
         fd, path = tempfile.mkstemp(prefix="longcat_avatar_vocal_", suffix=".wav")
@@ -1770,7 +1847,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         num_frames = _adjust_num_frames(int(extra.get("num_frames") or req.sampling_params.num_frames or 93))
         save_fps = int(extra.get("save_fps") or req.sampling_params.fps or self.save_fps)
         num_cond_frames = int(extra.get("num_cond_frames") or 13)
-        use_distill = _as_bool(extra.get("use_distill"), self.use_distill)
+        use_distill = _resolve_use_distill(extra, self.use_distill)
         steps = int(extra.get("num_inference_steps") or req.sampling_params.num_inference_steps or 50)
         text_guidance_scale = float(extra.get("text_guidance_scale") or req.sampling_params.guidance_scale or 4.0)
         audio_guidance_scale = float(extra.get("audio_guidance_scale") or req.sampling_params.guidance_scale_2 or 4.0)
@@ -1923,7 +2000,8 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             frames = np.asarray([np.asarray(frame) for frame in all_generated_frames], dtype=np.uint8)
         else:
             frames = (np.clip(output[0], 0.0, 1.0) * 255).round().astype("uint8")
+        driving_audio, driving_audio_rate = self._driving_audio_waveform(inputs, video_duration=len(frames) / save_fps)
         return DiffusionOutput(
-            output=torch.from_numpy(frames),
+            output=(torch.from_numpy(frames), driving_audio, driving_audio_rate),
             stage_durations={"avatar_generate_s": time.perf_counter() - started},
         )
