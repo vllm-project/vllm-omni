@@ -53,6 +53,15 @@ source frames, at least as many as requested and at most 4096. The runtime
 consumes only the prefix needed by the request. Longer rollouts also require
 sufficient device memory.
 
+Finite offline and stepwise requests draw their complete initial noise
+before denoising and take one slice per chunk. Re-noising uses the same
+generator. The request owns a temporary FP32 buffer proportional to its
+latent frame count (about 18.8 MiB per rank for the 201-frame, 464×832
+Example 03 workload). The buffer is released after use or request cleanup.
+Interactive ticks draw one block at a time because the rollout length is
+unknown. The same seed can therefore yield different outputs for finite
+requests and interactive ticks.
+
 ## Experimental KV writeback reuse
 
 To reuse KV from the final denoising step instead of running the additional

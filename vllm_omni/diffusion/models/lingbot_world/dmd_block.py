@@ -16,7 +16,7 @@ the ``ar`` argument, so this class never reaches back into the pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -54,6 +54,14 @@ class ARBlockContext:
     state: ARDiffusionKVState
     cross_attention: list[LingBotAttentionCache]
     branch: str
+
+
+class LingBotDMDStep(NamedTuple):
+    """Native integer timestep and its two scheduler sigma lookup rules."""
+
+    timestep: int
+    sigma: float
+    noise_sigma: float
 
 
 class LingBotDMDBlockRunner:
@@ -146,7 +154,7 @@ class LingBotDMDBlockRunner:
         cache: LingBotTransformerCache | None,
         ar: ARBlockContext | None,
         start_frame: int,
-        timestep_value: float,
+        timestep_value: int,
         step_index: int,
         camera_cache: CameraModulationCache | None = None,
         camera_pose: torch.Tensor | None = None,
@@ -163,7 +171,7 @@ class LingBotDMDBlockRunner:
         if not self.enforce_eager:
             torch.compiler.cudagraph_mark_step_begin()
         set_forward_context_denoise_step_idx(step_index)
-        timestep = torch.full((1,), float(timestep_value), device=self.device, dtype=torch.float32)
+        timestep = torch.full((1,), timestep_value, device=self.device, dtype=torch.int64)
         # Checkpoint channel contract:
         # [noise/x_t(16), temporal_mask(4), image_latent(16)] -> 36.
         model_input = torch.cat((current_latents.to(dtype=condition.dtype), condition), dim=1)
@@ -205,7 +213,14 @@ class LingBotDMDBlockRunner:
         # x0 = x_t - sigma * flow. Intermediate steps re-noise that x0
         # estimate at the next sigma; the final step keeps x0 as this
         # block's generated latent.
-        x0 = current_latents - sigma * flow_prediction.float()
+        # The native sampler performs the inversion in FP64 before returning
+        # to the FP32 denoise state; rounding the multiply first changes x0.
+        # Preserve the existing Ascend path: FP64 device arithmetic is not
+        # supported there, and native precision parity is not validated.
+        if current_latents.device.type not in ("cpu", "cuda"):
+            x0 = current_latents - sigma * flow_prediction.float()
+        else:
+            x0 = (current_latents.double() - sigma * flow_prediction.double()).to(current_latents.dtype)
         if next_sigma is None:
             return x0
         noise = randn_tensor(current_latents.shape, generator=generator, device=self.device, dtype=torch.float32)
@@ -305,19 +320,24 @@ class LingBotDMDBlockRunner:
         cache: LingBotTransformerCache | None,
         ar: ARBlockContext | None,
         start_frame: int,
-        schedule: tuple[tuple[float, float], ...],
+        schedule: tuple[LingBotDMDStep, ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        initial_latents: torch.Tensor | None = None,
         camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Request mode: all probes of one block, then its commit."""
         block_shape = (1, self.transformer.config.out_channels, *condition.shape[2:5])
-        current_latents = randn_tensor(block_shape, generator=generator, device=self.device, dtype=torch.float32)
+        current_latents = (
+            randn_tensor(block_shape, generator=generator, device=self.device, dtype=torch.float32)
+            if initial_latents is None
+            else initial_latents
+        )
         # Every forward below -- each probe and the commit -- reads the same camera trajectory, so the camera
         # injector is built once per block: one cache for the whole loop, exactly as the stepwise path holds
         # one per block across its separate calls.
         camera_cache = CameraModulationCache()
-        for step_index, (timestep_value, sigma) in enumerate(schedule):
+        for step_index, step in enumerate(schedule):
             flow_prediction = self.probe_step(
                 current_latents=current_latents,
                 condition=condition,
@@ -326,14 +346,14 @@ class LingBotDMDBlockRunner:
                 cache=cache,
                 ar=ar,
                 start_frame=start_frame,
-                timestep_value=timestep_value,
+                timestep_value=step.timestep,
                 step_index=step_index,
                 camera_cache=camera_cache,
                 camera_pose=camera_pose,
             )
-            next_sigma = schedule[step_index + 1][1] if step_index + 1 < len(schedule) else None
+            next_sigma = schedule[step_index + 1].noise_sigma if step_index + 1 < len(schedule) else None
             current_latents = self.apply_transition(
-                current_latents, flow_prediction, sigma, next_sigma=next_sigma, generator=generator
+                current_latents, flow_prediction, step.sigma, next_sigma=next_sigma, generator=generator
             )
             progress_bar.update()
         self.commit_block_kv(

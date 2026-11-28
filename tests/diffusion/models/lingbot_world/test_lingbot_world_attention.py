@@ -350,7 +350,9 @@ def _set_identity_attention(attention: nn.Module) -> None:
             projection.weight.copy_(torch.cat((identity, identity, identity)) if projection is qkv else identity)
             if projection.bias is not None:
                 projection.bias.zero_()
+    projection_dtype_weight = attention.norm_q.weight.detach().clone()
     attention.norm_q = nn.Identity()
+    attention.norm_q.register_parameter("weight", nn.Parameter(projection_dtype_weight))
     attention.norm_k = nn.Identity()
 
 
