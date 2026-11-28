@@ -14,7 +14,6 @@ from vllm_omni.diffusion.attention.schedule import (
 from vllm_omni.diffusion.data import uses_rank_local_dp_concurrency
 from vllm_omni.diffusion.mixfusion.request import request_batch_key_allowed
 from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
-from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -93,8 +92,9 @@ def text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
 
 
 def uses_text_encoder_allgather(config: object) -> bool:
-    resolved = resolve_offload(config)
-    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
+    from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
+    return execution_offload_facts(config).text_encoder_allgather
 
 
 def build_request_batch_sampling_params_key(

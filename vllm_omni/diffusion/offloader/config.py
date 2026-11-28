@@ -281,6 +281,21 @@ def _validate_legacy_layer_options(config: Any, public: ParsedDiffusionOffloadCo
 
 def resolve_offload(config: Any) -> ResolvedOffload:
     """Resolve and cache the complete offload policy on its owning config."""
+    from vllm_omni.diffusion.weight_management.startup import is_unified
+
+    if is_unified(config):
+        return ResolvedOffload(
+            strategy=OffloadStrategy.NONE,
+            public=None,
+            components=DEFAULT_OFFLOAD_COMPONENTS,
+            transfers={
+                DIT_COMPONENT: DLOTransfer.ALLGATHER,
+                TEXT_ENCODER_COMPONENT: DLOTransfer.RANK_LOCAL,
+            },
+            pin_memory=bool(getattr(config, "pin_cpu_memory", True)),
+            resident_layers=0,
+        )
+
     cached = getattr(config, "_resolved_diffusion_offload", None)
     if isinstance(cached, ResolvedOffload):
         return cached
@@ -375,6 +390,10 @@ def offload_streams_blocks(config: Any) -> bool:
 
 def materialize_legacy_offload_flags(config: Any) -> OffloadStrategy:
     """Keep existing strategy readers working after resolving the compact API."""
+    from vllm_omni.diffusion.weight_management.startup import is_unified
+
+    if is_unified(config):
+        return OffloadStrategy.NONE
     resolved = resolve_offload(config)
     for field, field_strategy in _LEGACY_STRATEGY_FIELDS.items():
         setattr(config, field, resolved.strategy is field_strategy)

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Resource accounting for the unified weight stack startup transaction.
+"""Selector, process state and resources for unified weight stack startup.
 
-This module starts as the ``ResourceLedger`` delivered by sub-RFC 01-1.  The
-weight-stack switch (01-2), ``execution_offload_facts`` (01-3) and the startup
-driver with ``FaultPlan`` (01-5) extend the same module later; the ledger is the
-only part that exists today.
+The startup driver (01-5) and execution offload facts (01-3) extend this module
+later.
 
 The ledger is *not* a global resource manager: it is created by the startup
 transaction (and, after commit, by the ``OffloadRuntime``), lives only as long
@@ -16,12 +14,100 @@ from __future__ import annotations
 
 import enum
 import logging
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
 
-from vllm_omni.diffusion.weight_management.errors import LifecycleError
+from vllm_omni.diffusion.weight_management.errors import ConfigError, LifecycleError
+from vllm_omni.diffusion.weight_management.interfaces import ExecutionOffloadFacts, WeightStack
 
 logger = logging.getLogger(__name__)
+
+
+def parse_weight_stack(value: object) -> WeightStack:
+    if value is None:
+        return WeightStack.LEGACY
+    if isinstance(value, str):
+        try:
+            return WeightStack(value)
+        except ValueError:
+            pass
+    raise ConfigError(
+        f"diffusion_weight_stack must be 'legacy' or 'unified', got {value!r}",
+        fix="use --diffusion-weight-stack legacy",
+    )
+
+
+def is_unified(config: object) -> bool:
+    value = getattr(config, "diffusion_weight_stack", None)
+    return isinstance(value, str) and parse_weight_stack(value) is WeightStack.UNIFIED
+
+
+def execution_offload_facts(config: object) -> ExecutionOffloadFacts:
+    """Return engine/executor offload facts for legacy or unified configuration."""
+    if is_unified(config):
+        # Before RFC 05 policy parsing exists, unified mode rejects offload so all facts are false.
+        return ExecutionOffloadFacts(
+            weight_collectives=False,
+            text_encoder_allgather=False,
+            whole_component_offload=False,
+        )
+    from vllm_omni.diffusion.offloader.config import (
+        TEXT_ENCODER_COMPONENT,
+        OffloadStrategy,
+        resolve_offload,
+    )
+
+    resolved = resolve_offload(config)
+    return ExecutionOffloadFacts(
+        weight_collectives=resolved.any_allgather,
+        text_encoder_allgather=resolved.offloads(TEXT_ENCODER_COMPONENT)
+        and resolved.uses_allgather(TEXT_ENCODER_COMPONENT),
+        whole_component_offload=resolved.strategy is OffloadStrategy.MODEL_LEVEL,
+    )
+
+
+# Identity keys support unhashable owners; weakrefs avoid leaking unclosed workers.
+_process_owners: dict[int, tuple[weakref.ref[object] | None, int | None, WeightStack]] = {}
+_process_lock = Lock()
+
+
+def _prune_dead_owners() -> None:
+    for owner_id in [k for k, (ref, _, _) in _process_owners.items() if ref is not None and ref() is None]:
+        _process_owners.pop(owner_id, None)
+
+
+def set_process_weight_stack(value: WeightStack, *, owner: object) -> None:
+    value = parse_weight_stack(value)
+    owner_id = id(owner)
+    stage_id = getattr(owner, "stage_id", None)
+    try:
+        ref: weakref.ref[object] | None = weakref.ref(owner)
+    except TypeError:
+        ref = None
+    with _process_lock:
+        _prune_dead_owners()
+        for current_id, (_, current_stage, current_value) in _process_owners.items():
+            if current_id != owner_id and current_value is not value:
+                raise ConfigError(
+                    f"stage {stage_id} selects {value.value!r}, but "
+                    f"stage {current_stage} already owns {current_value.value!r} "
+                    "in this process",
+                    fix="use the same diffusion_weight_stack for all workers in one process",
+                )
+        _process_owners[owner_id] = (ref, stage_id, value)
+
+
+def clear_process_weight_stack(*, owner: object) -> None:
+    with _process_lock:
+        _process_owners.pop(id(owner), None)
+
+
+def process_weight_stack() -> WeightStack:
+    with _process_lock:
+        _prune_dead_owners()
+        return next((value for _, _, value in _process_owners.values()), WeightStack.LEGACY)
 
 
 class ResourceKind(enum.IntEnum):
