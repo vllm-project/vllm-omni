@@ -1091,6 +1091,71 @@ async def test_wire_close_command_frees_the_slot_before_session_closed() -> None
         assert (await harness.open("sid-replacement")).ok is True
 
 
+async def test_replacement_open_waits_for_pending_window_release(monkeypatch) -> None:
+    port = PlacementStagePort()
+    release_attempts = 0
+
+    async def release_window(session_id: str) -> None:
+        nonlocal release_attempts
+        if session_id == "sid-closing":
+            release_attempts += 1
+            if release_attempts == 1:
+                raise TimeoutError("Stage 0 window release still pending")
+
+    monkeypatch.setattr(port, "release_session_window", release_window)
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        assert (await harness.open("sid-closing")).ok
+        await harness.events()
+        assert (await harness.close("sid-closing")).ok
+        assert [type(event) for event in await harness.events("sid-closing")] == [SessionClosed]
+        assert port.release_calls == []
+
+        replacement = asyncio.create_task(harness.open("sid-replacement"))
+        try:
+            await asyncio.sleep(0)
+            assert not replacement.done()
+            assert port.rejections == []
+            assert (await harness.open("sid-overflow")).error_code == "resource_exhausted"
+            assert port.reserve_calls == ["sid-closing"]
+            assert await harness.manager.reap_expired() == 1
+            assert (await asyncio.wait_for(replacement, timeout=1)).ok
+            assert port.release_calls == ["sid-closing"]
+            assert port.reserve_calls == ["sid-closing", "sid-replacement"]
+        finally:
+            if not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+
+
+@pytest.mark.parametrize("abandon", [False, True])
+async def test_pending_admission_releases_its_wait_position(monkeypatch, abandon: bool) -> None:
+    if not abandon:
+        monkeypatch.setattr("vllm_omni.engine.duplex.session.manager._CLOSING_ADMISSION_WAIT_S", 0.01)
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        assert (await harness.open("sid-closing")).ok
+        port.cleanup_failures_remaining = 1
+        assert (await harness.close("sid-closing")).ok
+
+        replacement = asyncio.create_task(harness.open("sid-waiting"))
+        try:
+            await asyncio.sleep(0)
+            assert port.rejections == []
+            if abandon:
+                assert (await harness.close("sid-waiting")).ok
+            result = await asyncio.wait_for(replacement, timeout=1)
+            assert result.error_code == ("session_closed" if abandon else "resource_exhausted")
+            assert port.reserve_calls == ["sid-closing"]
+            assert port.release_calls == []
+            assert not harness.manager._waiting_admissions
+            assert await harness.manager.reap_expired() == 1
+            assert (await harness.open("sid-replacement")).ok
+        finally:
+            if not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+
+
 async def test_wire_close_stops_the_worker_and_refuses_later_control_ops() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-wire")
