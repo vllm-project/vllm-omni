@@ -6,8 +6,11 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.utils.codec_registry import (
+    OmniCodecRegistry,
+)
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
-from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerde, OmniSerializer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -314,3 +317,95 @@ def test_tensor_serialize_into_edge_shapes():
         assert decoded.dtype == tensor.dtype
         assert decoded.shape == tensor.shape
         assert torch.equal(decoded, tensor)
+
+
+def test_codec_registry_mro_and_tag_lookup():
+    class Base:
+        pass
+
+    class Child(Base):
+        pass
+
+    registry = OmniCodecRegistry()
+    registry.register(Base, "base", encode=lambda value: value)
+
+    assert registry.lookup(Child) is registry.lookup(Base)
+    assert registry.lookup_tag("base") is registry.lookup(Base)
+
+
+def test_codec_registry_rejects_duplicate_unless_overridden():
+    registry = OmniCodecRegistry()
+    registry.register(dict, "dict", encode=lambda value: value)
+
+    with pytest.raises(ValueError):
+        registry.register(dict, "dict", encode=lambda value: value)
+
+    def replacement(value):
+        return value
+
+    registry.register(dict, "dict", encode=replacement, override=True)
+    assert registry.lookup(dict).encode is replacement
+
+
+def test_codec_registry_override_removes_the_previous_tag():
+    registry = OmniCodecRegistry()
+    registry.register(dict, "dict", encode=lambda value: value)
+    registry.register(dict, "mapping", encode=lambda value: value, override=True)
+
+    assert registry.lookup_tag("dict") is None
+    assert registry.lookup_tag("mapping") is registry.lookup(dict)
+
+
+def test_codec_registry_override_tag_removes_the_previous_type():
+    registry = OmniCodecRegistry()
+    registry.register(dict, "shared", encode=lambda value: value)
+    registry.register(list, "shared", encode=lambda value: value, override=True)
+
+    assert registry.lookup(dict) is None
+    assert registry.lookup_tag("shared") is registry.lookup(list)
+
+
+def test_registered_leaf_type_round_trips_top_level_and_nested():
+    """A codec registered after construction must also drive decoding."""
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    serde = OmniSerde()
+
+    class CustomLeaf:
+        def __init__(self, value):
+            self.value = value
+
+    def encode_leaf(obj):
+        return {"__custom_leaf__": True, "value": obj.value}
+
+    def decode_leaf(obj):
+        return CustomLeaf(obj["value"])
+
+    serde.encoder.codec_registry.register(CustomLeaf, "__custom_leaf__", encode=encode_leaf)
+    serde.decoder.codec_registry.register(CustomLeaf, "__custom_leaf__", decode=decode_leaf)
+
+    leaf = CustomLeaf("top-level")
+    restored = serde.deserialize(serde.serialize(leaf))
+    assert isinstance(restored, CustomLeaf)
+    assert restored.value == "top-level"
+
+    nested = {"items": [leaf], "mapping": {"leaf": leaf}}
+    restored_nested = serde.deserialize(serde.serialize(nested))
+    assert isinstance(restored_nested["items"][0], CustomLeaf)
+    assert restored_nested["items"][0].value == "top-level"
+    assert isinstance(restored_nested["mapping"]["leaf"], CustomLeaf)
+
+    # Registering a new leaf must not change the built-in wire format.
+    tensor = torch.tensor([[1.0, -2.5]], dtype=torch.bfloat16)
+    image = Image.new("RGB", (2, 1), color=(10, 20, 30))
+    payload = {"tensor": tensor, "array": np.arange(4), "image": image}
+    baseline = OmniSerde()
+    assert baseline.serialize(payload) == serde.serialize(payload)
+
+    round_tripped = serde.deserialize(serde.serialize(payload))
+    assert torch.equal(round_tripped["tensor"], tensor)
+    assert np.array_equal(round_tripped["array"], np.arange(4))
+    assert isinstance(round_tripped["image"], Image.Image)
+    assert list(round_tripped["image"].getdata()) == list(image.getdata())
