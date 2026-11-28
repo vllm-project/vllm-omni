@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, scheduler_ngram_factory, use_scheduler_ngram
+from vllm_omni.worker_v2.ngram_adapter import (
+    allow_ascend_scheduler_ngram,
+    is_thinker_ngram,
+    scheduler_ngram_factory,
+    use_scheduler_ngram,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -79,3 +85,22 @@ def test_cuda_ngram_keeps_worker_owned_proposals(thinker_config):
     thinker_config.device_config.device_type = "cuda"
     worker_speculator = object()
     assert scheduler_ngram_factory(lambda *_: worker_speculator)(thinker_config) is worker_speculator
+
+
+@pytest.mark.parametrize("has_blacklist", [False, True])
+def test_ascend_ngram_accepts_versions_with_or_without_v1_fallback(monkeypatch, thinker_config, has_blacklist):
+    ascend = ModuleType("vllm_ascend")
+    mrv2_utils = ModuleType("vllm_ascend.mrv2_utils")
+    ascend.mrv2_utils = mrv2_utils
+    monkeypatch.setitem(sys.modules, "vllm_ascend", ascend)
+    if has_blacklist:
+        mrv2_utils._v2_blacklist = lambda _: ["ngram speculative decoding", "other reason"]
+
+    allow_ascend_scheduler_ngram()
+
+    if has_blacklist:
+        assert mrv2_utils._v2_blacklist(thinker_config) == ["other reason"]
+        thinker_config.model_config.model_stage = "tts"
+        assert mrv2_utils._v2_blacklist(thinker_config) == ["ngram speculative decoding", "other reason"]
+    else:
+        assert not hasattr(mrv2_utils, "_v2_blacklist")
