@@ -333,7 +333,9 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
 
     video_processor = VideoProcessor(vae_scale_factor=16)
 
-    def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
+    def post_process_func(output: dict[str, Any], output_type: str | None = None, sampling_params=None):
+        if output_type is None:
+            output_type = (sampling_params.output_type if sampling_params is not None else None) or "np"
         if output_type == "latent":
             return output
 
@@ -529,27 +531,30 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        camera_major = torch.empty((1, 3, len(views) * num_frames, height, width), dtype=self.dtype, device="cpu")
+        for index, view in enumerate(views):
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
-                    continue
-                raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
-            frames = media_to_uint8_cthw(
-                value,
-                height=height,
-                width=width,
-                max_frames=1 if keep_first else num_frames,
-            )
+                    frames = torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
+                else:
+                    raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
+            else:
+                frames = media_to_uint8_cthw(
+                    value,
+                    height=height,
+                    width=width,
+                    max_frames=1 if keep_first else num_frames,
+                )
             if require_complete and frames.shape[1] < num_frames:
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
-        camera_major = torch.cat(prepared, dim=1)
-        return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
+            frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+            normalized = uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)
+            camera_major.narrow(2, index * num_frames, num_frames).copy_(normalized)
+            del frames, normalized
+        return camera_major
 
     def _encode_multiview_video(
         self,
@@ -770,18 +775,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 keep_first=condition_video_as_image,
                 require_complete=completion,
             )
-        control_pixels = (
-            self._prepare_camera_major_pixels(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
-            )
-            if selected_hints
-            else None
-        )
 
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         raw_indexes = multiview.get("condition_frame_indexes_vision")
@@ -822,6 +815,21 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             generator=generator,
             injected_latents=injected_latents,
         )
+        # RGB and control pixels each span the complete camera rig. Encode
+        # and release the RGB buffer before preparing the control buffer.
+        del target_pixels
+        control_pixels = (
+            self._prepare_camera_major_pixels(
+                views,
+                field="control",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                keep_first=False,
+            )
+            if selected_hints
+            else None
+        )
         control_latents = (
             self._encode_multiview_video(
                 control_pixels,
@@ -831,7 +839,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             if control_pixels is not None
             else None
         )
-        del target_pixels, control_pixels
+        del control_pixels
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
@@ -1018,6 +1026,38 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             open_guidance_interval=True,
             text_cfg_below_one=True,
         )
+        # The executor discards non-primary outputs. VAE patch parallelism
+        # is unsupported here, so decoding has no rank collectives and only
+        # the output owner needs to materialize complete CPU camera videos.
+        if torch.distributed.is_initialized():
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_classifier_free_guidance_rank,
+                get_fs_group,
+                get_hsdp_replicate_group,
+                get_sequence_parallel_rank,
+            )
+
+            if (
+                get_sequence_parallel_rank() != 0
+                or get_classifier_free_guidance_rank() != 0
+                or get_tensor_model_parallel_rank() != 0
+                or (
+                    self.od_config.parallel_config.use_hsdp
+                    and (
+                        get_fs_group().rank_in_group != 0
+                        or (
+                            self.od_config.parallel_config.hsdp_replicate_size > 1
+                            and get_hsdp_replicate_group().rank_in_group != 0
+                        )
+                    )
+                )
+            ):
+                return DiffusionOutput(
+                    stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+                )
+
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
         del condition_latents, control_latents, lidar_control_latents, lidar_condition_latents, shared_kwargs
         latents = final_targets[0]

@@ -5564,3 +5564,285 @@ def test_diffuse_releases_conditioning_after_completion_or_failure(
     assert pipeline.transformer.cached_kv is None
     assert pipeline.transformer.cached_freqs_gen is None
     assert "cache-lifetime" not in pipeline._memory_manager
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_multiview_pixel_normalization_is_bounded_to_one_camera(monkeypatch, dtype) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    pipeline = object.__new__(module.Cosmos3MultiviewPipeline)
+    pipeline.dtype = dtype
+    frames = [torch.full((3, 5, 2, 4), value, dtype=torch.uint8) for value in (64, 128, 255)]
+    views = [{"control": frame} for frame in frames]
+    normalized_sizes = []
+    original = module.uint8_cthw_to_normalized_5d
+
+    def normalize(frame, **kwargs):
+        normalized_sizes.append(frame.numel())
+        return original(frame, **kwargs)
+
+    monkeypatch.setattr(module, "uint8_cthw_to_normalized_5d", normalize)
+    actual = pipeline._prepare_camera_major_pixels(
+        views, field="control", height=2, width=4, num_frames=5, keep_first=False
+    )
+    expected = torch.cat(frames, dim=1).to(dtype).div(127.5).sub(1).unsqueeze(0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert max(normalized_sizes) <= frames[0].numel()
+
+
+def test_multiview_releases_vision_pixels_before_preparing_control(make_cosmos3_pipeline, monkeypatch) -> None:
+    import weakref
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.__class__ = module.Cosmos3MultiviewPipeline
+    pipeline.multiview_config = multiview_contract()
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    pipeline.multiview_cross_view_past_window_seconds = 0.4
+    pipeline.multiview_backend = "triton"
+    pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
+    vision_ref = None
+    prepared_roles = []
+
+    def prepare(views, *, field, **kwargs):
+        nonlocal vision_ref
+        prepared_roles.append(field)
+        if field == "control":
+            assert vision_ref is not None and vision_ref() is None
+        pixels = torch.zeros(1)
+        if field == "vision":
+            vision_ref = weakref.ref(pixels)
+        return pixels
+
+    pipeline._prepare_camera_major_pixels = prepare
+    pipeline._prepare_multiview_latents = lambda **kwargs: (
+        torch.zeros(1, 2, 2, 1, 1),
+        torch.ones(1, 1, 2, 1, 1),
+        torch.zeros(1, 2, 2, 1, 1),
+    )
+    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 2, 1, 1)
+    pipeline.diffuse_transfer = lambda **kwargs: kwargs["latents"]
+    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(1)
+    _capture_tokenize_calls(pipeline)
+    views = [
+        {
+            "camera_key": COSMOS3_MADS_CAMERAS[0],
+            "prompt": "A car drives.",
+            "control": torch.zeros(3, 5, 2, 4, dtype=torch.uint8),
+            "vision": torch.zeros(3, 5, 2, 4, dtype=torch.uint8),
+        }
+    ]
+    sp = make_sampling_params(
+        num_frames=5,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": views}, "wsm": {}, "aspect_ratio": "16,9"},
+    )
+    pipeline.forward(make_request_batch({"prompt": ""}, sp))
+    assert prepared_roles == ["vision", "control"]
+
+
+@pytest.mark.parametrize(
+    "sp_rank,cfg_rank,tp_rank,fs_rank,replicate_rank,dp_rank,use_hsdp,owns_output",
+    [
+        (0, 0, 0, 0, 0, 0, True, True),
+        (1, 0, 0, 0, 0, 0, True, False),
+        (0, 1, 0, 0, 0, 0, True, False),
+        (0, 0, 1, 0, 0, 0, True, False),
+        (0, 0, 0, 1, 0, 0, True, False),
+        (0, 0, 0, 0, 1, 0, True, False),
+        (0, 0, 0, 0, 0, 1, False, True),
+    ],
+)
+def test_multiview_decodes_only_the_replica_output_owner(
+    make_cosmos3_pipeline,
+    monkeypatch,
+    sp_rank,
+    cfg_rank,
+    tp_rank,
+    fs_rank,
+    replicate_rank,
+    dp_rank,
+    use_hsdp,
+    owns_output,
+) -> None:
+    import vllm.distributed
+
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: dp_rank * 2)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: sp_rank)
+    monkeypatch.setattr(parallel_state, "get_classifier_free_guidance_rank", lambda: cfg_rank)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(parallel_state, "get_fs_group", lambda: SimpleNamespace(rank_in_group=fs_rank))
+    monkeypatch.setattr(parallel_state, "get_data_parallel_rank", lambda: dp_rank)
+    monkeypatch.setattr(
+        parallel_state, "get_hsdp_replicate_group", lambda: SimpleNamespace(rank_in_group=replicate_rank)
+    )
+    pipeline = make_cosmos3_pipeline()
+    pipeline.__class__ = module.Cosmos3MultiviewPipeline
+    pipeline.od_config.parallel_config = SimpleNamespace(use_hsdp=use_hsdp, hsdp_replicate_size=2 if use_hsdp else 1)
+    pipeline.multiview_config = multiview_contract()
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    pipeline.multiview_cross_view_past_window_seconds = 0.4
+    pipeline.multiview_backend = "triton"
+    pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
+    pipeline._prepare_multiview_latents = lambda **kwargs: (
+        torch.zeros(1, 2, 2, 1, 1),
+        torch.ones(1, 1, 2, 1, 1),
+        torch.zeros(1, 2, 2, 1, 1),
+    )
+    pipeline.diffuse_transfer = lambda **kwargs: kwargs["latents"]
+    decoded = []
+
+    def decode(*args, **kwargs):
+        pixels = torch.zeros(1, 3, 5, 2, 4)
+        decoded.append(pixels)
+        return pixels
+
+    pipeline._decode_multiview_latents = decode
+    _capture_tokenize_calls(pipeline)
+    views = [{"camera_key": COSMOS3_MADS_CAMERAS[0], "prompt": "A car drives."}]
+    sp = make_sampling_params(
+        num_frames=5,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": views}, "aspect_ratio": "16,9"},
+    )
+    result = pipeline.forward(make_request_batch({"prompt": ""}, sp))
+    if owns_output:
+        assert result.output["payload"]["video"].shape == (1, 3, 5, 2, 4)
+        assert len(decoded) == 1
+    else:
+        assert result.output is None
+        assert decoded == []
+
+
+@pytest.mark.parametrize("output_type", ["np", "pt", "pil"])
+def test_multiview_postprocess_honors_request_output_type(output_type) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    payload = {
+        "payload": {"video": torch.zeros(1, 3, 6, 4, 4)},
+        "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+    }
+    result = postprocess(payload, sampling_params=OmniDiffusionSamplingParams(output_type=output_type))
+    video = result["payload"]["video"]
+    if output_type == "pil":
+        assert isinstance(video, list) and isinstance(video[0][0], Image.Image)
+    elif output_type == "pt":
+        assert isinstance(video, torch.Tensor) and video.shape == (1, 6, 3, 4, 4)
+    else:
+        assert isinstance(video, np.ndarray) and video.shape == (1, 6, 4, 4, 3)
+
+
+@pytest.mark.parametrize("output_type", ["np", "pil"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_multiview_cpu_worker_transport_engine_route_releases_raw_video(monkeypatch, output_type, dtype) -> None:
+    import gc
+    from multiprocessing import shared_memory
+    from typing import cast
+
+    from vllm_omni.diffusion import ipc
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    monkeypatch.setattr(ipc, "_SHM_TENSOR_THRESHOLD", 1)
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda: pytest.fail("CPU output accessed accelerator"))
+    config = SimpleNamespace(model_class_name="Cosmos3MultiviewPipeline", model_config={"guardrails": False})
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = config
+    engine.post_process_func = get_cosmos3_multiview_post_process_func(config)
+    engine._post_process_accepts_sampling_params = True
+    runner = object.__new__(DiffusionModelRunner)
+    params = OmniDiffusionSamplingParams(output_type=output_type)
+    request = OmniDiffusionRequest(prompt="", request_id="route", sampling_params=params)
+    cameras = [f"camera{i}" for i in range(7)]
+    source = torch.linspace(-1, 1, 7).repeat_interleave(3).view(1, 1, 21, 1, 1).expand(1, 3, 21, 4, 4)
+    lidar = torch.arange(36, dtype=torch.float32).reshape(1, 3, 2, 3, 2)
+    previous = None
+    for _ in range(2):
+        raw = source.to(dtype=dtype).clone()
+        worker_raw = weakref.ref(raw)
+        worker_storage = weakref.ref(raw.untyped_storage())
+        output = DiffusionOutput(
+            output={
+                "payload": {"video": raw, "lidar": lidar.clone()},
+                "metadata": {"multiview": {"cameras": cameras, "frames_per_view": 3}},
+            }
+        )
+        del raw
+        assert runner._prepare_output_for_transport(output, params) is output
+        ipc.pack_diffusion_output_shm(output, d2h_stream=cast(torch.Stream, object()))
+        gc.collect()
+        assert worker_raw() is None  # Packing committed handles before enqueue.
+        assert worker_storage() is None
+        names = [output.output["payload"][key]["name"] for key in ("video", "lidar")]
+        ipc.unpack_diffusion_output_shm(output)
+        for name in names:
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=name)
+        consumer_raw = weakref.ref(output.output["payload"]["video"])
+        consumer_storage = weakref.ref(output.output["payload"]["video"].untyped_storage())
+        [formatted] = engine.postprocess_output(request, output)
+        images = formatted.images[0]
+        if output_type == "pil":
+            assert isinstance(images, list) and all(isinstance(image, Image.Image) for image in images)
+            pixels = np.stack([np.asarray(image) for image in images])[None]
+            assert pixels.dtype == np.uint8 and pixels.shape == (1, 21, 4, 4, 3)
+        else:
+            pixels = np.asarray(images)
+            assert pixels.dtype == np.float32 and pixels.shape == (1, 21, 4, 4, 3)
+        torch.testing.assert_close(formatted.multimodal_output["lidar"], lidar, rtol=0, atol=0)
+        assert formatted.multimodal_output["metadata"]["multiview"]["cameras"] == cameras
+        if previous is not None:
+            np.testing.assert_array_equal(pixels, previous)
+        previous = pixels.copy()
+        del output
+        gc.collect()
+        assert consumer_raw() is None  # Formatted PIL/NumPy output retains no raw F32 video.
+        assert consumer_storage() is None
+
+
+@pytest.mark.parametrize(
+    ("explicit_type", "requested_type", "expected_type"),
+    [("pil", "np", "pil"), ("np", "pil", "np"), ("pt", "pil", "pt"), (None, "pil", "pil"), (None, None, "np")],
+)
+def test_multiview_explicit_output_type_precedes_request_default(
+    explicit_type: str | None, requested_type: str | None, expected_type: str
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    payload = {
+        "payload": {"video": torch.zeros(1, 3, 6, 4, 4)},
+        "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+    }
+    result = postprocess(
+        payload, output_type=explicit_type, sampling_params=OmniDiffusionSamplingParams(output_type=requested_type)
+    )
+    video = result["payload"]["video"]
+    if expected_type == "pil":
+        assert isinstance(video, list) and isinstance(video[0][0], Image.Image)
+    elif expected_type == "pt":
+        assert isinstance(video, torch.Tensor) and video.shape == (1, 6, 3, 4, 4)
+    else:
+        assert isinstance(video, np.ndarray) and video.shape == (1, 6, 4, 4, 3)

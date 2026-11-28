@@ -3563,9 +3563,20 @@ def test_download_completed_job_uses_storage_open_and_download_name(test_client,
 
 
 def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
-    test_client, isolated_video_backends, mocker: MockerFixture
+    test_client, isolated_video_backends, mocker: MockerFixture, tmp_path: Path
 ):
+    import torch
+    from safetensors import safe_open
+    from safetensors.numpy import load_file
+
+    from vllm_omni.model_extras.cosmos3_lidar import serialize_lidar_output
+
     _store, _tasks, storage = isolated_video_backends
+    frames = torch.empty((1, 3, 2, 128, 1800), dtype=torch.float32, device="cpu")
+    frames[:, 0, 0].fill_(12.5)
+    frames[:, 0, 1].fill_(25.0)
+    frames[:, 1].fill_(0.75)
+    frames[:, 2].fill_(1.0)
     lidar_metadata = {
         "shape": [3, 2, 128, 1800],
         "fps": 10.0,
@@ -3574,8 +3585,10 @@ def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
         "units": ["metres", "unit", "binary"],
         "apply_validity_mask": True,
         "validity_threshold": 0.5,
+        "start_time_seconds": 0.0,
         "range_projection": {"min_range_m": 0.0, "max_range_m": 80.0},
     }
+    lidar_bytes, lidar_metadata = serialize_lidar_output(frames, lidar_metadata)
     mocker.patch.object(
         OmniOpenAIServingVideo,
         "generate_video_bytes",
@@ -3583,7 +3596,7 @@ def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
             video_bytes=b"mp4",
             stage_durations={},
             peak_memory_mb=0.0,
-            lidar_bytes=b"LIDAR",
+            lidar_bytes=lidar_bytes,
             lidar_metadata=lidar_metadata,
         ),
     )
@@ -3593,17 +3606,34 @@ def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
     assert final["lidar"]["url"] == f"/v1/videos/{video_id}/content?variant=lidar"
     assert final["lidar"]["file_name"] == f"{video_id}.lidar.safetensors"
 
-    lidar = test_client.get(final["lidar"]["url"])
-    assert lidar.status_code == 200
-    assert lidar.content == b"LIDAR"
-    assert lidar.headers["content-type"] == "application/octet-stream"
-    assert final["lidar"]["file_name"] in lidar.headers["content-disposition"]
+    # Follow the descriptor and stream the numeric file, as the notebook does.
+    destination = tmp_path / final["lidar"]["file_name"]
+    with test_client.stream("GET", final["lidar"]["url"]) as lidar:
+        assert lidar.status_code == 200
+        assert lidar.headers["content-type"] == "application/octet-stream"
+        assert final["lidar"]["file_name"] in lidar.headers["content-disposition"]
+        with destination.open("wb") as output:
+            for chunk in lidar.iter_bytes():
+                output.write(chunk)
+    assert destination.read_bytes() == lidar_bytes
+    decoded = load_file(destination)
+    assert list(decoded) == ["frames"]
+    assert decoded["frames"].dtype == np.float32
+    np.testing.assert_array_equal(decoded["frames"], frames[0].numpy())
+    with safe_open(destination, framework="np") as handle:
+        assert json.loads(handle.metadata()["lidar"]) == lidar_metadata
+    for name, value in lidar_metadata.items():
+        assert final["lidar"][name] == value
     assert test_client.get(f"/v1/videos/{video_id}/content").content == b"mp4"
+    assert test_client.get(f"/v1/videos/{video_id}/content?variant=video").content == b"mp4"
+    assert test_client.get(f"/v1/videos/{video_id}/lidar").status_code == 404
     assert test_client.get(f"/v1/videos/{video_id}/content?variant=thumbnail").status_code == 422
 
     assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
     assert not os.path.exists(os.path.join(storage.storage_path, video_id))
     assert not os.path.exists(os.path.join(storage.storage_path, f"{video_id}.lidar.safetensors"))
+
+    assert test_client.get(final["lidar"]["url"]).status_code == 404
 
 
 def test_download_lidar_variant_requires_lidar_output(test_client, mocker: MockerFixture):

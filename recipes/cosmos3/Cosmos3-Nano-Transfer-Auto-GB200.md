@@ -122,6 +122,89 @@ created; other requests fail when generation starts.
 The checkpoint's query and KV head counts must be divisible by TP × CP, which
 is checked at load time. TP and HSDP cannot be combined.
 
+## Serialized FP8 checkpoints and MAPS
+
+A compatible ModelOpt checkpoint can store eligible UND/GEN projections as
+tensorwise E4M3 weights with static tensorwise FP32 weight and activation
+scales. BF16 exclusions, rig embeddings, RGB/LiDAR projections and both VAEs
+retain their checkpoint precision. The policy quantizes linear layers; it does
+not quantize attention scores or a KV cache.
+
+MAPS (mixed activation precision steps) is the default for the FP8 checkpoint.
+The checkpoint stores the policy in `transformer/config.json` under
+`quantization_config.runtime.diffusion_step_policy`. vLLM-Omni reads this
+policy at load time. No extra server argument is necessary:
+
+```json
+"diffusion_step_policy": {
+  "schema_version": 1,
+  "type": "first_last_n",
+  "index_space": "denoising_loop_iteration",
+  "scope": ["transformer"],
+  "default_mode": "native",
+  "first_steps": {"count": 3, "mode": "a16"},
+  "last_steps": {"count": 3, "mode": "a16"},
+  "overlap": "a16",
+  "reasoner": "a16"
+}
+```
+
+With this policy, GEN runs its first three and last three denoising steps with
+BF16 activations (A16) and the other steps with native FP8 activations (A8).
+UND runs with BF16 activations in all steps. The weights stay FP8 in all steps.
+A16 reconstructs the live local weights and runs a BF16 linear.
+
+```bash
+VLLM_OMNI_USE_QUACK_FP8=0 vllm serve /path/to/transfer-auto-modelopt-fp8 \
+  --omni \
+  --model-class-name Cosmos3MultiviewPipeline \
+  --enforce-eager
+```
+
+The server log shows the active policy and its source, for example
+`Cosmos3 mixed precision active (source=checkpoint): first_steps=3 last_steps=3 reasoner=a16`.
+
+For experiments, `--additional-config` can override the checkpoint policy. Here
+`N` is the request's number of denoising steps:
+
+| Execution | `cosmos3_mixed_precision` override |
+| --- | --- |
+| W8A16 | `{"first_steps": N, "last_steps": 0, "reasoner": "a16"}` |
+| W8A8 | `{"first_steps": 0, "last_steps": 0, "reasoner": "native"}` |
+
+An override changes execution only. It does not change the stored weights.
+
+Long multiview renders can exceed the executor's 600-second request timeout.
+Set `VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` to a suitable whole-request budget in seconds
+before starting the server or importing `Omni`. For example,
+`VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=10800` permits three hours per request; this does
+not change denoising steps or numerical behavior. Async output users can also
+set `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` to the same budget.
+
+The public `Omni` Python API reads the same checkpoint policy. It accepts the
+same `additional_config` override. A W8A16 override must set `first_steps` to
+the request length or more. Otherwise the remaining steps run native W8A8.
+Block-scaled formats, dynamic per-token/per-channel activations and SmoothQuant
+pre-scales are not interchangeable with this checkpoint contract.
+
+On datacenter Blackwell, the default FP8 backend can use Quack. Setting
+`VLLM_OMNI_USE_QUACK_FP8=0` explicitly selects FlashInfer for controlled
+validation. A FlashInfer kernel class name alone does not identify execution,
+because the Quack override patches that class. Backend selection and checkpoint
+precision are separate settings.
+
+The initial qualification uses eager execution and one active request per
+worker. Interleaved requests, top-level compilation, CUDA graphs, approximation
+caches and offload combinations require separate validation. Intrinsic compiled
+attention helpers and JIT linear kernels can still execute in eager mode. No
+throughput improvement or BF16 quality parity is implied.
+
+Camera preprocessing normalizes one view at a time and releases RGB pixels
+before allocating WSM pixels. With replicated VAEs, only the replica's output
+owner decodes RGB/LiDAR; other ranks complete denoising without allocating
+camera-sized output buffers. Camera ordering, VAE calls on the output rank and
+numeric LiDAR presentation retain the same contract.
+
 ## References
 
 - [Video API](../../docs/serving/videos_api.md)
@@ -314,6 +397,35 @@ each path must resolve inside that directory.
 `GET /v1/videos/{video_id}/content?variant=lidar` returns the numeric file. LiDAR
 output requires the asynchronous endpoint; `/v1/videos/sync` rejects it.
 
+Follow the completed job's `lidar.url` when downloading.
+Use the server origin as the client base URL because the descriptor includes
+`/v1`. Save the numeric safetensors and its descriptor separately from the MP4:
+
+```python
+import json
+from pathlib import Path
+
+import httpx
+
+job = json.loads(Path("job.json").read_text())  # Completed GET /v1/videos/{id}
+descriptor = job["lidar"]
+output = Path(descriptor["file_name"])
+with httpx.Client(base_url="http://localhost:8091") as client:
+    with client.stream("GET", descriptor["url"]) as response:
+        response.raise_for_status()
+        with output.open("wb") as destination:
+            for chunk in response.iter_bytes():
+                destination.write(chunk)
+output.with_suffix(".json").write_text(json.dumps(descriptor, indent=2))
+```
+
+The file contains one float32 tensor named `frames`, shaped `[3,T,128,1800]`,
+with range, intensity and validity channels. The safetensors `lidar` metadata
+matches the descriptor's numeric metadata, including the LiDAR FPS and time
+origin. A 297-frame/30 FPS joint clip produces 99 sweeps at 10 Hz starting at
+zero. The shared `/content` route uses `variant=video` by default and
+`variant=lidar` for this file.
+
 ## Verification
 
 With a server from [Server](#server) running, generate a two-camera T2V clip and
@@ -413,4 +525,4 @@ count, parallel topology, steps, cold/warm latency and peak memory.
 | Regional compilation | ✅ static GEN layers; `--enforce-eager` disables it | [Regional compilation](../../docs/user_guide/diffusion/regional_compilation.md) |
 | Cache-DiT / TeaCache | ❌ disabled at startup with a warning | [Cache-DiT](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md) |
 | Session state | ❌ rejected at load time | — |
-| LiDAR decoder parallelism | ❌ the decoder runs eager FP32 on every rank | — |
+| LiDAR decoder parallelism | ❌ — currently the decoder runs eager FP32 on the output owner rank only | — |
