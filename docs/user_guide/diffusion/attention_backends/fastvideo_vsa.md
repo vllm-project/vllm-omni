@@ -178,9 +178,37 @@ For H3, check `FastH3 adapter active` at startup and
 The Wan route requires CUDA tensors in FP16 or BF16, 256-token blocks,
 standard `head_size**-0.5` scaling, equal Q/K/V head counts, no attention mask,
 and no active sequence-parallel context. The MiniMax-H3 route uses 64-token
-`(4, 4, 4)` blocks and supports pure Ulysses. NPU and XPU paths do not execute
-the FastVideo VSA CUDA kernel. FastH3 Omni uses `(4, 4, 8)` logical blocks
+`(4, 4, 4)` blocks and supports pure Ulysses. XPU paths do not execute the
+FastVideo VSA CUDA kernel. FastH3 Omni uses `(4, 4, 8)` logical blocks
 instead; see its recipe for the separate tile128 provider requirements.
+
+### Ascend NPU
+
+On Ascend the 64-token MiniMax-H3 route runs on
+`torch_npu.npu_block_sparse_attention` with `fastvideo_vsa_provider: auto`
+(the named providers are CUDA kernels and are refused there). The operator
+takes query blocks of any size but key blocks only in multiples of 128, so
+queries keep their 64-token tiles and keys are paired: a query tile attends
+every tile it selected plus the neighbour each one shares a 128-token key
+block with. The selection is therefore a superset of the CUDA route's, never
+a subset, and the attention budget per query is up to twice the configured
+one. Padded key rows are filled with a valid key from their own 128-token
+block and padded value rows are zero; the padded rows' contribution to the
+softmax denominator is then removed using the log-sum-exp the operator returns.
+
+**Scope: Atlas A3.** The operator is called with `inner_precise=0`, and which
+precision modes a device accepts depends on its SoC version -- the 950 series
+documents 4 as its only one -- so the operator being installed does not mean
+the call will run. This route is measured on A3 and admits A3: another SoC
+version is refused at startup, before any kernel launch, rather than left to
+fail inside the operator. A device whose SoC version cannot be read is allowed
+through with a warning.
+
+Layers without a VSA gate (the token refiner) keep the dense path on this
+platform, as they do on CUDA. A 128-token layout is a different matter: it is
+not a fallback here but a startup error, so FastH3 Omni's tile128
+configuration, which the CUDA providers serve, is refused on Ascend rather
+than run densely.
 
 ## Automatic provider selection
 
