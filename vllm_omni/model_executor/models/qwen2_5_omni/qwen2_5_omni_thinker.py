@@ -90,15 +90,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
     resolve_encoder_quant_config,
 )
 
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
 logger = init_logger(__name__)
 
 _PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY = "_vllm_omni_per_video_use_audio_in_video"
@@ -1053,7 +1050,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         # force "use_flash_attention_2=True" to audio tower to align
         # the results.
-        if flash_attn is not None:
+        if current_omni_platform.supports_standalone_flash_attn():
             audio_config = thinker_config.audio_config
             audio_config._attn_implementation_autoset = True
             audio_config._attn_implementation = "flash_attention_2"
