@@ -317,6 +317,45 @@ class TestCleanup:
         assert connector.cleanup("consumed_req_99") is False
         assert "consumed_req_99" not in connector._pending_keys
 
+    def test_deferred_cleanup_keeps_lock_through_segment_gap(self, connector, monkeypatch):
+        key = f"release_gap_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        lock_path = connector._lock_file(key)
+        now = time.monotonic()
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        with open(lock_path, "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert not connector.cleanup_tracked(key, defer_if_busy=True)
+            connector._unlink_segment(key)
+            now += 60
+            connector.reap_consumed()
+            assert key in connector._pending_keys
+            assert os.path.exists(lock_path)
+
+        now += 60
+        connector.reap_consumed()
+        assert key not in connector._pending_keys
+        assert not os.path.exists(lock_path)
+
+    def test_busy_release_without_storage_identity_preserves_replacement(self, connector, monkeypatch):
+        monkeypatch.setattr(connector, "_segment_identity", lambda name: None)
+        key = f"release_no_identity_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, "original")[0]
+        with open(connector._lock_file(key), "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            assert not connector.cleanup_tracked(key, defer_if_busy=True)
+
+        writer = SharedMemoryConnector({})
+        try:
+            assert writer.put("0", "1", key, "replacement")[0]
+            with monkeypatch.context() as patch:
+                later = time.monotonic() + 60
+                patch.setattr(time, "monotonic", lambda: later)
+                connector.reap_consumed()
+            assert writer.get("0", "1", key)[0] == "replacement"
+        finally:
+            writer.close()
+
     def test_unlink_error_preserves_lock_and_tracking_for_retry(self, connector, monkeypatch):
         prefix = f"cleanup_error_{uuid.uuid4().hex}_"
         key = f"{prefix}0"
@@ -386,7 +425,6 @@ class TestLockFileLifecycle:
         receiver = SharedMemoryConnector({})
         key = f"poll_{uuid.uuid4().hex}"
         lock = tmp_path / f"shm_{key}_lockfile.lock"
-        # Production polling supplies source information without a SHM handle.
         source = {"source_host": "localhost", "source_port": 1234}
         try:
             lock.touch()
@@ -504,7 +542,6 @@ class TestLockFileLifecycle:
         flock = fcntl.flock
 
         def wait_for_writer(arg):
-            # Another open descriptor must be excluded until get/cleanup finishes.
             try:
                 with open(receiver._lock_file(key), "rb") as probe, pytest.raises(BlockingIOError):
                     flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -515,7 +552,6 @@ class TestLockFileLifecycle:
 
         def observe_write_lock(file, operation):
             if operation == fcntl.LOCK_EX and retiring.is_set():
-                # The writer already has a descriptor for the old lock inode.
                 writer_opened.set()
             return flock(file, operation)
 

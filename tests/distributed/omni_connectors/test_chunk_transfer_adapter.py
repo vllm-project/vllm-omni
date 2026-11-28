@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import fcntl
 import os
 import threading
 import uuid
@@ -62,8 +61,6 @@ def test_shm_abort_cleans_only_owned_chunks_before_id_reuse(shm_sender):
     adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
     adapter.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED, {request.request_id: request})
-    # Queue a replacement before cleanup runs. The same save loop must reclaim
-    # the old generation before its key can be written by the new generation.
     replacement = _req("new", RequestStatus.RUNNING, external_req_id=ext_id)
     adapter.save_async(None, replacement)
     adapter._send_single_request(adapter._pending_save_reqs.popleft())
@@ -132,59 +129,76 @@ def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
 
 @pytest.mark.parametrize("publish_replacement", [False, True], ids=["old-segment", "replacement"])
 @pytest.mark.parametrize("abort", [False, True], ids=["finish", "abort"])
-def test_shm_release_while_another_sender_holds_the_key(shm_sender, monkeypatch, publish_replacement, abort):
+def test_shm_release_allows_unrelated_sends_while_the_key_is_locked(
+    shm_sender, monkeypatch, publish_replacement, abort
+):
     adapter, sender = shm_sender
     ext_id = f"release_busy_{uuid.uuid4().hex}"
     key = f"{ext_id}_0_0"
-    assert sender.put("0", "1", key, "old")[0]
+    request = _req("busy", RequestStatus.RUNNING, external_req_id=ext_id)
+    sibling = _req("sibling", RequestStatus.RUNNING, external_req_id=f"{ext_id}_sibling")
+    sibling_key = f"{sibling.external_req_id}_0_0"
+    adapter.save_async(None, request)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert key in sender._pending_keys
 
     next_sender = SharedMemoryConnector({})
-    writing, release_attempted = threading.Event(), threading.Event()
+    writer_locked, allow_writer = threading.Event(), threading.Event()
+    sibling_sent, original_retired = threading.Event(), threading.Event()
     write_bytes = next_sender._write_bytes
-    flock = fcntl.flock
+    reap = sender.reap_consumed
 
     def hold_write(payload, name):
-        writing.set()
-        assert release_attempted.wait(timeout=5)
+        writer_locked.set()
+        allow_writer.wait()
         if not publish_replacement:
             raise OSError("write failed before replacing the old segment")
         return write_bytes(payload, name)
 
-    def observe_release(file, operation):
-        if operation & fcntl.LOCK_NB:
-            # Let a nonblocking attempt observe the busy lock before waking the writer.
-            try:
-                return flock(file, operation)
-            finally:
-                release_attempted.set()
-        release_attempted.set()
-        return flock(file, operation)
+    def observe_maintenance(**kwargs):
+        reap(**kwargs)
+        if sender._shm_exists(sibling_key):
+            sibling_sent.set()
+        with sender._pending_keys_lock:
+            if key not in sender._pending_keys:
+                original_retired.set()
 
+    monkeypatch.setattr(next_sender, "_write_bytes", hold_write)
+    monkeypatch.setattr(sender, "reap_consumed", observe_maintenance)
+    save_thread = threading.Thread(target=adapter.save_loop)
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            monkeypatch.setattr(next_sender, "_write_bytes", hold_write)
             writer = executor.submit(next_sender.put, "0", "1", key, "replacement")
             try:
-                assert writing.wait(timeout=5)
-                monkeypatch.setattr(fcntl, "flock", observe_release)
+                assert writer_locked.wait(timeout=5)
                 if abort:
-                    adapter._send_single_request({"cleanup_shm": (f"{ext_id}_0", 1)})
+                    adapter.finish_requests(
+                        [request.request_id], RequestStatus.FINISHED_ABORTED, {request.request_id: request}
+                    )
                 else:
                     adapter.release_shm_resources(ext_id)
-                    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+                adapter.save_async(None, sibling)
+                save_thread.start()
+                assert sibling_sent.wait(timeout=5), "terminal SHM cleanup blocked the unrelated send"
+                assert sender.get("0", "1", sibling_key) is not None
             finally:
-                release_attempted.set()
+                allow_writer.set()
             assert writer.result(timeout=5)[0] is publish_replacement
 
-        assert key not in sender._pending_keys
-        if not abort:
-            assert adapter._reclaimed_shm_total == int(not publish_replacement)
+        assert original_retired.wait(timeout=5), "idle maintenance did not retire the original publication"
         if publish_replacement:
+            assert os.path.exists(sender._lock_file(key))
             assert next_sender.get("0", "1", key)[0] == "replacement"
         else:
             assert not sender._shm_exists(key)
             assert not os.path.exists(sender._lock_file(key))
     finally:
+        adapter.stop_event.set()
+        with adapter._save_cond:
+            adapter._save_cond.notify()
+        if save_thread.ident is not None:
+            save_thread.join(timeout=5)
+            assert not save_thread.is_alive()
         next_sender.close()
 
 

@@ -51,7 +51,8 @@ This makes `SharedMemoryConnector` the simplest connector in the OmniConnector f
 Within the larger system:
 
 - `load_omni_transfer_config()` automatically fills missing edges with `SharedMemoryConnector`.
-- Callers interact with the connector exclusively through the `put()` / `get()` / `cleanup()` contract — the connector does not require caller-specific logic.
+- Stages transfer payloads through `put()` and `get()`. On request completion or abort, the sender
+  can reclaim the chunks it published.
 
 Compared with the remote Mooncake-based connectors, `SharedMemoryConnector` is intentionally minimal and local-only.
 
@@ -183,20 +184,26 @@ inline-payload path or size threshold.
 
 #### 6.2 Explicit Cleanup and Orphan Locks
 
-`cleanup(key)` tries the exact key's exclusive lock without waiting. A busy key keeps its
-tracking record. Cleanup removes the lock and record only after successfully unlinking the
-segment or confirming its absence. Other storage errors return `False` and preserve both for
-retry. Acquiring the lock can briefly create its file if the path is missing.
+`cleanup(key)` tries the exact key's exclusive lock without waiting, even if another sender published it.
+If the lock is busy, it returns `False` and the caller can retry. Cleanup removes the lock and
+tracking record only after unlinking the segment or confirming its absence. Other storage errors
+preserve both. Acquiring the lock can briefly create its file if the path is missing.
 
-For request completion and abort, the sender releases the publications it recorded.
-On the default Linux layout it records each segment's device and inode under the publication
-lock. A terminal release can wait for a busy lock, then compare the current segment with the
-record it selected. If the original is still there, it reclaims it. If another writer has
-replaced it, the replacement keeps its segment and lock. Prefix release selects tracked keys
-whose suffix is a numeric chunk ID. Backends with separate storage can provide a stable segment
-identity to support the same check. Without a recorded identity, release attempts the lock
-without waiting. Waiting for an identified publication can take as long as the holder keeps
-the lock.
+For request completion and abort, the sender releases the publications it recorded. Prefix cleanup
+selects tracked keys whose suffix is a numeric chunk ID. The default Linux connector records each
+segment's device and inode under the publication lock. It checks that identity before unlinking the
+segment. If another writer has replaced it, the new segment and its lock stay available to readers.
+
+The V1 chunk adapter handles abort and completion on the same thread that sends chunks. It tries
+the lock without waiting so other requests can send while a peer holds the lock. For a busy
+publication with a recorded identity, the connector keeps the original record for retry.
+Maintenance in `put()` and in the idle send loop retries these releases within its existing
+per-call budget. Only segments actually removed during a prefix cleanup count toward its return
+value.
+
+The native model runner v2 (MRv2) uses synchronous prefix cleanup and can wait for a busy lock
+when the segment has a recorded identity. A storage backend may supply its own stable identity.
+Without one, a tracked release tries the lock without waiting and leaves a busy publication in place.
 
 A crashed process can leave a lock file behind after its segment disappears. With the default
 file layout, initialization, `put()` and ordinary `get()` can trigger a scan of the lock directory. Each
@@ -208,8 +215,9 @@ until its next operation to scan again.
 
 #### 6.3 Closing the Connector
 
-`close()` attempts cleanup for the keys still tracked by this connector, removes its visibility
-marker and closes its wakeup FIFO.
+`close()` synchronously attempts cleanup for the publications this connector still tracks,
+including deferred releases. It can wait for the lock on an identified segment. It then removes
+the connector's visibility marker and closes its wakeup FIFO.
 
 ### 7. Data Flow in the Pipeline
 
