@@ -14,6 +14,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig, validate_dlo_host_regi
 
 from .component_utils import encoder_component_type
 from .config import (
+    DEFAULT_OFFLOAD_COMPONENTS,
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
     DLOTransfer,
@@ -21,6 +22,7 @@ from .config import (
     parse_dlo_transfer,
     parse_offload_components,
     resolve_offload,
+    validate_adaln_cache_options,
 )
 from .offload_plan import OffloadPlan
 
@@ -78,8 +80,14 @@ class OffloadConfig:
     # a frozenset is an explicit compact-API selection.
     components: frozenset[str] | None = None
     dlo_transfers: dict[str, DLOTransfer] | None = None
+    enable_adaln_cache: bool = False
+    adaln_cache_max_gib: float = 25.0
+    adaln_cache_reserve_gib: float = 8.0
 
     def __post_init__(self) -> None:
+        validate_adaln_cache_options(
+            self, self.strategy, DEFAULT_OFFLOAD_COMPONENTS if self.components is None else self.components
+        )
         if self.components is not None:
             self.components = parse_offload_components(self.components)
         if self.dlo_transfers is None:
@@ -222,6 +230,9 @@ class OffloadConfig:
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
             components=components,
             dlo_transfers=dlo_transfers,
+            enable_adaln_cache=getattr(od_config, "enable_adaln_cache", False),
+            adaln_cache_max_gib=getattr(od_config, "adaln_cache_max_gib", 25.0),
+            adaln_cache_reserve_gib=getattr(od_config, "adaln_cache_reserve_gib", 8.0),
         )
 
 

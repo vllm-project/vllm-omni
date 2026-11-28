@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -127,6 +128,19 @@ _LEGACY_STRATEGY_PRIORITY = (
     OffloadStrategy.LAYER_WISE,
     OffloadStrategy.MODEL_LEVEL,
 )
+
+
+def validate_adaln_cache_options(config: object, strategy: OffloadStrategy, components: Collection[str]) -> None:
+    """Validate optional rank-local AdaLN residency before model loading."""
+    enabled = getattr(config, "enable_adaln_cache", False)
+    if type(enabled) is not bool:
+        raise TypeError("enable_adaln_cache must be a bool")
+    for name, default in (("adaln_cache_max_gib", 25.0), ("adaln_cache_reserve_gib", 8.0)):
+        value = getattr(config, name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+    if enabled and (strategy is not OffloadStrategy.LAYER_WISE or DIT_COMPONENT not in components):
+        raise ValueError("enable_adaln_cache requires ordinary layerwise offload of the 'dit' component")
 
 
 _EnumT = TypeVar("_EnumT", bound=Enum)
@@ -322,6 +336,7 @@ def resolve_offload(config: Any) -> ResolvedOffload:
             resident_layers=0 if dit_options is None else dit_options.resident_layers,
         )
 
+    validate_adaln_cache_options(config, resolved.strategy, resolved.components)
     parallel_config = getattr(config, "parallel_config", None)
     data_parallel_size = int(getattr(parallel_config, "data_parallel_size", 1))
     cache_backend = getattr(config, "cache_backend", None)

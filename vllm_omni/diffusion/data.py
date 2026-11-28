@@ -1090,6 +1090,10 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Optional static AdaLN weight residency within ordinary layerwise offload.
+    enable_adaln_cache: bool = False
+    adaln_cache_max_gib: float = 25.0
+    adaln_cache_reserve_gib: float = 8.0
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # Sub-module level offloading: stream attn/mlp/adaln weights independently
@@ -1402,6 +1406,33 @@ class OmniDiffusionConfig:
 
         raise RuntimeError(
             f"Failed to find available port after {max_attempts} attempts (started from port {original_port})"
+        )
+
+    @property
+    def default_npu_cpu_binding(self) -> bool:
+        """Recognize configured MindIE-SD U8 x CP2, keeping native and SD8 defaults."""
+        if not (self.enable_layerwise_offload and self.enable_adaln_cache):
+            return False
+        parallel = self.parallel_config
+        if (
+            parallel is None
+            or parallel.ulysses_degree != 8
+            or parallel.allgather_degree != 2
+            or parallel.ring_degree != 1
+            or parallel.tensor_parallel_size != 1
+            or parallel.world_size != 16
+        ):
+            return False
+        attention = self.diffusion_attention_config
+        if attention is None:
+            return False
+        specs = [attention.default, *attention.per_role.values()]
+        return any(
+            spec is not None
+            and spec.backend.upper() == "RAINFUSION_ATTN"
+            and spec.block_sparse is not None
+            and getattr(spec.block_sparse, "parallel", None) is not None
+            for spec in specs
         )
 
     def __post_init__(self):

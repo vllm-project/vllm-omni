@@ -453,6 +453,9 @@ class OmniEngineArgs(EngineArgs):
     diffusion_offload_config: dict[str, Any] | None = None
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
+    enable_adaln_cache: bool | None = None
+    adaln_cache_max_gib: float | None = None
+    adaln_cache_reserve_gib: float | None = None
     enable_distributed_layerwise_offload: bool | None = None
     enable_submodule_offload: bool | None = None
     dlo_use_allgather: bool | None = None
@@ -896,6 +899,9 @@ class OrchestratorArgs:
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_adaln_cache: bool = False
+    adaln_cache_max_gib: float = 25.0
+    adaln_cache_reserve_gib: float = 8.0
     enable_distributed_layerwise_offload: bool = False
     enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
@@ -979,6 +985,9 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_offload_config",
         "enable_cpu_offload",
         "enable_layerwise_offload",
+        "enable_adaln_cache",
+        "adaln_cache_max_gib",
+        "adaln_cache_reserve_gib",
         "enable_distributed_layerwise_offload",
         "enable_submodule_offload",
         "dlo_use_allgather",
