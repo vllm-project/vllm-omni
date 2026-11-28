@@ -135,6 +135,9 @@ def _warn_on_dropped_pooling_keys(pooling_output: Any, mm_output: Any) -> None:
         )
 
 
+_DUPLEX_HANDOFF_TENSORS = frozenset({"latent", "latent_input_ids", "latent_positions"})
+
+
 class OmniRequestState(RequestState):
     """Request state for omni models, tracking multimodal outputs.
 
@@ -208,7 +211,15 @@ class OmniRequestState(RequestState):
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
 
-    def _consolidate_multimodal_tensors(self) -> None:
+    def _deferred_handoff_tensors(self, finish_reason: FinishReason | None) -> frozenset[str]:
+        # MiniCPM-o Stage 0 identifies its duplex handoff with this prompt
+        # snapshot. The bridge only consumes the hidden rows at a segment
+        # boundary. Interim output still carries text and snapshot metadata.
+        if finish_reason is None and self.streaming_input and "duplex_prompt_token_ids" in self.mm_accumulated:
+            return _DUPLEX_HANDOFF_TENSORS
+        return frozenset()
+
+    def _consolidate_multimodal_tensors(self, *, exclude: frozenset[str] = frozenset()) -> None:
         """Consolidate accumulated tensor lists into single tensors.
 
         Uses TensorAccumulationStrategy derived from the output modality
@@ -224,7 +235,7 @@ class OmniRequestState(RequestState):
             modality = OutputModality.TEXT
 
         try:
-            self.mm_accumulated.consolidate_tensors(modality)
+            self.mm_accumulated.consolidate_tensors(modality, exclude=exclude)
             self.mm_accumulated.consolidate_metadata()
         except (RuntimeError, TypeError, KeyError):
             logger.exception("Error consolidating multimodal tensors")
@@ -293,7 +304,7 @@ class OmniRequestState(RequestState):
         # Consolidate accumulated tensors when finishing, or for every
         # CUMULATIVE step so the consumer always sees a single tensor.
         if finished or not is_delta:
-            self._consolidate_multimodal_tensors()
+            self._consolidate_multimodal_tensors(exclude=self._deferred_handoff_tensors(finish_reason))
 
         if self.stream_interval > 1 and self.detokenizer is not None:
             # Send output request only when
@@ -381,7 +392,9 @@ class OmniRequestState(RequestState):
                 # Unflatten dotted keys (e.g. "hidden_states.layer_0") back
                 # to nested dicts so downstream consumers (thinker2talker etc.)
                 # can access with .get("hidden_states", {}).get("layers", {}).
-                merged = {**self.mm_accumulated.tensors, **self.mm_accumulated.metadata}
+                deferred = self._deferred_handoff_tensors(finish_reason)
+                merged = {key: value for key, value in self.mm_accumulated.tensors.items() if key not in deferred}
+                merged.update(self.mm_accumulated.metadata)
                 nested = unflatten_payload(merged)
                 snapshot = MultimodalPayload.from_dict(nested) or MultimodalPayload()
                 kwargs = {f.name: getattr(base_output, f.name) for f in dataclass_fields(CompletionOutput)}

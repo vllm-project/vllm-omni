@@ -1182,6 +1182,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             "context_max_units",
             "evidence_history_tokens",
             "evidence_query_retrieval",
+            "evidence_local_prefill",
         )
         provided = {name: extra_body.pop(name) for name in names if name in extra_body}
         if not provided:

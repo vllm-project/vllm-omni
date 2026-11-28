@@ -82,6 +82,7 @@ class MiniCPMO45DuplexWindowConfig:
     context_max_units: int = 24
     evidence_history_tokens: int = 800
     evidence_query_retrieval: bool = False
+    evidence_local_prefill: bool = False
 
     @classmethod
     def from_mapping(cls, value: object) -> MiniCPMO45DuplexWindowConfig:
@@ -105,6 +106,9 @@ class MiniCPMO45DuplexWindowConfig:
         retrieval = source.get("evidence_query_retrieval", False)
         if type(retrieval) is not bool or (retrieval and mode != "evidence"):
             raise ValueError("evidence_query_retrieval requires evidence window mode")
+        local_prefill = source.get("evidence_local_prefill", False)
+        if type(local_prefill) is not bool or (local_prefill and not retrieval):
+            raise ValueError("evidence_local_prefill requires query retrieval")
         config = cls(
             sliding_window_mode=str(mode),
             basic_window_high_tokens=integer("basic_window_high_tokens", 8000),
@@ -113,6 +117,7 @@ class MiniCPMO45DuplexWindowConfig:
             context_max_units=integer("context_max_units", 24),
             evidence_history_tokens=integer("evidence_history_tokens", 800),
             evidence_query_retrieval=retrieval,
+            evidence_local_prefill=local_prefill,
         )
         if config.basic_window_low_tokens >= config.basic_window_high_tokens:
             raise ValueError("basic_window_low_tokens must be less than basic_window_high_tokens")
@@ -132,6 +137,8 @@ class MiniCPMO45DuplexWindowConfig:
             result["evidence_history_tokens"] = self.evidence_history_tokens
             if self.evidence_query_retrieval:
                 result["evidence_query_retrieval"] = True
+            if self.evidence_local_prefill:
+                result["evidence_local_prefill"] = True
         return result
 
 

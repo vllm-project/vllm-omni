@@ -676,6 +676,15 @@ audio/video units if they fit and are still available. The archive lives with
 the active Stage-0 request. Barge-in carries the accepted active window through
 the existing window replay path.
 
+Set `evidence_local_prefill: true` with query retrieval to reuse the cached
+keys and values of an unchanged recent suffix during recovery. The Thinker
+aligns the cached keys to the new positions and pre-fills the restored history
+and new inputs. Reused rows still carry the context from their original
+forward pass, so responses can differ from full re-prefill. The fast path
+requires the CUDA MRv2 Thinker with `TRITON_ATTN` and synchronous scheduling.
+The engine uses ordinary prefill when the request or runtime cannot reuse the
+suffix safely. This option defaults to `false`.
+
 The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.

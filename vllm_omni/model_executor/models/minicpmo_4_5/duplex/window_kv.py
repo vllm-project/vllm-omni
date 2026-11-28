@@ -1075,6 +1075,68 @@ class MiniCPMO45SchedulerWindowPolicy:
             return len(update.prompt_token_ids)
         return None
 
+    def prepare_local_prefill(self, scheduler: OmniARScheduler, request: Request, update: StreamingUpdate) -> int:
+        duplex = update.model_intermediate_buffer["duplex"]
+        plan = duplex["stage0_window"].pop("local_prefill", None)
+        request._minicpmo45_local_prefill = None
+        if plan is None:
+            return 0
+        from vllm.logger import init_logger
+        from vllm.platforms import current_platform
+
+        model_config = scheduler.vllm_config.model_config
+        manager = self.find_duplex_window_manager(scheduler)
+        if (
+            manager is None
+            or len(scheduler.kv_cache_manager.coordinator.single_type_managers) != 1
+            or not current_platform.is_cuda()
+            or getattr(scheduler.vllm_config.attention_config.backend, "name", None) != "TRITON_ATTN"
+            or not model_config.use_v2_model_runner
+            or model_config.uses_mrope
+            or getattr(model_config, "uses_xdrope_dim", 0)
+            or scheduler.scheduler_config.async_scheduling
+            or scheduler.scheduler_config.max_num_batched_tokens < len(update.prompt_token_ids)
+            or manager.enable_caching
+            or getattr(scheduler, "connector", None) is not None
+            or request.num_in_flight_tokens
+        ):
+            init_logger(__name__).debug("MiniCPM-o local prefill unavailable for this engine or request")
+            return 0
+        prefix, old_start, new_start, count = plan
+        blocks = manager.req_to_blocks.get(request.request_id)
+        if not prefix or not blocks or any(block.is_null or block.ref_cnt != 1 for block in blocks):
+            return 0
+        if prefix >= new_start or old_start + count > len(blocks) * manager.block_size:
+            return 0
+        request._minicpmo45_local_prefill = (prefix, new_start, new_start + count)
+        duplex["stage0_local_prefill"] = plan
+        return prefix
+
+    @staticmethod
+    def is_local_prefill_gap(request: Request, scheduled_tokens: int) -> bool:
+        plan = getattr(request, "_minicpmo45_local_prefill", None)
+        if plan is None:
+            return False
+        prefix, split, _ = plan
+        return (
+            request.num_in_flight_tokens == 0
+            and request.num_computed_tokens == split
+            and scheduled_tokens == split - prefix
+        )
+
+    @staticmethod
+    def advance_local_prefill(requests: Iterable[Request]) -> None:
+        for request in requests:
+            plan = getattr(request, "_minicpmo45_local_prefill", None)
+            if plan is None:
+                continue
+            prefix, split, resume = plan
+            if request.num_computed_tokens < prefix:
+                request._minicpmo45_local_prefill = None
+            elif request.num_computed_tokens == split and not request.num_in_flight_tokens:
+                request.num_computed_tokens = resume
+                request._minicpmo45_local_prefill = None
+
     def release_session(self, session_id: str) -> None:
         if (carry := self.carry) is None:
             return
@@ -1112,7 +1174,21 @@ class MiniCPMO45SchedulerWindowPolicy:
         carry.snapshot_ids.add(session.request_id)
 
     def before_book(self, requests: Mapping[str, Request], output: SchedulerOutput) -> None:
-        """Drop the snapshots of requests whose append this step hands to the worker."""
+        """Book only the changed span and settle dispatched window snapshots."""
+        for req_id, tokens in output.num_scheduled_tokens.items():
+            request = requests.get(req_id)
+            plan = getattr(request, "_minicpmo45_local_prefill", None)
+            if plan is not None:
+                prefix, split, resume = plan
+                start = request.num_computed_tokens
+                if start == prefix and start + tokens <= resume:
+                    # If the full replacement could not be reserved in this
+                    # dispatch, use the ordinary prefill from the safe prefix.
+                    request._minicpmo45_local_prefill = None
+                    request.model_intermediate_buffer["duplex"].pop("stage0_local_prefill", None)
+                elif start < split < start + tokens:
+                    output.num_scheduled_tokens[req_id] = split - start
+                    output.total_num_scheduled_tokens -= start + tokens - split
         carry = self.carry
         if carry is None or not carry.snapshot_ids:
             return
@@ -1377,6 +1453,47 @@ class MiniCPMO45DuplexWorkerHelper:
         return []
 
     @classmethod
+    def _apply_local_prefill(cls, runner: Any, req_id: str, slot: int, plan: list[int]) -> None:
+        prefix, old_start, new_start, count = plan
+        computed = int(runner.req_states.num_computed_tokens_np[slot])
+        if computed == new_start + count:
+            # Upstream cached-request updates refresh only the host counter.
+            runner.req_states.num_computed_tokens.gpu[slot].fill_(computed)
+            from vllm.logger import init_logger
+
+            init_logger(__name__).debug("MiniCPM-o local prefill resumed at %d", computed)
+            return
+        if computed != prefix:
+            return
+        block_size, head_dim, inv_freq = cls.get_reanchor_parameters(runner)
+        head_dim = head_dim or 2 * inv_freq.numel()
+        ids = cls.resolve_group_block_ids(runner, req_id, 0)
+        table = torch.as_tensor(ids, dtype=torch.long, device=runner.device)
+        if max(old_start, new_start) + count > len(ids) * block_size:
+            raise RuntimeError("MiniCPM-o local prefill cannot relocate an unallocated KV span")
+        old = torch.arange(old_start, old_start + count, device=runner.device)
+        new = torch.arange(new_start, new_start + count, device=runner.device)
+        old_blocks, old_offsets = table[old // block_size], old % block_size
+        new_blocks, new_offsets = table[new // block_size], new % block_size
+        for cache in runner.kv_caches:
+            if cache.ndim != 4 or cache.shape[-1] != 2 * head_dim or cache.shape[2] != block_size:
+                raise RuntimeError("MiniCPM-o local prefill requires packed Triton KV")
+            # Advanced indexing copies all source rows before any overlapping writes.
+            rows = cache[old_blocks, :, old_offsets, :]
+            if old_start != new_start:
+                rows[..., :head_dim] = rotate_keys(rows[..., :head_dim], old_start - new_start, inv_freq)
+            cache[new_blocks, :, new_offsets, :] = rows
+        from vllm.logger import init_logger
+
+        init_logger(__name__).debug(
+            "MiniCPM-o local prefill hit prefix=%d gap=%d reused=%d displacement=%d",
+            prefix,
+            new_start - prefix,
+            count,
+            new_start - old_start,
+        )
+
+    @classmethod
     def maybe_apply_reanchor(cls, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
         req_states = getattr(runner, "req_states", None)
@@ -1404,6 +1521,9 @@ class MiniCPMO45DuplexWorkerHelper:
             duplex = info.get("duplex")
             if not isinstance(duplex, dict):
                 continue
+            local = duplex.get("stage0_local_prefill")
+            if local is not None and req_states is not None:
+                cls._apply_local_prefill(runner, req_id, slot, local)
             reanchor = duplex.pop("stage0_reanchor", None)
             if reanchor is None:
                 continue

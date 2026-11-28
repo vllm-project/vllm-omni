@@ -1746,3 +1746,30 @@ def test_native_finished_stats_preserve_watermark_status(watermarked, skipped, s
     assert stats.num_watermarked_reqs == int(watermarked)
     assert stats.num_watermark_skipped_reqs == int(skipped)
     assert stats.num_not_watermarked_reqs == int(not watermarked and not skipped)
+
+
+def test_native_duplex_defers_latent_rows_until_segment_finish():
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    state.streaming_input = True
+    chunks = [torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 4.0]])]
+    for offset, latent in enumerate(chunks):
+        payload = {
+            "latent": latent,
+            "latent_input_ids": torch.tensor([[10 + offset]]),
+            "latent_positions": torch.tensor([[100 + offset]]),
+        }
+        if offset == 0:
+            payload["duplex_prompt_token_ids"] = torch.tensor([21, 22])
+        state.add_multimodal_tensor(payload, LATENT)
+        partial = state.make_request_output([10 + offset], None, None, None)
+        pending = partial.outputs[0].multimodal_output
+        assert "latent" not in pending
+        assert "latent_input_ids" not in pending
+        assert "latent_positions" not in pending
+        assert torch.equal(pending["duplex_prompt_token_ids"], torch.tensor([21, 22]))
+
+    terminal = state.make_request_output([], None, FinishReason.STOP, None)
+    complete = terminal.outputs[0].multimodal_output
+    assert torch.equal(complete["latent"], torch.cat(chunks))
+    assert torch.equal(complete["latent_input_ids"], torch.tensor([[10], [11]]))
+    assert torch.equal(complete["latent_positions"], torch.tensor([[100], [101]]))

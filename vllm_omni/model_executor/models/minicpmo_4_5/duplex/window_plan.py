@@ -485,6 +485,20 @@ def prepare_stage0_window(
         ]
     if retrieval_plan is not None:
         duplex["stage0_window"].update(retrieval_plan)
+        if retrieval_plan["retrieval_query"] and window.get("evidence_local_prefill") and not carried_units:
+            # Only the contiguous unchanged suffix has a single RoPE displacement.
+            end = preserve_len + sum(unit["length"] for unit in units)
+            old_start = end
+            last = len(units) - 1
+            for source, _, removed, length in reversed(retrieval_plan["retrieval_keep"]):
+                if last < 0 or source != last or removed or length != units[last]["length"]:
+                    break
+                old_start -= length
+                last -= 1
+            new_start = old_start - dropped_len
+            keep = min(base_len, session.num_computed_tokens) - old_start
+            if end == boundary and keep >= 512 and new_start > preserve_len and new_start + keep < replacement_len:
+                duplex["stage0_window"]["local_prefill"] = (preserve_len, old_start, new_start, keep)
     if carried_units:
         duplex["stage0_window"]["carried_units"] = len(carried_units)
         duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]

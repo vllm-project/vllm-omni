@@ -511,7 +511,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
-    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+    def _replace_streaming_session(
+        self, session: Request, update: StreamingUpdate, *, computed_prefix: int = 0
+    ) -> None:
         """Replace a downstream stage's placeholder with its next payload."""
         self._reset_streaming_session_replacement_state(session)
         session._output_token_ids.clear()
@@ -520,7 +522,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         del session._all_token_ids[:]
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
+        session.num_computed_tokens = computed_prefix
         session.prompt_token_ids = new_prompt
         session.update_block_hashes()
         session.num_prompt_tokens = len(new_prompt)
