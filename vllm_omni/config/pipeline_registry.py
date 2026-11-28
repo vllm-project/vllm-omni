@@ -47,7 +47,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTA_PIPELINE,
     AUDEX_TTS_PIPELINE,
 )
-from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
+from vllm_omni.model_executor.models.audio8_tts.pipeline import resolve_audio8_pipeline
 from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import (
     AURA_OMNI_JUDGED_PIPELINE,
@@ -174,7 +174,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "abot_world": ABOT_WORLD_PIPELINE,
     "alpamayo2_super": ALPAMAYO2_SUPER_PIPELINE,
-    "arktts": AUDIO8_TTS_PIPELINE,
+    "arktts": resolve_audio8_pipeline,
     "audex_s2s": AUDEX_S2S_PIPELINE,
     "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
     "audex_tta": AUDEX_TTA_PIPELINE,
