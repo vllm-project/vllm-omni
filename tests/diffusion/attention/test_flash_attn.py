@@ -11,7 +11,7 @@ This script tests two main scenarios:
 
 import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -950,7 +950,14 @@ def _npu_impl(causal: bool = False) -> FlashAttentionImpl:
     return FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
 
 
-def _fake_mindiesd(monkeypatch, *, attention_forward=None, attention_forward_varlen=None):
+def _fake_mindiesd(
+    monkeypatch,
+    *,
+    attention_forward=None,
+    attention_forward_varlen=None,
+    is_a5: bool = False,
+    laser_min_seq_len: int = 2048,
+):
     """Install a stub ``mindiesd`` so local ``from mindiesd import ...`` works.
 
     Restored automatically by monkeypatch. Defaults are no-op callables so the
@@ -962,6 +969,27 @@ def _fake_mindiesd(monkeypatch, *, attention_forward=None, attention_forward_var
         attention_forward_varlen=attention_forward_varlen or Mock(return_value=torch.zeros(1)),
     )
     monkeypatch.setitem(sys.modules, "mindiesd", fake)
+    modules = {
+        name: ModuleType(name)
+        for name in (
+            "mindiesd.layers",
+            "mindiesd.layers.flash_attn",
+            "mindiesd.layers.flash_attn.attention_forward",
+            "mindiesd.utils",
+            "mindiesd.utils.get_platform",
+        )
+    }
+    for name, module in modules.items():
+        parent_name, _, attribute = name.rpartition(".")
+        parent = fake if parent_name == "mindiesd" else modules[parent_name]
+        setattr(parent, attribute, module)
+        monkeypatch.setitem(sys.modules, name, module)
+    setattr(
+        modules["mindiesd.layers.flash_attn.attention_forward"],
+        "ASCEND_LASER_ATTENTION_MIN_SEQLEN",
+        laser_min_seq_len,
+    )
+    setattr(modules["mindiesd.utils.get_platform"], "is_a5_device", lambda: is_a5)
     return fake
 
 
@@ -1651,7 +1679,7 @@ def test_prefix_kv_slice_applies_laser_input_scaling(monkeypatch):
         captured.update(kwargs)
         return torch.ones_like(query)  # deterministic stand-in kernel output
 
-    _fake_mindiesd(monkeypatch, attention_forward=fake_attention_forward)
+    _fake_mindiesd(monkeypatch, attention_forward=fake_attention_forward, laser_min_seq_len=1)
     impl = _npu_impl()  # softmax_scale == 0.5
     q = torch.randn(1, 8, 2, 4)
     cu = torch.tensor([0, 5, 8], dtype=torch.int32)
@@ -1670,10 +1698,12 @@ def test_prefix_kv_slice_applies_laser_input_scaling(monkeypatch):
     assert captured["value"].shape == (1, 5, 2, 4)
     assert captured["query"].shape == (1, 8, 2, 4)
     assert captured["attn_mask"] is None
+    assert captured["layout"] == "BNSD"
     # Pre-divide q/k/v by the factor and compensate the kernel scale by its
     # square (exact for power-of-two); output scaled back by the factor.
     torch.testing.assert_close(captured["query"], q / 256.0)
     torch.testing.assert_close(captured["key"], q[:, :5] / 256.0)
+    torch.testing.assert_close(captured["value"], q[:, :5] / 256.0)
     assert captured["scale"] == pytest.approx(0.5 * 256.0**2)
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4) * 256.0)
 
@@ -1688,7 +1718,7 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
         captured.update(kwargs)
         return torch.ones_like(query)
 
-    _fake_mindiesd(monkeypatch, attention_forward=fake_attention_forward)
+    _fake_mindiesd(monkeypatch, attention_forward=fake_attention_forward, laser_min_seq_len=1)
     impl = _npu_impl()
     q = torch.randn(1, 8, 2, 4)
     cu = torch.tensor([0, 5, 8], dtype=torch.int32)
@@ -1703,8 +1733,60 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     out = impl._forward_prefix_kv_slice_npu(q, q, q, extra)
 
     torch.testing.assert_close(captured["query"], q)
+    assert captured["layout"] == "BNSD"
     assert captured["scale"] == pytest.approx(0.5)
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
+
+
+@pytest.mark.parametrize(
+    ("is_a5", "q_len", "key_len", "used_k", "query_is_shard", "use_laser"),
+    [
+        pytest.param(False, 2048, 2048, 2048, False, True, id="laser-at-cutoff"),
+        pytest.param(True, 4096, 4096, 4096, False, False, id="a5-long-sequence"),
+        pytest.param(False, 1024, 4096, 4096, True, False, id="short-local-query"),
+        pytest.param(False, 3072, 3072, 2047, False, False, id="short-valid-key-prefix"),
+    ],
+)
+@pytest.mark.cpu
+def test_npu_prefix_preparation_matches_effective_operator(
+    monkeypatch, mocker, is_a5, q_len, key_len, used_k, query_is_shard, use_laser
+):
+    """Public packed dispatch prepares layouts and scaling for the selected MindIE operator."""
+    monkeypatch.setenv("MINDIE_SD_FA_TYPE", "ascend_laser_attention")
+    dense = mocker.Mock(side_effect=lambda query, *args, **kwargs: torch.full_like(query, 5.0))
+    _fake_mindiesd(monkeypatch, attention_forward=dense, is_a5=is_a5)
+    query = torch.full((1, q_len, 2, 4), 2.0, dtype=torch.bfloat16)
+    key = torch.full((1, key_len, 2, 4), 3.0, dtype=torch.bfloat16)
+    value = torch.full_like(key, 4.0)
+    total_q = key_len if query_is_shard else q_len
+    used_q = used_k if query_is_shard else min(q_len, used_k)
+    cu_q = [0, used_q] if used_q == total_q else [0, used_q, total_q]
+    cu_k = [0, used_k] if used_k == key_len else [0, used_k, key_len]
+    metadata = AttentionMetadata(
+        query_ranges=(QueryRange(local_start=0, local_end=q_len, global_start=0),) if query_is_shard else None,
+        extra={
+            "npu_attn_varlen": True,
+            "cu_seqlens_q": torch.tensor(cu_q, dtype=torch.int32),
+            "cu_seqlens_k": torch.tensor(cu_k, dtype=torch.int32),
+            "max_seqlen_q": used_q,
+            "max_seqlen_k": used_k,
+            "laser_input_scale": 256.0,
+        },
+    )
+
+    output = _npu_impl().forward_npu(query, key, value, metadata)
+
+    dense.assert_called_once()
+    args, kwargs = dense.call_args
+    factor = 256.0 if use_laser else 1.0
+    torch.testing.assert_close(args[0], query / factor, atol=0, rtol=0)
+    torch.testing.assert_close(args[1], key[:, :used_k] / factor, atol=0, rtol=0)
+    torch.testing.assert_close(args[2], value[:, :used_k] / factor, atol=0, rtol=0)
+    assert kwargs["layout"] == ("BNSD" if use_laser else "BSND")
+    assert kwargs["scale"] == 0.5 * factor**2
+    assert kwargs["opt_mode"] == "manual"
+    assert kwargs["attn_mask"] is None
+    torch.testing.assert_close(output, torch.full_like(query, 5.0 * factor), atol=0, rtol=0)
 
 
 # --- Test group E: NPU piecewise block-causal attention ----------------------

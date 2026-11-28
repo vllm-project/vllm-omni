@@ -128,6 +128,14 @@ normalization used by dispatch. AITER identity comes from initialization rather
 than caller-provided context. Quantized, paged, piecewise, and parallel paths
 remain outside these worked examples.
 
+On the NPU prefix-K/V path, MindIE-SD's manual dispatch uses LaserAttention
+when it is requested, the device is outside the A5 family, and both the actual
+query length and the sliced valid K/V length meet its minimum (2,048 in
+MindIE-SD 3.3.0). That path uses internal BNSD layout and honors the model's
+`laser_input_scale` for FP16 workspace overflow protection. If dispatch
+selects FlashAttentionScore, it passes BSND through directly and uses the
+original softmax scale.
+
 The new L1 tests use CPU tensors and replace only vendor kernel calls. They
 check path identity, forwarded masks/boundaries, fallback rejection, and
 conservative fullgraph-request handling. They do not test vendor numerics or

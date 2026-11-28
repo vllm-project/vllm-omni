@@ -39,6 +39,17 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _uses_mindie_laser_attention(q_len: int, kv_len: int) -> bool:
+    """Mirror MindIE-SD's manual LaserAttention dispatch for a sliced prefix."""
+    if os.environ.get("MINDIE_SD_FA_TYPE") != "ascend_laser_attention":
+        return False
+
+    from mindiesd.layers.flash_attn.attention_forward import ASCEND_LASER_ATTENTION_MIN_SEQLEN
+    from mindiesd.utils.get_platform import is_a5_device
+
+    return not is_a5_device() and min(q_len, kv_len) >= ASCEND_LASER_ATTENTION_MIN_SEQLEN
+
+
 def _packed_query_ranges(attn_metadata: AttentionMetadata | None) -> tuple[QueryRange, ...] | None:
     """Query ranges for the packed resolvers, or None outside SP slicing.
 
@@ -1579,14 +1590,14 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         from mindiesd import attention_forward
 
-        # mindiesd always takes BSND input regardless of `layout`; the arg
-        # selects the op-internal layout and laser only supports BNSD, so do
-        # NOT forward the model's qkv_layout ("BSND" for MiniMax-H3) here.
-        layout = "BNSD"
+        # MindIE-SD receives BSND tensors. Only LaserAttention needs its
+        # internal layout set to BNSD and the overflow workaround.
+        use_laser = _uses_mindie_laser_attention(query.shape[1], used_k)
+        layout = "BNSD" if use_laser else "BSND"
         key = key[:, :used_k]
         value = value[:, :used_k]
 
-        input_scale_raw = extra.get("laser_input_scale")
+        input_scale_raw = extra.get("laser_input_scale") if use_laser else None
         if isinstance(input_scale_raw, (int, float)) and input_scale_raw > 1:
             input_scale = float(input_scale_raw)
         else:
