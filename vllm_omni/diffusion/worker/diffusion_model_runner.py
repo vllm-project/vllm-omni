@@ -49,6 +49,7 @@ from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cancellation import check_request_cancellation, request_cancellation_scope
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError, OmniDiffusionConfig
+from vllm_omni.diffusion.denoise_progress import denoise_progress_scope
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
@@ -106,6 +107,7 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.execution import log_attention
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -467,6 +469,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
+        if self._execution_summary_enabled():
+            log_attention(self.pipeline)
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
         if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
@@ -1043,6 +1047,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     sigma_schedule,
                     from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
                 ),
+                denoise_progress_scope(enabled=self._execution_summary_enabled()) as denoise_progress,
             ):
                 with record_function(record_name):
                     try:
@@ -1066,6 +1071,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             [req.request_id for req in reqs],
                         )
                         outputs = [DiffusionOutput(aborted=True, abort_message=str(exc)) for _ in reqs]
+                if denoise_progress is not None:
+                    # One forward runs one denoising schedule for every request in the batch.
+                    completed, scheduled = denoise_progress.result()
+                    for output in outputs:
+                        output.num_completed_steps = completed
+                        output.num_scheduled_steps = scheduled
                 with record_function("prepare_output_for_transport"):
                     outputs = [
                         self._prepare_output_for_transport(output, req.sampling_params)
@@ -1094,6 +1105,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         return self._runner_output_from_outputs(reqs, outputs)
 
+    def _execution_summary_enabled(self) -> bool:
+        return getattr(self.od_config, "enable_execution_summary", False) is True
+
     def _attach_stepwise_metadata(
         self,
         state: StepRequestState,
@@ -1104,6 +1118,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             consume_pipeline_stage_durations(self.pipeline),
         )
         attach_stage_durations(state, output)
+        if self._execution_summary_enabled():
+            output.num_completed_steps = state.step_index
+            output.num_scheduled_steps = state.total_steps
 
         # In streaming output mode with interaction, acknowledge which events are handled in this chunk.
         meta = state.interaction_chunk_metadata

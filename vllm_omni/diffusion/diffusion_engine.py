@@ -87,6 +87,7 @@ from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics.definitions import SCHEDULER_QUEUE_WAIT_MS
+from vllm_omni.metrics.execution import EXECUTION_METRICS_KEY, diffusion_facts, log_config, num_tensor_frames
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
     extract_diffusion_denoise_ms,
@@ -348,6 +349,8 @@ class DiffusionEngine:
             self._init_runtime_state()
             self._init_execute_fn()
             self._log_execution_mode(od_config)
+            if getattr(od_config, "enable_execution_summary", False) is True:
+                log_config(od_config)
         except Exception:
             # close() cannot be used because runtime synchronization state may not exist yet.
             scheduler_to_close = getattr(self, "scheduler", None)
@@ -569,6 +572,8 @@ class DiffusionEngine:
         exec_start_time = time.perf_counter()
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
+        log_execution = getattr(getattr(self, "od_config", None), "enable_execution_summary", False) is True
+        num_streamed_frames = 0
         async for output in generator:
             output_ready_wait_time = output.output_ready_wait_time
             # The stream now materializes async outputs before yielding. Keep
@@ -583,6 +588,11 @@ class DiffusionEngine:
                 # abort/error paths, which do not produce formatted outputs.
                 setattr(exc, "diffusion_metrics", scheduler_metrics)
                 raise
+            execution = None
+            if log_execution:
+                execution, num_streamed_frames = self._execution_facts(
+                    request, output, formatted_outputs, num_streamed_frames
+                )
             postprocess_time = time.perf_counter() - postprocess_start_time
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
@@ -614,8 +624,29 @@ class DiffusionEngine:
                 kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
                 if kv_recv_ms > 0:
                     metrics_update["kv_recv_time_ms"] = kv_recv_ms
+                if execution is not None:
+                    metrics_update[EXECUTION_METRICS_KEY] = execution
                 request_output.metrics.update(metrics_update)
             yield formatted_outputs
+
+    def _execution_facts(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        formatted_outputs: list[OmniRequestOutput],
+        num_streamed_frames: int,
+    ) -> tuple[dict[str, Any] | None, int]:
+        """Facts of the final output (``--enable-execution-summary``); never fails the request."""
+        try:
+            num_streamed_frames += num_tensor_frames(output)
+            if not output.finished:
+                return None, num_streamed_frames
+            # Streamed requests return their video in chunks; the facts cover the whole clip.
+            clip_frames = num_streamed_frames if output.chunk_index else None
+            return diffusion_facts(request, output, formatted_outputs, self.od_config, clip_frames), num_streamed_frames
+        except Exception:
+            logger.warning("Failed to build the execution summary for %s", request.request_id, exc_info=True)
+            return None, num_streamed_frames
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         """Deprecated compatibility wrapper over ``step_streaming()``.

@@ -27,6 +27,8 @@ class ClientRequestState:
         self.first_chunk_submitted: asyncio.Future[None] | None = None
         # Request-scoped idempotency guard for Prometheus failure counters.
         self.failure_recorded = False
+        # Failure reason recorded with it, reported by the execution summary.
+        self.failure_reason: str | None = None
         # Wall-clock time at which the user's request arrived in the engine
         # entrypoint. Set in async_omni.generate() before the orchestrator
         # accepts the request. Used as the t0 anchor for audio_ttfp.

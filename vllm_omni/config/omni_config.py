@@ -1056,6 +1056,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     cache_config: Any = field(default_factory=dict)
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+    enable_execution_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)

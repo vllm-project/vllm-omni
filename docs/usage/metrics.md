@@ -163,3 +163,38 @@ the active turn context.
 
 No per-token or per-chunk spans, prompts, generated content or media are recorded
 by the pipeline instrumentation.
+
+## Execution summary
+
+Pass `--enable-execution-summary` to log what each request actually ran, for
+example to check a benchmark run against its declared workload. `[OmniTiming]`
+reports how long a request took; `[OmniExecution]` reports what it ran. Each line
+is one JSON object with `schema_version` (currently `1`) and an `event`:
+
+| `event` | When | Fields |
+| --- | --- | --- |
+| `request` | Once per finished request, next to `[OmniTiming]` | `request_id` (internal id, as in `[OmniTiming] req=`), `external_request_id` (the id the client sees: the `POST /v1/videos` job `id` or the `X-Request-Id` header), `status` (`completed` or `failed`), `failure_reason` (as in `vllm_omni:requests_failed`, e.g. `client_disconnect`, `stage_error`), `stages` |
+| `config` | Once per diffusion stage at startup | `vllm_omni_version`, `vllm_version`, `torch_version`, `model`, `model_revision`, `model_class_name`, `dtype`, `quantization`, `attention_backend` (configured; `null` lets the platform choose), `cache_backend`, `parallel_config`, `enforce_eager`, `step_execution`, `max_num_seqs` |
+| `attention` | Once per diffusion stage after the model loads | `device`, `world_size`, `num_layers`, `backends` (the backend each attention layer resolved, counted per role) |
+
+Each entry of `stages` has `stage_id`, `replica_id`, `output_type`, `batch_size`,
+`num_tokens_in` and `num_tokens_out`. Stages that output audio samples add `audio` (`duration_s`,
+`sample_rate`). Diffusion stages add `diffusion`:
+
+| Field | Meaning |
+| --- | --- |
+| `width`, `height`, `num_frames` | Size of what the pipeline generated where the output allows it, before optional frame interpolation (streamed requests sum the chunks' frames). |
+| `size_source` | `tensor` (typed video tensor), `image`, `metadata` (frame count reported with video the worker already encoded; width and height from the request) or `request` (resolved sampling parameters). |
+| `fps`, `seed` | Output rate; resolved seed, including a server-assigned random seed. |
+| `num_inference_steps` | Requested denoising steps. |
+| `num_scheduled_steps`, `num_completed_steps` | Denoising steps the pipeline scheduled and completed, counted by the model runner from the pipeline's denoising-loop progress bar (`ProgressBarMixin`); step execution reports the step scheduler's index. `null` for pipelines without that progress bar. |
+| `guidance_scale`, `flow_shift` | Values set by the request or the server; `null` means the model default applied. |
+| `num_outputs_per_prompt`, `attention_schedule`, `lora` | Request settings that change the work done. |
+
+```text
+[OmniExecution] {"schema_version": 1, "event": "request", "request_id": "video_gen_<job id>-<8 hex>", "external_request_id": "video_gen_<job id>", "status": "completed", "failure_reason": null, "stages": [{"stage_id": 0, "replica_id": 0, "output_type": "video", "batch_size": 1, "num_tokens_in": 0, "num_tokens_out": 0, "diffusion": {"width": 1344, "height": 768, "num_frames": 124, "size_source": "metadata", "fps": 24.0, "seed": 11, "num_inference_steps": 49, "num_scheduled_steps": 49, "num_completed_steps": 49, "guidance_scale": null, "flow_shift": 12.0, "num_outputs_per_prompt": 1, "attention_schedule": null, "lora": null}}]}
+```
+
+Failed requests whose diffusion stage did not return have no `diffusion` entry.
+Nothing is logged per denoising step; counting adds one integer update per step
+and only runs while the flag is set.

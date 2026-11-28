@@ -31,6 +31,7 @@ from vllm_omni.diffusion.media import (
     VideoValueRange,
 )
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -368,6 +369,43 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
     schedule, from_request = runner.pipeline.bound
     assert schedule == runner.od_config.diffusion_attention_schedule.default
     assert from_request is explicit
+
+
+class _ProgressBarPipeline(ProgressBarMixin):
+    """Runs a 3-of-4 step denoising loop for every request in the batch."""
+
+    supports_request_batch = True
+
+    def forward(self, batch):
+        self.set_progress_bar_config(disable=True)
+        with self.progress_bar(total=4) as bar:
+            for _ in range(3):
+                bar.update()
+        return [DiffusionOutput(output=prompt) for prompt in batch.prompts]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_forward_attaches_counted_denoise_steps(enabled, monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.enable_execution_summary = enabled
+    runner.pipeline = _ProgressBarPipeline()
+    request = _make_request()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: real_set_forward_context())
+
+    result = runner._execute_request_list(
+        [request],
+        od_config=runner.od_config,
+        allow_single_output=True,
+        require_request_batch_support=False,
+        record_name="test_denoise_progress",
+        record_output_peak_memory=False,
+    )
+
+    output = result.get_request_output(request.request_id).result
+    expected = (3, 4) if enabled else (None, None)
+    assert (output.num_completed_steps, output.num_scheduled_steps) == expected
 
 
 def _make_compile_runner(

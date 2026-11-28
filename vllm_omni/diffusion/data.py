@@ -1003,6 +1003,9 @@ class OmniDiffusionConfig:
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
+    # Attach per-request execution facts to the output metrics and log the stage
+    # configuration at startup (``--enable-execution-summary``).
+    enable_execution_summary: bool = False
 
     # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
     # pipeline's ``encode_prompt`` so repeated calls with identical prompt
@@ -2190,6 +2193,12 @@ class DiffusionOutput:
 
     # Host-side playback diagnostics; carried through the existing output metadata.
     streaming_metrics: dict[str, float | int] = field(default_factory=dict)
+
+    # Denoising steps the runner counted for this output: completed loop
+    # iterations and the scheduled loop length. None when the pipeline did not
+    # report progress (no shared progress bar) or counting was disabled.
+    num_completed_steps: int | None = None
+    num_scheduled_steps: int | None = None
 
     # In-process ownership only; never part of the pipeline constructor contract.
     _ready_event: torch.Event | None = field(default=None, init=False, repr=False, compare=False)
