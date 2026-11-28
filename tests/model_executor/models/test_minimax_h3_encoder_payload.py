@@ -553,7 +553,14 @@ def test_encoder_output_reuses_encoder_handoff_and_round_trips(monkeypatch) -> N
         MiniMaxH3EncoderConditioning.from_omni_payload(payload)
 
 
-def test_encoder_releases_workspace_after_cpu_payload(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("accelerator_available", "expected_empty_cache_calls"),
+    [(False, 0), (True, 1)],
+    ids=["unavailable", "available"],
+)
+def test_encoder_releases_workspace_only_with_available_accelerator(
+    monkeypatch: pytest.MonkeyPatch, accelerator_available: bool, expected_empty_cache_calls: int
+) -> None:
     from vllm_omni.model_executor.models.minimax_h3 import encoder as encoder_module
 
     model = encoder_module.MiniMaxH3Encoder.__new__(encoder_module.MiniMaxH3Encoder)
@@ -577,6 +584,7 @@ def test_encoder_releases_workspace_after_cpu_payload(monkeypatch) -> None:
         nonlocal empty_cache_calls
         empty_cache_calls += 1
 
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: accelerator_available)
     monkeypatch.setattr(torch.accelerator, "empty_cache", empty_cache)
     output = model.make_omni_output(
         torch.zeros(1, 5120),
@@ -584,7 +592,7 @@ def test_encoder_releases_workspace_after_cpu_payload(monkeypatch) -> None:
         request_sample_eligible=[True],
     )
 
-    assert empty_cache_calls == 1
+    assert empty_cache_calls == expected_empty_cache_calls
     assert output.multimodal_outputs is not None
     assert output.multimodal_outputs["embed"]["embedding"][0].device.type == "cpu"
 
