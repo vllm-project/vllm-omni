@@ -813,17 +813,16 @@ class TestLayerwiseComponentConfig:
         assert config.dlo_resident_layers == 20
         assert not config.uses_allgather("dit")
 
-    def test_dit_residency_rejects_allgather(self):
-        with pytest.raises(ValueError, match="resident_layers requires dit.weight_transfer='rank-local'"):
-            OffloadConfig.from_od_config(
-                _offload_od_config(
-                    diffusion_offload_config={
-                        "mode": "layer",
-                        "components": ["dit"],
-                        "layer_options": {"dit": {"weight_transfer": "allgather", "resident_layers": 1}},
-                    }
-                )
-            )
+    def test_dit_residency_with_streamed_allgather_tail(self):
+        config = _resolve_offload_config(
+            {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather", "resident_layers": 1}},
+            }
+        )
+        assert config.dlo_resident_layers == 1
+        assert config.uses_allgather("dit")
 
     def test_host_weight_runtime_remains_separate_from_compact_config(self):
         with pytest.raises(ValueError, match="cannot be combined with Host Weight Runtime"):
@@ -1009,12 +1008,13 @@ class TestLayerwiseComponentConfig:
                 )
             )
 
-    def test_legacy_allgather_resident_layers_fail_during_config_resolution(self):
-        with pytest.raises(ValueError, match="requires the DiT DLO transfer to be rank-local"):
-            OffloadConfig.from_od_config(
-                _offload_od_config(
-                    enable_distributed_layerwise_offload=True,
-                    dlo_use_allgather=True,
-                    dlo_resident_layers=12,
-                )
+    def test_legacy_allgather_preserves_resident_head(self):
+        config = OffloadConfig.from_od_config(
+            _offload_od_config(
+                enable_distributed_layerwise_offload=True,
+                dlo_use_allgather=True,
+                dlo_resident_layers=12,
             )
+        )
+        assert config.dlo_resident_layers == 12
+        assert config.uses_allgather("dit")

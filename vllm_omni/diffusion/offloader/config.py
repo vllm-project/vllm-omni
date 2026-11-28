@@ -219,10 +219,6 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
             "diffusion_offload_config.layer_options requires mode='layer'; "
             f"configured for: {', '.join(sorted(raw_layer_options))}"
         )
-    dit = layer_options.get(DIT_COMPONENT)
-    if dit is not None and dit.resident_layers and dit.weight_transfer is DLOTransfer.ALLGATHER:
-        raise ValueError("resident_layers requires dit.weight_transfer='rank-local'")
-
     return ParsedDiffusionOffloadConfig(
         mode=mode,
         components=components,
@@ -268,12 +264,6 @@ def _validate_legacy_layer_options(config: Any, public: ParsedDiffusionOffloadCo
                 "diffusion_offload_config cannot be combined with legacy DLO option(s): "
                 + ", ".join(conflicting_fields)
             )
-        return
-
-    if resident_layers and bool(getattr(config, "dlo_use_allgather", True)):
-        raise ValueError(
-            "dlo_resident_layers requires the DiT DLO transfer to be rank-local; set dlo_use_allgather=False"
-        )
 
 
 def resolve_offload(config: Any) -> ResolvedOffload:

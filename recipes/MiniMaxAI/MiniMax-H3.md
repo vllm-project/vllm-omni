@@ -1294,6 +1294,21 @@ balanced switch order.
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
 
+## RACE for dense T2VA
+
+For text-to-video with audio, set `VLLM_OMNI_MINIMAX_H3_RACE=1` before
+starting the server. Use `--cache-backend none` with the native Euler sampler
+in request mode. RACE measures the change in the first block's video features
+to decide when to run the full DiT. Between full evaluations, it estimates
+video and audio velocities separately and corrects the latent trajectories at
+the next full evaluation.
+
+The default spectral change threshold is 0.3. For example,
+`--cache-config '{"minimax_h3_race_threshold":0.2}'` refreshes more
+readily. A value of zero disables RACE. Supported parallel layouts are SP1
+(with optional tensor parallelism) and pure Ulysses SP with TP1. With DiT
+layerwise offload, keep at least the first block resident for the gate.
+
 ## Cache-DiT and TaylorSeer
 
 A server-level Cache-DiT profile is selected with `--cache-backend cache_dit`

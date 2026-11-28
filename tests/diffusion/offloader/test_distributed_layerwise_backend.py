@@ -2551,7 +2551,7 @@ class TestConfigValidation:
         assert config.dp_size == 2  # topology is retained; the hook selects group size 1
         assert config.dlo_resident_layers == 20
 
-    def test_resident_layers_with_allgather_rejected(self):
+    def test_resident_layers_with_allgather_tail(self):
         class FakePC:
             data_parallel_size = 2
             use_hsdp = False
@@ -2568,8 +2568,9 @@ class TestConfigValidation:
             parallel_config = FakePC()
             model = "/fake/path"
 
-        with pytest.raises(ValueError, match="requires the DiT DLO transfer to be rank-local"):
-            OffloadConfig.from_od_config(FakeODConfig())
+        config = OffloadConfig.from_od_config(FakeODConfig())
+        assert config.uses_allgather("dit")
+        assert config.dlo_resident_layers == 20
 
     @pytest.mark.parametrize("chunk_size_mb", [32, 128])
     def test_nondefault_dlo_chunk_size_reaches_offload_config(self, chunk_size_mb):

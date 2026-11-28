@@ -2,18 +2,36 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-local spectral refresh, SGVE, and RAIC for MiniMax H3 T2VA."""
 
+import math
 from collections import deque
+from collections.abc import Mapping
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.seacache.sea_filter import apply_sea_filter
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.layers.indexed_modulation import rms_norm_indexed_scale_shift
 
 from .minimax_h3_blocks import MINIMAX_H3_ADALN_MODALITY_NUM
 
 logger = init_logger(__name__)
+
+
+DEFAULT_RACE_THRESHOLD = 0.3
+
+
+def minimax_h3_race_threshold(cache_config) -> float:
+    key = "minimax_h3_race_threshold"
+    value = (
+        cache_config.get(key, DEFAULT_RACE_THRESHOLD)
+        if isinstance(cache_config, Mapping)
+        else getattr(cache_config, key, DEFAULT_RACE_THRESHOLD)
+    )
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{key} must be a finite non-negative number")
+    return float(value)
 
 
 class RACETrajectory:
@@ -67,9 +85,8 @@ class RACETrajectory:
 
 
 class MiniMaxH3RACE:
-    threshold = 0.3
-
-    def __init__(self, *, model, branch, num_steps: int) -> None:
+    def __init__(self, *, model, branch, num_steps: int, threshold: float = DEFAULT_RACE_THRESHOLD) -> None:
+        self.threshold = threshold
         self.model = model
         self.num_steps = num_steps
         self.video = RACETrajectory()
@@ -77,9 +94,12 @@ class MiniMaxH3RACE:
         self.previous = None
         self.accumulated = 0.0
         self.refresh_steps: list[int] = []
-        self.tp_group = get_tp_group()
-        self.is_gate_rank = self.tp_group.rank_in_group == 0
-        self.flags = torch.empty(1, dtype=torch.int32, device=branch.device) if self.tp_group.world_size > 1 else None
+        tp_group = get_tp_group()
+        self.probe_uses_tp = tp_group.world_size > 1
+        self.group = get_sp_group() if torch.distributed.is_initialized() and not self.probe_uses_tp else tp_group
+        self.shard_channels = not self.probe_uses_tp and self.group.world_size > 1
+        self.is_gate_rank = self.group.rank_in_group == 0
+        self.flags = torch.empty(1, dtype=torch.int32, device=branch.device) if self.probe_uses_tp else None
 
         layout = branch.static_kwargs["video_token_layout"]
         if layout.video_spans:
@@ -92,20 +112,24 @@ class MiniMaxH3RACE:
     def should_refresh(self, step: int, sigma: float, forward_kwargs: dict) -> bool:
         probe = self.probe(forward_kwargs)
         refresh = True
-        if self.is_gate_rank:
+        if self.is_gate_rank or self.shard_channels:
             assert probe is not None
             refresh = self.decide(probe, step, sigma)
         if self.flags is not None and step not in (0, self.num_steps - 1):
             # Keep every rank on the same path through the DiT collectives.
             if self.is_gate_rank:
                 self.flags.fill_(int(refresh))
-            refresh = bool(self.tp_group.broadcast(self.flags).item())
+            refresh = bool(self.group.broadcast(self.flags).item())
         if refresh:
             self.refresh_steps.append(step)
         return refresh
 
     def decide(self, probe: torch.Tensor, step: int, sigma: float) -> bool:
         """Match the H3 reference's raw endpoints and W, H, T FFT order."""
+        if self.shard_channels:
+            # The branch is replicated until the native transformer splits tokens.
+            # Each FFT needs the full T/H/W grid but channels are independent.
+            probe = probe.tensor_split(self.group.world_size, dim=-1)[self.group.rank_in_group].float()
         if step in (0, self.num_steps - 1):
             self.previous = probe.detach()
             self.accumulated = 0.0
@@ -113,8 +137,14 @@ class MiniMaxH3RACE:
         previous = self.previous
         assert previous is not None
         metric = apply_sea_filter(probe, sigma, dimensions=(2, 1, 0))
-        distance = (metric - previous).abs().mean() / (previous.abs().mean() + 1e-16)
-        self.accumulated += float(distance)
+        if self.shard_channels:
+            sums = torch.stack(((metric - previous).abs().sum(), previous.abs().sum()))
+            delta, magnitude = self.group.all_reduce(sums).tolist()
+            elements = self.video_positions.numel() * self.model.hidden_size
+            self.accumulated += delta / (magnitude + elements * 1e-16)
+        else:
+            distance = (metric - previous).abs().mean() / (previous.abs().mean() + 1e-16)
+            self.accumulated += float(distance)
         refresh = not self.accumulated < self.threshold
         if refresh:
             self.accumulated = 0.0
@@ -129,7 +159,7 @@ class MiniMaxH3RACE:
         time_embed = model.time_embedder(forward_kwargs["unique_timesteps"])
         block = model.blocks[0]
         shift, scale, *_ = block.adaln_proj(time_embed)
-        if not self.is_gate_rank:
+        if self.probe_uses_tp and not self.is_gate_rank:
             return None
         time_indices = forward_kwargs["inverse_indices"].index_select(0, self.video_positions)
         tags = forward_kwargs["token_tags"].index_select(0, self.video_positions)

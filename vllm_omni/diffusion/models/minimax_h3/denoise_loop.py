@@ -25,7 +25,7 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
-from .race import MiniMaxH3RACE
+from .race import DEFAULT_RACE_THRESHOLD, MiniMaxH3RACE
 from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -336,6 +336,7 @@ def minimax_h3_denoise_loop(
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
     race_enabled: bool = False,
+    race_threshold: float = DEFAULT_RACE_THRESHOLD,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -372,7 +373,9 @@ def minimax_h3_denoise_loop(
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
     # With at most two steps the spectral gate refreshes every step anyway.
-    race = MiniMaxH3RACE(model=model, branch=positive, num_steps=num_steps) if race_enabled and num_steps > 2 else None
+    race = None
+    if race_enabled and num_steps > 2 and race_threshold > 0:
+        race = MiniMaxH3RACE(model=model, branch=positive, num_steps=num_steps, threshold=race_threshold)
     reference_kv_state = None
     create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
     if callable(create_reference_kv_state):

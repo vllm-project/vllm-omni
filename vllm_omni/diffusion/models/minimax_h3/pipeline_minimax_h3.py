@@ -188,6 +188,7 @@ from .packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .race import DEFAULT_RACE_THRESHOLD, minimax_h3_race_threshold
 from .regenerate import (
     REGENERATE_DEFAULT_UPSCALE,
     REGENERATE_SUPPORTED_TASKS,
@@ -969,11 +970,15 @@ class MiniMaxH3Pipeline(
         race_flag = os.environ.get("VLLM_OMNI_MINIMAX_H3_RACE", "0")
         if race_flag not in {"0", "1"}:
             raise ValueError("VLLM_OMNI_MINIMAX_H3_RACE must be 0 or 1")
-        self._race_enabled = race_flag == "1"
+        self._race_threshold = (
+            minimax_h3_race_threshold(od_config.cache_config) if race_flag == "1" else DEFAULT_RACE_THRESHOLD
+        )
+        self._race_enabled = race_flag == "1" and self._race_threshold > 0
         if self._race_enabled:
             if (
                 getattr(od_config, "step_execution", False)
-                or self.parallel_config.sequence_parallel_size != 1
+                or (self.parallel_config.sequence_parallel_size > 1 and self.parallel_config.tensor_parallel_size != 1)
+                or self.parallel_config.sequence_parallel_size != self.parallel_config.ulysses_degree
                 or self.parallel_config.use_hsdp
                 or getattr(od_config, "lora_path", None)
                 or getattr(od_config, "quantization_config", None) is not None
@@ -981,7 +986,8 @@ class MiniMaxH3Pipeline(
                 or getattr(od_config, "kv_offload_config", None) is not None
             ):
                 raise ValueError(
-                    "MiniMax H3 RACE requires a dense base checkpoint, SP1, request mode, and cache-backend none"
+                    "MiniMax H3 RACE requires a dense base checkpoint, SP1 or pure Ulysses with TP1, "
+                    "request mode, and cache-backend none"
                 )
             offload = resolve_offload(od_config)
             if offload.offloads(DIT_COMPONENT) and offload.resident_layers < 1:
@@ -2444,6 +2450,7 @@ class MiniMaxH3Pipeline(
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
                     race_enabled=race_enabled,
+                    race_threshold=getattr(self, "_race_threshold", DEFAULT_RACE_THRESHOLD),
                     on_step=lambda step, video, audio: progress.update(),
                 )
 

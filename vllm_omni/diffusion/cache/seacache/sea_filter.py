@@ -41,7 +41,13 @@ def apply_sea_filter(
 
     assert gain is not None
     gain = gain / gain.mean()
-    return torch.fft.ifftn(spectrum * gain, dim=dimensions).real.to(original_dtype)
+    if spectrum.device.type == "npu":
+        # The gain is real. Scale both components directly to avoid the
+        # expensive broadcast complex multiply on Ascend.
+        spectrum = torch.view_as_complex(torch.view_as_real(spectrum) * gain.unsqueeze(-1))
+    else:
+        spectrum = spectrum * gain
+    return torch.fft.ifftn(spectrum, dim=dimensions).real.to(original_dtype)
 
 
 def relative_l1_distance(current: torch.Tensor, previous: torch.Tensor, eps: float = 1e-16) -> float:

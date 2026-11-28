@@ -107,7 +107,7 @@ omni = Omni(
 | `diffusion_offload_config.mode` | `module` or `layer` granularity | required |
 | `diffusion_offload_config.components` | Non-empty list containing `dit`, `text_encoder`, or both | required |
 | `layer_options.NAME.weight_transfer` | `rank-local` or `allgather` | `rank-local` |
-| `layer_options.dit.resident_layers` | Leading main-DiT blocks kept on device; requires `rank-local` and model-declared resident paths | `0` |
+| `layer_options.dit.resident_layers` | Leading main-DiT blocks kept on device; requires model-declared resident paths | `0` |
 | `diffusion_offload_config.pin_memory` | Pin streamed host memory for faster H2D copies | `true` |
 | `--data-parallel-size N` | DP ranks; DP is the DLO group when greater than one, otherwise SP is used | `1` |
 | `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
@@ -132,8 +132,8 @@ AllGather fails at startup with guidance to use `rank-local`. This makes SP
 AllGather available to replicated encoders without silently corrupting an
 encoder-TP layout.
 
-`resident_layers` remains a DiT-only setting and currently requires the DiT
-transfer to be `rank-local`.
+Each rank stages its resident DiT layers locally once per denoise pass. The
+remaining blocks use the configured DiT weight transfer, including AllGather.
 
 ## Host-weight loading
 
