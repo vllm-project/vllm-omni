@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Qwen3-ASR-1.7B: single-stage audio -> text transcription.
+#
+# Served as text output on /v1/chat/completions with an `input_audio` content
+# part (the omni task set has no transcription endpoint). Stage 0 runs on 1 GPU.
+pipeline: qwen3_asr
+async_chunk: false
+trust_remote_code: true
+# No pipeline-wide `dtype`: the checkpoint ships no torch_dtype, so `auto` loads
+# fp32, the same default plain vLLM uses without `--dtype`. The 310P recipe pins
+# fp16 under `platforms.npu`; other platforms keep `auto`.
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    limit_mm_per_prompt: {audio: 1}
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 8
+    max_model_len: 4096
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.5
+    skip_mm_profiling: true
+    enforce_eager: false
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 512
+      detokenize: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        # 310P has no bf16 and the checkpoint ships no torch_dtype, so fp16 is
+        # the validated 310P precision. Stage-scoped (engine_extras) so a CUDA
+        # run of the same recipe keeps `auto`.
+        dtype: float16
+        # 310P cannot capture the default FULL_AND_PIECEWISE graph set
+        # ("207008 Stream resources are insufficient"); decode-only graphs fit.
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
