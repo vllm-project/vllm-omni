@@ -62,11 +62,12 @@ async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: 
                         "temperature": 0.0,
                         "extra_body": {"auto_response": True, "force_listen_count": 0},
                         "turn_detection": None,
+                        "overlap_policy": "listen_only",
                         "playback_commit_policy": "ack_only",
                     },
                 }
             )
-            await receive_until(lambda e: e.get("type") == "session.created")
+            await receive_until(lambda e: e.get("type") == "session.updated")
             await send(
                 {
                     "type": "input.text.append",
@@ -74,11 +75,19 @@ async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: 
                     "force_listen": True,
                 }
             )
-            await receive_until(lambda e: e.get("type") == "response.listen")
-            await send({"type": "input.text.append", "text": "Count to 50."})
+            # Exercise the reported back-to-back inputs without a LISTEN barrier.
+            await send(
+                {
+                    "type": "input.text.append",
+                    "text": "Count slowly out loud from one to fifty in English. Say each number. Start now.",
+                }
+            )
             audio_types = {"response.output_audio.delta", "response.audio.delta"}
             audio = await receive_until(lambda e: e.get("type") in audio_types and e.get("delta"))
             old_id = audio["response_id"]
+            assert not any(
+                e.get("type") == "response.done" and e.get("response", {}).get("id") == old_id for e in events
+            ), "The counting response must still be active when interrupted"
             await send({"type": cancel, "response_id": old_id})
             await send(
                 {
@@ -100,7 +109,10 @@ async def _run_interrupted_recall(*, url: str, model: str, cancel: str, secret: 
                 "response.audio_transcript.delta",
                 "response.output_text.delta",
             }
-            transcript = "".join(e.get("delta", "") for e in tail if e.get("type") in transcript_types)
+            new_id = done["response"]["id"]
+            transcript = "".join(
+                e.get("delta", "") for e in tail if e.get("type") in transcript_types and e.get("response_id") == new_id
+            )
             packets = [e for e in tail if e.get("type") in audio_types and e.get("delta")]
             await send({"type": "session.close"})
             await receive_until(lambda e: e.get("type") == "session.closed")
