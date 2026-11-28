@@ -29,8 +29,10 @@ from typing import Any
 import torch
 import torch.distributed
 from torch import nn
+from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.utils import sync_stage_errors
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -57,6 +59,7 @@ from .host_registration import (
 )
 from .plan_resolver import BlockStack, ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
+    OffloadTensorInventory,
     clear_block_storage,
     clear_tensor_storage,
     describe_tensor_storage,
@@ -65,7 +68,6 @@ from .tensor_utils import (
     is_materialized_tensor,
     make_offload_placeholder,
     materialization_probe,
-    module_materialization_probe,
     restore_tensor_storage,
     set_tensor_storage,
     tensor_storage_metadata,
@@ -160,6 +162,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         tensor_transforms: dict[int, Any] | None = None,
         materialization_probe_tensor: torch.Tensor | None = None,
         chunk_size_bytes: int = 64 * 1024 * 1024,
+        tensor_inventory: OffloadTensorInventory = OffloadTensorInventory(),
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
         if type(dp_size) is not int or dp_size < 1:
@@ -182,6 +185,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.tensor_transforms = tensor_transforms or {}
 
         self._materialization_probe = materialization_probe_tensor
+        self._tensor_inventory = tensor_inventory
 
         self.chunk_size_bytes = chunk_size_bytes
         self.manifest: PartManifest | None = None
@@ -269,13 +273,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         module = super().initialize_hook(module)
 
-        self.block_parameters = dict(module.named_parameters())
-        self.block_buffers = dict(module.named_buffers())
+        current = self._tensor_inventory.owned(module)
+        self.block_parameters = current.parameters
+        self.block_buffers = current.buffers
         if self._materialization_probe is None:
             self._materialization_probe = materialization_probe(self.block_parameters, self.block_buffers)
 
-        self.next_block_parameters = dict(self.next_block.named_parameters())
-        self.next_block_buffers = dict(self.next_block.named_buffers())
+        following = self._tensor_inventory.owned(self.next_block)
+        self.next_block_parameters = following.parameters
+        self.next_block_buffers = following.buffers
 
         if self.rank_local_mmap:
             self.cpu_sources, self.metadata = self._collect_mmap_sources(
@@ -726,7 +732,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if self._shared_slot_owner is not None:
             self._shared_slot_owner[slot] = id(self)
 
-        # Re-point using cached metadata (avoids per-layer dict lookups).
+        self._bind_next_block(gpu_weights)
+
+    def _bind_next_block(self, gpu_weights: dict[torch.dtype, torch.Tensor]) -> None:
         for target, dtype, offset, numel, shape, stride in self._cached_repoint:
             set_tensor_storage(
                 target,
@@ -838,6 +846,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             if slot_contaminated:
                 # Another group (or no group) wrote to our slot — re-fetch
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
+            elif not self.is_materialized:
+                # Component offload can clear the bindings while the tail's
+                # prefetch still owns this slot (e.g. a retry before denoise).
+                weights = self._prev_hook.gpu_buffers[self.current_slot]
+                assert weights is not None
+                self._prev_hook._bind_next_block(weights)
             # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook._wait_for_weights(self.current_slot)
         elif (not self.is_materialized or weights_overwritten) and self._prev_hook is not None:
@@ -882,6 +896,7 @@ def apply_distributed_block_hook(
     tensor_transforms: dict[int, Any] | None = None,
     materialization_probe_tensor: torch.Tensor | None = None,
     chunk_size_bytes: int = 64 * 1024 * 1024,
+    tensor_inventory: OffloadTensorInventory = OffloadTensorInventory(),
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -899,6 +914,7 @@ def apply_distributed_block_hook(
         tensor_transforms=tensor_transforms,
         materialization_probe_tensor=materialization_probe_tensor,
         chunk_size_bytes=chunk_size_bytes,
+        tensor_inventory=tensor_inventory,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -922,9 +938,9 @@ class PinnedResidentLayerGroup:
     Unlike ``module.to(device)``/``module.to("cpu")``, this group retains a
     pinned CPU master copy (or mmap source plus bounded staging) and never
     copies generated device weights back to host. Entering the denoise stage
-    performs one asynchronous H2D pass;
-    leaving it only restores zero-sized placeholders and releases the device
-    buffers.  This lets the following VAE stage reuse the same HBM.
+    performs one asynchronous H2D pass. Leaving it restores zero-sized
+    placeholders and releases the device buffers by default. Enabling
+    ``retain_device_storage`` keeps those buffers for subsequent requests.
 
     The resident path is intentionally local-shard only.  With tensor
     parallelism, the regular model loader has already produced each rank's TP
@@ -940,6 +956,8 @@ class PinnedResidentLayerGroup:
         rank_local_mmap: bool = False,
         defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
+        tensor_inventory: OffloadTensorInventory = OffloadTensorInventory(),
+        retain_device_storage: bool = False,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
@@ -947,12 +965,14 @@ class PinnedResidentLayerGroup:
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.pin_memory = pin_memory
+        self.retain_device_storage = retain_device_storage
+        self._load_error: str | None = None
         self._states: list[dict[str, Any]] = []
         self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
 
         for block in blocks:
-            params = dict(block.named_parameters())
-            bufs = dict(block.named_buffers())
+            owned = tensor_inventory.owned(block)
+            params, bufs = owned.parameters, owned.buffers
             targets: dict[str, torch.Tensor] = {**params, **bufs}
             if rank_local_mmap:
                 cpu_sources, metadata = DistributedLayerwiseOffloadHook._collect_mmap_sources(
@@ -1005,21 +1025,71 @@ class PinnedResidentLayerGroup:
         # leaves every resident block intact.
         clear_tensor_storage(target for state in self._states for target in state["targets"].values())
 
+    def _bind_device_buffers(
+        self,
+        gpu_buffers: list[dict[torch.dtype, torch.Tensor]],
+    ) -> None:
+        for state, block_buffers in zip(self._states, gpu_buffers):
+            targets = state["targets"]
+            for dtype, metas in state["metadata"].items():
+                gpu_buffer = block_buffers[dtype]
+                for meta in metas:
+                    set_tensor_storage(
+                        targets[meta["name"]],
+                        torch.as_strided(
+                            gpu_buffer[meta["offset"] : meta["offset"] + meta["numel"]],
+                            size=meta["shape"],
+                            stride=meta["stride"],
+                        ),
+                    )
+
     def load(self) -> None:
+        if self._load_error is not None:
+            raise RuntimeError(self._load_error)
         if self.loaded:
             return
+        needs_copy = not self._gpu_buffers
+        gpu_buffers = self._allocate_device_buffers() if needs_copy else self._gpu_buffers
+        try:
+            if needs_copy:
+                self._copy_to_device(gpu_buffers)
+            self._bind_device_buffers(gpu_buffers)
+        except BaseException:
+            try:
+                current_omni_platform.synchronize()
+                clear_tensor_storage(target for state in self._states for target in state["targets"].values())
+            except BaseException as rollback_error:
+                # Keep transfers' backing alive until disable can drain and restore it.
+                self._gpu_buffers = gpu_buffers
+                self._load_error = (
+                    f"Resident core load rollback failed ({type(rollback_error).__name__}); "
+                    "restore CPU weights or disable before loading again"
+                )
+                raise
+            gpu_buffers.clear()
+            raise
+        self._gpu_buffers = gpu_buffers
+        self.loaded = True
 
+    def _allocate_device_buffers(self) -> list[dict[torch.dtype, torch.Tensor]]:
         # Allocate on the compute stream so the caching allocator can reuse
         # blocks released by the encoder stage.  Allocating on the copy stream
         # would create a separate stream-local pool and inflate peak HBM.
         gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
-        for state in self._states:
-            block_buffers: dict[torch.dtype, torch.Tensor] = {}
-            for dtype, metas in state["metadata"].items():
-                total = sum(meta["numel"] for meta in metas)
-                block_buffers[dtype] = torch.empty(total, dtype=dtype, device=self.device)
-            gpu_buffers.append(block_buffers)
+        try:
+            for state in self._states:
+                gpu_buffers.append(
+                    {
+                        dtype: torch.empty(sum(meta["numel"] for meta in metas), dtype=dtype, device=self.device)
+                        for dtype, metas in state["metadata"].items()
+                    }
+                )
+        except BaseException:
+            gpu_buffers.clear()
+            raise
+        return gpu_buffers
 
+    def _copy_to_device(self, gpu_buffers: list[dict[torch.dtype, torch.Tensor]]) -> None:
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
         ready = current_omni_platform.Event()
         with current_omni_platform.stream(self.copy_stream):
@@ -1060,25 +1130,9 @@ class PinnedResidentLayerGroup:
                     self._cpu_staging_events[slot] = slot_ready
             ready.record(self.copy_stream)
 
-        for state, block_buffers in zip(self._states, gpu_buffers):
-            targets = state["targets"]
-            for dtype, metas in state["metadata"].items():
-                gpu_buffer = block_buffers[dtype]
-                for meta in metas:
-                    set_tensor_storage(
-                        targets[meta["name"]],
-                        torch.as_strided(
-                            gpu_buffer[meta["offset"] : meta["offset"] + meta["numel"]],
-                            size=meta["shape"],
-                            stride=meta["stride"],
-                        ),
-                    )
-
         current_omni_platform.current_stream().wait_event(ready)
-        self._gpu_buffers = gpu_buffers
-        self.loaded = True
 
-    def offload(self) -> None:
+    def offload(self, *, release_storage: bool = False) -> None:
         if not self.loaded:
             return
 
@@ -1089,7 +1143,8 @@ class PinnedResidentLayerGroup:
         for state in self._states:
             for target in state["targets"].values():
                 set_tensor_storage(target, make_offload_placeholder(target))
-        self._gpu_buffers.clear()
+        if release_storage or not self.retain_device_storage:
+            self._gpu_buffers.clear()
         self.loaded = False
 
     def restore_to_cpu(self) -> None:
@@ -1100,6 +1155,8 @@ class PinnedResidentLayerGroup:
         the group, so it must first restore ordinary CPU tensors to make a
         later enable cycle safe.
         """
+        if self._load_error is not None:
+            current_omni_platform.synchronize()
         self.offload()
 
         for state in self._states:
@@ -1119,6 +1176,8 @@ class PinnedResidentLayerGroup:
                         stride=meta["stride"],
                     )
                     restore_tensor_storage(targets[meta["name"]], source, device="cpu")
+        self._gpu_buffers.clear()
+        self._load_error = None
 
 
 # ---------------------------------------------------------------------- #
@@ -1153,6 +1212,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.rank = 0
         self._blocks: list[list[nn.Module]] = []
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
+        self._tensor_inventory = OffloadTensorInventory()
         self._resident_blocks: list[nn.Module] = []
         self._resident_layer_group: PinnedResidentLayerGroup | None = None
         self._residency_pipeline_ref: weakref.ReferenceType[nn.Module] | None = None
@@ -1169,8 +1229,23 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
-        if self._resident_layer_group is not None:
-            self._resident_layer_group.load()
+        resident = self._resident_layer_group
+        if resident is None:
+            return
+        tp = get_tp_group() if model_parallel_is_initialized() else None
+        if tp is None or tp.world_size == 1:
+            resident.load()
+            return
+
+        # A peer may have no device memory left. Agree on the CPU group before
+        # any rank enters the DiT's first tensor-parallel collective.
+        status = torch.empty((), dtype=torch.int32, device="cpu")
+        try:
+            with sync_stage_errors("Resident DiT load", tp.cpu_group, status):
+                resident.load()
+        except Exception:
+            resident.offload(release_storage=True)
+            raise
 
     def offload_resident_layers(self) -> None:
         """Release leading blocks before VAE decode to bound peak HBM."""
@@ -1583,7 +1658,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         hooks: list[DistributedLayerwiseOffloadHook] = []
         self._all_hook_groups.append(hooks)
         self._blocks.append(block_list)
-        probes = {id(block): module_materialization_probe(block) for block in block_list}
+        probes = {
+            id(block): materialization_probe(owned.parameters, owned.buffers)
+            for block in block_list
+            for owned in (self._tensor_inventory.owned(block),)
+        }
         for block, next_block in zip(
             chain((block_list[-1],), block_list[:-1]),
             block_list,
@@ -1605,6 +1684,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
                     chunk_size_bytes=self.config.chunk_size_bytes,
+                    tensor_inventory=self._tensor_inventory,
                 )
             )
 
@@ -1637,7 +1717,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # also removes its partially-installed block hooks and marker state.
         self._encoder_modules.append(module)
         if not component.on_demand:
-            move_non_block_state_to_device(module, block_groups, self.device)
+            move_non_block_state_to_device(
+                module,
+                block_groups,
+                self.device,
+                tensor_inventory=self._tensor_inventory,
+            )
         set_encoder_layerwise_state(
             module,
             encoder_hooks,
@@ -1666,7 +1751,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
         # Keep the submodule's own non-block state resident by block identity,
         # so an attribute aliasing a streamed block is not placed with it.
-        move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
+        move_non_block_state_to_device(
+            component.module,
+            (stack.blocks,),
+            self.device,
+            tensor_inventory=self._tensor_inventory,
+        )
         self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=True)
 
     def _prepare_dit_non_block_modules(
@@ -1705,12 +1795,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     )
                 continue
 
+            if self._tensor_inventory.contains_independent(module):
+                move_non_block_state_to_device(module, (stack.blocks,), self.device, self._tensor_inventory)
+                continue
+
             try:
                 # Place only this child's non-block tensors. A wrapper can
                 # share the streamed layers through another attribute; moving
                 # it wholesale would materialize the entire DiT on device.
                 if any(id(child) in block_ids for child in module.modules()):
-                    move_non_block_state_to_device(module, (stack.blocks,), self.device)
+                    move_non_block_state_to_device(
+                        module,
+                        (stack.blocks,),
+                        self.device,
+                        tensor_inventory=self._tensor_inventory,
+                    )
                 else:
                     module.to(self.device)
             except (NotImplementedError, RuntimeError):
@@ -1770,6 +1869,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # One resolver call validates the whole topology; an explicit selection
         # has already failed by the time any of the checks below run.
         resolved = resolve_offload_plan(pipeline, self.config)
+        if self.host_weight_plan is not None and resolved.tensor_inventory.contains_independent(pipeline):
+            raise ValueError("Independent CPU roots cannot use loader-owned host plans")
+        self._tensor_inventory = resolved.tensor_inventory
         if not resolved.dits and self.config.offloads(DIT_COMPONENT):
             if self.host_weight_plan is not None:
                 raise RuntimeError(
@@ -1875,6 +1977,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 rank_local_mmap=self._using_rank_local_mmap,
                 defer_staging=bool(self._all_hook_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                tensor_inventory=self._tensor_inventory,
+                retain_device_storage=resolved.retain_resident_storage,
             )
             pipeline._dlo_residency_controller = self
             self._residency_pipeline_ref = weakref.ref(pipeline)
@@ -2110,6 +2214,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self._blocks.clear()
         self._all_hook_groups.clear()
+        self._tensor_inventory = OffloadTensorInventory()
         self._resident_blocks.clear()
         self._resident_layer_group = None
         self._encoder_modules.clear()

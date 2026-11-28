@@ -54,7 +54,7 @@ from vllm_omni.config.omni_config import (
 )
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.config.watermarking import WatermarkConfig
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, validate_diffusion_sleep
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
@@ -2114,6 +2114,17 @@ def get_stage_connector_spec(
         # is orchestrator-only and must neither wait for nor send connector chunks.
         return {"extra": {"role": "none"}}
     return {}
+
+
+def validate_diffusion_stage_sleep(stage_cfg: Any) -> None:
+    """Check the target stage's resolved options before pausing frontend admission."""
+    config = getattr(stage_cfg, "diffusion_config", None)
+    if config is None:
+        config = _get_attr_or_item(stage_cfg, "engine_args")
+    validate_diffusion_sleep(
+        _get_attr_or_item(config, "model_class_name"),
+        _get_attr_or_item(config, "additional_config") or {},
+    )
 
 
 def build_diffusion_config(

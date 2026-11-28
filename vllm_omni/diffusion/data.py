@@ -196,6 +196,16 @@ def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
         raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
 
 
+def validate_diffusion_sleep(model_class_name: str | None, additional_config: Mapping[str, Any]) -> None:
+    """Reject sleep when retained DiT weights live outside the sleep allocator."""
+    # Some stage configs leave pipeline selection to the worker at load time.
+    if (
+        model_class_name in (None, "MiniMaxH3ImagePipeline")
+        and additional_config.get("minimax_h3_retain_resident_cores") is True
+    ):
+        raise ValueError("minimax_h3_retain_resident_cores is incompatible with sleep mode")
+
+
 def validate_dlo_host_registration_options(
     *,
     limit_gib: object,
