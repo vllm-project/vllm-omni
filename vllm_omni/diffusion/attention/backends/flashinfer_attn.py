@@ -253,9 +253,13 @@ class FlashInferAttentionImpl(AttentionImpl):
         if not HAS_FLASHINFER:
             raise ImportError("FLASHINFER_ATTN backend requires flashinfer")
 
-        self._check_flashinfer_version()
-
         self.flashinfer_backend = self._select_backend(requested_backend, device=self.device)
+        if self.dtype_qk is not None and self.dtype_vo is not None:
+            # Fail at startup when both dtypes are configured; otherwise the
+            # model dtype fills in the unset side and forward checks it.
+            self._check_kv_dtypes(self.flashinfer_backend, self.dtype_qk, self.dtype_vo)
+
+        self._check_flashinfer_version()
 
         workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
         self._workspace = torch.empty(
@@ -303,6 +307,20 @@ class FlashInferAttentionImpl(AttentionImpl):
                 f"QK/V dtype attention (Q/K={self.dtype_qk}, V={self.dtype_vo}); "
                 "install flashinfer >= 0.6.16rc1."
             )
+
+    @staticmethod
+    def _check_kv_dtypes(backend: str, k_dtype: torch.dtype, v_dtype: torch.dtype) -> None:
+        # plan() takes one kv_data_type. fa2/fa3/cutlass kernels are built for
+        # it and run() does not check V, so a V of another dtype is read as K's
+        # dtype (an FP8 V is read past the end of its buffer).
+        if k_dtype == v_dtype or backend == "cute-dsl":
+            return
+        raise ValueError(
+            f"FLASHINFER_ATTN backend {backend!r} needs K and V of the same dtype, got K={k_dtype} "
+            f"and V={v_dtype}. Different Q/K and V dtypes (e.g. QK16/V8) need the cute-dsl backend "
+            "(SM 10.x/11.x); otherwise give quant.dtype_qk and quant.dtype_vo the same dtype "
+            "(an unset one follows the model dtype)."
+        )
 
     @staticmethod
     def _select_backend(requested_backend: str, device: torch.device | None = None) -> str:
@@ -430,8 +448,8 @@ class FlashInferAttentionImpl(AttentionImpl):
             causal=key.causal,
             sm_scale=key.softmax_scale,
             q_data_type=key.q_dtype,
-            # FlashInfer versions newer than 0.6.15 can dispatch K and V with
-            # independent runtime dtypes even though plan() names this K/V.
+            # Only cute-dsl takes V's dtype from run(); the other backends read
+            # V as this dtype (see _check_kv_dtypes).
             kv_data_type=key.k_dtype,
             o_data_type=key.o_dtype,
         )
@@ -488,6 +506,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         q = query.reshape(batch_size * qo_len, num_q_heads, head_dim_qk)
         k = key.reshape(batch_size * kv_len, num_kv_heads, head_dim_k)
         v = value.reshape(batch_size * kv_len, num_kv_heads, head_dim_vo)
+        self._check_kv_dtypes(self.flashinfer_backend, self.dtype_qk or k.dtype, self.dtype_vo or v.dtype)
         if self.flashinfer_backend == "cute-dsl":
             q, k, v = _dense_tokens(q), _dense_tokens(k), _dense_tokens(v)
         q, q_scale = self._per_tensor_quantize(q, self.dtype_qk or q.dtype)
