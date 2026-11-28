@@ -36,11 +36,44 @@ _IMAGE_FILE_METADATA = {
 }
 
 
-async def _iter_file_chunks(data: bytes) -> AsyncIterator[memoryview]:
+async def _iter_file_chunks(data: bytes | memoryview) -> AsyncIterator[memoryview]:
     """Yield fixed-size chunks of an in-memory payload."""
     view = memoryview(data)
     for offset in range(0, len(view), _FILE_RESPONSE_CHUNK_SIZE):
         yield view[offset : offset + _FILE_RESPONSE_CHUNK_SIZE]
+
+
+def stream_image_file_response(images: list[bytes | memoryview | None], output_format: str | None) -> StreamingResponse:
+    first_image = images[0] if images else None
+    if not first_image:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="No image data available for file response.",
+        )
+    extension, media_type = _IMAGE_FILE_METADATA.get(
+        (output_format or "png").lower(),
+        _IMAGE_FILE_METADATA["png"],
+    )
+    if len(images) == 1:
+        payload = first_image
+        filename = f"image_{uuid.uuid4().hex[:8]}.{extension}"
+    else:
+        with io.BytesIO() as zip_buffer:
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                for idx, image in enumerate(images):
+                    if image:
+                        archive.writestr(f"image_{idx}.{extension}", image)
+            payload = zip_buffer.getvalue()
+        filename = f"images_{uuid.uuid4().hex[:8]}.zip"
+        media_type = "application/zip"
+    return StreamingResponse(
+        _iter_file_chunks(payload),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
 
 
 class ResponseFormat(str, Enum):
@@ -238,42 +271,10 @@ class ImageGenerationResponse(BaseModel):
     )
 
     def stream_response(self) -> StreamingResponse:
-        if not self.data or not self.data[0].b64_json:
-            raise HTTPException(
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                detail="No image data available for file response.",
-            )
-        extension, media_type = _IMAGE_FILE_METADATA.get(
-            (self.output_format or "png").lower(),
-            _IMAGE_FILE_METADATA["png"],
+        return stream_image_file_response(
+            [base64.b64decode(item.b64_json) if item.b64_json else None for item in self.data],
+            self.output_format,
         )
-        if len(self.data) == 1:
-            image_bytes = base64.b64decode(self.data[0].b64_json)
-            filename = f"image_{uuid.uuid4().hex[:8]}.{extension}"
-            return StreamingResponse(
-                _iter_file_chunks(image_bytes),
-                media_type=media_type,
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Content-Length": str(len(image_bytes)),
-                },
-            )
-        else:
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for idx, item in enumerate(self.data):
-                    if item.b64_json:
-                        zf.writestr(f"image_{idx}.{extension}", base64.b64decode(item.b64_json))
-            zip_bytes = zip_buffer.getvalue()
-            filename = f"images_{uuid.uuid4().hex[:8]}.zip"
-            return StreamingResponse(
-                _iter_file_chunks(zip_bytes),
-                media_type="application/zip",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Content-Length": str(len(zip_bytes)),
-                },
-            )
 
 
 class ImageEditARDeltaChunk(BaseModel):
