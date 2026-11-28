@@ -123,25 +123,27 @@ def _snapshot_leftover_mm_cpu(
     run after the next forward overwrites graph buffers. Slice ``[:n]``
     only when ``shape[0] == n``; ``>= n`` would clip ``codes.ref``.
 
-    CUDA tensors land in pinned memory through a non-blocking copy on the
+    CUDA/NPU tensors land in pinned memory through a non-blocking copy on the
     current stream: stream order keeps it ahead of the next forward, and
     the engine thread does not wait for this forward to finish. The
-    returned event (None when nothing was on CUDA) must be synchronized
+    returned event (None when nothing was asynchronous) must be synchronized
     before the snapshot is read.
     """
     n = num_tokens_unpadded
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
-    on_cuda = False
+    copy_device: torch.device | None = None
 
     def _copy(val: Any) -> Any:
-        nonlocal on_cuda
+        nonlocal copy_device
         if isinstance(val, torch.Tensor):
             t = val[:n] if _is_step_token_tensor(val, n, padded) and int(val.shape[0]) == n else val
             t = t.detach()
-            if t.is_cuda:
-                host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
-                host.copy_(t, non_blocking=True)
-                on_cuda = True
+            if t.device.type in {"cuda", "npu"} and (copy_device is None or t.device == copy_device):
+                backend = torch.get_device_module(t.device.type)
+                with backend.device(t.device):
+                    host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+                    host.copy_(t, non_blocking=True)
+                copy_device = t.device
                 return host
             # .cpu() copies other device tensors; CPU/pinned views still share storage.
             copied = t.cpu() if t.device.type != "cpu" else t.clone()
@@ -158,9 +160,11 @@ def _snapshot_leftover_mm_cpu(
         key: _copy(val) for key, val in mm_outputs.items() if key not in device_snapshot_keys and not is_hidden_key(key)
     }
     event = None
-    if on_cuda:
-        event = torch.cuda.Event()
-        event.record()
+    if copy_device is not None:
+        backend = torch.get_device_module(copy_device.type)
+        with backend.device(copy_device):
+            event = backend.Event()
+            event.record()
     return leftover, event
 
 
@@ -200,7 +204,7 @@ class _StepOutputs:
     immediate: dict[str, torch.Tensor]
     deferred: dict[str, torch.Tensor]
     leftover: dict[str, Any]
-    # Completion of the leftover device→host copies; None when none ran on CUDA.
+    # Completion of asynchronous leftover device→host copies, if any.
     leftover_event: torch.cuda.Event | None = None
     # Pool storage allocated (unlocked) for keys first seen this step;
     # published into the pool / occupancy tables under the state lock.
@@ -417,10 +421,11 @@ class OmniPrefixCacheManager:
         config: PrefixCacheConfig,
         *,
         eager: bool | None = None,
+        device_type: str = "cuda",
     ):
         self._config = config
         self._pool = PrefixBlockPool(config)
-        self._controller = OmniPrefixCacheController(self._pool, config, eager=eager)
+        self._controller = OmniPrefixCacheController(self._pool, config, eager=eager, device_type=device_type)
         self._policy = ModelCachePolicy()
         # Serializes engine vs async-builder public entries. Non-reentrant:
         # those entries never call each other, and the lock must not cover
@@ -617,10 +622,7 @@ class OmniPrefixCacheManager:
 
         # Freeze on the compute stream before the controller launches copies.
         freezed_tensors = step_outputs.freeze_targets()
-        if freezed_tensors:
-            if torch.cuda.is_available() and any(t.is_cuda for t in freezed_tensors):
-                freeze_event = torch.cuda.Event()
-                freeze_event.record()
+        freeze_event = self._controller.record_freeze_event(freezed_tensors)
 
         step_id = self._next_step_id
         try:

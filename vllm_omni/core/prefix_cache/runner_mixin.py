@@ -117,7 +117,7 @@ class PrefixCacheRunnerMixin:
                 "omni prefix caching requires a block table on the input batch; "
                 "disable enable_prefix_caching for this model"
             )
-        manager = OmniPrefixCacheManager(cfg)
+        manager = self._new_prefix_cache_manager(cfg)
         manager.register_policy(self._omni_cache_policy)
         self.omni_prefix_cache = manager
         self._prefix_cache_adapter = adapter
@@ -126,6 +126,9 @@ class PrefixCacheRunnerMixin:
         if self._prefix_cache_coalesce_decode and policy.needs_full_hidden_states and not policy.deferred_keys:
             self._prefix_cache_decode_cfg = cfg
             self._prefix_cache_decode_steps = []
+
+    def _new_prefix_cache_manager(self, cfg: PrefixCacheConfig) -> OmniPrefixCacheManager:
+        return OmniPrefixCacheManager(cfg)
 
     def _new_prefix_cache_adapter(self) -> PrefixCacheSchedulerAdapter:
         return PrefixCacheSchedulerAdapter()

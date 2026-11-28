@@ -139,6 +139,13 @@ was checked at the revision in `last_verified_commit`.
 
 ### Caller cancellation
 
+A cross-loop submission without CFG companions first tries Janus's thread-safe
+`sync_q.put_nowait`. A successful put is settled before returning, so a later
+abort follows the ADD in queue order. A full or closed queue uses the owning
+loop's existing async group path, preserving cancellable backpressure and
+artifact cleanup. Companion groups always use that path so partial admission
+can revoke the parent before returning cancellation.
+
 On task cancellation or generator close, [`AsyncOmni.generate`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/entrypoints/async_omni.py)
 acts first. It shields the bounded `_abort_internal_requests` call from outer
 ASGI cancellation, settles any pending submit for the internal ID, and sends

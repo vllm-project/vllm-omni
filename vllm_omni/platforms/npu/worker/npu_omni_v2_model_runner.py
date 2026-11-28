@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+    from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+
 logger = init_logger(__name__)
 
 # GPUModelRunner initializes a speculator first. NPUModelRunner rebuilds
@@ -184,6 +187,11 @@ class NPUOmniV2RunnerMixin:
     """Ascend input buffers, batches and forward context for Omni V2 runners."""
 
     input_buffers: AscendInputBuffers
+
+    def _new_prefix_cache_manager(self, cfg: PrefixCacheConfig) -> OmniPrefixCacheManager:
+        from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+
+        return OmniPrefixCacheManager(cfg, device_type="npu")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         _default_ascend_decode_graph_flag()

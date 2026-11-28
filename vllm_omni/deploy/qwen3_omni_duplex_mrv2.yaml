@@ -5,7 +5,7 @@
 # Unconfigured history_policy preserves full history. Per-request media counts
 # use vLLM defaults; configure smaller counts explicitly when needed. Context
 # capacity and Session input-admission budgets still apply.
-# Thinker prefix caching remains disabled in the inherited codec profile.
+# Thinker prefix caching remains disabled on CUDA in the inherited codec profile.
 base_config: qwen3_omni_moe_codec.yaml
 
 session_mode: duplex
