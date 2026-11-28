@@ -784,10 +784,10 @@ def _silence_pi05_loader():
 def test_suffix_has_no_state_token(tiny_model):
     """π0's suffix is ``[state, actions...]`` with AR mask ``[1, 1, 0...]``;
     π0.5's is actions only with ``[1, 0...]``."""
-    embs, pad, att, cond = tiny_model.embed_suffix(torch.randn(1, 4, 8), torch.tensor([1.0]))
-    assert embs.shape[1] == 4
+    pad, att = tiny_model._suffix_masks(1, torch.device("cpu"), torch.float32)
+    assert pad.shape == (1, 4) and bool(pad.all())
     assert att[0].tolist() == [1, 0, 0, 0]
-    assert cond.shape == (1, tiny_model.expert_width)
+    assert tiny_model.embed_timestep(torch.tensor([1.0])).shape == (1, tiny_model.expert_width)
 
 
 # Not marked slow: constructs one small norm layer, no backbone.
@@ -1302,3 +1302,27 @@ def test_actions_from_noise_makes_no_host_tensors(monkeypatch):
     monkeypatch.setattr(torch, "tensor", no_host_tensor)
     with torch.no_grad():
         model.actions_from_noise(**inputs)
+
+
+@pytest.mark.slow
+def test_adarms_modulations_must_be_expanded_to_the_suffix_batch():
+    """A (N, 3*width) entry with N == batch would broadcast row-wise: reject it."""
+    model = _random_pi05_model()
+    pad, kv = _prefix_cache(model, bsize=2)
+    times = torch.full((2,), 0.5)
+    raw = model.paligemma_with_expert.adarms_modulations(model.embed_timestep(times))  # 2-D, N == batch == 2
+    mask, pos = model._suffix_attention(pad, torch.float32)
+    with pytest.raises(ValueError, match="must broadcast against the suffix"):
+        model._velocity(kv, torch.randn(2, 4, 8), mask, pos, adarms_modulations=raw)
+    expanded = [m[0].expand(2, 1, -1) for m in raw]
+    model._velocity(kv, torch.randn(2, 4, 8), mask, pos, adarms_modulations=expanded)
+
+
+def test_graph_runner_is_refused_with_release_after_denoise():
+    """π0.5 has no decode, so release-after-denoise would recapture every request: stay eager."""
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi.pi05.pipeline_pi05 import _graph_refusal
+
+    assert "no decode step" in _graph_refusal(SimpleNamespace(diffusion_graph_release_after_denoise=True))
+    assert _graph_refusal(SimpleNamespace(diffusion_graph_release_after_denoise=False)) is None

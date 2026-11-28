@@ -310,8 +310,17 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             expert_lm.layers[0].self_attn.q_proj,
         )
         mods = adarms_modulations
-        if mods is not None and len(mods) != 2 * num_layers + 1:
-            raise ValueError(f"Expected {2 * num_layers + 1} AdaRMS modulations, got {len(mods)}")
+        if mods is not None:
+            if len(mods) != 2 * num_layers + 1:
+                raise ValueError(f"Expected {2 * num_layers + 1} AdaRMS modulations, got {len(mods)}")
+            batch = inputs_embeds[1].shape[0]
+            # An unexpanded (N, 3*width) entry would broadcast row-wise when N == batch
+            # and condition sample i on step i: require the documented (B, 1, 3*width).
+            if any(m.ndim != 3 or m.shape[0] != batch for m in mods):
+                raise ValueError(
+                    "Each AdaRMS modulation must broadcast against the suffix "
+                    f"({batch}, 1, 3*width); got {[tuple(m.shape) for m in mods]}"
+                )
         for layer_idx in range(num_layers):
             hidden_states = _compute_layer_suffix_only(
                 layer_idx,
@@ -399,24 +408,6 @@ class Pi05ForActionPrediction(nn.Module):
         time_cond = F.silu(time_cond)
         time_cond = self.time_mlp_out(time_cond)
         return F.silu(time_cond)
-
-    def embed_suffix(
-        self,
-        noisy_actions: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the suffix: **action tokens only**, plus the AdaRMS condition.
-
-        π0's suffix is ``[state_token, action_tokens×H]`` with an AR mask of
-        ``[1, 1, 0...]``. π0.5 has no state token, so the suffix is
-        ``[action_tokens×H]`` and the mask is ``[1] + [0]*(H-1)``: the first
-        action token opens a causal block and the rest attend bidirectionally
-        within it.
-        """
-        time_cond = self.embed_timestep(timestep)
-        action_emb = self._embed_actions(noisy_actions)
-        pad_masks, att_masks = self._suffix_masks(action_emb.shape[0], action_emb.device, action_emb.dtype)
-        return action_emb, pad_masks, att_masks, time_cond
 
     def _embed_actions(self, noisy_actions: torch.Tensor) -> torch.Tensor:
         """``(B, H, action_dim)`` → ``(B, H, W)`` action tokens."""

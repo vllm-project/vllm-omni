@@ -56,6 +56,17 @@ SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
 assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
 
 
+def _graph_refusal(od_config: OmniDiffusionConfig) -> str | None:
+    """Why π0.5 must stay eager although the shared runner would accept the config, if it must.
+
+    ``diffusion_graph_release_after_denoise`` frees graph pools before a VAE decode;
+    π0.5 has no decode, so honoring it would only force a recapture per request.
+    """
+    if getattr(od_config, "diffusion_graph_release_after_denoise", False):
+        return "diffusion_graph_release_after_denoise frees graphs before decode, and π0.5 has no decode step"
+    return None
+
+
 def _checkpoint_declared_keys(model_dir: str) -> set[str]:
     """The keys the checkpoint's config.json actually carries."""
     path = os.path.join(model_dir, "config.json")
@@ -100,7 +111,9 @@ class Pi05Pipeline(nn.Module):
         self.model = self._initialize_model()
         # Opt-in (``diffusion_use_graph``): replays a request's prefix and whole
         # Euler loop as one device graph per (batch, num_steps); None stays eager.
-        self._denoise_graph_runner = build_denoise_graph_runner(od_config, self.model.actions_from_noise, "Pi05")
+        self._denoise_graph_runner = build_denoise_graph_runner(
+            od_config, self.model.actions_from_noise, "Pi05", refusal=_graph_refusal(od_config)
+        )
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
 
