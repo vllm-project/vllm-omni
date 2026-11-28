@@ -222,12 +222,39 @@ def pick_split(spatial_size: int, batch: int, num_groups: int, device: torch.dev
 
 
 @triton.jit
+def group_channel_base(n_idx, c_idx, C, spatial_size, frames):
+    """Element offset of the first spatial position of channel ``c_idx`` in group row ``n_idx``.
+
+    ``frames == 1`` is the contiguous ``(N, C, spatial)`` layout and gives the
+    original ``n * C * spatial + c * spatial``. With ``frames > 1`` the input is a
+    contiguous ``(B, C, T, spatial)`` tensor and row ``n = b * T + t`` is frame
+    ``t`` of sample ``b``: its channels sit ``T * spatial`` elements apart, so
+    per-frame statistics are read in place instead of from a ``(b t) c ...``
+    transposed copy.
+
+    The offset is computed in int64. A whole-clip video activation can exceed
+    2**31 elements (e.g. 128 channels x 17 frames at 1080p), which int32
+    arithmetic on these indices would overflow. Every operand is cast so no
+    product depends on mixed-width promotion. ``tl.cast`` rather than ``.to``
+    because callers may pass ``frames`` as the literal ``1``, a constexpr.
+    """
+    n_idx = tl.cast(n_idx, tl.int64)
+    c_idx = tl.cast(c_idx, tl.int64)
+    C = tl.cast(C, tl.int64)
+    spatial_size = tl.cast(spatial_size, tl.int64)
+    frames = tl.cast(frames, tl.int64)
+    channel_stride = frames * spatial_size
+    return (n_idx // frames) * C * channel_stride + (n_idx % frames) * spatial_size + c_idx * channel_stride
+
+
+@triton.jit
 def welford_group_range(
     x_ptr,
     n_idx,
     g_idx,
     C,
     spatial_size,
+    frames,
     group_size,
     lo,
     hi,
@@ -241,6 +268,7 @@ def welford_group_range(
     instead of re-read, and blocks are merged with the Chan et al. parallel
     formula. That keeps both the mean and the variance accurate for inputs like
     ``10000 +- 0.1``, where the naive ``E[x^2] - E[x]^2`` cancels catastrophically.
+    ``frames`` selects the layout; see :func:`group_channel_base`.
     """
     n_total = tl.zeros([1], dtype=tl.float32)
     mean_total = tl.zeros([1], dtype=tl.float32)
@@ -248,7 +276,7 @@ def welford_group_range(
 
     for c_offset in range(group_size):
         c_idx = g_idx * group_size + c_offset
-        base = n_idx * C * spatial_size + c_idx * spatial_size
+        base = group_channel_base(n_idx, c_idx, C, spatial_size, frames)
 
         for s_start in tl.range(lo, hi, BLOCK_SIZE, num_stages=num_stages):
             offsets = s_start + tl.arange(0, BLOCK_SIZE)
@@ -323,9 +351,11 @@ def welford_combine(
 def group_norm_partial_stats_kernel(
     x_ptr,
     ws_ptr,
-    # Shape info; x is contiguous (B, C, spatial_size)
+    # Shape info; x is contiguous (B, C, spatial_size), or (B, C, frames,
+    # spatial_size) with one group row per frame when frames > 1
     C,
     spatial_size,
+    frames,
     split_chunk,
     num_groups: tl.constexpr,
     SPLIT: tl.constexpr,
@@ -334,10 +364,11 @@ def group_norm_partial_stats_kernel(
 ):
     """Pass 1 of the split reduction: per ``(batch, group, slice)`` statistics.
 
-    Grid is ``(B * num_groups * SPLIT,)``. Consecutive programs cover adjacent
-    spatial slices of the same group, which keeps their loads neighbours in L2.
-    Each writes one unique ``(n, mean, m2)`` slot, so no atomics and no locks.
-    ``ws`` is laid out ``(B * num_groups, 3, SPLIT)``.
+    Grid is ``(B * num_groups * SPLIT,)``, where ``B`` counts group rows
+    (``batch * frames`` in the per-frame layout). Consecutive programs cover
+    adjacent spatial slices of the same group, which keeps their loads neighbours
+    in L2. Each writes one unique ``(n, mean, m2)`` slot, so no atomics and no
+    locks. ``ws`` is laid out ``(B * num_groups, 3, SPLIT)``.
     """
     pid = tl.program_id(0)
     bg = pid // SPLIT
@@ -351,7 +382,7 @@ def group_norm_partial_stats_kernel(
     hi = tl.minimum(lo + split_chunk, spatial_size)
 
     n_total, mean_total, m2_total = welford_group_range(
-        x_ptr, n_idx, g_idx, C, spatial_size, group_size, lo, hi, BLOCK_SIZE, num_stages
+        x_ptr, n_idx, g_idx, C, spatial_size, frames, group_size, lo, hi, BLOCK_SIZE, num_stages
     )
 
     # ``tl.arange(0, 1)`` is the zero vector; adding it carries the [1] shape of
@@ -371,8 +402,13 @@ def launch_partial_stats(
     num_groups: int,
     split: int,
     split_chunk: int,
+    frames: int = 1,
 ) -> torch.Tensor:
-    """Allocate the workspace and run pass 1. Only called when ``split > 1``."""
+    """Allocate the workspace and run pass 1. Only called when ``split > 1``.
+
+    ``batch`` counts group rows: pass ``B * T`` together with ``frames=T`` for
+    per-frame statistics over a contiguous ``(B, C, T, spatial)`` input.
+    """
     # Every slot is written by exactly one program, so uninitialized is fine.
     ws = torch.empty((batch * num_groups, 3, split), dtype=torch.float32, device=x_flat.device)
     group_norm_partial_stats_kernel[(batch * num_groups * split,)](
@@ -380,6 +416,7 @@ def launch_partial_stats(
         ws,
         channels,
         spatial_size,
+        frames,
         split_chunk,
         num_groups=num_groups,
         SPLIT=split,
@@ -392,6 +429,7 @@ __all__ = [
     "SPLIT_REDUCTION_CONFIGS",
     "SPLIT_REDUCTION_KEY",
     "SPLIT_REDUCTION_PRUNE",
+    "group_channel_base",
     "group_norm_partial_stats_kernel",
     "launch_partial_stats",
     "pick_split",

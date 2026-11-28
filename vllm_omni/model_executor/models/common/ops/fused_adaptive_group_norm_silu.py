@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
     SPLIT_REDUCTION_CONFIGS,
     SPLIT_REDUCTION_KEY,
     SPLIT_REDUCTION_PRUNE,
+    group_channel_base,
     launch_partial_stats,
     pick_split,
     welford_combine,
@@ -95,7 +96,7 @@ def _adaptive_group_norm_silu_kernel(
         lo = 0
         hi = spatial_size
         n_total, mean, m2_total = welford_group_range(
-            x_ptr, n_idx, g_idx, C, spatial_size, group_size, lo, hi, BLOCK_SIZE, num_stages
+            x_ptr, n_idx, g_idx, C, spatial_size, 1, group_size, lo, hi, BLOCK_SIZE, num_stages
         )
     else:
         lo = s * split_chunk
@@ -108,7 +109,7 @@ def _adaptive_group_norm_silu_kernel(
     # === Pass 2: normalize, affine, then adaptive modulation ===
     for c_offset in range(group_size):
         c_idx = g_idx * group_size + c_offset
-        base = n_idx * C * spatial_size + c_idx * spatial_size
+        base = group_channel_base(n_idx, c_idx, C, spatial_size, 1)
 
         weight_val = tl.load(weight_ptr + c_idx).to(tl.float32)
         bias_val = tl.load(bias_ptr + c_idx).to(tl.float32)
