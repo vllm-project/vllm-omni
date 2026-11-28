@@ -61,7 +61,6 @@ def _fallback_reason(attn, query, key, value, pack_info):
 def _fused_infer_attention(query, key, value):
     import torch_npu
 
-    # Q/K/V arrive as BSND, including strided QKV split views.
     q = query.transpose(1, 2).contiguous()
     k = key.transpose(1, 2).contiguous()
     v = value.transpose(1, 2).contiguous()
@@ -129,7 +128,6 @@ def install_vae_npu_fia(decoder, device: torch.device, logger, *, enabled: bool)
         if attn is None or not hasattr(attn, "perform_attention"):
             continue
         attn.perform_attention = MethodType(wrap(attn.perform_attention), attn)
-        # Keep the marker used by the native checkpoint patch and its tests.
         attn._h3_decoder_fused_infer_attention = True
         installed += 1
     if installed == 0:

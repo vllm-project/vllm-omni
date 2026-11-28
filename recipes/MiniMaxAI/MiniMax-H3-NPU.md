@@ -703,6 +703,8 @@ To opt in to Ascend FIA for MiniMax-H3 Video VAE decode, add this option to the 
 
 The option is a JSON boolean. Omitting it or passing `false` keeps the checkpoint's original attention. FIA applies to non-causal, unmasked FP16/BF16 self-attention with matching, nonempty Q/K/V shapes. Unsupported inputs keep the original attention; errors from a selected FIA operator propagate. Validate the workload on the target SoC and CANN version before enabling it.
 
+FIA restores the BSND output layout and applies `nan_to_num(0.0)`, matching the attention helper in the validated Ref2VA checkpoint. This maps NaN to zero and positive/negative infinity to the output dtype's largest/smallest finite value. Operator exceptions still propagate. This output normalization does not establish numerical correctness or compatibility with other custom checkpoint helpers.
+
 ### VAE decode ablation
 
 Use separate Python environments containing editable installs of the baseline and candidate sources on the same vLLM and CANN stack. Run the arms serially on the same cards with the same checkpoint, input latents and unrelated optimization settings.
