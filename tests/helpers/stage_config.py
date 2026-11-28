@@ -751,6 +751,40 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    # MOSS-TTS-Local-v1.5 on NPU: run both stages eagerly. Pipelined NPUGraph
+    # capture for ``moss_codec_decode`` fails on current torch-npu, and ACL
+    # graph replay in stage 0 can deadlock the 8B backbone; eager execution
+    # is required until the Ascend graph paths are fixed.
+    "moss_tts_local": {
+        "base_config": "moss_tts_local.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "enforce_eager": True,
+            },
+            {
+                "stage_id": 1,
+                "enforce_eager": True,
+            },
+        ],
+        # ``platforms.npu.stages[1]`` from the base deploy YAML contributes
+        # ``compilation_config.cudagraph_mode: PIECEWISE`` outside the top-level
+        # ``stages`` merge. Disable it explicitly so the CI profile does not
+        # depend on ``enforce_eager`` vs ``cudagraph_mode`` precedence.
+        "platforms": {
+            "npu": {
+                "stages": [
+                    {
+                        "stage_id": 1,
+                        "compilation_config": {
+                            "cudagraph_mode": "NONE",
+                            "cudagraph_capture_sizes": [],
+                        },
+                    },
+                ],
+            },
+        },
+    },
 }
 
 
