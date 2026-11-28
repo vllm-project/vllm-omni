@@ -66,6 +66,15 @@ Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
 `mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
 not require excluding FULL capture.
 
+A model can add graph variants to the MRv2 graph manager through
+`specialize_cudagraph_manager(manager)`. The runner calls it after
+`initialize_kv_cache`, the memory-profiling build included, so the profiler
+counts every variant. A manager that holds several FULL graphs per shape
+exposes `select_replay_graph(desc, input_batch)`, and FULL replay uses the
+descriptor it returns. Runners and models without these hooks keep the stock
+manager. MammothModa2 uses them on CUDA and ROCm to capture single-expert MoE
+graphs next to the blend graph and to pick one from the unpadded token ids.
+
 MRv2 computes prompt logprobs after sampling and may split prompt hidden states
 into arbitrary row chunks. A model whose sampling logits depend on request-local
 state or full-batch row spans can expose `compute_prompt_logits(hidden_states)`
