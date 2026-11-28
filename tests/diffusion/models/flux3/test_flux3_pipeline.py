@@ -27,8 +27,12 @@ from unittest import mock
 
 import pytest
 import torch
+from vllm.model_executor import parameter
+from vllm.model_executor.layers import linear
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.models.flux3 import flux3_transformer
 from vllm_omni.diffusion.models.flux3.flux3_image_vae import Flux3ImageVAE
 
 
@@ -93,6 +97,23 @@ def test_postprocess_labels_flux3_image_output(tmp_path: Path, monkeypatch: pyte
         output = postprocess({"image": torch.zeros(1)})
 
     assert output == {"image": "processed-image"}
+
+
+@pytest.mark.parametrize("block_type", [flux3_transformer._ModeBlock, flux3_transformer._SingleStreamBlock])
+def test_ffn_tp_preserves_gate_up_pairs(block_type, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flux3_transformer, "Attention", lambda **_: torch.nn.Identity())
+    hidden_size, mlp_hidden = 8, 16
+    checkpoint_weight = torch.arange(2 * mlp_hidden * hidden_size, dtype=torch.bfloat16).reshape(-1, hidden_size)
+    gate, up = checkpoint_weight.chunk(2)
+    for rank in range(2):
+        with monkeypatch.context() as tp:
+            for module in (linear, parameter):
+                tp.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+                tp.setattr(module, "get_tensor_model_parallel_rank", lambda rank=rank: rank)
+            block = block_type(DiffusionParallelConfig(), hidden_size, num_heads=2, mlp_ratio=2.0)
+            AutoWeightsLoader(block).load_weights([("mlp_in.weight", checkpoint_weight)])
+        expected = torch.cat((gate.chunk(2)[rank], up.chunk(2)[rank]))
+        torch.testing.assert_close(block.mlp_in.weight, expected.to(block.mlp_in.weight.dtype), rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------

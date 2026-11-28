@@ -24,6 +24,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -488,10 +489,10 @@ class _ModeBlock(nn.Module):
             prefix=_join_prefix(prefix, "attn_out"),
         )
 
-        # SwiGLU FFN: mlp_hidden*2 out from mlp_in (gate + up), then mlp_hidden in to mlp_out
-        self.mlp_in = ColumnParallelLinear(
+        # Keep matching gate and up shards together for the rank-local SwiGLU.
+        self.mlp_in = MergedColumnParallelLinear(
             hidden_size,
-            mlp_hidden * 2,
+            [mlp_hidden, mlp_hidden],
             bias=False,
             gather_output=False,
             return_bias=False,
@@ -583,9 +584,9 @@ class _SingleStreamBlock(nn.Module):
             quant_config=quant_config,
             prefix=_join_prefix(prefix, "attn_out"),
         )
-        self.mlp_in = ColumnParallelLinear(
+        self.mlp_in = MergedColumnParallelLinear(
             hidden_size,
-            mlp_hidden * 2,
+            [mlp_hidden, mlp_hidden],
             bias=False,
             gather_output=False,
             return_bias=False,
