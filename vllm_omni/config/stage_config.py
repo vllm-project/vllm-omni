@@ -716,6 +716,7 @@ class StageDeployConfig:
     vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
+    vae_spatial_temporal_chunk_size: int | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

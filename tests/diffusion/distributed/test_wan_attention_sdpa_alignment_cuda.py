@@ -54,3 +54,37 @@ def test_real_wan_attention_memory_efficient_sdpa(dtype: torch.dtype, height: in
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
     if (height, width) != (1, 1):
         torch.testing.assert_close(actual, unpatched, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("alignment_first", [False, True])
+def test_alignment_keeps_channels_last_spatial_local_queries(monkeypatch, alignment_first: bool) -> None:
+    """Installation order must not switch channels-last spatial attention to the full-frame path."""
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.forwards import CFG_ATTR, FastPathConfig
+
+    torch.manual_seed(0)
+    local = torch.randn(1, 64, 1, 4, 3, device="cuda", dtype=torch.bfloat16)
+    remote = torch.randn_like(local)
+    local_query_calls = []
+    local_queries = wan_spatial_shard._attention_local_queries
+
+    def spy(*args, **kwargs):
+        local_query_calls.append(True)
+        return local_queries(*args, **kwargs)
+
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 2))
+    monkeypatch.setattr(
+        wan_spatial_shard, "all_gather_along_dim", lambda x, *, group, dim: torch.cat((x, remote), dim=dim)
+    )
+    monkeypatch.setattr(wan_spatial_shard, "_attention_local_queries", spy)
+    block = WanAttentionBlock(64).to(device="cuda", dtype=torch.bfloat16).eval()
+    setattr(block, CFG_ATTR, FastPathConfig(channels_last=True))
+    if alignment_first:
+        install_wan_attention_sdpa_alignment(block)
+    wan_spatial_shard._patch_attention_block(block, None, "width")
+    if not alignment_first:
+        install_wan_attention_sdpa_alignment(block)
+    with torch.inference_mode():
+        block(local)
+    assert local_query_calls == [True]

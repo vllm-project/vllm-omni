@@ -20,7 +20,10 @@ from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
 )
 from vllm_omni.diffusion import registry as registry_module
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+    DistributedAutoencoderKLWan,
+    OmniAutoencoderKLWan,
+)
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     REPORT_ATTR,
     decode_frames,
@@ -441,20 +444,20 @@ def test_installer_preserves_wrappers_and_hooks_on_modules_it_still_calls() -> N
         handle.remove()
 
 
-def test_installer_refuses_unsupported_targets() -> None:
+def test_installer_refuses_unsupported_targets(monkeypatch) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
 
     assert install_wan_vae_fastpath(vae, level="off").installed is False
     assert not is_installed(vae)
 
-    vae._vllm_omni_wan_spatial_shard_installed = True
+    vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_height", parallel_size=2, group=None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     report = install_wan_vae_fastpath(vae)
-    assert not report.installed and "spatial-shard" in report.reason
-    del vae._vllm_omni_wan_spatial_shard_installed
-
-    vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_height")
-    report = install_wan_vae_fastpath(vae)
-    assert not report.installed and "spatial_shard_height" in report.reason
+    assert not report.installed and "deferred" in report.reason
+    assert vae._vllm_omni_wan_spatial_fastpath_level == "lossless"
+    assert not install_wan_vae_fastpath(vae, level="off").installed
+    assert not hasattr(vae, "_vllm_omni_wan_spatial_fastpath_level")
     del vae.distributed_executor
 
     report = install_wan_vae_fastpath(nn.Linear(2, 2))
@@ -707,7 +710,8 @@ def test_rms_norm_forward_preserves_autograd() -> None:
     torch.testing.assert_close(candidate.gamma.grad, reference.gamma.grad)
 
 
-def test_omni_diffusion_config_validates_vae_fast_path() -> None:
+def test_omni_diffusion_config_validates_vae_fast_path(mocker) -> None:
+    mocker.patch("vllm_omni.diffusion.data.get_model_path", side_effect=lambda model, revision: model)
     assert OmniDiffusionConfig(model="x").vae_fast_path == "lossless"
     assert OmniDiffusionConfig(model="x", vae_fast_path="channels_last").vae_fast_path == "channels_last"
     with pytest.raises(ValueError, match="vae_fast_path"):
@@ -733,6 +737,43 @@ def test_registry_hook_installs_on_supported_platform(mocker, device_type: str, 
     assert is_installed(vae) is expected
     if expected:
         assert getattr(vae, REPORT_ATTR).level == level
+
+
+@pytest.mark.parametrize(
+    "level,parallel_size", [(None, 1), ("off", 1), ("lossless", 4), ("channels_last", 1), ("channels_last", 4)]
+)
+@torch.inference_mode()
+def test_single_gpu_spatial_fallback_preserves_fastpath(mocker, level, parallel_size):
+    vae = DistributedAutoencoderKLWan(**TINY_RESIDUAL).eval()
+    vae.use_tiling = True
+    vae.distributed_executor = SimpleNamespace(
+        parallel_mode="spatial_shard_width", parallel_size=parallel_size, group=None
+    )
+    # Also cover a multi-rank request whose actual process group has one rank.
+    mocker.patch("torch.distributed.is_initialized", return_value=True)
+    mocker.patch("torch.distributed.get_world_size", return_value=1)
+    mocker.patch.object(registry_module, "current_omni_platform").is_cuda.return_value = True
+    config = SimpleNamespace() if level is None else SimpleNamespace(vae_fast_path=level)
+    registry_module._apply_vae_fast_paths_if_enabled(_StubPipeline(vae), config)
+    selected = "lossless" if level is None else level
+    assert not vae.is_distributed_enabled()
+    assert not hasattr(vae, "_vllm_omni_wan_spatial_fastpath_level")
+    assert is_installed(vae) is (selected != "off")
+    if selected != "off":
+        assert getattr(vae, REPORT_ATTR).level == selected
+        assert vae.decoder.conv_in.weight.is_contiguous(memory_format=torch.channels_last_3d) is (
+            selected == "channels_last"
+        )
+    assert torch.isfinite(vae.decode(torch.randn(1, 4, 2, 4, 4)).sample).all()
+
+
+def test_partial_spatial_group_installs_tile_fastpath(monkeypatch):
+    vae = DistributedAutoencoderKLWan(**TINY_RESIDUAL).eval()
+    vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_width", parallel_size=2, group=None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+    assert not vae._spatial_shard_decode_enabled(torch.empty(1, 4, 1, 4, 4))
+    assert install_wan_vae_fastpath(vae, level="channels_last").installed
 
 
 def test_registry_hook_skips_unsupported_platform_and_non_wan_vaes(mocker) -> None:

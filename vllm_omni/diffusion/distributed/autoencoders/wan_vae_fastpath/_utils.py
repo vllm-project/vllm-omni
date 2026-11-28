@@ -9,6 +9,8 @@ import torch
 # Re-exported for the fast path's own kernels; defined next to the shared norm epilogue.
 from vllm_omni.diffusion.layers.vae_norm_epilogue import KERNEL_DEVICE_TYPES, on_kernel_device  # noqa: F401
 
+# Sharded row kernels use a fixed tile across local extents.
+ROW_TILE_WIDTH = 64
 _ROW_BLOCK_WIDTHS = (64, 128, 256)
 
 

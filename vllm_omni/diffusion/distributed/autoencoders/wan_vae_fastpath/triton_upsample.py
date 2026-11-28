@@ -28,7 +28,9 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import in_multi_gpu_spatial_decode
+
+from ._utils import ROW_TILE_WIDTH, _pick_block_width, on_kernel_device, suggests_channels_last
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Input elements loaded per program iteration; each is stored four times, so a
@@ -81,7 +83,30 @@ if HAS_TRITON:
             tl.store(out_ptr + out_offsets, doubled, mask=out_mask)
             tl.store(out_ptr + (out_offsets + out_width), doubled, mask=out_mask)
 
-    @triton.jit
+    _spatial_upsample2x_rows_kernel = triton.jit(
+        _upsample2x_rows_kernel.fn,
+        do_not_specialize=[
+            "rows",
+            "height",
+            "width",
+            "out_width",
+            "stride_x_height",
+            "stride_x_channel",
+            "stride_x_batch",
+        ],
+    )
+
+    @triton.jit(
+        do_not_specialize=[
+            "channels",
+            "height",
+            "width",
+            "width_blocks",
+            "stride_x_batch",
+            "stride_x_height",
+            "stride_x_width",
+        ]
+    )
     def _upsample2x_pixels_kernel(
         x_ptr,
         out_ptr,
@@ -92,6 +117,7 @@ if HAS_TRITON:
         stride_x_batch,
         stride_x_height,
         stride_x_width,
+        PADDED: tl.constexpr,
         BLOCK_W: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -103,23 +129,86 @@ if HAS_TRITON:
         pid = tl.program_id(0).to(tl.int64)
         width_block = pid % width_blocks
         rest = pid // width_blocks
-        in_height = rest % height
-        batch = rest // height
+        rows = height + PADDED
+        in_height = rest % rows
+        batch = rest // rows
         cols = width_block * BLOCK_W + tl.arange(0, BLOCK_W)
-        col_mask = cols < width
         x_row = batch * stride_x_batch + in_height * stride_x_height
-        out_row_stride = (2 * width) * channels
-        out_row = (batch * (2 * height) + 2 * in_height) * out_row_stride
-        out_pixels = out_row + (2 * cols) * channels
+        out_row_stride = (2 * (width + PADDED)).to(tl.int64) * channels
+        top = 2 * in_height + PADDED
+        left = 2 * cols + PADDED
+        bottom = top + 1
+        right = left + 1
+        if PADDED:
+            # The extra tile coordinates cover both edges, including the corners.
+            top = tl.where(in_height == height, 0, top)
+            bottom = tl.where(in_height == height, 2 * height + 1, bottom)
+            left = tl.where(cols == width, 0, left)
+            right = tl.where(cols == width, 2 * width + 1, right)
+        batch_offset = batch * 2 * rows * out_row_stride
         for c0 in range(0, channels, BLOCK_C):
             chans = c0 + tl.arange(0, BLOCK_C)
-            mask = col_mask[:, None] & (chans < channels)[None, :]
-            values = tl.load(x_ptr + (x_row + cols[:, None] * stride_x_width + chans[None, :]), mask=mask, other=0)
-            first = out_pixels[:, None] + chans[None, :]
+            mask = (cols < width + PADDED)[:, None] & (chans < channels)[None, :]
+            load_mask = mask
+            if PADDED:
+                load_mask = (in_height < height) & (cols < width)[:, None] & (chans < channels)[None, :]
+            values = tl.load(x_ptr + (x_row + cols[:, None] * stride_x_width + chans[None, :]), mask=load_mask, other=0)
+            first = batch_offset + top * out_row_stride + left[:, None] * channels + chans[None, :]
+            dx = (right - left)[:, None] * channels
+            dy = (bottom - top) * out_row_stride
             tl.store(out_ptr + first, values, mask=mask)
-            tl.store(out_ptr + (first + channels), values, mask=mask)
-            tl.store(out_ptr + (first + out_row_stride), values, mask=mask)
-            tl.store(out_ptr + (first + out_row_stride + channels), values, mask=mask)
+            tl.store(out_ptr + first + dx, values, mask=mask)
+            tl.store(out_ptr + first + dy, values, mask=mask)
+            tl.store(out_ptr + first + dy + dx, values, mask=mask)
+
+
+def _launch_pixel_upsample(x: torch.Tensor, out: torch.Tensor, *, padded: bool) -> None:
+    batch, channels, height, width = x.shape
+    block_c = min(triton.next_power_of_2(channels), _MAX_BLOCK_C)
+    block_w = max(1, _TILE_ELEMENTS // block_c)
+    width_blocks = triton.cdiv(width + padded, block_w)
+    grid = (batch * (height + padded) * width_blocks,)
+    with torch.get_device_module().device(x.device):
+        _upsample2x_pixels_kernel[grid](
+            x,
+            out,
+            channels,
+            height,
+            width,
+            width_blocks,
+            x.stride(0),
+            x.stride(2),
+            x.stride(3),
+            PADDED=padded,
+            BLOCK_W=block_w,
+            BLOCK_C=block_c,
+            num_warps=_NUM_WARPS,
+        )
+
+
+def upsample_nearest_2x_padded(x: torch.Tensor, out: torch.Tensor) -> bool:
+    """Write nearest-2x BF16 input into an NHWC buffer with one-cell borders.
+
+    Border values are zero; the spatial wrapper fills received halos afterward.
+    Returns False without writing when the kernel cannot handle the tensors.
+    """
+    if (
+        not HAS_TRITON
+        or not x.is_cuda
+        or x.ndim != 4
+        or x.dtype != torch.bfloat16
+        or x.numel() == 0
+        or not x.is_contiguous(memory_format=torch.channels_last)
+        or out.device != x.device
+        or out.dtype != x.dtype
+        or out.shape != (x.shape[0], x.shape[1], 2 * x.shape[2] + 2, 2 * x.shape[3] + 2)
+        or not out.is_contiguous(memory_format=torch.channels_last)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+    ):
+        return False
+    _launch_pixel_upsample(x, out, padded=True)
+    return True
 
 
 def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
@@ -144,11 +233,13 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
     if not channels_last and x.stride(3) == 1 and x.stride(2) == width:
         out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
         rows = batch * channels * height
-        block_w = _pick_block_width(width)
+        spatial = in_multi_gpu_spatial_decode()
+        block_w = ROW_TILE_WIDTH if spatial else _pick_block_width(width)
         rows_per_program = max(1, _TILE_ELEMENTS // block_w)
         grid = (triton.cdiv(rows, rows_per_program),)
         with torch.get_device_module().device(x.device):
-            _upsample2x_rows_kernel[grid](
+            kernel = _spatial_upsample2x_rows_kernel if spatial else _upsample2x_rows_kernel
+            kernel[grid](
                 x,
                 out,
                 rows,
@@ -167,28 +258,10 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
 
     if channels_last and channels > 1 and x.is_contiguous(memory_format=torch.channels_last):
         out = torch.empty(out_shape, device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
-        block_c = min(triton.next_power_of_2(channels), _MAX_BLOCK_C)
-        block_w = max(1, _TILE_ELEMENTS // block_c)
-        width_blocks = triton.cdiv(width, block_w)
-        grid = (batch * height * width_blocks,)
-        with torch.get_device_module().device(x.device):
-            _upsample2x_pixels_kernel[grid](
-                x,
-                out,
-                channels,
-                height,
-                width,
-                width_blocks,
-                x.stride(0),
-                x.stride(2),
-                x.stride(3),
-                BLOCK_W=block_w,
-                BLOCK_C=block_c,
-                num_warps=_NUM_WARPS,
-            )
+        _launch_pixel_upsample(x, out, padded=False)
         return out
 
     return None
 
 
-__all__ = ["upsample_nearest_2x"]
+__all__ = ["upsample_nearest_2x", "upsample_nearest_2x_padded"]

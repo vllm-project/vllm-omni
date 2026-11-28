@@ -22,7 +22,9 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import in_multi_gpu_spatial_decode
+
+from ._utils import ROW_TILE_WIDTH, _pick_block_width, on_kernel_device, suggests_channels_last
 
 _MAX_INT32 = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -42,6 +44,12 @@ _PLANE_BLOCK = 4096
 # Square tile edge for assembling channels-first input into channels-last output.
 _TRANSPOSE_BLOCK = 64
 _HAS_INTERLEAVE = HAS_TRITON and hasattr(tl, "interleave")
+
+
+def _stride_args(tensors: tuple[str, ...], axes: tuple[str, ...]) -> list[str]:
+    """Triton argument names for strides that can change with the local shard shape."""
+    return [f"stride_{tensor}_{axis}" for tensor in tensors for axis in axes]
+
 
 if HAS_TRITON:
 
@@ -112,7 +120,7 @@ if HAS_TRITON:
                 keep_plane = (batch * channels_outer + channel) * keep_frames + (frame - keep_start)
                 tl.store(keep_ptr + keep_plane * plane_size + offsets, values, mask=mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["height", "out_height", "row_blocks"])
     def _cat_pad_rows_kernel(
         x_ptr,
         cache_ptr,
@@ -209,7 +217,25 @@ if HAS_TRITON:
                 if frame >= keep_start:
                     tl.store(keep_ptr + keep_row_offsets[:, None] + in_cols[None, :], values, mask=interior)
 
-    @triton.jit
+    _spatial_cat_pad_rows_kernel = triton.jit(
+        _cat_pad_rows_kernel.fn,
+        do_not_specialize=[
+            "frames",
+            "height",
+            "width",
+            "cache_frames",
+            "out_frames",
+            "out_height",
+            "out_width",
+            "zero_front_frames",
+            "keep_start",
+            "keep_frames",
+            "row_blocks",
+        ]
+        + _stride_args(("x", "cache"), ("batch", "channel", "frame", "height", "width")),
+    )
+
+    @triton.jit(do_not_specialize=["height", "out_height"])
     def _cat_pad_pixels_kernel(
         x_ptr,
         cache_ptr,
@@ -314,7 +340,13 @@ if HAS_TRITON:
                     keep_offsets = keep_pixels[:, None] + chans[None, :] * stride_keep_channel
                     tl.store(keep_ptr + keep_offsets, values, mask=load_mask)
 
-    @triton.jit
+    _spatial_cat_pad_pixels_kernel = triton.jit(
+        _cat_pad_pixels_kernel.fn,
+        do_not_specialize=["height", "width", "out_height", "out_width", "width_blocks"]
+        + _stride_args(("x", "cache", "keep"), ("batch", "channel", "frame", "height", "width")),
+    )
+
+    @triton.jit(do_not_specialize=["out_height", "row_blocks"])
     def _dup_up3d_add_rows_kernel(
         main_ptr,
         source_ptr,
@@ -403,7 +435,13 @@ if HAS_TRITON:
             value = main + source.to(tl.float32)
             tl.store(out_ptr + offsets, value.to(dtype), mask=mask)
 
-    @triton.jit
+    _spatial_dup_up3d_add_rows_kernel = triton.jit(
+        _dup_up3d_add_rows_kernel.fn,
+        do_not_specialize=["out_height", "out_width", "source_width", "row_blocks"]
+        + _stride_args(("main", "source"), ("batch", "channel", "frame", "height")),
+    )
+
+    @triton.jit(do_not_specialize=["out_height"])
     def _dup_up3d_add_pixels_kernel(
         main_ptr,
         source_ptr,
@@ -427,7 +465,8 @@ if HAS_TRITON:
         FT: tl.constexpr,
         FS: tl.constexpr,
         REPEATS: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
+        has_bias,
+        STATIC_BIAS: tl.constexpr,
         BLOCK_W: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -438,6 +477,9 @@ if HAS_TRITON:
         (a contiguous span when in/out channels match, stride 2 when the block
         halves the channel count); main and out are contiguous along channels.
         """
+        # Uneven shards may apply bias before masking. Ordinary decode specializes this branch.
+        if STATIC_BIAS is not None:
+            has_bias = STATIC_BIAS
         pid = tl.program_id(0).to(tl.int64)
         width_block = pid % width_blocks
         rest = pid // width_blocks
@@ -474,7 +516,7 @@ if HAS_TRITON:
             mask = col_mask[:, None] & chan_mask[None, :]
             offsets = main_pixels[:, None] + chans[None, :]
             main = tl.load(main_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-            if HAS_BIAS:
+            if has_bias:
                 bias = tl.load(bias_ptr + chans, mask=chan_mask, other=0.0).to(tl.float32)
                 main = (main + bias[None, :]).to(dtype).to(tl.float32)
             source_channels = (((chans * FT + temporal_remainder) * FS + height_remainder) * FS) // REPEATS
@@ -482,6 +524,12 @@ if HAS_TRITON:
                 tl.float32
             )
             tl.store(out_ptr + offsets, (main + source).to(dtype), mask=mask)
+
+    _spatial_dup_up3d_add_pixels_kernel = triton.jit(
+        _dup_up3d_add_pixels_kernel.fn,
+        do_not_specialize=["out_height", "out_width", "source_width", "width_blocks", "has_bias"]
+        + _stride_args(("main", "source"), ("batch", "frame", "height", "width")),
+    )
 
     @triton.jit
     def _add_bias_residual_kernel(
@@ -526,6 +574,8 @@ if HAS_TRITON:
             h = (h + bias_h).to(dtype).to(tl.float32)
         tl.store(out_ptr + offsets, (x + h).to(dtype), mask=mask)
 
+    _spatial_add_bias_residual_kernel = triton.jit(_add_bias_residual_kernel.fn, do_not_specialize=["spatial", "total"])
+
 
 def _next_power_of_2(value: int) -> int:
     return 1 << max(0, value - 1).bit_length()
@@ -538,6 +588,7 @@ def cat_pad_5d(
     keep_cache_frames: int = 0,
     *,
     channels_last_output: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Fuse temporal concat, constant padding, and optional cache refresh.
 
@@ -546,6 +597,8 @@ def cat_pad_5d(
     the same dense layout that the reference ``cat``/``pad`` path selects, or
     ``channels_last_3d`` when ``channels_last_output`` is set (a fused transpose
     for channels-first ``x``; the cache refresh still follows ``x``'s layout).
+    An optional dense ``out`` buffer selects the output layout and avoids an
+    allocation (used by spatial halo assembly).
     With ``keep_cache_frames > 0`` the last non-padding frames of the assembled input
     (without spatial padding) are also written to a second tensor that
     replaces the reference ``x[:, :, -CACHE_T:].clone()`` cache refresh.
@@ -592,12 +645,20 @@ def cat_pad_5d(
     out_width = width + 2 * pad_width_left
     # Never keep the zero front frames (as upstream caches ``x[:, :, -CACHE_T:]``): the next call pads them again.
     keep_frames = min(keep_cache_frames, cache_frames + frames)
-    out = torch.empty(
-        (batch, channels, out_frames, out_height, out_width),
-        device=x.device,
-        dtype=x.dtype,
-        memory_format=torch.channels_last_3d if out_channels_inner else torch.contiguous_format,
-    )
+    shape = (batch, channels, out_frames, out_height, out_width)
+    if out is None:
+        out = torch.empty(
+            shape,
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d if out_channels_inner else torch.contiguous_format,
+        )
+    else:
+        if out.shape != shape or out.device != x.device or out.dtype != x.dtype:
+            return None
+        out_channels_inner = out.is_contiguous(memory_format=torch.channels_last_3d)
+        if not out_channels_inner and not out.is_contiguous():
+            return None
     if out.numel() == 0:
         return None
 
@@ -645,7 +706,8 @@ def cat_pad_5d(
                 block_w = _TRANSPOSE_BLOCK
             width_blocks = triton.cdiv(out_width, block_w)
             grid = (batch * out_frames * out_height * width_blocks,)
-            _cat_pad_pixels_kernel[grid](
+            kernel = _spatial_cat_pad_pixels_kernel if in_multi_gpu_spatial_decode() else _cat_pad_pixels_kernel
+            kernel[grid](
                 x,
                 cache_arg,
                 out,
@@ -662,14 +724,13 @@ def cat_pad_5d(
                 num_warps=_NUM_WARPS,
             )
         else:
-            # 256-wide column chunks keep 84% of the lanes useful on the 642-wide
-            # 720p rows (a 1024-wide block would waste 37%); ROWS rows share the
-            # chunk so a program still moves a 4096-element tile per iteration.
-            block_w = min(_next_power_of_2(out_width), _ROWS_BLOCK_W)
+            spatial = in_multi_gpu_spatial_decode()
+            block_w = ROW_TILE_WIDTH if spatial else min(_next_power_of_2(out_width), _ROWS_BLOCK_W)
             rows_per_program = max(1, _TILE_ELEMENTS // block_w)
             row_blocks = triton.cdiv(out_height, rows_per_program)
             grid = (batch * channels * out_frames * row_blocks,)
-            _cat_pad_rows_kernel[grid](
+            kernel = _spatial_cat_pad_rows_kernel if spatial else _cat_pad_rows_kernel
+            kernel[grid](
                 x,
                 cache_arg,
                 out,
@@ -716,8 +777,8 @@ def cat_time_5d(
     Returns the assembled tensor (in the memory format upstream's ``torch.cat``
     would allocate) and, with ``keep_cache_frames > 0``, its last cache/``x`` frames as
     the next feature-cache entry.
-    Because only whole aligned planes move, this runs at memory bandwidth in
-    both layouts; the spatial zero padding is left to the convolution
+    The kernel copies whole contiguous planes in both layouts.
+    The spatial zero padding is left to the convolution
     (``padding=(0, ph, pw)``), whose bitwise agreement with a pre-padded input
     the caller verifies. Unsupported inputs return ``None``.
     """
@@ -876,15 +937,17 @@ def dup_up3d_add(
         return None
     bias_arg = main if main_bias is None else main_bias.contiguous()
     _, _, out_frames, out_height, out_width = expected_shape
-    factors = dict(FT=factor_temporal, FS=factor_spatial, REPEATS=repeats, HAS_BIAS=main_bias is not None)
+    factors = dict(FT=factor_temporal, FS=factor_spatial, REPEATS=repeats)
 
     with torch.get_device_module().device(main.device):
         if _rows_layout(main) and _rows_layout(source):
-            block_w = _pick_block_width(out_width)
+            spatial = in_multi_gpu_spatial_decode()
+            block_w = ROW_TILE_WIDTH if spatial else _pick_block_width(out_width)
             rows_per_program = max(1, _TILE_ELEMENTS // block_w)
             row_blocks = triton.cdiv(out_height, rows_per_program)
             grid = (batch * out_channels * out_frames * row_blocks,)
-            _dup_up3d_add_rows_kernel[grid](
+            kernel = _spatial_dup_up3d_add_rows_kernel if spatial else _dup_up3d_add_rows_kernel
+            kernel[grid](
                 main,
                 source,
                 bias_arg,
@@ -898,6 +961,7 @@ def dup_up3d_add(
                 row_blocks,
                 *main.stride()[:4],
                 *source.stride()[:4],
+                HAS_BIAS=main_bias is not None,
                 **factors,
                 ROWS=rows_per_program,
                 BLOCK_W=block_w,
@@ -911,7 +975,9 @@ def dup_up3d_add(
             grid = (batch * out_frames * out_height * width_blocks,)
             main_strides = (main.stride(0), main.stride(2), main.stride(3), main.stride(4))
             source_strides = (source.stride(0), source.stride(2), source.stride(3), source.stride(4))
-            _dup_up3d_add_pixels_kernel[grid](
+            spatial = in_multi_gpu_spatial_decode()
+            kernel = _spatial_dup_up3d_add_pixels_kernel if spatial else _dup_up3d_add_pixels_kernel
+            kernel[grid](
                 main,
                 source,
                 bias_arg,
@@ -925,6 +991,8 @@ def dup_up3d_add(
                 width_blocks,
                 *main_strides,
                 *source_strides,
+                has_bias=spatial and main_bias is not None,
+                STATIC_BIAS=None if spatial else main_bias is not None,
                 **factors,
                 BLOCK_W=block_w,
                 BLOCK_C=block_c,
@@ -983,7 +1051,8 @@ def add_bias_residual(
     out = torch.empty_like(x)
     grid = (triton.cdiv(total, _BLOCK_SIZE),)
     with torch.get_device_module().device(x.device):
-        _add_bias_residual_kernel[grid](
+        kernel = _spatial_add_bias_residual_kernel if in_multi_gpu_spatial_decode() else _add_bias_residual_kernel
+        kernel[grid](
             x,
             x if bias_x is None else bias_x,
             h,

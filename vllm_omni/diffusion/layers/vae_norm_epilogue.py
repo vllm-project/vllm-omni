@@ -40,6 +40,7 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import in_multi_gpu_spatial_decode
 from vllm_omni.platforms import current_omni_platform
 
 # Devices whose Triton backend runs the fused kernels: NVIDIA (CUDA) and Intel (XPU) GPUs.
@@ -123,6 +124,8 @@ if HAS_TRITON:
             v = div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
         tl.store(OUT + base, v, mask=mask)
 
+    _spatial_rms_norm_scale_kernel = triton.jit(_rms_norm_scale_kernel.fn, do_not_specialize=["spatial", "channels"])
+
 
 def rms_norm_scale(
     x: torch.Tensor,
@@ -131,6 +134,7 @@ def rms_norm_scale(
     scale: float,
     *,
     silu: bool = False,
+    spatial_shard: bool | None = None,
 ) -> torch.Tensor | None:
     """``(x / denom) * scale * gamma + 0.0`` (optionally followed by SiLU), or ``None`` to decline.
 
@@ -164,7 +168,10 @@ def rms_norm_scale(
     out = torch.empty_like(x)
     grid = (batch * channels, spatial_blocks)
     with torch.get_device_module().device(x.device):
-        _rms_norm_scale_kernel[grid](
+        if spatial_shard is None:
+            spatial_shard = in_multi_gpu_spatial_decode()
+        kernel = _spatial_rms_norm_scale_kernel if spatial_shard else _rms_norm_scale_kernel
+        kernel[grid](
             x,
             denom,
             gamma,
@@ -190,19 +197,19 @@ def _bitwise_equal_allow_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
     return bool((same_bits | both_nan).all().item())
 
 
-_SILU_EXACT_CACHE: dict[tuple[str, torch.dtype], bool] = {}
+_SILU_EXACT_CACHE: dict[tuple[str, torch.dtype, bool], bool] = {}
 
 
-def silu_epilogue_is_exact(device: torch.device, dtype: torch.dtype) -> bool:
+def silu_epilogue_is_exact(device: torch.device, dtype: torch.dtype, *, spatial_shard: bool = False) -> bool:
     """Exhaustively verify the fused SiLU epilogue against ``F.silu`` for one dtype.
 
     bf16 and fp16 have 65,536 values each, so the check is complete and costs
-    about a millisecond. The result is cached per device. fp32 cannot be
+    about a millisecond. The result is cached per device and kernel variant. fp32 cannot be
     checked exhaustively and always returns ``False``.
     """
     if dtype not in (torch.bfloat16, torch.float16):
         return False
-    key = (str(device), dtype)
+    key = (str(device), dtype, spatial_shard)
     cached = _SILU_EXACT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -213,7 +220,7 @@ def silu_epilogue_is_exact(device: torch.device, dtype: torch.dtype) -> bool:
             x = bits.view(dtype).reshape(1, 1, -1)
             denom = torch.ones((1, 1, x.shape[-1]), dtype=torch.float32, device=device)
             gamma = torch.ones((1,), dtype=dtype, device=device)
-            out = rms_norm_scale(x, denom, gamma, 1.0, silu=True)
+            out = rms_norm_scale(x, denom, gamma, 1.0, silu=True, spatial_shard=spatial_shard)
             if out is not None:
                 # The reference epilogue also ends with ``+ 0.0`` before SiLU.
                 reference = F.silu(x + 0.0)

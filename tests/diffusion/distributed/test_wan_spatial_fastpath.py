@@ -1,0 +1,570 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Run with torchrun --nproc-per-node=2 -m pytest this_file.py.
+
+Compare against the same spatial partition, independently of the numerical
+changes caused by partitioning a full-frame cuDNN convolution.
+"""
+
+import copy
+import os
+from datetime import timedelta
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import (
+    spatial_shard_decode,
+)
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+    install_wan_vae_fastpath,
+    is_installed,
+    uninstall_wan_vae_fastpath,
+)
+from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.full_model,
+    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
+]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def process_group():
+    if int(os.environ.get("WORLD_SIZE", "1")) < 2 or not torch.cuda.is_available():
+        pytest.skip("requires torchrun with at least two CUDA ranks")
+    current_omni_platform.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("nccl", timeout=timedelta(seconds=120))
+    # Keep the FP32 check independent of cuDNN choosing TF32 for one layout.
+    old_tf32 = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    yield
+    torch.backends.cudnn.allow_tf32 = old_tf32
+    dist.destroy_process_group()
+
+
+# Representative combinations cover both axes, levels, and Wan decoder variants
+# without a Cartesian product of otherwise identical decode checks.
+@pytest.mark.parametrize(
+    "axis,level,variant,dtype",
+    [
+        ("height", "lossless", "wan21", torch.float32),
+        ("width", "lossless", "patch2", torch.bfloat16),
+        ("width", "channels_last", "wan22", torch.bfloat16),
+        ("height", "channels_last", "patch2", torch.float32),
+    ],
+)
+@torch.inference_mode()
+def test_spatial_fastpath_parity_and_lifecycle(axis, level, variant, dtype):
+    torch.manual_seed(41)
+    patch = variant == "patch2"
+    config = dict(
+        base_dim=8,
+        decoder_base_dim=8,
+        z_dim=4,
+        dim_mult=[1, 1],
+        num_res_blocks=1,
+        temperal_downsample=[False, True],
+        is_residual=variant != "wan21",
+        patch_size=2 if patch else None,
+        in_channels=12 if patch else 3,
+        out_channels=12 if patch else 3,
+    )
+    reference = OmniAutoencoderKLWan(**config).eval().to(device="cuda", dtype=dtype)
+    candidate = copy.deepcopy(reference)
+    if variant == "wan21":
+        # Existing direct installation must be rebound around spatial wrappers.
+        assert install_wan_vae_fastpath(candidate, level=level).installed
+    else:
+        candidate.distributed_executor = SimpleNamespace(parallel_mode=f"spatial_shard_{axis}", parallel_size=2)
+        report = install_wan_vae_fastpath(candidate, level=level)
+        assert not report.installed and "deferred" in report.reason
+    # Uneven shard extents, first/cached frames, shape changes and fresh sessions.
+    for frames, height, width in [(6, 7, 9), (1, 8, 10), (2, 7, 9)]:
+        z = torch.randn(1, 4, frames, height, width, device="cuda", dtype=dtype)
+        dist.broadcast(z, 0)
+        expected = spatial_shard_decode(
+            reference, z, group=dist.group.WORLD, split_dim=axis, temporal_chunk_size=4
+        ).sample
+        actual = spatial_shard_decode(
+            candidate, z, group=dist.group.WORLD, split_dim=axis, temporal_chunk_size=4
+        ).sample
+        assert is_installed(candidate)
+        one_frame = spatial_shard_decode(reference, z, group=dist.group.WORLD, split_dim=axis).sample
+        if dist.get_rank() == 0:
+            # Batching must preserve causal history across the four-frame chunk
+            # and short tail, allowing convolution-algorithm rounding changes.
+            torch.testing.assert_close(expected, one_frame, atol=0.04 if dtype == torch.bfloat16 else 1e-4, rtol=0)
+            if level == "lossless":
+                assert torch.equal(actual, expected), (actual.float() - expected.float()).abs().max().item()
+            else:
+                error = (actual.float() - expected.float()).abs()
+                assert error.max() <= (0.04 if dtype == torch.bfloat16 else 1e-4)
+                assert error.square().mean().sqrt() <= (0.005 if dtype == torch.bfloat16 else 1e-5)
+        else:
+            assert actual.numel() == expected.numel() == 0
+        chunks: list[torch.Tensor] = []
+        spatial_shard_decode(
+            candidate, z, group=dist.group.WORLD, split_dim=axis, temporal_chunk_size=4, on_chunk=chunks.append
+        )
+        if dist.get_rank() == 0:
+            assert torch.equal(torch.cat(chunks, dim=2), actual)
+        else:
+            assert not chunks
+        # A subsequent small request takes ordinary temporal dispatch, while
+        # the decoder remains spatially patched and only rank 0 owns output.
+        candidate.enable_tiling()
+        assert height <= candidate.tile_sample_min_height // candidate.spatial_compression_ratio
+        assert width <= candidate.tile_sample_min_width // candidate.spatial_compression_ratio
+        small = candidate.decode(z).sample
+        if dist.get_rank() == 0:
+            torch.testing.assert_close(small, one_frame, atol=0.04 if dtype == torch.bfloat16 else 1e-4, rtol=0)
+        else:
+            assert small.shape == (0,)
+    wrapper = candidate.decoder.forward
+    uninstall_wan_vae_fastpath(candidate)
+    assert candidate.decoder.forward is wrapper
+    assert not is_installed(candidate)
+    actual = spatial_shard_decode(candidate, z, group=dist.group.WORLD, split_dim=axis, temporal_chunk_size=4).sample
+    assert torch.equal(actual, expected)
+    assert install_wan_vae_fastpath(candidate, level=level).installed
+
+
+@pytest.mark.parametrize("ndim,axis,dtype", [(4, "height", torch.float32), (5, "width", torch.bfloat16)])
+@torch.inference_mode()
+def test_deferred_spatial_bias_preserves_invalid_extent(ndim, axis, dtype):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    torch.manual_seed(44)
+    cls = WanCausalConv3d if ndim == 5 else torch.nn.Conv2d
+    source = cls(4, 4, kernel_size=3, padding=1).cuda().to(dtype=dtype)
+    source.bias.fill_(0.25)
+    wrapper = spatial.WanDistCausalConv3d if ndim == 5 else spatial.WanDistConv2d
+    conv = wrapper(source, dist.group.WORLD, split_dim=axis)
+    conv.input_memory_format = torch.channels_last_3d if ndim == 5 else torch.channels_last
+    conv.to(memory_format=conv.input_memory_format)
+    extent = (4, 5) if axis == "height" else (5, 4)
+    shape = (1, 4, 2, *extent) if ndim == 5 else (2, 4, *extent)
+    x = torch.randn(shape, device="cuda", dtype=dtype).to(memory_format=conv.input_memory_format)
+    token = spatial._SPATIAL_SHARD_CONTEXT.set(
+        spatial.SpatialShardContext(
+            input_extent=7,
+            local_input_extent=4,
+            split_dim=axis,
+            rank=dist.get_rank(),
+            world_size=dist.get_world_size(),
+        )
+    )
+    try:
+        reference = conv(x)
+        actual, bias = conv(x, return_bias=True)
+        if dist.get_rank() == 1:
+            assert bias is None
+            invalid = actual.narrow(-2 if axis == "height" else -1, 3, 1)
+            assert torch.count_nonzero(invalid) == 0
+        else:
+            assert bias is not None
+            actual = actual + bias.view(1, -1, *([1] * (ndim - 2)))
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    finally:
+        spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("ndim,axis,dtype", [(4, "height", torch.float32), (5, "width", torch.bfloat16)])
+@torch.inference_mode()
+def test_channels_last_halo_exchange(ndim, axis, dtype):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    shape = (2, 7, 3, 9, 11) if ndim == 5 else (6, 7, 9, 11)
+    fmt = torch.channels_last_3d if ndim == 5 else torch.channels_last
+    dim = ndim - (2 if axis == "height" else 1)
+    extent = shape[dim]
+
+    # Preserve variation across channels, batches, and the unsplit spatial axes.
+    def rank_input(owner):
+        generator = torch.Generator(device="cuda").manual_seed(1337 + owner)
+        return torch.randn(shape, generator=generator, device="cuda", dtype=dtype).contiguous(memory_format=fmt)
+
+    buf = rank_input(rank)
+    expected = buf.clone()
+    expected.narrow(dim, 0, 2).zero_()
+    expected.narrow(dim, extent - 2, 2).zero_()
+    if rank > 0:
+        expected.narrow(dim, 0, 2).copy_(rank_input(rank - 1).narrow(dim, extent - 4, 2))
+    if rank + 1 < world:
+        expected.narrow(dim, extent - 2, 2).copy_(rank_input(rank + 1).narrow(dim, 2, 2))
+
+    module = SimpleNamespace(
+        split_tensor_dim=dim,
+        group=dist.group.WORLD,
+        _backend="nccl",
+        _halo_recv_top_buf=None,
+        _halo_recv_bottom_buf=None,
+    )
+    spatial._exchange_input_halos(module, buf, 2, rank, world)
+    assert torch.equal(buf, expected)
+    assert module._halo_recv_top_buf.is_contiguous(memory_format=fmt)
+    assert module._halo_recv_bottom_buf.is_contiguous(memory_format=fmt)
+
+
+@pytest.mark.parametrize(
+    "axis,dtype,shape",
+    [("width", torch.bfloat16, (2, 2, 7, 9)), ("height", torch.float32, (1, 1, 1, 8))],
+)
+@torch.inference_mode()
+def test_local_attention_queries_with_uneven_and_empty_shards(axis, dtype, shape):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    torch.manual_seed(32)
+    baseline = WanAttentionBlock(8).eval().to(device="cuda", dtype=dtype)
+    candidate = copy.deepcopy(baseline)
+    spatial._patch_attention_block(baseline, dist.group.WORLD, axis)
+    spatial._patch_attention_block(candidate, dist.group.WORLD, axis)
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.forwards import CFG_ATTR, FastPathConfig
+
+    setattr(candidate, CFG_ATTR, FastPathConfig(channels_last=True))
+    batch, frames, height, width = shape
+    full = torch.randn(batch, 8, frames, height, width, device="cuda", dtype=dtype)
+    dist.broadcast(full, 0)
+    dim = spatial._spatial_dim(axis)
+    full_extent = full.shape[dim]
+    local, _ = spatial.split_for_parallel_decode(full, upsample_count=0, split_dim=axis, group=dist.group.WORLD)
+    token = spatial._SPATIAL_SHARD_CONTEXT.set(
+        spatial.SpatialShardContext(full_extent, local.shape[dim], axis, dist.get_rank(), dist.get_world_size())
+    )
+    try:
+        expected = baseline(local)
+        actual = candidate(local)
+        torch.testing.assert_close(actual, expected, atol=0.02 if dtype == torch.bfloat16 else 2e-6, rtol=0)
+        valid = spatial._local_valid_extent(local.shape[dim])
+        if valid < local.shape[dim]:
+            assert torch.count_nonzero(actual.narrow(dim, valid, local.shape[dim] - valid)) == 0
+    finally:
+        spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("axis", ["height", "width"])
+@pytest.mark.parametrize("uneven", [False, True])
+@torch.inference_mode()
+def test_spatial_shortcut_bias_residual_fusion(axis, uneven, monkeypatch):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanResidualBlock
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
+
+    torch.manual_seed(83)
+    block = WanResidualBlock(128, 64, dropout=0.0).eval().to(device="cuda", dtype=torch.bfloat16)
+    for name in ("conv1", "conv2", "conv_shortcut"):
+        source = getattr(block, name)
+        source.bias.copy_(torch.randn_like(source.bias))
+        conv = spatial.WanDistCausalConv3d(source, dist.group.WORLD, split_dim=axis)
+        conv.input_memory_format = torch.channels_last_3d
+        conv.to(memory_format=torch.channels_last_3d)
+        setattr(block, name, conv)
+    setattr(block, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    x = torch.randn(2, 128, 2, 6, 6, device="cuda", dtype=torch.bfloat16)
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    token = spatial._SPATIAL_SHARD_CONTEXT.set(
+        spatial.SpatialShardContext(11 if uneven else 12, 6, axis, dist.get_rank(), 2)
+    )
+    observed = []
+    original_add = fp._residual_add
+
+    def capture(x, bias_x, h, bias_h):
+        observed.append(bias_h)
+        return original_add(x, bias_x, h, bias_h)
+
+    monkeypatch.setattr(fp, "_residual_add", capture)
+    try:
+        # A hook forces the original shortcut path and observes its biased output.
+        hooked = []
+        hook = block.conv_shortcut.register_forward_hook(lambda m, args, out: hooked.append(out.clone()))
+        expected = fp.residual_block_forward(block, x, feat_cache=[None, None], feat_idx=[0])
+        hook.remove()
+        assert len(hooked) == 1 and observed[-1] is None
+        actual = fp.residual_block_forward(block, x, feat_cache=[None, None], feat_idx=[0])
+        assert torch.equal(actual, expected)
+        masked = uneven and dist.get_rank() == 1
+        assert (observed[-1] is None) == masked
+        if masked:
+            dim = spatial._spatial_dim(axis)
+            assert torch.count_nonzero(actual.narrow(dim, 5, 1)) == 0
+    finally:
+        spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("axis", ["height", "width"])
+@pytest.mark.parametrize("shape", [(1, 64, 1, 1), (2, 64, 7, 9)])
+@torch.inference_mode()
+def test_fused_bf16_upsample_spatial_conv(axis, shape):
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    torch.manual_seed(97 + dist.get_rank())
+    source = torch.nn.Conv2d(shape[1], 32, 3, padding=1).to(device="cuda", dtype=torch.bfloat16)
+    conv = spatial.WanDistConv2d(source, dist.group.WORLD, split_dim=axis)
+    conv.input_memory_format = torch.channels_last
+    conv.to(memory_format=torch.channels_last)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
+    upsample = torch.nn.Upsample(scale_factor=2, mode="nearest-exact")
+    extent = shape[-1] if axis == "width" else shape[-2]
+    for uneven in (False, True):
+        token = spatial._SPATIAL_SHARD_CONTEXT.set(
+            spatial.SpatialShardContext(
+                extent * dist.get_world_size() - int(uneven), extent, axis, dist.get_rank(), dist.get_world_size()
+            )
+        )
+        try:
+            reference, _ = conv._assemble_input(upsample(x))
+            reference = reference.clone()
+            expected = conv(upsample(x))
+            actual = conv.forward_upsampled(x)
+            assert torch.equal(conv._input_buf, reference)
+            assert torch.equal(actual, expected)
+            deferred = conv.forward_upsampled(x, return_bias=True)
+            assert isinstance(deferred, tuple)
+            actual, bias = deferred
+            if bias is not None:
+                actual = actual + bias.view(1, -1, 1, 1)
+            assert torch.equal(actual, expected)
+        finally:
+            spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+    assert conv.forward_upsampled(x.float()) is None
+    if not x.contiguous().is_contiguous(memory_format=torch.channels_last):
+        assert conv.forward_upsampled(x.contiguous()) is None
+    with torch.enable_grad():
+        assert conv.forward_upsampled(x) is None
+
+
+@torch.inference_mode()
+def test_resample_automatically_fuses_bf16_upsampling_and_preserves_hooks(monkeypatch):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
+
+    torch.manual_seed(108)
+    resample = WanResample(64, mode="upsample2d").eval().to(device="cuda", dtype=torch.bfloat16)
+    conv = spatial.WanDistConv2d(resample.resample[1], dist.group.WORLD, split_dim="width")
+    conv.input_memory_format = torch.channels_last
+    conv.to(memory_format=torch.channels_last)
+    resample.resample[1] = conv
+    setattr(resample, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    x = torch.randn(2, 64, 2, 7, 9, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last_3d
+    )
+    original = conv.forward_upsampled
+    monkeypatch.setattr(conv, "forward_upsampled", lambda *a, **kw: None)
+    expected = fp.resample_forward(resample, x)
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(conv, "forward_upsampled", capture)
+    assert torch.equal(fp.resample_forward(resample, x), expected)
+    assert len(calls) == 1
+    for target in (resample.resample, resample.resample[0], conv):
+        observed = []
+        hook = target.register_forward_hook(lambda m, args, output: observed.append(output.clone()))
+        try:
+            assert torch.equal(fp.resample_forward(resample, x), expected)
+            assert len(observed) == 1
+            assert len(calls) == 1
+        finally:
+            hook.remove()
+
+    for target in (resample.resample, resample.resample[0], conv):
+        with monkeypatch.context() as patch:
+            original_forward = target.forward
+            patch.setattr(target, "forward", lambda *args, **kwargs: original_forward(*args, **kwargs))
+            assert torch.equal(fp.resample_forward(resample, x), expected)
+            assert len(calls) == 1
+
+
+@torch.inference_mode()
+def test_cached_spatial_conv_global_hook_sees_tensor():
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
+
+    source = torch.nn.Conv3d(2, 2, 1).cuda()
+    conv = WanDistCausalConv3d(source, dist.group.WORLD)
+    conv.input_memory_format = torch.channels_last_3d
+    observed = []
+
+    def record(module, args, output):
+        if module is conv:
+            observed.append(output)
+
+    with torch.nn.modules.module.register_module_forward_hook(record):
+        out, bias = fp._run_cached_causal_conv(
+            conv, torch.ones(1, 2, 1, 4, 4, device="cuda"), [None], 0, return_bias=True
+        )
+    assert len(observed) == 1 and observed[0] is out
+    assert bias is None
+
+
+@torch.inference_mode()
+def test_padded_upsample_reuses_kernel_across_resolutions(monkeypatch):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+
+    kernels = []
+    run = up._upsample2x_pixels_kernel.run
+
+    def capture(*args, **kwargs):
+        kernel = run(*args, **kwargs)
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(up._upsample2x_pixels_kernel, "run", capture)
+    for h, w in ((16, 32), (13, 23), (31, 48)):
+        x = torch.randn(2, 16, h, w, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
+        out = x.new_empty((2, 16, 2 * h + 2, 2 * w + 2)).contiguous(memory_format=torch.channels_last)
+        assert up.upsample_nearest_2x_padded(x, out)
+    assert len(kernels) == 3 and kernels[0] is not None and all(k is kernels[0] for k in kernels)
+
+
+@pytest.fixture
+def spatial_kernel_context():
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import (
+        _SPATIAL_SHARD_CONTEXT,
+        SpatialShardContext,
+    )
+
+    token = _SPATIAL_SHARD_CONTEXT.set(SpatialShardContext(32, 16, "width", dist.get_rank(), 2))
+    try:
+        yield
+    finally:
+        _SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("world_size", [None, 1])
+@torch.inference_mode()
+def test_unsharded_decode_uses_original_row_kernel(mocker, world_size):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import (
+        _SPATIAL_SHARD_CONTEXT,
+        SpatialShardContext,
+    )
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import _pick_block_width
+
+    original = mocker.spy(up._upsample2x_rows_kernel, "run")
+    spatial = mocker.spy(up._spatial_upsample2x_rows_kernel, "run")
+    context = SpatialShardContext(128, 128, "width", 0, world_size) if world_size else None
+    token = _SPATIAL_SHARD_CONTEXT.set(context)
+    try:
+        x = torch.randn(1, 32, 8, 128, device="cuda", dtype=torch.bfloat16)
+        assert up.upsample_nearest_2x(x) is not None
+    finally:
+        _SPATIAL_SHARD_CONTEXT.reset(token)
+    original.assert_called_once()
+    assert original.call_args.kwargs["BLOCK_W"] == _pick_block_width(128)
+    spatial.assert_not_called()
+
+
+@torch.inference_mode()
+def test_row_upsample_reuses_kernel_across_tile_and_alignment_boundaries(mocker, spatial_kernel_context):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+
+    run = mocker.spy(up._spatial_upsample2x_rows_kernel, "run")
+    kernels = []
+    for height, width in ((15, 62), (16, 65)):
+        x = torch.randn(1, 32, height, width, device="cuda", dtype=torch.bfloat16)
+        actual = up.upsample_nearest_2x(x)
+        assert torch.equal(actual, x.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3))
+        kernels.append(run.spy_return)
+    assert run.call_count == 2 and kernels[0] is not None and kernels[0] is kernels[1]
+
+
+@pytest.mark.parametrize("channels_last", [False, True], ids=["lossless", "channels_last"])
+@pytest.mark.parametrize(
+    "shapes",
+    [((16, 32), (17, 32)), ((16, 46), (16, 47)), ((90, 160), (90, 168)), ((49, 62), (49, 65))],
+    ids=["height", "padded-width-alignment", "latent-width", "tile-boundary"],
+)
+@torch.inference_mode()
+def test_kernels_reuse_binary_across_shard_shapes(mocker, channels_last, shapes, spatial_kernel_context):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
+
+    cat_pad = mocker.spy(dm._spatial_cat_pad_pixels_kernel if channels_last else dm._spatial_cat_pad_rows_kernel, "run")
+    residual = mocker.spy(
+        dm._spatial_dup_up3d_add_pixels_kernel if channels_last else dm._spatial_dup_up3d_add_rows_kernel, "run"
+    )
+    kernels = []
+    for height, width in shapes:
+        x = torch.randn(1, 32, 2, height, width, device="cuda", dtype=torch.bfloat16)
+        if channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+        assert dm.cat_pad_5d(x, None, (1, 1, 1, 1, 0, 0)) is not None
+        assert dm.dup_up3d_add(x, x, 1, 1, 1, False) is not None
+        kernels.append((cat_pad.spy_return, residual.spy_return))
+    assert cat_pad.call_count == residual.call_count == 2
+    first, second = kernels
+    assert first[0] is not None and first[0] is second[0]
+    assert first[1] is not None and first[1] is second[1]
+
+
+@torch.inference_mode()
+def test_channels_last_residual_reuses_kernel_with_and_without_deferred_bias(mocker, spatial_kernel_context):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
+
+    run = mocker.spy(dm._spatial_dup_up3d_add_pixels_kernel, "run")
+    main = torch.randn(1, 32, 2, 8, 9, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last_3d
+    )
+    source = torch.randn_like(main)
+    bias = torch.randn(32, device=main.device, dtype=main.dtype)
+    kernels = []
+    for main_bias in (bias, None):
+        actual = dm.dup_up3d_add(main, source, 1, 1, 1, False, main_bias)
+        expected = main if main_bias is None else main + main_bias.view(1, -1, 1, 1, 1)
+        assert torch.equal(actual, expected + source)
+        kernels.append(run.spy_return)
+    assert run.call_count == 2 and kernels[0] is not None and kernels[0] is kernels[1]
+
+
+@torch.inference_mode()
+def test_registry_preserves_lingbot_streaming_spatial_decoder(mocker):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.entry import WAN_FAMILY_FAST_PATH
+    from vllm_omni.diffusion.registry import _apply_vae_fast_paths_if_enabled
+    from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+    torch.manual_seed(173)
+    vae = (
+        OmniAutoencoderKLWan(
+            base_dim=8, decoder_base_dim=8, z_dim=4, dim_mult=[1, 2], num_res_blocks=1, temperal_downsample=[True]
+        )
+        .eval()
+        .cuda()
+    )
+    install_wan_spatial_shard_decode(vae, dist.group.WORLD, split_dim="width", dst=None)
+    latents = torch.randn(1, 4, 2, 6, 10, device="cuda")
+
+    def stream():
+        decoder = WanStreamingDecoder(vae)
+        state = decoder.new_decode_state("session")
+        return [decoder.decode_chunk(chunk, state) for chunk in latents.split(1, dim=2)]
+
+    expected = stream()
+    pipeline = torch.nn.Module()
+    pipeline.vae = vae
+    install = mocker.spy(WAN_FAMILY_FAST_PATH, "install")
+    _apply_vae_fast_paths_if_enabled(pipeline, SimpleNamespace(vae_encode_fast_path="off"))
+    assert install.call_args.args[:3] == (vae, "decoder", "lossless")
+    assert not is_installed(vae)
+    for actual, reference in zip(stream(), expected, strict=True):
+        assert actual.numel() > 0 and torch.equal(actual, reference)
