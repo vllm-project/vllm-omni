@@ -509,7 +509,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         rt = runtime_config or {}
         window_config = rt.get("duplex_window_config")
         state.window_enabled = bool(rt.get("duplex_boundary_token_ids")) or (
-            isinstance(window_config, dict) and window_config.get("sliding_window_mode") in {"basic", "context"}
+            isinstance(window_config, dict)
+            and window_config.get("sliding_window_mode") in {"basic", "context", "uniform"}
         )
         state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
         state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
@@ -1143,12 +1144,25 @@ class MiniCPMO45Stage0DuplexRuntime:
         elif placed and not stage0_window.get("replay_cut"):
             self._end_carried_speech_with_listen(placed[-1])
         state.window_units[:0] = placed
-        if drop_units > len(state.window_units):
-            raise RuntimeError(
-                "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
-                f"drop={drop_units}, completed={len(state.window_units)}"
-            )
-        del state.window_units[:drop_units]
+        dropped_positions = stage0_window.get("dropped_positions")
+        if isinstance(dropped_positions, list) and dropped_positions:
+            # The uniform plan drops a non-contiguous set of units, so it
+            # names the positions: delete exactly those and keep the
+            # retained ones in their chronological slots.
+            positions = {int(pos) for pos in dropped_positions}
+            if max(positions) >= len(state.window_units):
+                raise RuntimeError(
+                    "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
+                    f"drop_positions={sorted(positions)}, completed={len(state.window_units)}"
+                )
+            state.window_units[:] = [unit for index, unit in enumerate(state.window_units) if index not in positions]
+        else:
+            if drop_units > len(state.window_units):
+                raise RuntimeError(
+                    "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
+                    f"drop={drop_units}, completed={len(state.window_units)}"
+                )
+            del state.window_units[:drop_units]
 
         mode = stage0_window.get("mode")
         embeds: list[Any] = []

@@ -262,7 +262,7 @@ def prepare_stage0_window(
     runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
     window = runtime_config.get("duplex_window_config")
     mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
-    if mode not in {"basic", "context"}:
+    if mode not in {"basic", "context", "uniform"}:
         # Without a window the worker keeps no unit history to carry.
         session._minicpmo45_carried_window = None
 
@@ -294,7 +294,7 @@ def prepare_stage0_window(
     # async lookahead can overwrite the worker's pending terminator after
     # the scheduler accepted the segment stop. Window retention is optional.
     if not isinstance(window, dict) or (
-        mode not in {"basic", "context"}
+        mode not in {"basic", "context", "uniform"}
         and (
             not runtime_config.get("duplex_boundary_token_ids")
             or duplex.get("session_window_owned") is False
@@ -337,6 +337,7 @@ def prepare_stage0_window(
             session._minicpmo45_window_previous_token_ids = list(carry.get("previous", ()))
     drop_count = 0
     dropped_len = 0
+    dropped_positions: list[int] = []
 
     if mode == "basic":
         try:
@@ -373,8 +374,78 @@ def prepare_stage0_window(
         session._minicpmo45_window_previous_token_ids = previous
         session._minicpmo45_window_previous_len = len(previous_with_marker)
         projected_len += len(previous_with_marker) - old_previous_len
+    elif mode == "uniform":
+        try:
+            high = int(window.get("basic_window_high_tokens", 8000))
+            low = int(window.get("basic_window_low_tokens", 6000))
+            stride = max(1, int(window.get("uniform_retain_stride", 4) or 4))
+            retain_max = int(window.get("uniform_retain_max_tokens", 1000) or 0)
+        except (TypeError, ValueError):
+            return False
+        if projected_len > high:
+            retained_total = 0
+            evicted = 0
+            for index, unit in enumerate(units):
+                if projected_len - dropped_len <= low:
+                    break
+                if unit.get("retained") is True:
+                    # Already part of the retained set; it keeps its slot
+                    # and its budget, so it never re-competes here.
+                    retained_total += int(unit["length"])
+                    continue
+                evicted += 1
+                length = int(unit["length"])
+                if evicted % stride == 0 and retain_max > 0 and length <= retain_max:
+                    # Every stride-th eviction: retain the unit in place so
+                    # an older observation stays visible at the same
+                    # budget. The replacement is planned before any
+                    # retained unit is unmarked: a displacement only runs
+                    # when the admission is guaranteed after ALL planned
+                    # evictions, so the retained set is never dismantled
+                    # for a unit that is then dropped anyway. A unit
+                    # larger than the whole budget never fits and skips
+                    # displacement entirely.
+                    if retained_total + length > retain_max:
+                        to_evict: list[int] = []
+                        freed = 0
+                        for older_idx, older in enumerate(units[:index]):
+                            if retained_total - freed + length <= retain_max:
+                                break
+                            if older.get("retained") is True:
+                                to_evict.append(older_idx)
+                                freed += int(older["length"])
+                        if retained_total - freed + length <= retain_max:
+                            for older_idx in to_evict:
+                                older = units[older_idx]
+                                older.pop("retained", None)
+                                retained_total -= int(older["length"])
+                                dropped_len += int(older["length"])
+                                dropped_positions.append(older_idx)
+                    if retained_total + length <= retain_max:
+                        unit["retained"] = True
+                        retained_total += length
+                        continue
+                dropped_len += length
+                dropped_positions.append(index)
+            # Budget backstop: the retained slots occupy the landing
+            # budget, so the loop above can finish still above the low
+            # watermark. Unmark retained units from the oldest until the
+            # landing fits — the retained set slides forward over time.
+            dropped_set = set(dropped_positions)
+            for index, unit in enumerate(units):
+                if projected_len - dropped_len <= low:
+                    break
+                if index in dropped_set or unit.get("retained") is not True:
+                    continue
+                unit.pop("retained", None)
+                dropped_len += int(unit["length"])
+                dropped_positions.append(index)
+                dropped_set.add(index)
+        drop_count = len(dropped_positions)
 
-    retained_units = units[drop_count:]
+    retained_units = (
+        [u for i, u in enumerate(units) if i not in set(dropped_positions)] if dropped_positions else units[drop_count:]
+    )
     session._minicpmo45_window_units = retained_units
     if drop_count == 0 and not carried_units:
         session._minicpmo45_window_open_start = boundary
@@ -414,6 +485,11 @@ def prepare_stage0_window(
     if carried_units:
         duplex["stage0_window"]["carried_units"] = len(carried_units)
         duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]
+    if mode == "uniform":
+        # The uniform plan drops a non-contiguous set of units; name the
+        # positions so the worker deletes exactly those.
+        duplex["stage0_window"]["dropped_positions"] = dropped_positions
+        duplex["stage0_window"]["drop_units"] = drop_count
     if completed_terminator is not None:
         duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
     recorded_prefix_len = runtime_config.get("duplex_window_prefix_tokens")

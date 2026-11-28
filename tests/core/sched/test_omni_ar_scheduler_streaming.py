@@ -2734,3 +2734,244 @@ def test_mrv2_talker_reuses_confirmed_prompt_window(attention_type, prompt_len, 
         sched._free_request_blocks.assert_called_once_with(session)
     else:
         sched._free_request_blocks.assert_not_called()
+
+
+def test_stage0_uniform_window_retains_stride_th_evicted_unit() -> None:
+    """The uniform window keeps every stride-th evicted unit inside the budget.
+
+    With five 9-token units, stride 2 and a retained budget of 40 tokens, a
+    trim must mark the 2nd and 4th evicted units as retained, drop the others
+    by position, and land the session on the same low watermark accounting.
+    """
+    session = SimpleNamespace(
+        num_prompt_tokens=48,
+        _all_token_ids=[0] * 48 + [40],
+        num_computed_tokens=49,
+        num_output_placeholders=0,
+        _minicpmo45_window_open_start=42,
+        _minicpmo45_window_units=[{"length": 9, "generated_token_ids": [41 + i]} for i in range(5)],
+    )
+
+    update = _make_minicpm_window_update(seq=2, mode="uniform", high=30, low=30)
+    config = update.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    config["uniform_retain_max_tokens"] = 40
+
+    assert prepare_stage0_window(session, update, segment_output_ids=[40])
+
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["replace"] is True
+    assert plan["mode"] == "uniform"
+    # Evictions run 1..5: the 2nd and 4th (positions 1 and 3) are retained,
+    # the odd ones drop. The retained slots plus the new unit land exactly on
+    # the low watermark, so the backstop never fires.
+    assert plan["dropped_positions"] == [0, 2, 4]
+    assert plan["dropped_tokens"] == 27
+    assert plan["replacement_prompt_len"] == 30
+    units = list(session._minicpmo45_window_units)
+    retained = [u for u in units if u.get("retained") is True]
+    assert [u["generated_token_ids"] for u in retained] == [[42], [44]]
+    # The open start advances past every surviving unit (2 retained + the
+    # newly appended one).
+    assert session._minicpmo45_window_open_start == 3 + 9 * 3
+
+
+def test_stage0_uniform_window_retained_budget_bounds_the_marks() -> None:
+    """A retained budget smaller than one unit retains nothing."""
+    session = SimpleNamespace(
+        num_prompt_tokens=48,
+        _all_token_ids=[0] * 48 + [40],
+        num_computed_tokens=49,
+        num_output_placeholders=0,
+        _minicpmo45_window_open_start=42,
+        _minicpmo45_window_units=[{"length": 9, "generated_token_ids": [41 + i]} for i in range(5)],
+    )
+
+    update = _make_minicpm_window_update(seq=2, mode="uniform", high=30, low=30)
+    config = update.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    config["uniform_retain_max_tokens"] = 5
+
+    assert prepare_stage0_window(session, update, segment_output_ids=[40])
+
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["replace"] is True
+    # No unit fits the 5-token retained budget, so the trim behaves like a
+    # plain prefix drop and retains nothing.
+    assert plan["dropped_positions"] == [0, 1, 2]
+    assert all(not u.get("retained") for u in session._minicpmo45_window_units)
+    assert len(session._minicpmo45_window_units) == 3
+
+
+def test_stage0_uniform_window_displaces_oldest_retained_across_second_trim() -> None:
+    """A full retained budget slides forward instead of pinning the first units.
+
+    The first trim fills the retained budget exactly (two 9-token units into
+    an 18-token budget). A second trim that reaches another stride-th eviction
+    must displace the oldest retained unit for the new one: the displaced
+    unit's position joins the drop set after the in-flight prefix drop, so
+    the plan names a non-monotonic position set the worker deletes exactly.
+    """
+    session = SimpleNamespace(
+        num_prompt_tokens=48,
+        _all_token_ids=[0] * 48 + [40],
+        num_computed_tokens=49,
+        num_output_placeholders=0,
+        _minicpmo45_window_open_start=42,
+        _minicpmo45_window_units=[{"length": 9, "generated_token_ids": [41 + i]} for i in range(5)],
+    )
+
+    first = _make_minicpm_window_update(seq=2, mode="uniform", high=30, low=30)
+    config = first.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    # Exactly two 9-token retained units: the budget leaves this trim full.
+    config["uniform_retain_max_tokens"] = 18
+
+    assert prepare_stage0_window(session, first, segment_output_ids=[40])
+
+    first_plan = first.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert first_plan["dropped_positions"] == [0, 2, 4]
+    retained_after_first = [u for u in session._minicpmo45_window_units if u.get("retained") is True]
+    assert [u["generated_token_ids"] for u in retained_after_first] == [[42], [44]]
+
+    # The worker applied the replacement prompt (30 tokens) and three more
+    # units completed since: the second trim starts from a full budget.
+    session.num_prompt_tokens = 30
+    session._all_token_ids = [0] * 30 + [50, 51, 52, 53, 54, 55, 56]
+    session._minicpmo45_window_units.extend({"length": 9, "generated_token_ids": [60 + i]} for i in range(3))
+
+    second = _make_minicpm_window_update(seq=3, mode="uniform", high=36, low=27)
+    config = second.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    config["uniform_retain_max_tokens"] = 18
+
+    assert prepare_stage0_window(session, second, segment_output_ids=[50, 51, 52, 53, 54, 55, 56])
+
+    plan = second.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["replace"] is True
+    assert plan["mode"] == "uniform"
+    # The stride hit at the 4th unit finds the budget full (18 of 18): the
+    # oldest retained unit is displaced so the set slides forward. Its
+    # position lands after the in-flight prefix drop, so the drop set is not
+    # monotonically increasing — the worker deletes exactly these positions.
+    assert plan["dropped_positions"] == [2, 0]
+    assert plan["dropped_tokens"] == 18
+    assert plan["replacement_prompt_len"] == 27
+    retained_after_second = [u for u in session._minicpmo45_window_units if u.get("retained") is True]
+    # The oldest retained unit [42] gave up its slot to the newer [60];
+    # [44] keeps its budget and never re-competes.
+    assert [u["generated_token_ids"] for u in retained_after_second] == [[44], [60]]
+    assert session._minicpmo45_window_open_start == 3 + 9 * 5
+
+
+def test_stage0_uniform_window_displacement_evicts_just_enough_for_unequal_units() -> None:
+    """Displacement plans the replacement before mutating the retained set.
+
+    The retained budget is full of two 9-token units when a stride-selected
+    17-token unit arrives: one eviction cannot fit it (26 of an 18-token
+    budget), so the trim evicts both 9s and admits the 17 — instead of the
+    old behavior of evicting one retained unit for nothing and then dropping
+    the new unit too. The drop set is non-monotonic and the replacement
+    length agrees with the surviving units.
+    """
+    session = SimpleNamespace(
+        num_prompt_tokens=48,
+        _all_token_ids=[0] * 48 + [40],
+        num_computed_tokens=49,
+        num_output_placeholders=0,
+        _minicpmo45_window_open_start=42,
+        _minicpmo45_window_units=[{"length": 9, "generated_token_ids": [41 + i]} for i in range(5)],
+    )
+
+    first = _make_minicpm_window_update(seq=2, mode="uniform", high=30, low=30)
+    config = first.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    # Exactly two 9-token retained units: the budget leaves this trim full.
+    config["uniform_retain_max_tokens"] = 18
+
+    assert prepare_stage0_window(session, first, segment_output_ids=[40])
+
+    retained_after_first = [u for u in session._minicpmo45_window_units if u.get("retained") is True]
+    assert [u["generated_token_ids"] for u in retained_after_first] == [[42], [44]]
+
+    # The worker applied the replacement prompt; three more units completed
+    # since, with the 17-token one unequal to the retained 9s.
+    session.num_prompt_tokens = 30
+    session._all_token_ids = [0] * 30 + [50, 51, 52, 53, 54, 55, 56]
+    session._minicpmo45_window_units = [
+        {"length": 9, "generated_token_ids": [42], "retained": True},
+        {"length": 9, "generated_token_ids": [44], "retained": True},
+        {"length": 9, "generated_token_ids": [60]},
+        {"length": 17, "generated_token_ids": [62]},
+        {"length": 9, "generated_token_ids": [64]},
+    ]
+
+    second = _make_minicpm_window_update(seq=3, mode="uniform", high=60, low=36)
+    second.prompt_token_ids = [0] * 28
+    config = second.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    config["uniform_retain_max_tokens"] = 18
+
+    assert prepare_stage0_window(session, second, segment_output_ids=[50, 51, 52, 53, 54, 55, 56])
+
+    plan = second.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["replace"] is True
+    # Evictions 1..4: the fresh 9 drops, the stride-selected 17 finds the
+    # budget full (18 of 18) and evicts both retained 9s to admit itself,
+    # then the trailing fresh 9 drops. The displaced positions land after
+    # the in-flight drop, so the set is non-monotonic.
+    assert plan["dropped_positions"] == [2, 0, 1, 4]
+    assert plan["dropped_tokens"] == 36
+    # The 17-token unit is admitted — never evicting for a unit that is
+    # then dropped anyway.
+    retained_after_second = [u for u in session._minicpmo45_window_units if u.get("retained") is True]
+    assert [u["generated_token_ids"] for u in retained_after_second] == [[62]]
+    # Scheduler/worker length agreement: the replacement prompt is exactly
+    # the preserve span plus the surviving units.
+    assert plan["replacement_prompt_len"] == 3 + sum(int(u["length"]) for u in session._minicpmo45_window_units)
+    assert plan["replacement_prompt_len"] == 29
+    assert session._minicpmo45_window_open_start == 3 + 17 + 9
+
+
+def test_stage0_uniform_displacement_is_all_or_nothing() -> None:
+    """A mixed-size displacement only evicts when the admission follows.
+
+    A pre-retained 9-token unit against an 18-token budget with a
+    17-token unit arriving under a full budget: freeing the 9 alone cannot
+    fit 17, so the displacement must not run — the pre-retained unit
+    stays and the 17-token unit drops like a normal eviction, never one
+    old unit evicted for nothing and the new one dropped too.
+    """
+    session = SimpleNamespace(
+        num_prompt_tokens=75,
+        _all_token_ids=[0] * 75 + [40],
+        num_computed_tokens=76,
+        num_output_placeholders=0,
+        _minicpmo45_window_open_start=75 - 9 - 17 - 9 - 20 - 20,
+        # 5 units: [9 (pre-retained), 17, 9, 20, 20].
+        _minicpmo45_window_units=[
+            {"length": 9, "generated_token_ids": [41], "retained": True},
+            {"length": 17, "generated_token_ids": [42]},
+            {"length": 9, "generated_token_ids": [43]},
+            {"length": 20, "generated_token_ids": [44]},
+            {"length": 20, "generated_token_ids": [45]},
+        ],
+    )
+
+    update = _make_minicpm_window_update(seq=2, mode="uniform", high=70, low=70)
+    config = update.model_intermediate_buffer["duplex"]["runtime_config"]["duplex_window_config"]
+    config["uniform_retain_stride"] = 2
+    config["uniform_retain_max_tokens"] = 18
+
+    assert prepare_stage0_window(session, update, segment_output_ids=[40])
+
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["replace"] is True
+    # The pre-retained unit survives (position 0 is NOT in dropped_positions).
+    assert 0 not in plan["dropped_positions"]
+    units = list(session._minicpmo45_window_units)
+    # Some unit carries the retained mark.
+    assert any(u.get("retained") is True for u in units)
+    # The 17-token unit (position 1) IS dropped: the budget held a 9-token
+    # retained unit and 9 + 17 = 26 > 18, so displacement cannot free enough.
+    assert 1 in plan["dropped_positions"]

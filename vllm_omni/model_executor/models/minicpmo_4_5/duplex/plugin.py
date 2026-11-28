@@ -1133,6 +1133,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             "basic_window_low_tokens",
             "context_previous_max_tokens",
             "context_max_units",
+            "uniform_retain_stride",
+            "uniform_retain_max_tokens",
         )
         provided = {name: extra_body.pop(name) for name in names if name in extra_body}
         if not provided:

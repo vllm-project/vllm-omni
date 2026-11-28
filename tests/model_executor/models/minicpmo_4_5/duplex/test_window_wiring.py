@@ -1438,3 +1438,119 @@ def test_flattened_layout_preflight_preserves_storage():
     view = validate(key, 16, 8, 8)
     assert view.data_ptr() == key.data_ptr()
     torch.testing.assert_close(storage, before)
+
+
+def test_uniform_rebuild_keeps_retained_units_in_chronological_slots():
+    """The uniform plan names the dropped units; the survivors keep order.
+
+    Five units with distinct token ranges, positions 0/1/3 dropped: the
+    rebuild must return the surviving units in their original chronological
+    order (2 then 4) and the length check must pass.
+    """
+    units = [
+        _MiniCPMO45WindowUnit(
+            embeds=[torch.full((1, 4), float(10 + i)) for _ in range(3)],
+            token_ids=[10 + i] * 3,
+        )
+        for i in range(5)
+    ]
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="req-uniform",
+        window_enabled=True,
+        window_units=units,
+        context_embeds=[torch.zeros(1, 4)] * 2,
+        context_token_ids=[7, 8],
+    )
+    state.pending_window_unit = None
+
+    helper = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    stage0_window = {
+        "replace": True,
+        "mode": "uniform",
+        "drop_units": 3,
+        "dropped_tokens": 9,
+        "dropped_positions": [0, 1, 3],
+        "replacement_prompt_len": 2 + 3 + 3,
+    }
+    embeds, token_ids = helper._window_replacement_parts(state, stage0_window)
+    assert token_ids == [7, 8, 12, 12, 12, 14, 14, 14]
+    assert len(embeds) == len(token_ids)
+    # The survivors keep their chronological slots: unit 2 ahead of unit 4.
+    assert [u.token_ids[0] for u in state.window_units] == [12, 14]
+
+
+def test_pop_window_config_plumbs_uniform_retain_knobs() -> None:
+    """The uniform knobs reach the window config exactly as the client sent them.
+
+    ``_pop_window_config`` is the client-facing entry for window knobs: it
+    must pop both uniform keys from ``extra_body`` (so they never leak into
+    any other runtime-config consumer), parse them through
+    ``from_mapping``, and serialize them back via ``as_dict`` into the
+    runtime config the scheduler reads.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
+        MiniCPMO45DuplexPlugin,
+    )
+
+    extra_body: dict[str, object] = {
+        "sliding_window_mode": "uniform",
+        "uniform_retain_stride": 7,
+        # 0 is a valid retained budget: it disables retention entirely.
+        "uniform_retain_max_tokens": 0,
+        "unrelated_key": "kept",
+    }
+    config = MiniCPMO45DuplexPlugin._pop_window_config(extra_body)
+    assert config is not None
+    assert config.sliding_window_mode == "uniform"
+    assert config.uniform_retain_stride == 7
+    assert config.uniform_retain_max_tokens == 0
+    # Both knobs are popped: nothing window-related stays in extra_body.
+    assert extra_body == {"unrelated_key": "kept"}
+    # as_dict round-trips them into the runtime config the scheduler reads.
+    as_dict = config.as_dict()
+    assert as_dict["uniform_retain_stride"] == 7
+    assert as_dict["uniform_retain_max_tokens"] == 0
+
+
+def test_uniform_rebuild_mixed_lengths_and_non_monotonic_drops():
+    """A displacement plan drops mixed-length units out of order.
+
+    Unequal unit lengths make the stride-selected replacement evict more
+    than one retained unit, so the drop set is neither a prefix nor sorted
+    (the displaced positions land after the in-flight drop). The rebuild
+    deletes exactly the named units and its length agrees with the
+    replacement_prompt_len the scheduler computed from its own accounting.
+    """
+    units = [
+        _MiniCPMO45WindowUnit(
+            embeds=[torch.full((1, 4), float(10 + i)) for _ in range(n)],
+            token_ids=[10 + i] * n,
+        )
+        for i, n in enumerate((3, 3, 2, 4, 2))
+    ]
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="req-unequal",
+        window_enabled=True,
+        window_units=units,
+        context_embeds=[torch.zeros(1, 4)] * 2,
+        context_token_ids=[7, 8],
+    )
+    state.pending_window_unit = None
+
+    helper = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    stage0_window = {
+        "replace": True,
+        "mode": "uniform",
+        "drop_units": 4,
+        "dropped_tokens": 3 + 3 + 2 + 2,
+        "dropped_positions": [2, 0, 1, 4],
+        "replacement_prompt_len": 2 + 4,
+    }
+    embeds, token_ids = helper._window_replacement_parts(state, stage0_window)
+    # Unit 3 (the 4-token survivor, the analogue of the admitted 17) keeps
+    # its chronological slot behind the context prefix.
+    assert token_ids == [7, 8, 13, 13, 13, 13]
+    assert len(embeds) == len(token_ids)
+    assert [u.token_ids[0] for u in state.window_units] == [13]
+    # Scheduler/worker length agreement on mixed lengths.
+    assert len(token_ids) == stage0_window["replacement_prompt_len"]
