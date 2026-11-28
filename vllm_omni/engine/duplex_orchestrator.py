@@ -631,8 +631,49 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 done, _ = await asyncio.wait((release,), timeout=pool.RELEASE_RPC_TIMEOUT_S)
                 if owners.get(session_id) is owner:
                     if not done:
-                        raise TimeoutError(f"Timed out releasing the Stage-0 window for {session_id}")
-                    release.result()
+                        # The release task stays registered and keeps running, so the
+                        # window state is still released when the engine core services
+                        # the utility RPC. Raising here would pin the session's admission
+                        # slot until the reaper sees the release through, and under
+                        # sustained duplex load that starved enough slots to exhaust
+                        # the session capacity outright (#11301): a late release is
+                        # harmless (idempotent per session id), a pinned slot is not.
+                        # The owner entry is dropped below, so no later call joins the
+                        # task — it cleans its own registry entry up on completion.
+                        def _drop_when_complete(
+                            task: asyncio.Task,
+                            session_id: str = session_id,
+                            owner: tuple[int, Any] = owner,
+                        ) -> None:
+                            if self._window_releases.get(session_id) is task:
+                                self._window_releases.pop(session_id, None)
+                            if owners.get(session_id) is owner:
+                                owners.pop(session_id, None)
+
+                        release.add_done_callback(_drop_when_complete)
+                        logger.warning(
+                            "Timed out awaiting the Stage-0 window release for %s; "
+                            "the in-flight release continues in the background",
+                            session_id,
+                        )
+                        # Keep the owner entry: replica retirement still needs it to
+                        # cancel this in-flight release, and a retry that arrives
+                        # after the task completed cleans it up through the tail
+                        # below. The session's admission slot is not tied to this
+                        # entry — the caller has already been told the release is
+                        # in flight and continues its own cleanup.
+                        return
+                    else:
+                        try:
+                            release.result()
+                        except Exception:
+                            # Same reasoning as the timeout: the window state of a
+                            # closed session is inert, so a failed release must not
+                            # hold the admission slot hostage either.
+                            logger.exception(
+                                "Stage-0 window release for %s failed; leaving the release best-effort",
+                                session_id,
+                            )
             finally:
                 if release.done() and self._window_releases.get(session_id) is release:
                     self._window_releases.pop(session_id)
