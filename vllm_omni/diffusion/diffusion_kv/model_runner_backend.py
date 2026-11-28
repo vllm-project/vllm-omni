@@ -11,7 +11,14 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec, get_block_table_width
+from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    get_block_table_width,
+)
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
@@ -22,6 +29,7 @@ from vllm_omni.diffusion.diffusion_kv.layout import (
     assert_backend_layout_supported,
 )
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.diffusion_kv.offload import KVPageOffloadStore, OffloadedKVPage
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionLayerAdapter,
@@ -33,6 +41,8 @@ from vllm_omni.platforms import current_omni_platform
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
 DiffusionKVSnapshot = tuple[object, ...]
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,7 @@ class DiffusionKVModelRunnerBackend:
         self._diffusion_kv_identity_to_row: dict[DiffusionKVIdentity, int] = {}
         self._diffusion_kv_free_rows: list[int] = []
         self._diffusion_kv_request_states: dict[str, _DiffusionKVRequestState] = {}
+        self._kv_page_offload_store: KVPageOffloadStore | None = None
 
     def register_kv_cache_layers(
         self,
@@ -655,6 +666,117 @@ class DiffusionKVModelRunnerBackend:
         self._diffusion_kv_free_rows.extend(rows)
         self._diffusion_kv_free_rows.sort(reverse=True)
         return len(rows)
+
+    def save_diffusion_kv_pages(self, pages: Sequence[OffloadedKVPage]) -> dict[bytes, int]:
+        """Copy named device pages into this Worker's host offload store.
+
+        Returns the byte size of every saved page, keyed by page key.  The
+        payload of one page is the group's layers in ``layer_names`` order,
+        each flattened from that manager block's ``[H, N, C]`` slice; a later
+        restore reverses this with the same group config.  The Scheduler only
+        ever sees page names and byte sizes.
+        """
+
+        if (
+            not is_scheduler_paged_kv_mode(
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            )
+            or self.block_tables is None
+            or self.kv_cache_config is None
+        ):
+            raise RuntimeError("paged_scheduler native KV cache is not initialized")
+        if not pages:
+            return {}
+
+        groups = self.kv_cache_config.kv_cache_groups
+        caches_by_layer = self.kv_caches_by_layer
+        if self._kv_page_offload_store is None:
+            # Pinned host staging can be added once phase 1 proves the copy
+            # path; the store degrades gracefully when pinning is unavailable.
+            self._kv_page_offload_store = KVPageOffloadStore()
+        store = self._kv_page_offload_store
+
+        sizes: dict[bytes, int] = {}
+        for page in pages:
+            if not 0 <= page.group_index < len(groups):
+                raise ValueError(f"Offloaded KV page {page.key!r} names unknown cache group {page.group_index}")
+            if not 0 <= page.source_block_id < self.kv_cache_config.num_blocks:
+                raise ValueError(
+                    f"Offloaded KV page {page.key!r} names device block {page.source_block_id} outside "
+                    f"[0, {self.kv_cache_config.num_blocks})"
+                )
+            sizes[page.key] = store.save(
+                page,
+                self._capture_page_payload(
+                    page,
+                    group=groups[page.group_index],
+                    caches_by_layer=caches_by_layer,
+                ),
+            )
+        logger.info(
+            "Saved %d Diffusion KV page(s) to host offload store (%d bytes, store now holds %d page(s))",
+            len(sizes),
+            sum(sizes.values()),
+            len(store),
+        )
+        return sizes
+
+    def discard_diffusion_kv_pages(self, keys: Sequence[bytes]) -> int:
+        """Drop host-resident page payloads; returns how many were present.
+
+        The Scheduler only forgets a page after this returns, so a missing key
+        here is not an error: a rank that never recorded the page simply
+        reports fewer drops and the executor rejects the disagreement.
+        """
+
+        store = self._kv_page_offload_store
+        if store is None:
+            return 0
+        return sum(1 for key in keys if store.discard(key))
+
+    def _capture_page_payload(
+        self,
+        page: OffloadedKVPage,
+        *,
+        group: KVCacheGroupSpec,
+        caches_by_layer: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Flatten one manager block across a group's layers into host bytes.
+
+        Upstream addresses a manager block directly at its group's
+        ``block_size``; a backend that splits blocks virtually gives the layer
+        cache ``ratio`` kernel blocks per manager block (FlashAttention uses
+        one).  The ratio is derived from the cache's own block axis rather than
+        from ``BlockTables``, whose subdivision attribute was removed in the
+        vLLM 0.34 alignment.  The payload is one contiguous uint8 tensor: for
+        every layer of the group, in ``layer_names`` order, that manager
+        block's kernel blocks.  Every layer of a group shares one attention
+        geometry per rank, so the slice shapes are recomputable at restore time
+        from the same group config.
+        """
+
+        num_blocks = self.kv_cache_config.num_blocks
+        byte_slices = []
+        for name in group.layer_names:
+            cache = caches_by_layer[name]
+            if cache.shape[0] % num_blocks:
+                raise ValueError(
+                    f"KV cache axis of layer {name!r} has {cache.shape[0]} block(s), "
+                    f"which is not a multiple of the group's {num_blocks} manager block(s)"
+                )
+            ratio = cache.shape[0] // num_blocks
+            start = page.source_block_id * ratio
+            byte_slices.append(cache[start : start + ratio].view(torch.uint8))
+        numels = [slc.numel() for slc in byte_slices]
+        # Copy each strided block slice straight into its host position: one
+        # D2H transfer per layer instead of a device-side gather first.
+        payload = torch.empty(sum(numels), dtype=torch.uint8, device="cpu")
+        offset = 0
+        for byte_slice, numel in zip(byte_slices, numels, strict=True):
+            end = offset + numel
+            payload[offset:end].view(byte_slice.shape).copy_(byte_slice)
+            offset = end
+        return payload
 
     def refresh_block_table_layout(self) -> None:
         """Refresh native pointer tensors after a CuMem KV-cache wake-up."""

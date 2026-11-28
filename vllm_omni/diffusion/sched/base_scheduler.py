@@ -34,6 +34,11 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.diffusion_kv.offload import (
+    DiffusionKVOffloadCoordinator,
+    DiffusionKVOffloadIndex,
+    OffloadedKVPage,
+)
 from vllm_omni.diffusion.mixfusion.request import relax_step_batch_key
 from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -98,6 +103,13 @@ class BaseScheduler(ABC):
         self._kv_loading_request_ids: set[str] = set()
         self._kv_request_generations: dict[str, int] = {}
         self._kv_draining_requests: dict[str, SchedulerRequestState] = {}
+        self._kv_offloading_requests: dict[str, SchedulerRequestState] = {}
+        self._kv_offload_pins: dict[str, list] = {}
+        self._kv_offload_targets: dict[str, tuple[OffloadedKVPage, ...]] = {}
+        # Created by ``initialize`` only when page offload is enabled.  It owns
+        # the off-device identity index and the host byte budget; the Engine
+        # relays the byte movement, so this coordinator has no local transport.
+        self._kv_offload_coordinator: DiffusionKVOffloadCoordinator | None = None
         self._kv_received_request_ids: set[str] = set()
         self._native_prefetch_enabled = False
         self._native_prefetch_request_id: str | None = None
@@ -125,6 +137,14 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         self._reset_kv_transfer_state()
+        if getattr(od_config, "enable_diffusion_kv_page_offload", False):
+            # The budget is enforced by the Engine relay: the Scheduler plans
+            # the discards and the Engine issues the Worker RPC.
+            self._kv_offload_coordinator = DiffusionKVOffloadCoordinator(
+                max_bytes=getattr(od_config, "diffusion_kv_offload_max_bytes", None)
+            )
+        else:
+            self._kv_offload_coordinator = None
         max_num_seqs = od_config.max_num_seqs
         try:
             self.max_num_running_reqs = max(1, int(max_num_seqs))
@@ -204,6 +224,8 @@ class BaseScheduler(ABC):
             raise InvalidAttentionScheduleError(str(exc)) from exc
         if request_id in self._request_states or request_id in self._kv_draining_requests:
             raise ValueError(f"request_id {request_id!r} is already active.")
+        if request_id in self._kv_offloading_requests:
+            raise ValueError(f"request_id {request_id!r} is pending KV page offload.")
         state = self._make_request_state(request_id, request)
         state.queued_at = time.perf_counter()
         self._request_states[request_id] = state
@@ -520,6 +542,134 @@ class BaseScheduler(ABC):
             if request_id not in self._request_states:
                 self._kv_request_generations.pop(request_id, None)
 
+    def _hold_request_for_offload(self, state: SchedulerRequestState, status: DiffusionRequestStatus) -> bool:
+        """Intercept a FINISHED_COMPLETED+published request for page offload.
+
+        This is the RFC #9192 phase-1 mount point.  Only the stable prefix of
+        a *completed* request may leave the device, so the hold happens
+        exactly where ``publish_request`` has already cached the prefix pages
+        and ``free_request`` would hand them back to the pool.  The request
+        and its pinned pages survive until the Engine's save RPC lands.
+
+        Any hold failure falls back to the plain free path: offload must
+        never turn a finished request into an error.
+        """
+
+        request_id = state.request_id
+        if status is not DiffusionRequestStatus.FINISHED_COMPLETED:
+            return False
+        if self._diffusion_kv_manager is None or not self._diffusion_kv_manager.has_request(request_id):
+            return False
+        if not bool(getattr(self.od_config, "enable_diffusion_kv_page_offload", False)):
+            return False
+        targets = self._diffusion_kv_manager.get_publish_offload_targets(request_id)
+        if not targets:
+            return False
+        pool = self._diffusion_kv_manager.native_manager.block_pool
+        pinned = [pool.blocks[page.source_block_id] for page in targets]
+        # Pin the published pages so no concurrent allocation can evict or
+        # reuse them before the Worker finishes copying to the host.
+        pool.touch(pinned)
+        self._kv_offloading_requests[request_id] = state
+        self._kv_offload_pins[request_id] = pinned
+        # Resolve the identity once: the pins guarantee the block hashes cannot
+        # move between the hold and the save, so the Engine RPC and the commit
+        # describe the same pages.
+        self._kv_offload_targets[request_id] = tuple(targets)
+        return True
+
+    def pending_kv_page_offloads(self) -> dict[str, tuple[OffloadedKVPage, ...]]:
+        """Held completed requests with their offload targets.
+
+        The Engine drives the Worker save RPC for these and reports back
+        through :meth:`commit_kv_page_offload`.
+        """
+
+        if not self._kv_offloading_requests:
+            return {}
+        return {request_id: self._kv_offload_targets.get(request_id, ()) for request_id in self._kv_offloading_requests}
+
+    def commit_kv_page_offload(self, request_id: str, sizes: dict[bytes, int]) -> None:
+        """Track saved host pages, unpin, and free the held request."""
+
+        state = self._kv_offloading_requests.pop(request_id, None)
+        pins = self._kv_offload_pins.pop(request_id, [])
+        targets = self._kv_offload_targets.pop(request_id, ())
+        if state is None:
+            raise KeyError(f"Diffusion KV request {request_id!r} is not held for page offload")
+        manager = self._diffusion_kv_manager
+        if manager is None:
+            raise RuntimeError(f"Diffusion KV request {request_id!r} committed after KV teardown")
+        coordinator = self._kv_offload_coordinator
+        if targets:
+            if coordinator is None:
+                raise RuntimeError(
+                    f"Diffusion KV request {request_id!r} committed with page offload disabled; "
+                    "the off-device index would disagree with the Worker store"
+                )
+            # The Worker owns the bytes from here on, so the Scheduler must
+            # record their identity; otherwise the host budget has nothing to
+            # evict and the store grows for the life of the process.
+            coordinator.commit_saved_pages(targets, sizes)
+        # The Worker has the bytes, so the device pages go back to the pool.
+        if pins:
+            manager.native_manager.block_pool.free_blocks(pins)
+        logger.info(
+            "Offloaded %d Diffusion KV prefix page(s) of request %s (%d bytes); device blocks released",
+            len(sizes),
+            request_id,
+            sum(sizes.values()),
+        )
+        self._release_request_kv(state, DiffusionRequestStatus.FINISHED_COMPLETED, allow_offload_hold=False)
+
+    def plan_kv_page_discards(self) -> tuple[bytes, ...]:
+        """Return host page keys to discard so the offload store fits its budget.
+
+        The Engine discards them on every Worker and reports back through
+        :meth:`confirm_kv_page_discards`; nothing leaves the index until the
+        Worker confirms the payload is gone.
+        """
+
+        coordinator = self._kv_offload_coordinator
+        if coordinator is None:
+            return ()
+        return coordinator.plan_budget_evictions()
+
+    def confirm_kv_page_discards(self, keys: Iterable[bytes]) -> None:
+        """Forget saved pages whose Worker payloads the Engine discarded."""
+
+        coordinator = self._kv_offload_coordinator
+        if coordinator is None:
+            raise RuntimeError("Diffusion KV page offload is disabled; nothing can be discarded")
+        coordinator.confirm_evictions(keys)
+
+    @property
+    def kv_offload_index(self) -> DiffusionKVOffloadIndex | None:
+        """The Scheduler's index of off-device pages, or ``None`` when disabled."""
+
+        coordinator = self._kv_offload_coordinator
+        return None if coordinator is None else coordinator.index
+
+    def abort_kv_page_offload(self, request_ids: Iterable[str]) -> None:
+        """Release held requests without tracking any page.
+
+        Called when the Engine's save RPC fails: the hold must never turn a
+        finished request into an error, so the requests take the plain free
+        path and the pinned pages return to the pool.
+        """
+
+        for request_id in request_ids:
+            state = self._kv_offloading_requests.pop(request_id, None)
+            pins = self._kv_offload_pins.pop(request_id, [])
+            self._kv_offload_targets.pop(request_id, None)
+            if state is None:
+                continue
+            manager = self._diffusion_kv_manager
+            if manager is not None and pins:
+                manager.native_manager.block_pool.free_blocks(pins)
+            logger.info("Released Diffusion KV request %s on-device without tracking offloaded pages", request_id)
+            self._release_request_kv(state, DiffusionRequestStatus.FINISHED_COMPLETED, allow_offload_hold=False)
+
     def num_waiting_requests(self) -> int:
         return len(self._waiting)
 
@@ -597,6 +747,9 @@ class BaseScheduler(ABC):
         self._finish_requests({request_id: status for request_id in request_ids})
 
     def close(self) -> None:
+        # Shutdown cannot wait for a Worker save: free every held request
+        # through the plain path so the pool returns to a consistent state.
+        self.abort_kv_page_offload(tuple(self._kv_offloading_requests))
         self._shutdown_diffusion_kv()
         self._request_states.clear()
         self._waiting.clear()
@@ -611,6 +764,10 @@ class BaseScheduler(ABC):
         self._kv_finished_request_ids.clear()
         self._kv_loading_request_ids.clear()
         self._kv_draining_requests.clear()
+        self._kv_offloading_requests.clear()
+        self._kv_offload_pins.clear()
+        self._kv_offload_targets.clear()
+        self._kv_offload_coordinator = None
         self._kv_received_request_ids.clear()
         self._kv_request_generations.clear()
         self._native_prefetch_request_id = None
@@ -674,7 +831,15 @@ class BaseScheduler(ABC):
         self._finished_req_ids |= finished_req_ids
         return finished_req_ids
 
-    def _release_request_kv(self, state: SchedulerRequestState, status: DiffusionRequestStatus) -> None:
+    def _release_request_kv(
+        self,
+        state: SchedulerRequestState,
+        status: DiffusionRequestStatus,
+        *,
+        allow_offload_hold: bool = True,
+    ) -> None:
+        if allow_offload_hold and self._hold_request_for_offload(state, status):
+            return
         request_id = state.request_id
         if self._kv_connector is not None:
             for request in state.diffusion_kv_requests:
