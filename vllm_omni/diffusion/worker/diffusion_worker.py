@@ -75,6 +75,7 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.models.interface import SupportsLiveVideoAudio
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.request_streaming import request_chunk_transport
@@ -455,6 +456,18 @@ class DiffusionWorker:
     All model-related operations (loading, compilation, execution) are
     delegated to DiffusionModelRunner.
     """
+
+    @torch.inference_mode()
+    def video_live_audio(self, operation: str, request_id: str, *args: Any) -> dict[str, Any] | None:
+        """Dispatch a finite live-audio operation to a supporting pipeline."""
+        pipeline = self.model_runner.pipeline if self.model_runner is not None else None
+        if not isinstance(pipeline, SupportsLiveVideoAudio) or self.od_config.num_gpus != 1:
+            raise ValueError("Live video audio requires a supporting single-GPU pipeline.")
+        with (
+            set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            return pipeline.run_live_audio(operation, request_id, *args)
 
     def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
         from vllm_omni.distributed.weight_sharing.worker_session import control_runner

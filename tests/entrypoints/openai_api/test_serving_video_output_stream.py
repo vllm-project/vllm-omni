@@ -5,17 +5,21 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import queue
 import threading
+import wave
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
 import anyio
 import numpy as np
+import pybase64
 import pytest
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pytest_mock import MockerFixture
@@ -24,6 +28,7 @@ from starlette.testclient import TestClient
 from tests.helpers.media import generate_synthetic_image
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.video.generation.helpers import VideoRequestResources
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -428,7 +433,9 @@ class TestStreamingVideoOutputWebSocket:
         )
         request = VideoGenerationRequest(**request_data)
 
-        _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        _prompt, sampling_params, _video_params = asyncio.run(
+            handler._build_prompt_and_sampling_params(request, VideoRequestResources())
+        )
 
         assert sampling_params.quality == "high"
 
@@ -452,11 +459,15 @@ class TestStreamingVideoOutputWebSocket:
         )
         request = VideoGenerationRequest(**request_data)
 
-        _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        _prompt, sampling_params, _video_params = asyncio.run(
+            handler._build_prompt_and_sampling_params(request, VideoRequestResources())
+        )
 
         assert sampling_params.quality == "high"
         sampling_params.extra_args["stage_default"] = "mutated"
-        _prompt, next_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        _prompt, next_params, _video_params = asyncio.run(
+            handler._build_prompt_and_sampling_params(request, VideoRequestResources())
+        )
         assert next_params.extra_args["stage_default"] == "keep"
         assert defaults.extra_args == {"stage_default": "keep"}
 
@@ -508,15 +519,32 @@ class TestStreamingVideoOutputWebSocket:
         engine_client.streaming_encoder_factory.assert_called_once()
         assert engine_client.streaming_encoder_factory.call_args.kwargs["output_format"] == "m4s"
 
-    def test_streaming_session_accepts_initial_image_reference(self, mocker: MockerFixture):
-        """session.start forwards image_reference as prompt multi_modal_data.image."""
+    @pytest.mark.parametrize("with_audio", [False, True])
+    def test_streaming_session_accepts_initial_media_references(self, mocker: MockerFixture, with_audio: bool):
+        audio_buffer = io.BytesIO()
+        with wave.open(audio_buffer, "wb") as wav:
+            wav.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            wav.writeframes(bytes(480))
+        audio_bytes = audio_buffer.getvalue()
+        audio_url = "data:audio/wav;base64," + pybase64.b64encode(audio_bytes).decode()
+        audio_paths: list[Path] = []
         captured_prompts: list[dict[str, object]] = []
 
         async def mock_generate(*_args, **kwargs):
             captured_prompts.append(kwargs["prompt"])
+            if with_audio:
+                path = Path(kwargs["prompt"]["multi_modal_data"]["audio"])
+                assert path.read_bytes() == audio_bytes
+                audio_paths.append(path)
             yield OmniRequestOutput.from_diffusion(
                 request_id="req-ws",
                 images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=False,
+            )
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[],
                 final_output_type="image",
                 finished=True,
             )
@@ -539,6 +567,7 @@ class TestStreamingVideoOutputWebSocket:
                         "width": 4,
                         "height": 4,
                         "image_reference": {"image_url": image_url},
+                        **({"audio_reference": {"audio_url": audio_url}} if with_audio else {}),
                     }
                 )
                 assert ws.receive_json()["type"] == "video.start"
@@ -549,6 +578,71 @@ class TestStreamingVideoOutputWebSocket:
         image = prompt["multi_modal_data"]["image"]  # type: ignore[index]
         assert image.size == (4, 4)
         engine_client.abort.assert_not_called()
+        if with_audio:
+            assert len(audio_paths) == 1
+            assert not audio_paths[0].exists()
+
+    @pytest.mark.parametrize("close_fails", [False, True])
+    def test_live_audio_delivers_video_before_audio_done(self, mocker: MockerFixture, close_fails: bool):
+        async def no_full_request(**_kwargs):
+            pytest.fail("Live audio should use finite Worker calls.")
+            yield
+
+        app, _handler, engine = _build_test_app(
+            mocker=mocker, streaming_chunks=[(b"live-fragment", True)] * 2, mock_generate=no_full_request
+        )
+        from vllm_omni.diffusion.models.kyutai_aura import pipeline_kyutai_aura as aura
+
+        mocker.patch.object(aura, "AuraLiveAudio")
+        pipeline = mocker.Mock(_live_audio_sessions={})
+        run_live_audio = aura.KyutaiAuraPipeline.run_live_audio
+        calls = []
+
+        async def rpc(method, *, stage_ids, args, timeout):
+            assert method == "video_live_audio" and stage_ids == [0]
+            operation, request_id, *parameters = args
+            calls.append((operation, request_id, parameters))
+            if operation == "close" and close_fails and request_id == calls[0][1]:
+                raise TimeoutError("Close did not reach the worker")
+            if operation == "push":
+                audio, final = parameters
+                assert audio == (b"" if final else b"\0\0")
+                chunks = [] if final else [{"video": _fake_video_frames(2)}]
+                return [[{"chunks": chunks}]]
+            return [[run_live_audio(pipeline, operation, request_id, *parameters)]]
+
+        engine._engine_core_rpc = rpc
+        image = generate_synthetic_image(4, 4)
+
+        def run_session(client):
+            with client.websocket_connect("/v1/realtime/video") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.start",
+                        "prompt": "Speak.",
+                        "fps": 16,
+                        "image_reference": {"image_url": f"data:image/jpeg;base64,{image['base64']}"},
+                        "extra_params": {"live_audio": True},
+                    }
+                )
+                started = ws.receive_json()
+                assert started["type"] == "video.start"
+                ws.send_json({"type": "input_audio_buffer.append", "audio": "AAA="})
+                assert _receive_video_chunk(ws)[1] == b"live-fragment"
+                ws.send_json({"type": "input_audio_buffer.done"})
+                assert ws.receive_json()["type"] == "session.done"
+                return started["request_id"]
+
+        with TestClient(app) as client:
+            first_id = run_session(client)
+            second_id = run_session(client)
+
+        assert [call[0] for call in calls] == ["start", "push", "push", "close"] * 2
+        assert first_id != second_id
+        assert {call[1] for call in calls[:4]} == {first_id}
+        assert {call[1] for call in calls[4:]} == {second_id}
+        assert calls[4][2][-1] == ((first_id,) if close_fails else ())
+        assert not pipeline._live_audio_sessions
 
     def test_streaming_session_rejects_unknown_format(self, mocker: MockerFixture):
         async def mock_generate(*_args, **_kwargs):
@@ -1536,7 +1630,7 @@ class TestStreamingVideoOutputExtraParams:
         request = VideoGenerationRequest(prompt="p", extra_params={"preencode_mp4": True})
 
         with pytest.raises(HTTPException) as excinfo:
-            await self._handler()._build_prompt_and_sampling_params(request)
+            await self._handler()._build_prompt_and_sampling_params(request, VideoRequestResources())
 
         assert excinfo.value.status_code == HTTPStatus.BAD_REQUEST.value
         assert "preencode_mp4" in excinfo.value.detail
@@ -1544,7 +1638,7 @@ class TestStreamingVideoOutputExtraParams:
     async def test_other_extra_params_still_reach_the_engine(self):
         request = VideoGenerationRequest(prompt="p", extra_params={"flow_shift": 3.0})
 
-        _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
+        _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request, VideoRequestResources())
 
         assert gen_params.extra_args["flow_shift"] == 3.0
 

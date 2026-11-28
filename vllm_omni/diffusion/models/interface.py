@@ -44,6 +44,13 @@ class SupportAudioInput(Protocol):
 
 
 @runtime_checkable
+class SupportsLiveVideoAudio(Protocol):
+    """Pipeline operations for a request with incrementally supplied PCM."""
+
+    def run_live_audio(self, operation: str, request_id: str, *args: Any) -> dict[str, Any] | None: ...
+
+
+@runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True
 
