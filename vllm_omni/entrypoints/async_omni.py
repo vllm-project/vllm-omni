@@ -130,10 +130,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # request's own submit so a queue-parked ADD cannot be admitted after
         # the abort returns.
         self._pending_submits: dict[str, asyncio.Task[None]] = {}
-        # True after pause_generation() or AR EngineCore sleep; wake_up must
-        # not reopen generate() until resume_generation(). Diffusion-only
-        # sleep uses _paused as a temporary admission gate and clears it
-        # on wake so sleep → wake → generate keeps working.
+        # True after an explicit pause_generation() or release_kv_cache_memory();
+        # wake_up must not reopen generate() until resume_generation(). Plain
+        # sleep() uses _paused as a temporary admission gate and clears it once
+        # all sleeping tags are restored, matching upstream vLLM AsyncLLM so
+        # sleep -> wake_up -> generate keeps working.
         self._hold_admission_until_resume: bool = False
         # Stages whose scheduler pause_generation closed (AR in any mode,
         # diffusion with mode="keep"); admission stays closed until
@@ -141,6 +142,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._paused_stage_ids: set[int] = set()
         self._sleeping_tags: set[str] = set()
         self._stage_sleeping_tags: dict[int, set[str]] = {}
+        self._inflight_sleeps: int = 0
         self._level2_sleeping: bool = False
         # Paced interaction ingress is stamped before ordered worker delivery.
         self._interaction_reservations: dict[tuple[str, str], float | None] = {}
@@ -429,7 +431,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     def _generation_admission_ready(self) -> bool:
         self._check_frontend_admission()
-        return not self._paused and not getattr(self, "_sleeping_tags", None)
+        return (
+            not self._paused and not getattr(self, "_sleeping_tags", None) and getattr(self, "_inflight_sleeps", 0) == 0
+        )
+
+    def _maybe_reopen_admission_locked(self) -> None:
+        """Clear ``_paused`` when no hold, sleeping tag, or in-flight sleep remains."""
+        if (
+            not getattr(self, "_hold_admission_until_resume", False)
+            and not getattr(self, "_sleeping_tags", None)
+            and getattr(self, "_inflight_sleeps", 0) == 0
+        ):
+            self._paused = False
 
     def _on_frontend_shutdown(self) -> None:
         loop = self._output_loop
@@ -497,7 +510,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             if hold_admission:
                 async with self._pause_cond:
                     # Same full-wake condition as generate()'s gate: streaming
-                    # ADDs must not race a partially-asleep engine either (#8678).
+                    # ADDs must not race a partially-asleep or sleeping engine either (#8678).
                     await self._pause_cond.wait_for(self._generation_admission_ready)
                     self._admitting = getattr(self, "_admitting", 0) + 1
             try:
@@ -1247,8 +1260,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             return
 
         async with self._pause_cond:
-            self._paused = False
             self._hold_admission_until_resume = False
+            if getattr(self, "_inflight_sleeps", 0) == 0:
+                self._paused = False
             self._pause_cond.notify_all()
 
     async def is_paused(self) -> bool:
@@ -1419,11 +1433,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         in flight. This does **not** invoke EngineCore.pause_scheduler again
         (sleep already pauses the AR scheduler).
 
-        For AR / mixed engines, ``wake_up`` does **not** clear ``_paused``;
-        callers must :meth:`resume_generation` when ready (typical trainer
-        order: pause → abort → sleep → train → wake → resume). Diffusion-only
-        engines have no EngineCore pause to hold, so ``wake_up`` restores
-        admission and ``sleep → wake → generate`` keeps working.
+        Once all sleeping tags are restored via :meth:`wake_up`, frontend
+        admission reopens automatically (matching upstream vLLM ``AsyncLLM``
+        where ``EngineCore.wake_up`` auto-resumes the scheduler), unless an
+        explicit :meth:`pause_generation` (or :meth:`release_kv_cache_memory`)
+        holds admission until :meth:`resume_generation`.
         """
         # Validate before touching admission state. Raising after
         # ``_paused = True`` would wedge generate() for good: nothing was
@@ -1432,69 +1446,97 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
 
         # Block admission before any sleep RPC so generate() waits on
-        # _pause_cond during the drain/offload window. Wait until generate()
-        # coroutines that already passed the pause check have submitted (or
-        # failed) so EngineCore does not see ADD frames while sleeping.
-        async with self._pause_cond:
-            self._paused = True
-            # Cancel inside the lock, after the gate closed (matching
-            # pause_generation's ordering): a generate that has not passed
-            # the gate cannot register a submit this snapshot would miss.
-            if mode == "abort":
-                self._cancel_pending_submits()
-            await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
-        # EngineCore.sleep resets receiver caches itself; only clear P0 here.
-        if 0 in ar_stage_ids:
-            await self._clear_frontend_mm_cache()
+        # _pause_cond during the drain/offload window. Track the sleep as
+        # in-flight while the RPCs execute so an overlapping wake_up() for
+        # another stage cannot reopen admission before this stage records its
+        # sleeping tags. Wait until generate() coroutines that already passed
+        # the pause check have submitted (or failed) so EngineCore does not
+        # see ADD frames while sleeping.
+        allow_reopen = True
+        sleep_entered = False
+        try:
+            async with self._pause_cond:
+                self._paused = True
+                self._inflight_sleeps = getattr(self, "_inflight_sleeps", 0) + 1
+                sleep_entered = True
+                # Cancel inside the lock, after the gate closed (matching
+                # pause_generation's ordering): a generate that has not passed
+                # the gate cannot register a submit this snapshot would miss.
+                if mode == "abort":
+                    self._cancel_pending_submits()
+                await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
 
-        self._final_output_handler()
-        sleep_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
-        final_acks: list[OmniACK] = []
-        if ar_stage_ids:
-            self._hold_admission_until_resume = True
-            logger.info(
-                "[%s] Sleeping AR stage(s) %s via EngineCore.sleep(level=%s, mode=%s)",
-                self._name,
-                ar_stage_ids,
-                level,
-                mode,
-            )
-            await self._engine_core_rpc(
-                "sleep",
-                stage_ids=ar_stage_ids,
-                args=(level, mode),
-            )
-            # EngineCore.sleep has no OmniACK handshake; emit stage-level SUCCESS
-            # markers so callers/tests that count ACKs keep a stable API.
-            task_id = f"engine_core-sleep-{uuid.uuid4().hex[:8]}"
-            final_acks.extend(
-                OmniACK(
-                    task_id=task_id,
-                    status="SUCCESS",
-                    stage_id=sid,
-                    rank=0,
-                    metadata={"path": "engine_core", "level": level, "mode": mode},
+            # EngineCore.sleep resets receiver caches itself; only clear P0 here.
+            if 0 in ar_stage_ids:
+                await self._clear_frontend_mm_cache()
+
+            self._final_output_handler()
+            sleep_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
+            final_acks: list[OmniACK] = []
+            if ar_stage_ids:
+                logger.info(
+                    "[%s] Sleeping AR stage(s) %s via EngineCore.sleep(level=%s, mode=%s)",
+                    self._name,
+                    ar_stage_ids,
+                    level,
+                    mode,
                 )
-                for sid in ar_stage_ids
-            )
-            self._record_stage_sleep(ar_stage_ids, sleep_tags)
-            if level == 2 and not ar_level2_wake_enabled():
-                self._level2_sleeping = True
-
-        if diffusion_stage_ids:
-            acks: list[OmniACK] = []
-            try:
-                acks = await self._sleep_diffusion(diffusion_stage_ids, level)
-            finally:
-                # A failed sleep may have released part of a stage, so wake_up must still reach it.
-                self._record_stage_sleep(diffusion_stage_ids, sleep_tags)
-                # Level 2 has discarded weights only where a replica finished its sleep.
-                if level == 2 and any(self._diffusion_ack_error(ack) is None for ack in acks):
+                allow_reopen = False
+                try:
+                    await self._engine_core_rpc(
+                        "sleep",
+                        stage_ids=ar_stage_ids,
+                        args=(level, mode),
+                    )
+                except BaseException:
+                    self._hold_admission_until_resume = True
+                    raise
+                # EngineCore.sleep has no OmniACK handshake; emit stage-level SUCCESS
+                # markers so callers/tests that count ACKs keep a stable API.
+                task_id = f"engine_core-sleep-{uuid.uuid4().hex[:8]}"
+                final_acks.extend(
+                    OmniACK(
+                        task_id=task_id,
+                        status="SUCCESS",
+                        stage_id=sid,
+                        rank=0,
+                        metadata={"path": "engine_core", "level": level, "mode": mode},
+                    )
+                    for sid in ar_stage_ids
+                )
+                self._record_stage_sleep(ar_stage_ids, sleep_tags)
+                if level == 2 and not ar_level2_wake_enabled():
                     self._level2_sleeping = True
-            self._raise_on_diffusion_errors("handle_sleep_task", acks)
-            final_acks.extend(acks)
 
-        return final_acks
+            if diffusion_stage_ids:
+                acks: list[OmniACK] = []
+                allow_reopen = False
+                try:
+                    acks = await self._sleep_diffusion(diffusion_stage_ids, level)
+                finally:
+                    # A failed sleep may have released part of a stage, so wake_up must still reach it.
+                    self._record_stage_sleep(diffusion_stage_ids, sleep_tags)
+                    # Level 2 has discarded weights only where a replica finished its sleep.
+                    if level == 2 and any(self._diffusion_ack_error(ack) is None for ack in acks):
+                        self._level2_sleeping = True
+                self._raise_on_diffusion_errors("handle_sleep_task", acks)
+                final_acks.extend(acks)
+
+            allow_reopen = True
+            return final_acks
+        finally:
+            if sleep_entered:
+                with anyio.CancelScope(shield=True):
+                    async with self._pause_cond:
+                        self._inflight_sleeps = max(0, getattr(self, "_inflight_sleeps", 1) - 1)
+                        # Reopen when exiting before any worker RPC was
+                        # dispatched (or after all sleeping tags were recorded
+                        # and a concurrent wake_up already cleared them);
+                        # uncertain post-dispatch failures stay fail-closed and
+                        # explicit pause holds are preserved.
+                        if allow_reopen:
+                            self._maybe_reopen_admission_locked()
+                        self._pause_cond.notify_all()
 
     async def _sleep_diffusion(self, stage_ids: list[int], level: int) -> list[OmniACK]:
         """Worker-level sleep RPC for diffusion stages only."""
@@ -1550,11 +1592,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         AR/LLM stages use EngineCore.wake_up (restore memory, auto-resume
         scheduler). Diffusion stages keep the worker-level wake RPC.
 
-        Does **not** clear the frontend ``_paused`` admission gate when
-        :meth:`pause_generation` ran or AR stages were slept — call
-        :meth:`resume_generation` when the trainer is ready to admit new
-        requests. Diffusion-only ``sleep`` uses ``_paused`` only as a race
-        guard; this method restores admission after a successful wake.
+        Restores the frontend ``_paused`` admission gate once all sleeping
+        tags across all stages are warm, unless an explicit
+        :meth:`pause_generation` or :meth:`release_kv_cache_memory` holds
+        admission until :meth:`resume_generation`. Partial wakes (e.g.
+        ``tags=["weights"]`` while ``kv_cache`` is still asleep, or waking a
+        subset of sleeping stages) keep ``_paused`` closed until the remaining
+        sleeping tags are restored.
         """
         self._final_output_handler()
 
@@ -1582,53 +1626,56 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             return []
 
         final_acks: list[OmniACK] = []
-        if ar_stage_ids:
-            logger.info("[%s] Waking AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
-            await self._engine_core_rpc(
-                "wake_up",
-                stage_ids=ar_stage_ids,
-                kwargs={"tags": requested_tags},
-            )
-            task_id = f"engine_core-wake-{uuid.uuid4().hex[:8]}"
-            final_acks.extend(
-                OmniACK(
-                    task_id=task_id,
-                    status="SUCCESS",
-                    stage_id=sid,
-                    rank=0,
-                    metadata={"path": "engine_core", "tags": list(requested_tags)},
+        try:
+            if ar_stage_ids:
+                logger.info("[%s] Waking AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
+                await self._engine_core_rpc(
+                    "wake_up",
+                    stage_ids=ar_stage_ids,
+                    kwargs={"tags": requested_tags},
                 )
-                for sid in ar_stage_ids
+                task_id = f"engine_core-wake-{uuid.uuid4().hex[:8]}"
+                final_acks.extend(
+                    OmniACK(
+                        task_id=task_id,
+                        status="SUCCESS",
+                        stage_id=sid,
+                        rank=0,
+                        metadata={"path": "engine_core", "tags": list(requested_tags)},
+                    )
+                    for sid in ar_stage_ids
+                )
+                self._clear_stage_sleep(ar_stage_ids, requested_tags)
+
+            for sid in diffusion_stage_ids:
+                final_acks.extend(await self._wake_diffusion([sid], requested_tags))
+                self._clear_stage_sleep([sid], requested_tags)
+            if diffusion_stage_ids:
+                await asyncio.sleep(0.1)
+
+            logger.info(
+                "[%s] Wake-up complete for stage(s) %s.",
+                self._name,
+                ar_stage_ids + diffusion_stage_ids,
             )
-            self._clear_stage_sleep(ar_stage_ids, requested_tags)
-
-        for sid in diffusion_stage_ids:
-            final_acks.extend(await self._wake_diffusion([sid], requested_tags))
-            self._clear_stage_sleep([sid], requested_tags)
-        if diffusion_stage_ids:
-            await asyncio.sleep(0.1)
-
-        # Only clear the level-2 flag once all tags are warm, in case partial
-        # wake support (e.g. tags=["kv_cache"] only) is added in the future.
-        if not getattr(self, "_sleeping_tags", None):
-            self._level2_sleeping = False
-        logger.info(
-            "[%s] Wake-up complete for stage(s) %s.",
-            self._name,
-            ar_stage_ids + diffusion_stage_ids,
-        )
-        # generate() coroutines parked on the full wake (sleeping tags in the
-        # admission-gate predicate) may now pass the gate (#8678).
-        async with self._pause_cond:
-            self._pause_cond.notify_all()
-        # Diffusion-only sleep uses `_paused` as a race guard. Restore
-        # generate() admission after memory is back. AR/mixed sleep and
-        # pause_generation keep the trainer hold until resume_generation.
-        if not getattr(self, "_hold_admission_until_resume", False):
-            async with self._pause_cond:
-                self._paused = False
-                self._pause_cond.notify_all()
-        return final_acks
+            return final_acks
+        finally:
+            # Only clear the level-2 flag once all tags are warm, in case partial
+            # wake support (e.g. tags=["kv_cache"] only) is added in the future.
+            if not getattr(self, "_sleeping_tags", None):
+                self._level2_sleeping = False
+            # Sleep uses `_paused` as a temporary admission gate. Restore
+            # generate() admission once all sleeping tags are warm and no other
+            # sleep() is still in flight, unless an explicit pause_generation() /
+            # release_kv_cache_memory() holds it. Running in finally ensures a
+            # cancellation after tags are cleared (e.g. during post-wake settle)
+            # cannot wedge admission closed.
+            # Always notify parked waiters (e.g. generate() waiting on sleeping
+            # tags after wake_up(tags=["weights"]) + resume_generation(), #8678).
+            with anyio.CancelScope(shield=True):
+                async with self._pause_cond:
+                    self._maybe_reopen_admission_locked()
+                    self._pause_cond.notify_all()
 
     async def _wake_diffusion(self, stage_ids: list[int], requested_tags: list[str]) -> list[OmniACK]:
         """Worker-level wake RPC for diffusion stages only."""
