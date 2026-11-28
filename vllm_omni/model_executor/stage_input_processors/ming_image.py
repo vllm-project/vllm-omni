@@ -28,11 +28,11 @@ def _output_payload(source_output: Any) -> tuple[list[int], dict[str, torch.Tens
 def _validate_query_suffix(prompt_ids: list[int]) -> tuple[int, int]:
     expected = _NUM_QUERY_TOKENS + 2
     if len(prompt_ids) < expected:
-        raise ValueError("Ming-Image prompt is shorter than its image-query suffix.")
+        raise OmniClientError("Ming-Image prompt is shorter than its image-query suffix.")
     start = len(prompt_ids) - _NUM_QUERY_TOKENS - 1
     end = len(prompt_ids) - 1
     if prompt_ids[end] != _IMAGE_END_TOKEN_ID or any(token != _IMAGE_PATCH_TOKEN_ID for token in prompt_ids[start:end]):
-        raise ValueError("Ming-Image query suffix must end with 256 image-patch tokens and an image-end token.")
+        raise OmniClientError("Ming-Image query suffix must end with 256 image-patch tokens and an image-end token.")
     return start, end
 
 
