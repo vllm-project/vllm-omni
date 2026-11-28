@@ -426,6 +426,7 @@ class OmniEngineArgs(EngineArgs):
     lora_backend: str | None = None
     lora_application: str | None = None
     lora_scale: float | None = None
+    enable_moe_lora: bool | None = None
     diffusers_load_kwargs: str | None = None
     diffusers_call_kwargs: str | None = None
     diffusion_quantization_config: str | None = None
@@ -850,6 +851,7 @@ class OrchestratorArgs:
     lora_backend: str | None = None
     lora_application: str | None = None
     lora_scale: float | None = None
+    enable_moe_lora: bool | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
@@ -952,6 +954,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "lora_backend",
         "lora_application",
         "lora_scale",
+        "enable_moe_lora",
         "diffusers_load_kwargs",
         "diffusers_call_kwargs",
         "diffusion_quantization_config",

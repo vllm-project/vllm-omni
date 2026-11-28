@@ -90,6 +90,9 @@ def test_hunyuan_image3_dit_moe_lora_generation(tmp_path: Path):
                 "stages": [
                     {
                         "stage_id": 0,
+                        # Request-time expert adapters need stage-scoped opt-in
+                        # when no startup lora_path is set (#10798).
+                        "enable_moe_lora": True,
                         "devices": ",".join(map(str, range(tp))),
                         "max_num_seqs": 1,
                         "enforce_eager": True,
