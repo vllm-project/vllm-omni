@@ -19,7 +19,7 @@ then compares the decoded MP4 frames.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python benchmarks/lingbot_video/dense_pipeline_parity.py \
+python tests/parity/lingbot_video/dense_pipeline_parity.py \
   --model /path/to/lingbot-video-dense-1.3b \
   --official-repo /path/to/lingbot-video \
   --output-dir /tmp/lingbot_dense_parity
@@ -37,7 +37,7 @@ scatter-weighted restore, padding masks, and the shared expert.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python benchmarks/lingbot_video/moe_transformer_parity.py \
+python tests/parity/lingbot_video/moe_transformer_parity.py \
   --scope block \
   --official-repo /path/to/lingbot-video \
   --output-json /tmp/lingbot_moe_block_parity.json
@@ -49,7 +49,7 @@ sequentially and compares their output tensors. It requires a CUDA device with
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python benchmarks/lingbot_video/moe_transformer_parity.py \
+python tests/parity/lingbot_video/moe_transformer_parity.py \
   --scope transformer \
   --official-repo /path/to/lingbot-video \
   --model /path/to/lingbot-video-moe-30b-a3b \
