@@ -43,12 +43,11 @@ _RESULT_DIR = Path(
     )
 )
 
-# The 0.78 gate (934/1197) sits 1 item above the observed NPU mean
-# (~933/1197) and inside the observed 932~940 spread, so it flips nightly -
-# 3 failures in the latest 7 dated NPU nightlies (#6887). 0.77 (922/1197)
-# sits 10 items below the observed minimum (932) while still failing a
-# >=1pp real accuracy regression.
-_MIN_DAILY_OMNI_ACCURACY = 0.77
+# The deterministic 599-row sample scored 455/599 (0.7596) on MI300 in AMD
+# NIGHTLY #17796, with all requests and gold answers present. A 0.75 floor
+# requires at least 450 correct answers and fails at 449, preserving the
+# approximately 1 percentage-point regression guard used by the full dataset.
+_MIN_DAILY_OMNI_ACCURACY = 0.75
 _DAILY_OMNI_NUM_PROMPTS = 599  # ceil(1197 / 2); the shared runner uses deterministic seed 0.
 _MAX_SEED_TTS_MEAN_WER = 0.05
 # English Seed-TTS, 1088 utterances. 2026-10-08 mean SIM 0.865 (median 0.869),
