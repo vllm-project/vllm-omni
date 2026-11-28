@@ -70,6 +70,8 @@ class Qwen3OmniFirstFrameDecoder(nn.Module):
         if device.type != "cuda":
             return
         for batch_size in sorted(set(batch_sizes)):
+            if batch_size in self._graphs:
+                continue
             static_input = torch.zeros(batch_size, self.num_quantizers, 1, dtype=torch.long, device=device)
             self.code2wav(static_input)
             torch.accelerator.synchronize(device)
@@ -78,6 +80,10 @@ class Qwen3OmniFirstFrameDecoder(nn.Module):
                 static_output = self.code2wav(static_input)
             self._graphs[batch_size] = (graph, static_input, static_output)
         logger.info("Captured Qwen3-Omni Talker first-frame decoder graphs for batch sizes %s", sorted(self._graphs))
+
+    def release(self) -> None:
+        """Drop graph pools and their static tensors after memory profiling."""
+        self._graphs.clear()
 
     @torch.inference_mode()
     def decode(self, codes: torch.Tensor) -> torch.Tensor:

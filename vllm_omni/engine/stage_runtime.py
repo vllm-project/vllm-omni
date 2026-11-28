@@ -932,6 +932,8 @@ class StageRuntime:
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
                 async_chunk=self._async_chunk,
+                stage_config=stage_cfg,
+                local_stages=self._stage_configs if local_replica_counts is None else (),
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]

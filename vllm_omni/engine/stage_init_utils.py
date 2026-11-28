@@ -2071,8 +2071,50 @@ def get_stage_connector_spec(
     omni_transfer_config: Any,
     stage_id: int,
     async_chunk: bool,
+    *,
+    stage_config: Any = None,
+    local_stages: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Return the first connector spec for a stage data-plane edge."""
+    spec = _get_stage_edge_spec(omni_transfer_config, stage_id)
+    if isinstance(stage_config, BaseVllmOmniStageConfig):
+        model_arch = stage_config.model_config.model_arch
+        role = stage_config.model_stage
+    else:
+        args = getattr(stage_config, "engine_args", None)
+        model_arch = _get_attr_or_item(args, "model_arch")
+        role = _get_attr_or_item(args, "model_stage")
+    if model_arch != "Qwen3OmniMoeForConditionalGeneration" or role != "talker":
+        return spec
+
+    # The Talker loads code2wav.* from its own checkpoint. A separately
+    # launched or independently updated codec must render the entire stream.
+    codec = next(
+        (
+            s
+            for s in local_stages
+            if isinstance(s, BaseVllmOmniStageConfig) and s.model_stage == "code2wav" and stage_id in s.input_sources
+        ),
+        None,
+    )
+    if not (
+        isinstance(stage_config, BaseVllmOmniStageConfig)
+        and codec is not None
+        and stage_config.weight_transfer_config is None
+        and codec.weight_transfer_config is None
+        and stage_config.model_config.model == codec.model_config.model
+        and stage_config.model_config.model_subdir == codec.model_config.model_subdir
+        and stage_config.model_config.revision == codec.model_config.revision
+        and stage_config.model_config.dtype == codec.model_config.dtype
+        and model_arch == codec.model_config.model_arch
+        and stage_config.load_config.load_format == codec.load_config.load_format != "dummy"
+        and stage_config.load_config.model_loader_extra_config == codec.load_config.model_loader_extra_config
+    ):
+        spec["extra"] = {**spec.get("extra", {}), "talker_first_audio": False}
+    return spec
+
+
+def _get_stage_edge_spec(omni_transfer_config: Any, stage_id: int) -> dict[str, Any]:
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)

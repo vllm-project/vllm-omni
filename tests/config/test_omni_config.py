@@ -1595,6 +1595,69 @@ def test_qwen3_omni_downstream_mrv2_accepts_duplex_sessions():
     assert [stage.yaml_engine_args["session_mode"] for stage in merged] == ["duplex", "duplex", "duplex"]
 
 
+@pytest.mark.parametrize("mooncake", [None, {"config_file": "/store.json", "namespace": "turn-test"}])
+def test_mooncake_turn_acceptance_overrides_resolve(tmp_path, mooncake):
+    from tests.engine.test_mooncake_turn_consistency_qwen3 import REVISION, WORKER, _stage_overrides
+    from vllm_omni.config.resolver import resolve_omni_config
+
+    Qwen3OmniMoeConfig(architectures=["Qwen3OmniMoeForConditionalGeneration"]).save_pretrained(tmp_path)
+    resolution = resolve_omni_config(
+        str(tmp_path),
+        trust_remote_code=True,
+        deploy_config_path=str(_DEPLOY_DIR / "qwen3_omni_moe.yaml"),
+        cli_overrides={"revision": REVISION},
+        stage_overrides=_stage_overrides(mooncake),
+        strategy_config_path=None,
+    )
+    thinker = resolution.stage_by_id(0)
+    assert all(s.model_config.use_v2_model_runner for s in resolution.stage_configs)
+    assert thinker.runtime_config.worker_cls == WORKER
+    store = (thinker.connector_config.omni_kv_config or {}).get("kv_store_config", {})
+    assert store.get("mooncake_config") == mooncake
+
+
+@pytest.mark.parametrize(
+    ("talker_model", "overrides", "headless", "enabled"),
+    [
+        (None, {}, False, True),
+        (None, {"stage_1_revision": "rev-b", "stage_2_revision": "rev-b"}, False, True),
+        (None, {"stage_2_revision": "rev-b"}, False, False),
+        ("/alternate", {}, False, False),
+        (None, {"stage_2_model_subdir": "alternate"}, False, False),
+        (None, {"stage_2_dtype": "float32"}, False, False),
+        (None, {"load_format": "dummy"}, False, False),
+        (None, {"stage_2_weight_transfer_config": {"backend": "nccl"}}, False, False),
+        (None, {}, True, False),
+    ],
+)
+def test_qwen3_omni_first_frame_requires_matching_codec_weights(tmp_path, talker_model, overrides, headless, enabled):
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec, load_omni_transfer_config_for_model
+
+    model = "/checkpoint"
+    deploy = tmp_path / "deploy.yaml"
+    base = _DEPLOY_DIR / "qwen3_omni_moe.yaml"
+    deploy.write_text(
+        f"base_config: {base}\n"
+        + (f"stages:\n  - stage_id: 1\n    engine_extras:\n      model: {talker_model}\n" if talker_model else "")
+    )
+    config = VllmOmniConfig.from_pipeline_config(
+        _qwen3_omni_pipeline(),
+        deploy_config_path=str(deploy),
+        cli_overrides={"model": model, "revision": "rev-a", **overrides},
+    )
+    transfer = load_omni_transfer_config_for_model(model, config.orchestrator_config.deploy_config_path)
+    talker = config.stage_configs[1]
+    spec = get_stage_connector_spec(
+        transfer,
+        talker.stage_id,
+        async_chunk=True,
+        stage_config=talker,
+        local_stages=() if headless else config.stage_configs,
+    )
+    assert spec["extra"]["talker_first_audio"] is enabled
+    assert spec["extra"]["codec_chunk_ramp"][0] == 1
+
+
 def test_qwen3_tts_b2_retunes_do_not_change_base_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
     tuned = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_b2.yaml")

@@ -6282,7 +6282,6 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
         "tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py",
         "tests/assets/minicpmo_4_5/",
         "vllm_omni/deploy/qwen3_omni_duplex.yaml",
-        "vllm_omni/deploy/qwen3_omni_duplex.yaml",
         "vllm_omni/engine/duplex/",
         "vllm_omni/model_executor/models/qwen3_omni/",
     } <= qwen_paths

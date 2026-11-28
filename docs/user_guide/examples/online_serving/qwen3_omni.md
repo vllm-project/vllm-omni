@@ -77,8 +77,9 @@ audio corruption; only do so after validating your stack and decode windows.
 FP32 increases Code2Wav memory use; latency depends on the selected kernels.
 The Instruct checkpoint's 216,016,577 Code2Wav parameters occupy about 412 MiB
 in BF16/FP16 and 824 MiB in FP32, an increase of 412 MiB **per decoder copy**.
-The default profile loads one copy. Profiles enabling Talker first-frame audio
-load a second copy, adding another 412 MiB to the Talker process. Activations,
+When the default profile enables Talker first-frame audio, it loads a second
+decoder copy in the Talker process. Deployments using Code2Wav for every
+frame load one copy. Activations,
 cuDNN workspace and CUDA Graph pools need additional memory; these weight-only
 figures do not establish the peak memory or that a deployment fits its budgets.
 

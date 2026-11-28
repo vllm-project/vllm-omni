@@ -64,16 +64,8 @@ def _multimodal_cases(prompt: dict) -> list[tuple[str, dict]]:
     return cases
 
 
-def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncake: dict | None, monkeypatch) -> dict:
-    from vllm import SamplingParams
-
-    from vllm_omni.entrypoints.omni import Omni
-
-    directory.mkdir()
-    (directory / "case.txt").write_text("startup")
-    monkeypatch.setenv(AUDIT_ENV, str(directory))
+def _stage_overrides(mooncake: dict | None) -> dict:
     thinker = {
-        "use_v2_model_runner": True,
         "worker_cls": WORKER,
         "tensor_parallel_size": 1,
         "max_num_seqs": 1,
@@ -87,7 +79,7 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
     }
     if mooncake is not None:
         thinker["omni_kv_config"] = {"kv_store_config": {"mooncake_config": mooncake}}
-    overrides = helpers.stage_overrides(
+    return helpers.stage_overrides(
         lmcache=False,
         thinker_extra=thinker,
         downstream_extra={
@@ -106,11 +98,21 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
             },
         },
     )
+
+
+def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncake: dict | None, monkeypatch) -> dict:
+    from vllm import SamplingParams
+
+    from vllm_omni.entrypoints.omni import Omni
+
+    directory.mkdir()
+    (directory / "case.txt").write_text("startup")
+    monkeypatch.setenv(AUDIT_ENV, str(directory))
     omni = Omni(
         model=model,
         revision=REVISION,
         deploy_config="qwen3_omni_moe.yaml",
-        stage_overrides=overrides,
+        stage_overrides=_stage_overrides(mooncake),
         trust_remote_code=True,
         stage_init_timeout=1800,
         init_timeout=1800,

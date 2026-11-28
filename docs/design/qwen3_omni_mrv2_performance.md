@@ -28,6 +28,10 @@ establish duplex latency or interruption behavior.
 
 First-frame delivery requires `talker_first_audio: true` in connector extra,
 a one-frame initial codec chunk, CUDA, a local single-rank Talker and Talker prefix caching disabled.
+The launcher must resolve both stages to the same model, subdirectory, revision and configured dtype.
+Separately launched stages and stages configured for independent weight updates
+use Code2Wav for the entire stream. When CUDA graph memory estimation is enabled,
+the worker measures the Talker's first-frame graph pools before sizing the KV cache.
 Other deployments retain the regular Code2Wav path.
 Set `talker_first_audio: false` (or `VLLM_OMNI_TALKER_FIRST_AUDIO=0`) to disable
 first-frame delivery. To restore the previous codec defaults, also set
