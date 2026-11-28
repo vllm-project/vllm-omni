@@ -353,6 +353,11 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         self._tp_rank = tp_rank
         self._tp_size = tp_size
 
+    @property
+    def _int8_scale_tp_group(self) -> torch.distributed.ProcessGroup:
+        """Reduce sharded INT8 scales on the encoder's TP group."""
+        return self.group.device_group
+
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.input_is_parallel:
             input_parallel = input_

@@ -8,6 +8,7 @@ Tests for the DiffusersPipelineLoader.
 import json
 import os
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file
+from safetensors.torch import load, load_file, save_file
 from vllm.config.load import LoadConfig
 
 import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
@@ -697,6 +698,80 @@ def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypa
         "transformer.audio_proj_in.weight",
         "transformer.transformer_blocks.0.audio_ff.weight",
     ]
+
+
+def _load_online_int8_tp_shards(rank: int, checkpoint: Path, strategy: str | None) -> None:
+    import torch.distributed as dist
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm.model_executor.parameter import ModelWeightParameter
+
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config, NPUInt8OnlineLinearMethod
+
+    class Pipeline(nn.ModuleList):
+        def load_weights(self, weights):
+            return AutoWeightsLoader(self).load_weights(weights)
+
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    dist.init_process_group(
+        "gloo", init_method=(checkpoint / "rendezvous").as_uri(), rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        config = DiffusionInt8Config()
+        model = Pipeline(nn.Module() for _ in range(4))
+        model.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(str(checkpoint), subfolder=None, revision=None)
+        ]
+
+        tp_group = SimpleNamespace(rank_in_group=rank, world_size=2, device_group=dist.group.WORLD)
+        loader = DiffusersPipelineLoader(
+            LoadConfig(use_tqdm_on_load=False, safetensors_load_strategy=strategy),
+            _loader_config(
+                enable_multithread_weight_load=strategy != "eager",
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+                quantization_config=config,
+            ),
+        )
+
+        # Threaded reads can finish shards in either order. Eager reads can
+        # return keys within a shard in either order. Force both across ranks.
+        def completion_order(futures):
+            submitted = list(futures)
+            return reversed(submitted) if rank else iter(submitted)
+
+        def eager_load(data):
+            return dict(sorted(load(data).items(), reverse=bool(rank)))
+
+        with (
+            patch("vllm.distributed.parallel_state._TP", tp_group),
+            patch("concurrent.futures.as_completed", completion_order),
+            patch("vllm.model_executor.model_loader.weight_utils.load", eager_load),
+        ):
+            for layer in model:
+                # The input-sharded NPU path uses PyTorch ops and can run on CPU.
+                layer.quant_method = NPUInt8OnlineLinearMethod(config)
+                layer.quant_method.create_weights(
+                    layer, 2, [2], 4, 2, torch.bfloat16, weight_loader=ModelWeightParameter.load_row_parallel_weight
+                )
+            loader.load_weights(model)
+
+        for i, layer in enumerate(model):
+            full_weight = load_file(checkpoint / f"model-{i // 2}.safetensors")[f"{i}.weight"].float()
+            full_amax = full_weight.abs().amax(dim=1, keepdim=True)
+            expected_weight = (full_weight * (127 / full_amax)).round().to(torch.int8)
+            torch.testing.assert_close(layer.weight_scale, full_amax.squeeze(1) / 127, rtol=0, atol=0)
+            torch.testing.assert_close(layer.weight.T, expected_weight.chunk(2, dim=1)[rank])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires torch.distributed gloo")
+@pytest.mark.parametrize("strategy", [None, "eager"], ids=["multithread", "eager"])
+def test_online_int8_tp_load_matches_unsharded_quantization_across_files(tmp_path, strategy):
+    weight = torch.tensor([[1, -2, 8, 6], [-5, 3, 1, 2]], dtype=torch.bfloat16)
+    for shard in range(2):
+        weights = {f"{i}.weight": (4**i) * weight for i in (2 * shard, 2 * shard + 1)}
+        save_file(weights, tmp_path / f"model-{shard}.safetensors")
+    torch.multiprocessing.spawn(_load_online_int8_tp_shards, args=(tmp_path, strategy), nprocs=2)
 
 
 def test_safetensors_directory_source_selects_model_file_from_package_root(
