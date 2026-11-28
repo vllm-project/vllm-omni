@@ -20,7 +20,8 @@ already-loaded decoder.
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MethodType
@@ -181,6 +182,7 @@ def all_gather_along_dim(
     group: dist.ProcessGroup,
     dim: int,
     dst: int | None = None,
+    communication_guard: Callable[[str], AbstractContextManager] = nullcontext,
 ) -> torch.Tensor:
     rank, world_size = _rank_world(group)
     if world_size <= 1:
@@ -189,7 +191,9 @@ def all_gather_along_dim(
     gathered = [torch.empty_like(x) for _ in range(world_size)]
     # NCCL has no rank-local gather, so every rank joins the collective; only ``dst``
     # keeps the assembled tensor while the rest drop their copies.
-    dist.all_gather(gathered, x.contiguous(), group=group)
+    send = x.contiguous()
+    with communication_guard("all-gather"):
+        dist.all_gather(gathered, send, group=group)
     if dst is not None and rank != dst:
         return x.new_zeros(0)
     return torch.cat(gathered, dim=dim)
@@ -272,6 +276,7 @@ def _halo_exchange_p2p(
     bottom_row_ref: torch.Tensor,
     recv_top_buf: torch.Tensor,
     recv_bottom_buf: torch.Tensor,
+    communication_guard: Callable[[str], AbstractContextManager] = nullcontext,
 ) -> None:
     p2p_ops = []
     if rank > 0:
@@ -291,9 +296,10 @@ def _halo_exchange_p2p(
         recv_bottom_buf.zero_()
 
     if p2p_ops:
-        reqs = dist.batch_isend_irecv(p2p_ops)
-        for req in reqs:
-            req.wait()
+        with communication_guard("halo exchange"):
+            reqs = dist.batch_isend_irecv(p2p_ops)
+            for req in reqs:
+                req.wait()
 
 
 def halo_exchange(
@@ -304,6 +310,7 @@ def halo_exchange(
     split_dim: str = "height",
     recv_top_buf: torch.Tensor | None = None,
     recv_bottom_buf: torch.Tensor | None = None,
+    communication_guard: Callable[[str], AbstractContextManager] = nullcontext,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     if halo_size <= 0:
         return x, recv_top_buf, recv_bottom_buf
@@ -326,6 +333,7 @@ def halo_exchange(
         bottom_row_ref=bottom_row_ref,
         recv_top_buf=recv_top_buf,
         recv_bottom_buf=recv_bottom_buf,
+        communication_guard=communication_guard,
     )
 
     return torch.cat([recv_top_buf, x, recv_bottom_buf], dim=dim), recv_top_buf, recv_bottom_buf
