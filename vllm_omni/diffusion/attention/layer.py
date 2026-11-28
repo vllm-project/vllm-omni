@@ -1407,29 +1407,35 @@ class Attention(nn.Module):
                 parallel_strategy=strategy.name,
             )
 
-        # Scheduler rows describe the logical sequence, while strict Ulysses
-        # may append synthetic tokens solely to make the image shard divisible.
-        # Remove those tokens after the all-to-all and put zero placeholders
-        # back before the reverse all-to-all.
-        paged_sp_padding = 0
-        paged_sp_padding_offset = query.shape[1]
-        if use_paged_attention and strategy is not self._no_parallel_strategy and strategy.name == "ulysses":
+        # Strip synthetic sequence rows after the all-to-all. Restore them
+        # before the reverse all-to-all so every rank has the same shard size.
+        sp_padding = attn_metadata.ulysses_suffix_padding if attn_metadata is not None else 0
+        padding_end = query.shape[1]
+        if sp_padding:
+            # Cosmos3 prepends text keys/values without corresponding queries.
+            # The padding is the same suffix length on each tensor.
+            if strategy.name != "ulysses" or self.use_ring or not 0 < sp_padding < min(query.size(1), key.size(1)):
+                raise ValueError(f"Invalid Ulysses suffix padding {sp_padding} for Q={query.shape}, K={key.shape}")
+            query = query[:, :-sp_padding].contiguous()
+            key = key[:, :-sp_padding].contiguous()
+            value = value[:, :-sp_padding].contiguous()
+        elif use_paged_attention and strategy is not self._no_parallel_strategy and strategy.name == "ulysses":
             forward_ctx = get_forward_context() if is_forward_context_available() else None
-            paged_sp_padding = int(getattr(forward_ctx, "sp_padding_size", 0))
-            if paged_sp_padding:
+            sp_padding = int(getattr(forward_ctx, "sp_padding_size", 0))
+            if sp_padding:
                 joint_len = int(getattr(ctx, "joint_len", 0))
                 joint_strategy = str(getattr(ctx, "joint_strategy", "front"))
-                paged_sp_padding_offset = query.shape[1] - (joint_len if joint_strategy == "rear" else 0)
-                padding_start = paged_sp_padding_offset - paged_sp_padding
+                padding_end = query.shape[1] - (joint_len if joint_strategy == "rear" else 0)
+                padding_start = padding_end - sp_padding
                 if padding_start < 0:
                     raise ValueError(
                         "Paged Ulysses padding exceeds the post-all-to-all sequence: "
-                        f"padding={paged_sp_padding}, sequence={query.shape[1]}"
+                        f"padding={sp_padding}, sequence={query.shape[1]}"
                     )
 
                 def _remove_paged_sp_padding(tensor: torch.Tensor) -> torch.Tensor:
                     return torch.cat(
-                        (tensor[:, :padding_start], tensor[:, paged_sp_padding_offset:]),
+                        (tensor[:, :padding_start], tensor[:, padding_end:]),
                         dim=1,
                     ).contiguous()
 
@@ -1476,9 +1482,9 @@ class Attention(nn.Module):
                         ),
                     )
 
-        if paged_sp_padding:
-            padding_start = paged_sp_padding_offset - paged_sp_padding
-            output_padding = out.new_zeros((out.shape[0], paged_sp_padding, *out.shape[2:]))
+        if sp_padding:
+            padding_start = padding_end - sp_padding
+            output_padding = out.new_zeros((out.shape[0], sp_padding, *out.shape[2:]))
             out = torch.cat((out[:, :padding_start], output_padding, out[:, padding_start:]), dim=1)
 
         # 3. Post-processing (Reverse Communication)

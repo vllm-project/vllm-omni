@@ -1010,7 +1010,11 @@ def test_gen_sp_prepare_resets_branch_local_padding_metadata() -> None:
     assert ctx.sp_original_seq_len is None
 
 
-def test_sp_attention_masks_padded_gen_and_joint_und_keys() -> None:
+@pytest.mark.parametrize(
+    ("ulysses", "ring", "allgather", "padding", "suffix"),
+    [(2, 1, 1, 1, 1), (2, 1, 1, 0, 0), (2, 2, 1, 1, 0), (2, 1, 2, 1, 0)],
+)
+def test_sp_attention_padding_metadata(ulysses: int, ring: int, allgather: int, padding: int, suffix: int) -> None:
     from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
 
@@ -1036,14 +1040,55 @@ def test_sp_attention_masks_padded_gen_and_joint_und_keys() -> None:
     v = torch.zeros_like(q)
     k_und = torch.zeros(1, 3, 2, 4)
     v_und = torch.zeros_like(k_und)
-    ctx = ForwardContext(sp_padding_size=1, sp_original_seq_len=3)
+    parallel = SimpleNamespace(
+        ulysses_degree=ulysses, ring_degree=ring, allgather_degree=allgather, ulysses_mode="strict"
+    )
+    ctx = ForwardContext(
+        omni_diffusion_config=SimpleNamespace(parallel_config=parallel),
+        sp_padding_size=padding,
+        sp_original_seq_len=4 - padding,
+    )
     with override_forward_context(ctx):
         output = module._forward_sp(q, k, v, k_und, v_und)
 
     assert output.shape == (1, 2, 8)
-    assert recording_attention.metadata is not None
-    assert recording_attention.metadata.attn_mask.tolist() == [[True, True, True, False]]
-    assert recording_attention.metadata.joint_attn_mask.tolist() == [[True, True, True]]
+    metadata = recording_attention.metadata
+    assert metadata.ulysses_suffix_padding == suffix
+    if padding and not suffix:
+        assert metadata.attn_mask.tolist() == [[True, True, True, False]]
+        assert metadata.joint_attn_mask.tolist() == [[True, True, True]]
+    else:
+        assert metadata.attn_mask is None
+        assert metadata.joint_attn_mask is None
+
+
+def test_ulysses_suffix_padding_matches_unpadded_attention(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    # Post-all-to-all tensors: three real GEN queries and two extra UND keys.
+    q = torch.tensor([1.0, -1.0, 2.0, 99.0]).view(1, 4, 1, 1)
+    k = torch.tensor([-2.0, 1.0, 0.0, 3.0, -1.0, 99.0]).view(1, 6, 1, 1)
+    v = torch.tensor([11.0, 7.0, 2.0, 5.0, 3.0, 999.0]).view_as(k)
+    expected = (q.flatten()[:3, None] * k.flatten()[None, :5]).softmax(-1) @ v.flatten()[:5]
+
+    strategy = SimpleNamespace(
+        name="ulysses",
+        pre_attention=lambda q, k, v, md: (q, k, v, md, None),
+        post_attention=lambda output, ctx: output,
+    )
+    layer = Attention(num_heads=1, head_size=1, softmax_scale=1.0, causal=False)
+    monkeypatch.setattr(layer, "_get_active_parallel_strategy", lambda: strategy)
+
+    def local_attention(q, k, v, metadata):
+        assert (q.size(1), k.size(1), v.size(1)) == (3, 5, 5)
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(layer, "_run_local_attention", local_attention)
+    output = layer(q, k, v, AttentionMetadata(ulysses_suffix_padding=1))
+    torch.testing.assert_close(output.flatten(), torch.cat((expected, torch.zeros(1))))
 
 
 def test_ulysses_2d_mask_uses_key_length_with_kv_only_joint_context(
