@@ -8,7 +8,11 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.minimax_h3.image_vae import MiniMaxH3ImageVAE
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
+]
 
 
 def test_graph_tile_decode_is_bitwise_eager():
