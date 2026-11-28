@@ -42,7 +42,7 @@ from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session import history_calibration as history_calibration_module
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
-from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
@@ -108,6 +108,7 @@ async def open_qwen(
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
     history_policy=None,
+    clock=None,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
@@ -131,6 +132,7 @@ async def open_qwen(
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
         model_config=None,
+        clock=clock,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
     for key, value in config_overrides.items():
@@ -1757,6 +1759,103 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
             actual = submission.prompt["multi_modal_data"]["image"][0]
             assert saved.size == actual.size
             assert saved.tobytes() == actual.tobytes()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_tool_result_reaches_the_prompt_after_an_intervening_turn():
+    """Keep the published call and deliver its result without judging generated answers."""
+    h = await open_qwen(
+        modalities=["text"],
+        playback_commit_policy="commit_all_on_done",
+        extra_body={"function_call_interrupt_policy": "keep"},
+    )
+    try:
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "original input"}],
+                    }
+                )
+            )
+        )
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 1
+        request_id = h.port.submissions[-1].context.request_id
+        # Only model output is scripted: parsing, publication and registration
+        # still go through the real Qwen data plane and session runner.
+        await h.deliver_and_settle(
+            tts_output(
+                request_id,
+                samples=0,
+                text='<tool_call>{"name":"lookup","arguments":{"key":"original"}}</tool_call>',
+                finished=True,
+            ),
+            stage_id=0,
+        )
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=2)
+        (published,) = [event for event in h.events if event.type == "response.function_call_arguments.done"]
+        call_id = published.call_id
+        record = h.runner.tool_calls.record(call_id)
+        assert record is not None and record.state is ToolCallState.PENDING
+        origin = record.origin
+        anchor = h.session.runtime_config["qwen_call_anchors"][call_id]
+
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "intervening input"}],
+                    }
+                )
+            )
+        )
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 2
+        request_id = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=0, text="intervening reply", finished=True), stage_id=0
+        )
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=2)
+        assert h.session.active_response_id is None
+        assert h.runner.tool_calls.record(call_id) is record
+        assert record.state is ToolCallState.PENDING and record.origin == origin
+        assert h.session.runtime_config["qwen_call_anchors"][call_id] == anchor
+
+        output = '{"marker":"result-A"}'
+        accepted = await h.run(
+            CreateItem(
+                item=normalize_conversation_item({"type": "function_call_output", "call_id": call_id, "output": output})
+            )
+        )
+        assert [event.item["call_id"] for event in accepted if event.type == "conversation.item.created"] == [call_id]
+        assert record.state is ToolCallState.ACCEPTED
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 3
+        messages = ast.literal_eval(h.port.submissions[-1].prompt["prompt"])
+        assert messages == [
+            {"role": "user", "content": [{"type": "text", "text": "original input"}]},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": origin.name, "arguments": origin.arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": output},
+            {"role": "user", "content": [{"type": "text", "text": "intervening input"}]},
+            {"role": "assistant", "content": "intervening reply"},
+        ]
+        assert not any(event.type == "error" for event in h.events)
     finally:
         await h.manager.shutdown()
 

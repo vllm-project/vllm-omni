@@ -666,6 +666,32 @@ class DuplexModelPlugin(ABC):
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
 
+    def fast_path_active(self, request_id: str, output_metadata: Mapping[str, object]) -> bool:
+        """Whether this decoded Stage-0 frame opens a back-to-back stretch.
+
+        While it holds, the session appends the model's own silence frame as
+        soon as each frame is handled instead of waiting for the client's next
+        unit, so a model that emits several tokens per spoken frame (a tool call
+        the user never hears) is not paced by the client's 80 ms clock. The
+        plugin owns the step budget; the runner does not count these appends
+        against the response continuation limit. Default is off.
+        """
+        del request_id, output_metadata
+        return False
+
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """One spoken warmup append, or None to keep the shared probe.
+
+        The shared video-turn probe sends a short tone plus one frame. A model
+        that treats an empty transcript as silence never reaches its later
+        stages on that input. Override this with the same fields as an
+        ``input_audio_buffer.append`` (base64 ``audio``, ``format``,
+        ``sample_rate_hz``, and optionally ``is_speech`` and ``video_frames``)
+        plus ``instructions`` when the shared warmup prompt is wrong for the
+        model. None leaves the shared probe unchanged.
+        """
+        return None
+
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
     @abstractmethod
@@ -1090,6 +1116,19 @@ class DuplexModelPlugin(ABC):
         """
         del model_result
         return None
+
+    def function_call_releases_turn(self, model_result: Mapping[str, object]) -> bool:
+        """Whether publishing this call finishes a non-resumable turn.
+
+        The function-call branch returns before the normal end-of-turn path.
+        A call that still has speech, or a model that emits its own terminal
+        event afterwards, must keep the default: releasing here would abort
+        that speech. A model whose call has nothing left to speak overrides
+        this so the request is free before the client sends the tool result
+        and ``response.create``.
+        """
+        del model_result
+        return False
 
     def runtime_config_for_function_output(
         self,

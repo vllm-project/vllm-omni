@@ -56,6 +56,20 @@ def test_baseline_confirmation_policies_reference_existing_metrics() -> None:
                     )
 
 
+def test_qwen3_async_chunk_confirms_only_the_noisy_mi300_tpot_sweep() -> None:
+    config_path = Path(__file__).parent / "test_qwen3_omni_async_chunk.json"
+    configs = json.loads(config_path.read_text(encoding="utf-8"))
+    phases = configs[0]["benchmark_params"]
+    confirmed = [phase for phase in phases if "baseline_confirmation" in phase]
+
+    assert len(confirmed) == 1
+    phase = confirmed[0]
+    assert phase["request_rate"] == [0.5]
+    assert phase["num_prompts"] == [40]
+    assert "extra_body" not in phase
+    assert phase["baseline_confirmation"] == {"MI300": {"metrics": ["mean_tpot_ms"], "attempts": 3, "tolerance": 0.1}}
+
+
 def test_unknown_metric_direction_is_rejected() -> None:
     with pytest.raises(ValueError, match="no regression direction"):
         metric_lower_is_better("custom_score")
