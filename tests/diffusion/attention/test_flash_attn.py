@@ -725,31 +725,16 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize(("query_length", "is_cross_attn"), [(2, False), (6, True)])
-def test_unpad_qkv_input_slices_static_cache(query_length, is_cross_attn):
-    """Static-cache padding must not shift selected rows in later batches."""
-    query = torch.arange(2 * query_length, dtype=torch.float32).reshape(2, query_length, 1, 1)
-    key = torch.arange(12, dtype=torch.float32).reshape(2, 6, 1, 1)
-    value = key + 100
-    mask = torch.tensor([[True, False, True, False], [False, True, True, True]])
-
-    q, k, v, indices_q, (cu_q, cu_k), _ = fa._unpad_qkv_input(query, key, value, mask, is_cross_attn=is_cross_attn)
-
-    torch.testing.assert_close(q, query.flatten(0, 1))
-    torch.testing.assert_close(k.flatten(), torch.tensor([0.0, 2.0, 7.0, 8.0, 9.0]))
-    torch.testing.assert_close(v.flatten(), torch.tensor([100.0, 102.0, 107.0, 108.0, 109.0]))
-    assert indices_q is None
-    assert cu_q.tolist() == [0, query_length, 2 * query_length]
-    assert cu_k.tolist() == [0, 2, 5]
-
-
-@pytest.mark.cpu
 @pytest.mark.parametrize("query_length", [2, 4])
-def test_varlen_masked_routing_by_role(monkeypatch, query_length):
+@pytest.mark.parametrize("cache_length", [4, 6])
+def test_varlen_masked_routing_by_role(monkeypatch, query_length, cache_length):
     """Only equal-length self-attention applies the key mask to query rows."""
-    calls = []
+    calls: list[tuple[int, torch.Tensor, torch.Tensor]] = []
 
     def fake_varlen_func(q, k, v, **kwargs):
+        # Static-cache slots beyond the mask must not shift later batches.
+        torch.testing.assert_close(k, key[:, :seq_len][metadata.attn_mask])
+        torch.testing.assert_close(v, key[:, :seq_len][metadata.attn_mask])
         calls.append((q.shape[0], kwargs["cu_seqlens_q"], kwargs["cu_seqlens_k"]))
         return q
 
@@ -758,7 +743,9 @@ def test_varlen_masked_routing_by_role(monkeypatch, query_length):
 
     batch_size, seq_len, num_heads, head_dim = 2, 4, 2, 8
     query = torch.randn(batch_size, query_length, num_heads, head_dim)
-    key = torch.randn(batch_size, seq_len, num_heads, head_dim)
+    key = torch.arange(batch_size * cache_length * num_heads * head_dim, dtype=torch.float32).reshape(
+        batch_size, cache_length, num_heads, head_dim
+    )
     metadata = AttentionMetadata(attn_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]))
 
     cross_impl = FlashAttentionImpl(
@@ -775,8 +762,8 @@ def test_varlen_masked_routing_by_role(monkeypatch, query_length):
     output = self_impl.forward_cuda(query, key, key, metadata)
     assert output.shape == query.shape
     num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
-    assert num_q_rows == (5 if query_length == seq_len else batch_size * query_length)
-    assert cu_seqlens_q.tolist() == ([0, 2, 5] if query_length == seq_len else [0, query_length, 2 * query_length])
+    assert num_q_rows == (5 if query_length == cache_length else batch_size * query_length)
+    assert cu_seqlens_q.tolist() == ([0, 2, 5] if query_length == cache_length else [0, query_length, 2 * query_length])
     assert cu_seqlens_k.tolist() == [0, 2, 5]
 
 
